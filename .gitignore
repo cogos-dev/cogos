@@ -1,0 +1,16 @@
+# Binaries
+cog
+cog-*
+*.exe
+
+# Test artifacts
+*.tmp.*
+*.test
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
