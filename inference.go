@@ -34,12 +34,12 @@ import (
 type ErrorType int
 
 const (
-	ErrorNone ErrorType = iota
-	ErrorRateLimit      // 429 - retry with backoff
-	ErrorContextOverflow // Context too long - compress and retry
-	ErrorAuth           // Authentication failure - fail fast
-	ErrorTransient      // Transient failure - retry with backoff
-	ErrorFatal          // Fatal error - don't retry
+	ErrorNone            ErrorType = iota
+	ErrorRateLimit                 // 429 - retry with backoff
+	ErrorContextOverflow           // Context too long - compress and retry
+	ErrorAuth                      // Authentication failure - fail fast
+	ErrorTransient                 // Transient failure - retry with backoff
+	ErrorFatal                     // Fatal error - don't retry
 )
 
 // String returns human-readable error type
@@ -301,7 +301,7 @@ func DefaultProviders() map[ProviderType]*ProviderConfig {
 		ProviderLocal: {
 			Type:    ProviderLocal,
 			BaseURL: "http://localhost:" + localPort + "/v1",
-			APIKey:  "",     // Local kernel doesn't require API key
+			APIKey:  "",       // Local kernel doesn't require API key
 			Model:   "claude", // Route to Claude by default
 		},
 	}
@@ -412,13 +412,13 @@ type OpenAIStreamChunk struct {
 
 // RequestEntry represents a tracked request in the registry
 type RequestEntry struct {
-	ID        string             `json:"id"`
-	Origin    string             `json:"origin"`
-	Model     string             `json:"model"`
-	Started   time.Time          `json:"started"`
-	Status    string             `json:"status"` // "running", "completed", "cancelled", "failed"
-	Cancel    context.CancelFunc `json:"-"`
-	Prompt    string             `json:"prompt,omitempty"` // First 100 chars for display
+	ID      string             `json:"id"`
+	Origin  string             `json:"origin"`
+	Model   string             `json:"model"`
+	Started time.Time          `json:"started"`
+	Status  string             `json:"status"` // "running", "completed", "cancelled", "failed"
+	Cancel  context.CancelFunc `json:"-"`
+	Prompt  string             `json:"prompt,omitempty"` // First 100 chars for display
 }
 
 // RequestRegistry tracks in-flight inference requests
@@ -711,7 +711,7 @@ func runHTTPInference(req *InferenceRequest, providerType ProviderType, modelNam
 			return nil, fmt.Errorf("API key not set for provider %s (set OPENAI_API_KEY)", providerType)
 		case ProviderOpenRouter:
 			return nil, fmt.Errorf("API key not set for provider %s (set OPENROUTER_API_KEY)", providerType)
-		// Ollama, Local, and Custom don't require API keys
+			// Ollama, Local, and Custom don't require API keys
 		}
 	}
 
@@ -841,7 +841,7 @@ func runHTTPInferenceStream(req *InferenceRequest, providerType ProviderType, mo
 			return nil, fmt.Errorf("API key not set for provider %s (set OPENAI_API_KEY)", providerType)
 		case ProviderOpenRouter:
 			return nil, fmt.Errorf("API key not set for provider %s (set OPENROUTER_API_KEY)", providerType)
-		// Ollama, Local, and Custom don't require API keys
+			// Ollama, Local, and Custom don't require API keys
 		}
 	}
 
@@ -2198,6 +2198,307 @@ Notes:
   - JSON output includes prompt/completion tokens and context metrics
   - Supports automatic retry with exponential backoff for rate limits
   - Context-aware invocation via ContextState (programmatic API)
+`)
+}
+
+// === INFERENCE CLI COMMANDS (ADR-046) ===
+
+// cmdInference handles the "cog inference" command group for provider management
+func cmdInference(args []string) int {
+	if len(args) == 0 {
+		printInferenceHelp()
+		return 0
+	}
+
+	switch args[0] {
+	case "list":
+		return cmdInferenceList(args[1:])
+	case "status":
+		return cmdInferenceStatus(args[1:])
+	case "use":
+		return cmdInferenceUse(args[1:])
+	case "test":
+		return cmdInferenceTest(args[1:])
+	case "help", "-h", "--help":
+		printInferenceHelp()
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown inference subcommand: %s\n", args[0])
+		printInferenceHelp()
+		return 1
+	}
+}
+
+// cmdInferenceList lists all configured providers with status
+func cmdInferenceList(args []string) int {
+	// Fetch from local kernel if running, otherwise show defaults
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://localhost:5100/v1/providers")
+
+	if err != nil {
+		// Kernel not running, show default providers
+		fmt.Println("PROVIDER     STATUS   ACTIVE  MODELS")
+		fmt.Println("claude       unknown  *       (kernel not running)")
+		fmt.Println("\nNote: Start kernel with 'cog serve' to see live status")
+		return 0
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Data []struct {
+			ID     string   `json:"id"`
+			Name   string   `json:"name"`
+			Status string   `json:"status"`
+			Active bool     `json:"active"`
+			Models []string `json:"models"`
+		} `json:"data"`
+		Active        string   `json:"active"`
+		FallbackChain []string `json:"fallback_chain"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+		return 1
+	}
+
+	// Print table header
+	fmt.Printf("%-12s %-8s %-7s %s\n", "PROVIDER", "STATUS", "ACTIVE", "MODELS")
+
+	for _, p := range data.Data {
+		active := ""
+		if p.Active {
+			active = "*"
+		}
+
+		// Status indicator
+		statusIcon := "?"
+		switch p.Status {
+		case "online":
+			statusIcon = "✓"
+		case "offline":
+			statusIcon = "✗"
+		case "degraded":
+			statusIcon = "!"
+		}
+
+		// Truncate models list
+		modelsStr := strings.Join(p.Models, ", ")
+		if len(modelsStr) > 40 {
+			modelsStr = modelsStr[:37] + "..."
+		}
+
+		fmt.Printf("%-12s %s %-6s %-7s %s\n", p.ID, statusIcon, p.Status, active, modelsStr)
+	}
+
+	fmt.Printf("\nActive: %s\n", data.Active)
+	if len(data.FallbackChain) > 0 {
+		fmt.Printf("Fallback: %s\n", strings.Join(data.FallbackChain, " -> "))
+	}
+
+	return 0
+}
+
+// cmdInferenceStatus shows health status of all providers
+func cmdInferenceStatus(args []string) int {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("http://localhost:5100/v1/providers")
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Kernel not running on localhost:5100\n")
+		fmt.Fprintf(os.Stderr, "Start with: cog serve\n")
+		return 1
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Data []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Health struct {
+				LastCheck *string `json:"last_check"`
+				LatencyMs *int    `json:"latency_ms"`
+				Error     *string `json:"error"`
+			} `json:"health"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+		return 1
+	}
+
+	for _, p := range data.Data {
+		statusIcon := "?"
+		switch p.Status {
+		case "online":
+			statusIcon = "✓"
+		case "offline":
+			statusIcon = "✗"
+		case "degraded":
+			statusIcon = "!"
+		}
+
+		latency := ""
+		if p.Health.LatencyMs != nil {
+			latency = fmt.Sprintf("(%dms)", *p.Health.LatencyMs)
+		}
+
+		errMsg := ""
+		if p.Health.Error != nil {
+			errMsg = fmt.Sprintf(" - %s", *p.Health.Error)
+		}
+
+		fmt.Printf("%s %s: %s %s%s\n", statusIcon, p.Name, p.Status, latency, errMsg)
+	}
+
+	return 0
+}
+
+// cmdInferenceUse switches to a different provider
+func cmdInferenceUse(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: cog inference use <provider>\n")
+		fmt.Fprintf(os.Stderr, "Example: cog inference use openrouter\n")
+		return 1
+	}
+
+	providerID := args[0]
+
+	// POST to activate the provider
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := fmt.Sprintf("http://localhost:5100/v1/providers/%s/activate", providerID)
+
+	body := strings.NewReader(`{"set_as_default": true}`)
+	resp, err := client.Post(url, "application/json", body)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Kernel not running on localhost:5100\n")
+		fmt.Fprintf(os.Stderr, "Start with: cog serve\n")
+		return 1
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		fmt.Fprintf(os.Stderr, "Error: Provider '%s' not found\n", providerID)
+		fmt.Fprintf(os.Stderr, "Run 'cog inference list' to see available providers\n")
+		return 1
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&errResp)
+		fmt.Fprintf(os.Stderr, "Error: %s\n", errResp.Error.Message)
+		return 1
+	}
+
+	var result struct {
+		Success  bool   `json:"success"`
+		Active   string `json:"active"`
+		Previous string `json:"previous"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("Switched to %s (was: %s)\n", result.Active, result.Previous)
+	return 0
+}
+
+// cmdInferenceTest tests a specific provider
+func cmdInferenceTest(args []string) int {
+	providerID := ""
+	if len(args) > 0 {
+		providerID = args[0]
+	}
+
+	var url string
+	if providerID == "" {
+		// Test all providers - just do a status check
+		return cmdInferenceStatus(args)
+	}
+
+	url = fmt.Sprintf("http://localhost:5100/v1/providers/%s/test", providerID)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(url, "application/json", nil)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Kernel not running on localhost:5100\n")
+		return 1
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		fmt.Fprintf(os.Stderr, "Error: Provider '%s' not found\n", providerID)
+		return 1
+	}
+
+	var result struct {
+		Provider  string  `json:"provider"`
+		Status    string  `json:"status"`
+		LatencyMs int     `json:"latency_ms"`
+		TestModel string  `json:"test_model"`
+		Error     *string `json:"error"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+		return 1
+	}
+
+	statusIcon := "✓"
+	if result.Status != "online" {
+		statusIcon = "✗"
+	}
+
+	errMsg := ""
+	if result.Error != nil {
+		errMsg = fmt.Sprintf(" - %s", *result.Error)
+	}
+
+	fmt.Printf("%s %s: %s (%dms)%s\n", statusIcon, result.Provider, result.Status, result.LatencyMs, errMsg)
+	if result.TestModel != "" {
+		fmt.Printf("  Tested with: %s\n", result.TestModel)
+	}
+
+	return 0
+}
+
+func printInferenceHelp() {
+	fmt.Printf(`Inference - Provider management (ADR-046)
+
+Usage: cog inference <command> [args...]
+
+Commands:
+  list                 List all providers with status
+  status               Show health status of all providers  
+  use <provider>       Switch to a different provider
+  test [provider]      Test a specific provider (or all if none specified)
+
+Examples:
+  cog inference list                # Show all providers
+  cog inference status              # Check health of all
+  cog inference use openrouter      # Switch to OpenRouter
+  cog inference test anthropic      # Test Anthropic connection
+
+Available Providers:
+  claude       Claude CLI (default, via Max subscription)
+  openai       OpenAI API (requires OPENAI_API_KEY)
+  openrouter   OpenRouter (requires OPENROUTER_API_KEY)
+  ollama       Ollama local models (http://localhost:11434)
+  local        Local kernel (for testing)
+
+Notes:
+  - Requires kernel running: cog serve
+  - Provider switch persists until kernel restart
+  - Health checks are cached for 60 seconds
 `)
 }
 

@@ -125,9 +125,9 @@ type Cogdoc struct {
 	ID      string      `yaml:"id"`
 	Title   string      `yaml:"title"`
 	Created string      `yaml:"created"`
-	Status  string      `yaml:"status,omitempty"`   // proposed, active, deprecated, etc.
-	Tags    []string    `yaml:"tags,omitempty"`     // Tags for categorization
-	Refs    interface{} `yaml:"refs,omitempty"`     // Can be []string or []TypedRef
+	Status  string      `yaml:"status,omitempty"` // proposed, active, deprecated, etc.
+	Tags    []string    `yaml:"tags,omitempty"`   // Tags for categorization
+	Refs    interface{} `yaml:"refs,omitempty"`   // Can be []string or []TypedRef
 }
 
 // TypedRef represents a reference with relationship type
@@ -138,16 +138,16 @@ type TypedRef struct {
 
 // Standard relationship types
 var validRefRelations = map[string]bool{
-	"refs":             true, // default
-	"implements":       true,
-	"extends":          true,
-	"supersedes":       true,
-	"describes":        true,
-	"requires":         true,
-	"suggests":         true,
-	"validates":        true,
-	"challenges":       true,
-	"prepares":         true,
+	"refs":              true, // default
+	"implements":        true,
+	"extends":           true,
+	"supersedes":        true,
+	"describes":         true,
+	"requires":          true,
+	"suggests":          true,
+	"validates":         true,
+	"challenges":        true,
+	"prepares":          true,
 	"crystallized_from": true,
 }
 
@@ -175,7 +175,7 @@ type Ontology struct {
 
 	// Workspace topology
 	Topology struct {
-		Root       string                      `yaml:"root"`
+		Root       string                        `yaml:"root"`
 		Primitives map[string]*OntologyPrimitive `yaml:"primitives"`
 		Ontology   *OntologyPrimitive            `yaml:"ontology"`
 	} `yaml:"topology"`
@@ -498,16 +498,16 @@ func isValidRelationFromOntology(rel string) bool {
 
 // IndexedCogdoc represents a cogdoc with full metadata for indexing
 type IndexedCogdoc struct {
-	URI         string     // cog://mem/episodic/decisions/foo
-	Path        string     // .cog/mem/episodic/decisions/foo.cog.md
-	Type        string     // decision, session, guide, etc.
-	ID          string     // kebab-case identifier
-	Title       string     // Human-readable title
-	Created     string     // YYYY-MM-DD
-	Status      string     // proposed, active, deprecated, etc.
-	Tags        []string   // Tags for categorization
-	Refs        []TypedRef // Structural references from frontmatter
-	InlineRefs  []string   // Navigational references from content
+	URI        string     // cog://mem/episodic/decisions/foo
+	Path       string     // .cog/mem/episodic/decisions/foo.cog.md
+	Type       string     // decision, session, guide, etc.
+	ID         string     // kebab-case identifier
+	Title      string     // Human-readable title
+	Created    string     // YYYY-MM-DD
+	Status     string     // proposed, active, deprecated, etc.
+	Tags       []string   // Tags for categorization
+	Refs       []TypedRef // Structural references from frontmatter
+	InlineRefs []string   // Navigational references from content
 }
 
 // CogdocIndex is an in-memory index of all cogdocs
@@ -714,21 +714,21 @@ var validCogdocTypes = map[string]bool{
 	"adr":       true,
 	"knowledge": true,
 	"event":     true, // Declarative event handlers
-	"skill":    true, // Skill definitions
-	"command":  true, // Command definitions
+	"skill":     true, // Skill definitions
+	"command":   true, // Command definitions
 	// Extended semantic types (common in memory)
-	"note":              true, // General notes
-	"term":              true, // Terminology definitions
-	"spec":              true, // Specifications
-	"claim":             true, // Research claims
-	"insight":           true, // Crystallized insights
-	"architecture":      true, // Architecture docs
+	"note":               true, // General notes
+	"term":               true, // Terminology definitions
+	"spec":               true, // Specifications
+	"claim":              true, // Research claims
+	"insight":            true, // Crystallized insights
+	"architecture":       true, // Architecture docs
 	"research_synthesis": true, // Research synthesis
-	"observation":       true, // Observations
-	"assessment":        true, // Assessments
-	"procedural":        true, // Procedural knowledge
-	"summary":           true, // Summaries
-	"specification":     true, // Full specifications
+	"observation":        true, // Observations
+	"assessment":         true, // Assessments
+	"procedural":         true, // Procedural knowledge
+	"summary":            true, // Summaries
+	"specification":      true, // Full specifications
 }
 
 // isKebabCase validates that a string is kebab-case
@@ -787,11 +787,11 @@ type CoherenceRecord struct {
 
 // HookResult represents the result of a hook execution
 type HookResult struct {
-	Decision          string `json:"decision"`                     // "allow" or "block"
-	Reason            string `json:"reason,omitempty"`             // Why blocked
-	Message           string `json:"message,omitempty"`            // Human-readable message
-	Fallback          bool   `json:"fallback,omitempty"`           // Used default behavior
-	AdditionalContext string `json:"additionalContext,omitempty"`  // Context to inject (for PreInference)
+	Decision          string `json:"decision"`                    // "allow" or "block"
+	Reason            string `json:"reason,omitempty"`            // Why blocked
+	Message           string `json:"message,omitempty"`           // Human-readable message
+	Fallback          bool   `json:"fallback,omitempty"`          // Used default behavior
+	AdditionalContext string `json:"additionalContext,omitempty"` // Context to inject (for PreInference)
 }
 
 // Handler represents a hook handler
@@ -812,17 +812,17 @@ type Task struct {
 	Command   string   `yaml:"command"`
 	Cache     bool     `yaml:"cache"`
 	DependsOn []string `yaml:"dependsOn,omitempty"`
-	Inputs    []string `yaml:"inputs,omitempty"`    // Glob patterns for input files
-	Outputs   []string `yaml:"outputs,omitempty"`   // Glob patterns for output files
-	Env       []string `yaml:"env,omitempty"`       // Environment variables affecting cache
+	Inputs    []string `yaml:"inputs,omitempty"`  // Glob patterns for input files
+	Outputs   []string `yaml:"outputs,omitempty"` // Glob patterns for output files
+	Env       []string `yaml:"env,omitempty"`     // Environment variables affecting cache
 }
 
 // KernelConfig represents the unified kernel configuration
 type KernelConfig struct {
-	Version   string            `yaml:"version"`
-	GlobalEnv []string          `yaml:"globalEnv,omitempty"`
-	Tasks     map[string]Task   `yaml:"tasks,omitempty"`
-	Cache     CacheConfig       `yaml:"cache,omitempty"`
+	Version   string          `yaml:"version"`
+	GlobalEnv []string        `yaml:"globalEnv,omitempty"`
+	Tasks     map[string]Task `yaml:"tasks,omitempty"`
+	Cache     CacheConfig     `yaml:"cache,omitempty"`
 }
 
 // CacheConfig controls caching behavior
@@ -988,11 +988,11 @@ func nowISO() string {
 
 // Projection defines how a URI type resolves to filesystem paths
 type Projection struct {
-	Base      string // Base directory under .cog/
-	Pattern   string // Pattern: "direct", "glob", or "directory"
-	Suffix    string // File suffix for direct patterns
-	GlobPat   string // Glob pattern for glob-based resolution
-	ExtBase   string // External base (e.g., .claude/ for skills)
+	Base    string // Base directory under .cog/
+	Pattern string // Pattern: "direct", "glob", or "directory"
+	Suffix  string // File suffix for direct patterns
+	GlobPat string // Glob pattern for glob-based resolution
+	ExtBase string // External base (e.g., .claude/ for skills)
 }
 
 // URI type projections
@@ -2240,7 +2240,6 @@ func discoverHandlersInDir(dir, event, matcher string) []Handler {
 
 	return handlers
 }
-
 
 // runHandler executes a single handler script
 func runHandler(handler Handler, inputData map[string]interface{}) *HookResult {
@@ -4420,6 +4419,10 @@ Inference:
     --model, -m <model>     Model to use (default: claude)
     --json                  Output as JSON (for programmatic use)
     --origin <origin>       Tag request origin (default: "cli")
+  inference list            List all providers with status
+  inference status          Show health status of all providers
+  inference use <name>      Switch to a different provider
+  inference test [name]     Test a specific provider (or all if none specified)
   serve [command] [--port]  OpenAI-compatible HTTP server (default port: 5100)
     (no command)            Run in foreground
     start                   Start as background daemon
@@ -5225,6 +5228,8 @@ func main() {
 		code = cmdFleet(os.Args[2:])
 	case "infer":
 		code = cmdInfer(os.Args[2:])
+	case "inference":
+		code = cmdInference(os.Args[2:])
 	case "serve":
 		code = cmdServe(os.Args[2:])
 	case "health":
