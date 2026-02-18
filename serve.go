@@ -466,10 +466,12 @@ type serveServer struct {
 	kernel        *sdk.Kernel
 	lastTAAState  *ContextState // Most recent TAA context for debugging
 	taaStateMutex sync.RWMutex
+	busChat       *busChat        // Bus event emission for chat (nil if no workspace)
+	busBroker     *busEventBroker // SSE subscriber broker for bus events
 }
 
 func newServeServer(port int, kernel *sdk.Kernel) *serveServer {
-	return &serveServer{port: port, kernel: kernel}
+	return &serveServer{port: port, kernel: kernel, busBroker: newBusEventBroker()}
 }
 
 // deepCopyContextState creates a deep copy of a ContextState so that the copy
@@ -499,19 +501,6 @@ func deepCopyContextState(src *ContextState) *ContextState {
 		dst.Tier4Semantic = &t
 	}
 
-	// Deep copy slices
-	if src.AllowedTools != nil {
-		dst.AllowedTools = append([]string(nil), src.AllowedTools...)
-	}
-	if src.DisallowedTools != nil {
-		dst.DisallowedTools = append([]string(nil), src.DisallowedTools...)
-	}
-
-	// Deep copy json.RawMessage (which is []byte)
-	if src.Schema != nil {
-		dst.Schema = append(json.RawMessage(nil), src.Schema...)
-	}
-
 	return &dst
 }
 
@@ -532,6 +521,10 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/debug", s.handleDebug)
 	mux.HandleFunc("/services", s.handleServices)
+
+	// Bus event streaming (SSE) and REST endpoints
+	mux.HandleFunc("GET /v1/events/stream", s.handleEventsStream)
+	mux.HandleFunc("GET /v1/bus/", s.handleBusEventsREST)
 
 	// SDK routes (universal cog:// access)
 	if s.kernel != nil {
@@ -1477,6 +1470,17 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		sessionID = r.Header.Get("X-Eidolon-ID")
 	}
 
+	// Auto-derive session from origin when no explicit session provided.
+	// This enables bus event emission for gateway-routed requests (e.g. OpenClaw→Discord)
+	// that don't send X-Session-ID. All requests from the same origin share one bus.
+	if sessionID == "" {
+		origin := r.Header.Get("X-Origin")
+		if origin == "" {
+			origin = "http"
+		}
+		sessionID = origin
+	}
+
 	// Persist user message to thread (substrate-based memory)
 	if err := s.appendToThread("user", userPrompt.String(), sessionID); err != nil {
 		log.Printf("[TAA] Failed to persist user message: %v", err)
@@ -1501,11 +1505,26 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 
 	if taaEnabled {
 		var err error
-		contextState, err = ConstructContextStateWithProfile(req.Messages, sessionID, workspaceRoot, taaProfile)
+
+		// Try bus-sourced context first (multi-turn history)
+		if s.busChat != nil && sessionID != "" {
+			busCtxID := fmt.Sprintf("bus_chat_%s", sessionID)
+			contextState = s.busChat.buildContextFromBus(busCtxID, userPrompt.String())
+			if contextState != nil {
+				log.Printf("[TAA] Using bus history: %s (%d total tokens) instead of request messages",
+					busCtxID, contextState.TotalTokens)
+			}
+		}
+
+		// Fall back to request-only context
+		if contextState == nil {
+			contextState, err = ConstructContextStateWithProfile(req.Messages, sessionID, workspaceRoot, taaProfile)
+		}
+
 		if err != nil {
 			// Log but don't fail - context is optional enhancement
 			log.Printf("[TAA] Context construction warning (profile=%s): %v", taaProfile, err)
-		} else {
+		} else if contextState != nil {
 			log.Printf("[TAA] Context loaded: profile=%s, tokens=%d, coherence=%.2f",
 				taaProfile, contextState.TotalTokens, contextState.CoherenceScore)
 
@@ -1530,6 +1549,26 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 				}
 				ucpContext.TAA.TierBreakdown = tierBreakdown
 			}
+
+			// Log low coherence for observability
+			if contextState.ShouldRefresh {
+				log.Printf("[TAA] Low coherence (%.2f) — context may be degraded", contextState.CoherenceScore)
+			}
+		}
+	}
+
+	// Emit bus chat.request event (side-effect for CogField visibility)
+	var busID string
+	var requestSeq int
+	if s.busChat != nil && sessionID != "" {
+		var reqEvt *BusEventData
+		origin := r.Header.Get("X-Origin")
+		if origin == "" {
+			origin = "http"
+		}
+		busID, reqEvt, _ = s.busChat.emitRequest(sessionID, userPrompt.String(), origin)
+		if reqEvt != nil {
+			requestSeq = reqEvt.Seq
 		}
 	}
 
@@ -1559,14 +1598,15 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Handle streaming vs non-streaming
+	startTime := time.Now()
 	if req.Stream {
-		s.handleStreamingResponse(w, inferReq, sessionID)
+		s.handleStreamingResponse(w, inferReq, sessionID, busID, requestSeq, startTime)
 	} else {
-		s.handleNonStreamingResponse(w, inferReq, sessionID)
+		s.handleNonStreamingResponse(w, inferReq, sessionID, busID, requestSeq, startTime)
 	}
 }
 
-func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID string) {
+func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID, busID string, requestSeq int, startTime time.Time) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1775,9 +1815,9 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 					"choices":    []any{}, // Required for OpenAI SDK compatibility
 					"event_type": "usage",
 					"usage": map[string]any{
-						"input_tokens":  chunk.Usage.InputTokens,
-						"output_tokens": chunk.Usage.OutputTokens,
-						"cost_usd":      chunk.Usage.CostUSD,
+						"prompt_tokens":     chunk.Usage.InputTokens,
+						"completion_tokens": chunk.Usage.OutputTokens,
+						"total_tokens":      chunk.Usage.InputTokens + chunk.Usage.OutputTokens,
 					},
 				}
 				data, _ := json.Marshal(usageChunk)
@@ -1807,11 +1847,20 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
+
+			// Emit bus chat.response event
+			if s.busChat != nil && busID != "" && accumulatedContent.Len() > 0 {
+				tokensUsed := 0
+				if chunk.Usage != nil {
+					tokensUsed = chunk.Usage.InputTokens + chunk.Usage.OutputTokens
+				}
+				s.busChat.emitResponse(busID, requestSeq, accumulatedContent.String(), model, time.Since(startTime).Milliseconds(), tokensUsed)
+			}
 		}
 	}
 }
 
-func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID string) {
+func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID, busID string, requestSeq int, startTime time.Time) {
 	// Store TAA context for /v1/taa endpoint
 	// Deep copy to prevent data races — the original may be mutated concurrently.
 	if inferReq.ContextState != nil {
@@ -1872,6 +1921,12 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+
+	// Emit bus chat.response event
+	if s.busChat != nil && busID != "" && resp.Content != "" {
+		tokensUsed := resp.PromptTokens + resp.CompletionTokens
+		s.busChat.emitResponse(busID, requestSeq, resp.Content, model, time.Since(startTime).Milliseconds(), tokensUsed)
+	}
 }
 
 // handleRequests handles GET /v1/requests - list in-flight requests
@@ -2301,6 +2356,8 @@ func cmdServe(args []string) int {
 				fmt.Sscanf(args[i+1], "%d", &port)
 				i++
 			}
+		case "--debug":
+			DebugMode.Store(true)
 		case "--help", "-h":
 			printServeHelp()
 			return 0
@@ -2363,6 +2420,18 @@ func cmdServeForeground(port int) int {
 	}
 
 	server := newServeServer(port, kernel)
+
+	// Initialize bus chat event emission if we have a workspace
+	if root != "" {
+		server.busChat = newBusChat(root)
+		// Wire SSE broker to bus event emission
+		server.busChat.manager.onEvent = func(busID string, evt *BusEventData) {
+			server.busBroker.publish(busID, evt)
+		}
+		log.Printf("[bus-chat] initialized (taa_profile=%s, context_from_bus=%v)",
+			server.busChat.config.TAAProfile, server.busChat.config.Features.ContextFromBus)
+	}
+
 	if err := server.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1

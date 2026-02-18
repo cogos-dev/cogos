@@ -40,6 +40,79 @@ func TestNormalizePath(t *testing.T) {
 	}
 }
 
+// TestResolveMemoryPath tests the shared path resolution that prevents double-nesting
+func TestResolveMemoryPath(t *testing.T) {
+	memoryDir := "/home/user/workspace/.cog/mem"
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "memory-relative path (common case)",
+			input:    "semantic/insights/topic.md",
+			expected: "/home/user/workspace/.cog/mem/semantic/insights/topic.md",
+		},
+		{
+			name:     "workspace-relative with .cog/mem/ prefix",
+			input:    ".cog/mem/semantic/insights/topic.md",
+			expected: "/home/user/workspace/.cog/mem/semantic/insights/topic.md",
+		},
+		{
+			name:     "absolute path containing .cog/mem/",
+			input:    "/home/user/workspace/.cog/mem/semantic/insights/topic.md",
+			expected: "/home/user/workspace/.cog/mem/semantic/insights/topic.md",
+		},
+		{
+			name:     "absolute path without .cog/mem/",
+			input:    "/tmp/other/file.md",
+			expected: "/tmp/other/file.md",
+		},
+		{
+			name:     "deeply nested .cog/mem/ in absolute (double-nest scenario)",
+			input:    "/home/user/workspace/.cog/mem/.cog/mem/procedural/foo.md",
+			expected: "/home/user/workspace/.cog/mem/procedural/foo.md",
+		},
+		{
+			name:     "workspace-relative procedural path",
+			input:    ".cog/mem/procedural/guides/planning.cog.md",
+			expected: "/home/user/workspace/.cog/mem/procedural/guides/planning.cog.md",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resolveMemoryPath(memoryDir, tt.input)
+			if result != tt.expected {
+				t.Errorf("resolveMemoryPath(%q) =\n  %s\nwant:\n  %s", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestMemoryWritePathNormalization verifies MemoryWrite doesn't double-nest .cog/mem
+func TestMemoryWritePathNormalization(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// This is the exact pattern that caused the bug: passing .cog/mem/ prefixed path
+	err := MemoryWrite(tmpDir, ".cog/mem/semantic/test/doc.md", "Test", "content")
+	if err != nil {
+		t.Fatalf("MemoryWrite failed: %v", err)
+	}
+
+	// Should be at the correct path, NOT double-nested
+	correctPath := filepath.Join(tmpDir, ".cog", "mem", "semantic", "test", "doc.md")
+	wrongPath := filepath.Join(tmpDir, ".cog", "mem", ".cog", "mem", "semantic", "test", "doc.md")
+
+	if _, err := os.Stat(correctPath); os.IsNotExist(err) {
+		t.Errorf("file not found at correct path: %s", correctPath)
+	}
+	if _, err := os.Stat(wrongPath); err == nil {
+		t.Errorf("file found at WRONG double-nested path: %s", wrongPath)
+	}
+}
+
 // TestLoadWaypointGraph tests loading waypoint graph from JSON
 func TestLoadWaypointGraph(t *testing.T) {
 	// Create temp directory

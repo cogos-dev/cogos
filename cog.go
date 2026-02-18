@@ -16,8 +16,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -3502,6 +3504,111 @@ func cmdVersion() int {
 	return 0
 }
 
+func cmdInfo() int {
+	green := "\033[32m"
+	yellow := "\033[33m"
+	red := "\033[31m"
+	dim := "\033[2m"
+	reset := "\033[0m"
+
+	// --- Kernel ---
+	fmt.Printf("Kernel:\n")
+	fmt.Printf("  version:   %s\n", Version)
+	if BuildTime != "unknown" {
+		fmt.Printf("  built:     %s\n", BuildTime)
+	}
+	fmt.Printf("  platform:  %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("  go:        %s\n", runtime.Version())
+
+	// --- Workspace ---
+	root, _, err := ResolveWorkspace()
+	if err != nil {
+		fmt.Printf("\nWorkspace: %s%s%s\n", red, err, reset)
+		return 1
+	}
+	fmt.Printf("\nWorkspace:\n")
+	fmt.Printf("  root:      %s\n", root)
+
+	// Identity
+	cogRoot := filepath.Join(root, ".cog")
+	valid, _, sig, _ := verifyIdentity(cogRoot)
+	if valid && sig != nil {
+		fmt.Printf("  identity:  %s%s%s\n", green, sig.Self[:16], reset)
+	} else {
+		fmt.Printf("  identity:  %s%s%s\n", red, "unsigned", reset)
+	}
+
+	// Git branch
+	gitBranch, err := exec.Command("git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err == nil {
+		fmt.Printf("  branch:    %s\n", strings.TrimSpace(string(gitBranch)))
+	}
+
+	// Kernel binary hash
+	data, _ := os.ReadFile(filepath.Join(cogRoot, "cog.go"))
+	if len(data) > 0 {
+		fmt.Printf("  kernel:    %s\n", hashShort(data))
+	}
+
+	// --- Server ---
+	fmt.Printf("\nServer:\n")
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://localhost:5100/health")
+	if err != nil {
+		fmt.Printf("  status:    %s%s%s\n", dim, "not running", reset)
+	} else {
+		defer resp.Body.Close()
+		var health map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&health); err == nil {
+			status, _ := health["status"].(string)
+			if status == "healthy" {
+				fmt.Printf("  status:    %s%s%s\n", green, "healthy", reset)
+			} else if status != "" {
+				fmt.Printf("  status:    %s%s%s\n", yellow, status, reset)
+			} else {
+				fmt.Printf("  status:    %s%s%s\n", yellow, "unknown", reset)
+			}
+			fmt.Printf("  endpoint:  http://localhost:5100\n")
+		}
+	}
+
+	// --- Buses ---
+	busDir := filepath.Join(cogRoot, ".state", "buses", "registry.json")
+	busData, err := os.ReadFile(busDir)
+	if err == nil {
+		var buses []busRegistryEntry
+		if err := json.Unmarshal(busData, &buses); err == nil {
+			activeBuses := 0
+			totalEvents := 0
+			for _, b := range buses {
+				if b.State == "active" {
+					activeBuses++
+					totalEvents += b.EventCount
+				}
+			}
+			fmt.Printf("\nBuses:\n")
+			fmt.Printf("  active:    %d\n", activeBuses)
+			fmt.Printf("  events:    %d\n", totalEvents)
+			for _, b := range buses {
+				if b.State == "active" {
+					fmt.Printf("  %s- %s %s(%s, %d events)%s\n", dim, b.BusID, reset+dim, b.Transport, b.EventCount, reset)
+				}
+			}
+		}
+	}
+
+	// --- CLI Tools ---
+	fmt.Printf("\nCLI Tools:\n")
+	claudeOut, err := exec.Command("claude", "--version").Output()
+	if err == nil {
+		fmt.Printf("  claude:    %s\n", strings.TrimSpace(string(claudeOut)))
+	} else {
+		fmt.Printf("  claude:    %s%s%s\n", red, "not found", reset)
+	}
+
+	return 0
+}
+
 func cmdHealth(args []string) int {
 	root, _, err := ResolveWorkspace()
 	if err != nil {
@@ -4502,8 +4609,21 @@ Observability:
   ontology types   List valid cogdoc types
   ontology relations  List valid reference relations
 
+Infrastructure as Code:
+  plan <resource>              Generate reconciliation plan (read-only)
+  apply <resource>             Apply reconciliation plan
+  status <resource>            Show config vs live summary
+  snapshot <resource>          Crawl live server → config + state
+  refresh <resource>           Update state from live (detect drift)
+  import <resource> [type] [id]  Import resource into state
+  migrate <resource>           Convert config format (e.g. YAML → HCL)
+
+  Resources: discord
+  Flags: --token TOKEN, --json (plan only)
+
 Info:
-  version          Show kernel version
+  info             Show kernel, workspace, server, and CLI versions
+  version          Show kernel version (short)
   help             Show this help
 
 Examples:
@@ -5347,8 +5467,28 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}
+	case "plan":
+		code = cmdPlan(os.Args[2:])
+	case "apply":
+		code = cmdApply(os.Args[2:])
+	case "status":
+		code = cmdStatus(os.Args[2:])
+	case "snapshot":
+		code = cmdSnapshot(os.Args[2:])
+	case "refresh":
+		code = cmdRefresh(os.Args[2:])
+	case "import":
+		code = cmdImport(os.Args[2:])
+	case "migrate":
+		code = cmdMigrate(os.Args[2:])
+	case "watch":
+		code = cmdWatch(os.Args[2:])
+	case "reconcile":
+		code = cmdReconcile(os.Args[2:])
 	case "version", "-v", "--version":
 		code = cmdVersion()
+	case "info":
+		code = cmdInfo()
 	case "help", "-h", "--help":
 		cmdHelp()
 	default:

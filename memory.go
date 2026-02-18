@@ -651,32 +651,45 @@ func MemoryList(cogRoot string, sector string, subdir string) ([]MemorySearchRes
 	return results, nil
 }
 
+// === MEMORY PATH RESOLUTION ===
+
+// resolveMemoryPath normalizes a path to an absolute path within the memory directory.
+// Handles all input formats:
+//   - Memory-relative:    "semantic/insights/topic.md"
+//   - Workspace-relative: ".cog/mem/semantic/insights/topic.md"
+//   - Absolute:           "/Users/.../cog-workspace/.cog/mem/semantic/insights/topic.md"
+//
+// This prevents double-nesting (e.g., .cog/mem/.cog/mem/...) which occurs when
+// a .cog/mem/ prefixed path is blindly joined with the memory directory.
+func resolveMemoryPath(memoryDir, path string) string {
+	// Absolute path containing .cog/mem/ — extract the memory-relative portion
+	// Use LastIndex to handle double-nesting: .cog/mem/.cog/mem/foo → takes "foo"
+	if idx := strings.LastIndex(path, "/.cog/mem/"); idx >= 0 {
+		relPath := path[idx+len("/.cog/mem/"):]
+		return filepath.Join(memoryDir, relPath)
+	}
+
+	// Workspace-relative path starting with .cog/mem/
+	if strings.HasPrefix(path, ".cog/mem/") {
+		relPath := strings.TrimPrefix(path, ".cog/mem/")
+		return filepath.Join(memoryDir, relPath)
+	}
+
+	// Already absolute — use as-is
+	if strings.HasPrefix(path, "/") {
+		return path
+	}
+
+	// Memory-relative path (the common case)
+	return filepath.Join(memoryDir, path)
+}
+
 // === MEMORY READ ===
 
 // MemoryRead reads a memory document and updates last_accessed timestamp
 func MemoryRead(cogRoot string, path string) (string, error) {
 	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
-
-	// Resolve path (handle multiple formats)
-	fullPath := path
-
-	// If path contains .cog/mem/, extract memory-relative portion
-	if strings.Contains(path, "/.cog/mem/") {
-		parts := strings.SplitN(path, "/.cog/mem/", 2)
-		if len(parts) == 2 {
-			fullPath = filepath.Join(memoryDir, parts[1])
-		}
-	} else if strings.HasPrefix(path, ".cog/mem/") {
-		// Workspace-relative path
-		relPath := strings.TrimPrefix(path, ".cog/mem/")
-		fullPath = filepath.Join(memoryDir, relPath)
-	} else if !strings.HasPrefix(path, "/") {
-		// Memory-relative path
-		fullPath = filepath.Join(memoryDir, path)
-	} else {
-		// Absolute path — still validate it's within memory dir
-		fullPath = path
-	}
+	fullPath := resolveMemoryPath(memoryDir, path)
 
 	// Validate path stays within memory directory
 	cleanFull := filepath.Clean(fullPath)
@@ -785,7 +798,7 @@ func marshalYAML(data map[string]interface{}) (string, error) {
 // MemoryWrite creates a new memory document with frontmatter
 func MemoryWrite(cogRoot string, path string, title string, content string) error {
 	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
-	fullPath := filepath.Join(memoryDir, path)
+	fullPath := resolveMemoryPath(memoryDir, path)
 
 	// Validate path stays within memory directory
 	cleanFull := filepath.Clean(fullPath)
@@ -820,7 +833,7 @@ func MemoryWrite(cogRoot string, path string, title string, content string) erro
 // MemoryAppend appends content to an existing memory document
 func MemoryAppend(cogRoot string, path string, content string) error {
 	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
-	fullPath := filepath.Join(memoryDir, path)
+	fullPath := resolveMemoryPath(memoryDir, path)
 
 	// Check if file exists
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {

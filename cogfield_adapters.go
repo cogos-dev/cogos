@@ -125,9 +125,12 @@ func (a *BusAdapter) ID() string { return "bus" }
 func (a *BusAdapter) NodeConfig() AdapterNodeConfig {
 	return AdapterNodeConfig{
 		BlockTypes: map[string]BlockTypeConfig{
-			"bus.message": {EntityType: "bus.message", Shape: "block", Color: "#22d3ee", Label: "Message"},
-			"bus.open":    {EntityType: "bus.open", Shape: "triangle", Color: "#22d3ee", Label: "Open"},
-			"bus.close":   {EntityType: "bus.close", Shape: "triangle", Color: "#22d3ee", Label: "Close"},
+			"bus.message":      {EntityType: "bus.message", Shape: "block", Color: "#22d3ee", Label: "Message"},
+			"bus.open":         {EntityType: "bus.open", Shape: "triangle", Color: "#22d3ee", Label: "Open"},
+			"bus.close":        {EntityType: "bus.close", Shape: "triangle", Color: "#22d3ee", Label: "Close"},
+			"bus.chat_request": {EntityType: "bus.chat_request", Shape: "block", Color: "#818cf8", Label: "Chat In"},
+			"bus.chat_response":{EntityType: "bus.chat_response", Shape: "block", Color: "#34d399", Label: "Chat Out"},
+			"bus.chat_error":   {EntityType: "bus.chat_error", Shape: "ring", Color: "#f87171", Label: "Chat Err"},
 		},
 		DefaultSector: "buses",
 		ChainThread:   "chain",
@@ -213,10 +216,17 @@ func (a *BusAdapter) ExpandNode(root, nodeID string) ([]CogFieldNode, []CogField
 // busEventToCogBlock converts a BusEventData into a CogBlock.
 func busEventToCogBlock(busID string, evt BusEventData) CogBlock {
 	blockType := "bus.message"
-	if evt.Type == "open" || evt.Type == "bus.open" {
+	switch evt.Type {
+	case "open", "bus.open":
 		blockType = "bus.open"
-	} else if evt.Type == "close" || evt.Type == "bus.close" {
+	case "close", "bus.close":
 		blockType = "bus.close"
+	case "chat.request":
+		blockType = "bus.chat_request"
+	case "chat.response":
+		blockType = "bus.chat_response"
+	case "chat.error":
+		blockType = "bus.chat_error"
 	}
 
 	return CogBlock{

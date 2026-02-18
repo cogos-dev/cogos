@@ -26,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	sdk "github.com/cogos-dev/cogos/sdk"
 )
 
 // === INFERENCE REQUEST/RESPONSE TYPES ===
@@ -109,13 +111,6 @@ type ContextState struct {
 	// Model selection (optional override)
 	Model string `json:"model,omitempty"`
 
-	// JSON schema for structured output
-	Schema json.RawMessage `json:"schema,omitempty"`
-
-	// Tool control
-	AllowedTools    []string `json:"allowed_tools,omitempty"`
-	DisallowedTools []string `json:"disallowed_tools,omitempty"`
-
 	// Metadata
 	TotalTokens    int     `json:"total_tokens,omitempty"`
 	CoherenceScore float64 `json:"coherence_score,omitempty"`
@@ -149,6 +144,24 @@ func (cs *ContextState) BuildContextString() string {
 	}
 
 	return strings.Join(parts, "\n\n---\n\n")
+}
+
+// chainSystemPrompt combines TAA context and client system prompt into a single
+// header chain, separated by ---. TAA context comes first (identity, temporal,
+// present, semantic), followed by any client-provided system instructions.
+func chainSystemPrompt(req *InferenceRequest) string {
+	var taaBlock string
+	if req.ContextState != nil {
+		taaBlock = req.ContextState.BuildContextString()
+	}
+	switch {
+	case taaBlock != "" && req.SystemPrompt != "":
+		return taaBlock + "\n\n---\n\n" + req.SystemPrompt
+	case taaBlock != "":
+		return taaBlock
+	default:
+		return req.SystemPrompt
+	}
 }
 
 // ContextMetrics captures metrics about context used in inference
@@ -591,27 +604,14 @@ func buildClaudeArgs(req *InferenceRequest) []string {
 		"--dangerously-skip-permissions", // Allow tool execution without prompts
 	}
 
-	// Determine system prompt source
-	// Priority: ContextState > SystemPrompt (backward compatibility)
-	var systemPrompt string
-	if req.ContextState != nil {
-		systemPrompt = req.ContextState.BuildContextString()
-	}
-	if systemPrompt == "" && req.SystemPrompt != "" {
-		systemPrompt = req.SystemPrompt
+	// Build system prompt: chain TAA context + client system prompt
+	if sp := chainSystemPrompt(req); sp != "" {
+		args = append(args, "--append-system-prompt", sp)
 	}
 
-	// Add system prompt if present
-	if systemPrompt != "" {
-		args = append(args, "--append-system-prompt", systemPrompt)
-	}
-
-	// Determine schema source
-	// Priority: ContextState.Schema > req.Schema
+	// Use request-level schema if provided
 	var schema json.RawMessage
-	if req.ContextState != nil && len(req.ContextState.Schema) > 0 {
-		schema = req.ContextState.Schema
-	} else if len(req.Schema) > 0 {
+	if len(req.Schema) > 0 {
 		schema = req.Schema
 	}
 
@@ -643,16 +643,6 @@ func buildClaudeArgs(req *InferenceRequest) []string {
 	// Note: Claude CLI doesn't have a max-tokens option
 	// The max_tokens parameter from the request is ignored for Claude CLI
 	// but may be used by other providers (OpenAI, OpenRouter)
-
-	// Add tool restrictions from ContextState
-	if req.ContextState != nil {
-		if len(req.ContextState.AllowedTools) > 0 {
-			args = append(args, "--allowed-tools", strings.Join(req.ContextState.AllowedTools, ","))
-		}
-		if len(req.ContextState.DisallowedTools) > 0 {
-			args = append(args, "--disallowed-tools", strings.Join(req.ContextState.DisallowedTools, ","))
-		}
-	}
 
 	return args
 }
@@ -722,14 +712,8 @@ func runHTTPInference(req *InferenceRequest, providerType ProviderType, modelNam
 	// Build messages
 	messages := []OpenAIChatMessage{}
 
-	// Add system prompt if present
-	systemPrompt := req.SystemPrompt
-	if req.ContextState != nil {
-		contextStr := req.ContextState.BuildContextString()
-		if contextStr != "" {
-			systemPrompt = contextStr
-		}
-	}
+	// Build system prompt: chain TAA context + client system prompt
+	systemPrompt := chainSystemPrompt(req)
 	if systemPrompt != "" {
 		messages = append(messages, OpenAIChatMessage{
 			Role:    "system",
@@ -852,14 +836,8 @@ func runHTTPInferenceStream(req *InferenceRequest, providerType ProviderType, mo
 	// Build messages
 	messages := []OpenAIChatMessage{}
 
-	// Add system prompt if present
-	systemPrompt := req.SystemPrompt
-	if req.ContextState != nil {
-		contextStr := req.ContextState.BuildContextString()
-		if contextStr != "" {
-			systemPrompt = contextStr
-		}
-	}
+	// Build system prompt: chain TAA context + client system prompt
+	systemPrompt := chainSystemPrompt(req)
 	if systemPrompt != "" {
 		messages = append(messages, OpenAIChatMessage{
 			Role:    "system",
@@ -2180,7 +2158,15 @@ func StartRegistryCleanup() {
 
 // === CLI COMMAND ===
 
-// cmdInfer handles the "cog infer" command
+// cmdInfer handles the "cog infer" command.
+//
+// Three modes:
+//   --stateless          Zero bus interaction, like "claude -p". Nothing recorded, nothing read.
+//   (default)            Records to bus (visible in peripheral context), but no TAA history loaded.
+//   --profile <name>     Full continuity — bus history loaded into context assembly pipeline.
+//
+// --session <slug> names the conversation thread (default: "cli"). Multiple slugs
+// give you parallel named conversations: --session debug, --session research, etc.
 func cmdInfer(args []string) int {
 	// Parse flags
 	var (
@@ -2190,6 +2176,10 @@ func cmdInfer(args []string) int {
 		jsonOutput   bool
 		origin       string = "cli"
 		prompt       string
+		taaProfile   string
+		contextURI   string
+		sessionSlug  string
+		stateless    bool
 	)
 
 	for i := 0; i < len(args); i++ {
@@ -2209,7 +2199,24 @@ func cmdInfer(args []string) int {
 				model = args[i+1]
 				i++
 			}
-		case "--json":
+		case "--profile", "-p":
+			if i+1 < len(args) {
+				taaProfile = args[i+1]
+				i++
+			}
+		case "--context", "-c":
+			if i+1 < len(args) {
+				contextURI = args[i+1]
+				i++
+			}
+		case "--session", "-S":
+			if i+1 < len(args) {
+				sessionSlug = args[i+1]
+				i++
+			}
+		case "--stateless":
+			stateless = true
+		case "--json", "-j":
 			jsonOutput = true
 		case "--origin":
 			if i+1 < len(args) {
@@ -2220,9 +2227,12 @@ func cmdInfer(args []string) int {
 			printInferHelp()
 			return 0
 		default:
-			if !strings.HasPrefix(args[i], "-") {
-				prompt = args[i]
+			if strings.HasPrefix(args[i], "-") {
+				fmt.Fprintf(os.Stderr, "Error: unknown flag %q\n", args[i])
+				printInferHelp()
+				return 1
 			}
+			prompt = args[i]
 		}
 	}
 
@@ -2250,6 +2260,40 @@ func cmdInfer(args []string) int {
 		schema = data
 	}
 
+	// Derive session ID: --session slug > origin (default "cli")
+	sessionID := origin
+	if sessionSlug != "" {
+		sessionID = sessionSlug
+	}
+
+	// Initialize bus chat unless --stateless.
+	// Default mode: records to bus (visible in other sessions' peripheral context)
+	// but doesn't load history into own context. --profile activates full continuity.
+	var bc *busChat
+	if !stateless {
+		workspaceRoot, _, _ := ResolveWorkspace()
+		if workspaceRoot != "" {
+			bc = newBusChat(workspaceRoot)
+		}
+	}
+
+	// Emit chat.request event (before context construction so it appears in bus history)
+	var busID string
+	var requestSeq int
+	if bc != nil {
+		var reqEvt *BusEventData
+		busID, reqEvt, _ = bc.emitRequest(sessionID, prompt, origin)
+		if reqEvt != nil {
+			requestSeq = reqEvt.Seq
+		}
+	}
+
+	// Build TAA context using bus history for conversation continuity
+	var contextState *ContextState
+	if !stateless && (contextURI != "" || taaProfile != "") {
+		contextState = buildCLIContext(prompt, taaProfile, contextURI, bc, sessionID)
+	}
+
 	// Build request
 	req := &InferenceRequest{
 		Prompt:       prompt,
@@ -2259,6 +2303,7 @@ func cmdInfer(args []string) int {
 		Origin:       origin,
 		Stream:       false,
 		Context:      context.Background(),
+		ContextState: contextState,
 	}
 
 	// Run inference
@@ -2266,7 +2311,15 @@ func cmdInfer(args []string) int {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if bc != nil && busID != "" {
+			bc.emitError(busID, requestSeq, err.Error(), "inference_error")
+		}
 		return 1
+	}
+
+	// Emit chat.response event so next invocation sees this exchange
+	if bc != nil && busID != "" && resp.Content != "" {
+		bc.emitResponse(busID, requestSeq, resp.Content, model, 0, 0)
 	}
 
 	// Output result
@@ -2280,6 +2333,125 @@ func cmdInfer(args []string) int {
 	return 0
 }
 
+// buildCLIContext constructs a ContextState for CLI inference.
+//
+// Two modes:
+//  1. --profile <name>: Direct profile-based construction (same pipeline as HTTP)
+//  2. --context <cog://context?...>: URI-based with query params for budget, tier, model
+//
+// If both are specified, --context takes precedence (its profile param overrides --profile).
+// When bc (busChat) is non-nil, reads conversation history from the bus for continuity.
+func buildCLIContext(prompt, taaProfile, contextURI string, bc *busChat, sessionID string) *ContextState {
+	workspaceRoot, _, err := ResolveWorkspace()
+	if err != nil {
+		log.Printf("[TAA] CLI: workspace resolution failed: %v", err)
+		return nil
+	}
+
+	// Build message history: bus history (if available) + current prompt
+	var messages []ChatMessage
+	if bc != nil && sessionID != "" {
+		busID := fmt.Sprintf("bus_chat_%s", sessionID)
+		busMessages, err := bc.manager.busEventsToMessages(busID, bc.config.MaxHistory)
+		if err == nil && len(busMessages) > 0 {
+			messages = busMessages
+			log.Printf("[TAA] CLI: loaded %d messages from bus history", len(busMessages))
+		}
+	}
+	// The current prompt was already emitted as a bus event, so it's included
+	// in busMessages. If no bus history, fall back to single-message.
+	if len(messages) == 0 {
+		contentBytes, _ := json.Marshal(prompt)
+		messages = []ChatMessage{{Role: "user", Content: contentBytes}}
+	}
+
+	// URI mode: parse cog://context?budget=50000&profile=default&model=sonnet
+	if contextURI != "" {
+		parsed, err := parseContextURI(contextURI)
+		if err != nil {
+			log.Printf("[TAA] CLI: invalid context URI %q: %v", contextURI, err)
+			return nil
+		}
+
+		// Extract profile from URI or fall back to --taa flag
+		profile := parsed.profile
+		if profile == "" {
+			profile = taaProfile
+		}
+		if profile == "" {
+			profile = "default"
+		}
+
+		log.Printf("[TAA] CLI: context URI=%s profile=%s budget=%d", contextURI, profile, parsed.budget)
+
+		var state *ContextState
+		if profile != "" {
+			state, err = ConstructContextStateWithProfile(messages, sessionID, workspaceRoot, profile)
+		} else {
+			state, err = ConstructContextState(messages, sessionID, workspaceRoot)
+		}
+		if err != nil {
+			log.Printf("[TAA] CLI: context construction warning: %v", err)
+		}
+		if state != nil {
+			// Override model from URI if specified
+			if parsed.model != "" {
+				state.Model = parsed.model
+			}
+			log.Printf("[TAA] CLI: context loaded, tokens=%d coherence=%.2f", state.TotalTokens, state.CoherenceScore)
+		}
+		return state
+	}
+
+	// Profile mode: --taa <profile>
+	if taaProfile != "" {
+		log.Printf("[TAA] CLI: profile=%s", taaProfile)
+		state, err := ConstructContextStateWithProfile(messages, sessionID, workspaceRoot, taaProfile)
+		if err != nil {
+			log.Printf("[TAA] CLI: context construction warning: %v", err)
+		}
+		if state != nil {
+			log.Printf("[TAA] CLI: context loaded, tokens=%d coherence=%.2f", state.TotalTokens, state.CoherenceScore)
+		}
+		return state
+	}
+
+	return nil
+}
+
+// contextURIParams holds parsed parameters from a cog://context URI.
+type contextURIParams struct {
+	budget  int
+	profile string
+	model   string
+	tier    string
+}
+
+// parseContextURI parses a cog://context URI into structured parameters.
+// Accepts both full URI (cog://context?budget=50000) and shorthand ("context?budget=50000").
+func parseContextURI(uri string) (*contextURIParams, error) {
+	// Accept shorthand without cog:// prefix
+	if !strings.HasPrefix(uri, "cog://") {
+		uri = "cog://" + uri
+	}
+
+	parsed, err := sdk.ParseURI(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	if parsed.Namespace != "context" {
+		return nil, fmt.Errorf("expected cog://context namespace, got %q", parsed.Namespace)
+	}
+
+	return &contextURIParams{
+		budget:  parsed.GetQueryInt("budget", 0),
+		profile: parsed.GetQuery("profile"),
+		model:   parsed.GetQuery("model"),
+		tier:    parsed.GetQuery("tier"),
+	}, nil
+}
+
 func printInferHelp() {
 	fmt.Printf(`Infer - Run inference using shared engine
 
@@ -2289,22 +2461,37 @@ Options:
   --schema, -s <path>    JSON schema file for structured output
   --system <prompt>      System prompt
   --model, -m <model>    Model to use (default: claude)
-  --json                 Output as JSON (for programmatic use)
+  --profile, -p <name>   Context assembly profile — enables full conversation continuity
+  --context, -c <uri>    Context URI (cog://context?budget=50000&profile=default)
+  --session, -S <slug>   Name the conversation thread (default: "cli")
+  --stateless            Zero bus interaction — nothing recorded, nothing read
+  --json, -j             Output as JSON (for programmatic use)
   --origin <origin>      Tag request origin (default: "cli")
   --help, -h             Show this help
 
+Modes:
+  (default)              Records to bus, visible in other sessions' peripheral context
+  --profile <name>       Full continuity — loads bus history into context assembly pipeline
+  --stateless            Like "claude -p" — pure one-shot, no side effects
+
 Examples:
-  cog infer "What is 2+2?"
-  cog infer --schema .cog/schemas/inference/tasks/summarize.schema.json "Summarize..."
-  cog infer --json --origin hook "Process this event"
-  cog infer --model claude-sonnet-4-20250514 "Complex task..."
+  cog infer "What is 2+2?"                                   # default: records to bus
+  cog infer -p default "Explain the reconciliation loop"      # full continuity
+  cog infer -p default -S debug "Why is X broken?"            # named session
+  cog infer -S research "What does the paper say?"            # named, no profile
+  cog infer --stateless "Quick one-off question"              # zero side effects
+  cog infer -c "cog://context?profile=default" "Summarize recent work"
+  cog infer -s .cog/schemas/tasks/summarize.schema.json "Summarize..."
 
 Notes:
   - Requires Claude CLI installed (npm install -g @anthropic-ai/claude-code)
   - Uses the same inference engine as the serve command
+  - --profile loads the full 4-tier context pipeline (identity, temporal, present, semantic)
+  - --session creates a named bus (bus_chat_<slug>) for parallel conversation threads
+  - --context accepts a cog://context URI with query params: budget, profile, model, tier
+  - If both --profile and --context are specified, --context takes precedence
+  - Without --profile, messages still accumulate on the bus for peripheral awareness
   - JSON output includes prompt/completion tokens and context metrics
-  - Supports automatic retry with exponential backoff for rate limits
-  - Context-aware invocation via ContextState (programmatic API)
 `)
 }
 

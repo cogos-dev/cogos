@@ -35,11 +35,23 @@ type BudgetConfig struct {
 
 // TemporalConfig controls Tier 2 extraction behavior.
 type TemporalConfig struct {
-	ExtractionMethod    string  `yaml:"extraction_method"`
-	AnchorKeywords      int     `yaml:"anchor_keywords"`
-	GoalKeywords        int     `yaml:"goal_keywords"`
-	RecencyWindow       int     `yaml:"recency_window"`
-	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
+	ExtractionMethod    string           `yaml:"extraction_method"`    // TODO: not yet wired — always "heuristic", reserved for future LLM extraction
+	AnchorKeywords      int              `yaml:"anchor_keywords"`
+	GoalKeywords        int              `yaml:"goal_keywords"`
+	RecencyWindow       int              `yaml:"recency_window"`
+	ConfidenceThreshold float64          `yaml:"confidence_threshold"` // TODO: not yet wired — extraction confidence not scored
+	RecentMessages      int              `yaml:"recent_messages"`      // Number of recent messages to echo in Tier 2 for momentary awareness (default: 6)
+	Peripheral          PeripheralConfig `yaml:"peripheral"`
+}
+
+// PeripheralConfig controls cross-session peripheral awareness in Tier 2.
+type PeripheralConfig struct {
+	MaxBuses     int     `yaml:"max_buses"`      // Max other buses to read (default: 5)
+	MaxAgeHours  int     `yaml:"max_age_hours"`  // Skip buses older than this (default: 24)
+	BudgetPct    int     `yaml:"budget_pct"`     // % of Tier 2 budget for peripheral (default: 60)
+	MinBusChars  int     `yaml:"min_bus_chars"`  // Min chars per bus to bother including (default: 200)
+	RecencyDecay float64 `yaml:"recency_decay"`  // Decay factor for budget allocation (default: 0.7)
+	MaxMsgChars  int     `yaml:"max_msg_chars"`  // Truncate individual messages beyond this (default: 2000)
 }
 
 // SemanticConfig controls Tier 4 retrieval behavior.
@@ -71,15 +83,15 @@ type RankingConfig struct {
 // CoherenceConfig controls context refresh triggers.
 type CoherenceConfig struct {
 	MinScore    float64 `yaml:"min_score"`
-	FailureMode string  `yaml:"failure_mode"`
+	FailureMode string  `yaml:"failure_mode"` // TODO: not yet wired — always "continue"
 }
 
 // DebugConfig controls tracing and logging.
 type DebugConfig struct {
-	TraceTiers     bool   `yaml:"trace_tiers"`
+	TraceTiers     bool   `yaml:"trace_tiers"`      // TODO: not yet wired — per-tier input/output tracing
 	TraceQueries   bool   `yaml:"trace_queries"`
 	TraceSubstance bool   `yaml:"trace_substance"`
-	TraceFile      string `yaml:"trace_file"`
+	TraceFile      string `yaml:"trace_file"`        // TODO: not yet wired — trace output file path
 }
 
 // Default configuration values
@@ -97,6 +109,15 @@ var defaultTAAConfig = TAAConfig{
 		GoalKeywords:        5,
 		RecencyWindow:       10,
 		ConfidenceThreshold: 0.6,
+		RecentMessages:      6,
+		Peripheral: PeripheralConfig{
+			MaxBuses:     5,
+			MaxAgeHours:  24,
+			BudgetPct:    60,
+			MinBusChars:  200,
+			RecencyDecay: 0.7,
+			MaxMsgChars:  2000,
+		},
 	},
 	Semantic: SemanticConfig{
 		MaxCandidates:     20,

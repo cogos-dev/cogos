@@ -57,8 +57,11 @@ cog coherence check     # Check workspace coherence
 cog memory search "topic"
 cog memory list semantic
 
-# Inference
-cog infer "prompt"
+# Inference (bus-integrated conversation continuity)
+cog infer "prompt"                                    # Records to bus
+cog infer --profile default "continue our discussion"  # Full continuity
+cog infer --profile default --session debug "why?"    # Named session thread
+cog infer --stateless "one-off question"              # No bus, like claude -p
 cog infer --model openrouter/anthropic/claude-3.5-sonnet "prompt"
 
 # API Server
