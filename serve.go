@@ -42,6 +42,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 	sdk "github.com/cogos-dev/cogos/sdk"
 	"github.com/cogos-dev/cogos/sdk/httputil"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // === CONFIGURATION ===
@@ -193,6 +195,7 @@ type ChatCompletionRequest struct {
 	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 	SystemPrompt   string          `json:"system_prompt,omitempty"` // Extension for explicit system
 	TAA            json.RawMessage `json:"taa,omitempty"`           // TAA context: false/absent=none, true=default, "name"=profile
+	Tools          []json.RawMessage `json:"tools,omitempty"`       // OpenAI-format tool definitions
 }
 
 // GetTAAProfile parses the TAA field and returns the profile name to use.
@@ -512,7 +515,7 @@ func (s *serveServer) Start() error {
 	mux := http.NewServeMux()
 
 	// Inference routes (keep custom streaming implementation)
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("/v1/chat/completions", otelMiddleware("POST /v1/chat/completions", s.handleChatCompletions))
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/providers", s.handleProviders)     // ADR-046: Provider discovery
 	mux.HandleFunc("/v1/providers/", s.handleProviderByID) // Provider activate/test
@@ -1401,6 +1404,13 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Enrich OTEL span with request attributes
+	span := trace.SpanFromContext(r.Context())
+	span.SetAttributes(
+		attribute.String("model", req.Model),
+		attribute.Bool("stream", req.Stream),
+	)
+
 	// Parse UCP headers (Universal Context Protocol)
 	workspaceRoot := s.kernel.Root()
 	ucpContext, err := parseUCPHeaders(r, workspaceRoot)
@@ -1589,6 +1599,18 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		Stream:       req.Stream,
 		Context:      r.Context(),
 		ContextState: contextState,
+		Tools:        req.Tools,
+	}
+
+	// Parse X-Allowed-Tools header for explicit tool control
+	if allowedToolsHeader := r.Header.Get("X-Allowed-Tools"); allowedToolsHeader != "" {
+		var tools []string
+		for _, t := range strings.Split(allowedToolsHeader, ",") {
+			if trimmed := strings.TrimSpace(t); trimmed != "" {
+				tools = append(tools, trimmed)
+			}
+		}
+		inferReq.AllowedTools = tools
 	}
 
 	// Set UCP response headers if UCP was used
@@ -2445,9 +2467,22 @@ func cmdServeForeground(port int) int {
 			server.busChat.config.TAAProfile, server.busChat.config.Features.ContextFromBus)
 	}
 
+	// Initialize OpenTelemetry tracing (noop if OTEL_EXPORTER_OTLP_ENDPOINT is not set)
+	tp, otelErr := initTracer()
+	if otelErr != nil {
+		log.Printf("[otel] failed to initialize tracer: %v", otelErr)
+	} else if tp != nil {
+		log.Printf("[otel] tracing enabled (endpoint=%s)", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	}
+
 	if err := server.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
+	}
+
+	// Flush and shut down the tracer after server stops
+	if tp != nil {
+		shutdownTracer(tp)
 	}
 
 	return 0

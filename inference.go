@@ -28,6 +28,8 @@ import (
 	"time"
 
 	sdk "github.com/cogos-dev/cogos/sdk"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // === INFERENCE REQUEST/RESPONSE TYPES ===
@@ -186,6 +188,10 @@ type InferenceRequest struct {
 
 	// Context pipeline (new)
 	ContextState *ContextState // Four-tier context for context-aware invocation
+
+	// Tool definitions
+	Tools        []json.RawMessage // OpenAI-format tool definitions from client
+	AllowedTools []string          // Claude CLI --allowed-tools patterns (e.g. "Bash", "Bash(git:*)")
 
 	// Retry configuration
 	MaxRetries int           // Max retry attempts (0 = use default)
@@ -644,7 +650,67 @@ func buildClaudeArgs(req *InferenceRequest) []string {
 	// The max_tokens parameter from the request is ignored for Claude CLI
 	// but may be used by other providers (OpenAI, OpenRouter)
 
+	// Forward tool control to Claude CLI
+	if len(req.AllowedTools) > 0 {
+		// Explicit allowed-tools list takes priority
+		args = append(args, "--allowed-tools", strings.Join(req.AllowedTools, ","))
+	} else if len(req.Tools) > 0 {
+		// Map OpenAI-format tool definitions to Claude CLI tool names
+		if mapped := mapToolsToCLINames(req.Tools); len(mapped) > 0 {
+			args = append(args, "--allowed-tools", strings.Join(mapped, ","))
+		}
+	}
+
 	return args
+}
+
+// mapToolsToCLINames extracts function names from OpenAI-format tool definitions
+// and maps them to Claude CLI built-in tool names where possible.
+func mapToolsToCLINames(tools []json.RawMessage) []string {
+	var result []string
+	seen := make(map[string]bool)
+
+	for _, raw := range tools {
+		var tool struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(raw, &tool); err != nil || tool.Function.Name == "" {
+			continue
+		}
+
+		cliName := mapToolName(tool.Function.Name)
+		if cliName == "" {
+			log.Printf("[tools] Unknown tool name %q — skipping", tool.Function.Name)
+			continue
+		}
+		if !seen[cliName] {
+			seen[cliName] = true
+			result = append(result, cliName)
+		}
+	}
+	return result
+}
+
+// mapToolName maps an OpenAI-format tool function name to a Claude CLI tool name.
+func mapToolName(name string) string {
+	switch strings.ToLower(name) {
+	case "exec", "bash", "shell":
+		return "Bash"
+	case "read", "file_read":
+		return "Read"
+	case "write", "file_write":
+		return "Write"
+	case "edit", "apply-patch", "apply_patch":
+		return "Edit"
+	case "search", "grep":
+		return "Grep"
+	case "glob", "find":
+		return "Glob"
+	default:
+		return ""
+	}
 }
 
 // buildContextMetrics extracts metrics from ContextState for response
@@ -1173,6 +1239,17 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// OTEL: top-level inference span
+	ctx, span := tracer.Start(ctx, "inference.sync",
+		trace.WithAttributes(
+			attribute.String("model", req.Model),
+			attribute.String("origin", req.Origin),
+			attribute.Int("tool_count", len(req.Tools)),
+		),
+	)
+	defer span.End()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1194,6 +1271,13 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 
 	// Build Claude CLI arguments
 	args := buildClaudeArgs(req)
+
+	// OTEL: child span for CLI execution
+	_, cliSpan := tracer.Start(ctx, "claude.cli.exec",
+		trace.WithAttributes(
+			attribute.Int("arg_count", len(args)),
+		),
+	)
 
 	// Create command with context for cancellation
 	cmd := exec.CommandContext(ctx, claudeCommand, args...)
@@ -1313,6 +1397,20 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 
 	// Wait for process to complete
 	waitErr := cmd.Wait()
+
+	// OTEL: end CLI span with exit code
+	if waitErr != nil {
+		cliSpan.SetAttributes(attribute.Int("exit_code", 1))
+	} else {
+		cliSpan.SetAttributes(attribute.Int("exit_code", 0))
+	}
+	cliSpan.End()
+
+	// OTEL: record token counts on the parent inference span
+	span.SetAttributes(
+		attribute.Int("tokens.input", promptTokens),
+		attribute.Int("tokens.output", completionTokens),
+	)
 
 	// Check for context cancellation
 	if ctx.Err() == context.Canceled {
@@ -1590,6 +1688,16 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 
 	// Set up context and cancellation
 	ctx := req.Context
+
+	// OTEL: top-level inference span
+	ctx, span := tracer.Start(ctx, "inference.stream",
+		trace.WithAttributes(
+			attribute.String("model", req.Model),
+			attribute.String("origin", req.Origin),
+			attribute.Int("tool_count", len(req.Tools)),
+		),
+	)
+
 	ctx, cancel := context.WithCancel(ctx)
 
 	// Register the request
@@ -1605,11 +1713,20 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 	// Build Claude CLI arguments
 	args := buildClaudeArgs(req)
 
+	// OTEL: child span for CLI execution
+	_, cliSpan := tracer.Start(ctx, "claude.cli.exec",
+		trace.WithAttributes(
+			attribute.Int("arg_count", len(args)),
+		),
+	)
+
 	// Create command with context for cancellation
 	cmd := exec.CommandContext(ctx, claudeCommand, args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cliSpan.End()
+		span.End()
 		cancel()
 		timeoutCancel()
 		if registry != nil {
@@ -1622,6 +1739,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 
 	if err := cmd.Start(); err != nil {
 		stdout.Close() // Close the pipe to prevent resource leak
+		cliSpan.End()
+		span.End()
 		cancel()
 		timeoutCancel()
 		if registry != nil {
@@ -1640,6 +1759,8 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 		defer close(chunks)
 		defer cancel()
 		defer timeoutCancel()
+		defer span.End()
+		defer cliSpan.End() // safe: OTEL End() is idempotent
 
 		// safeSend sends a chunk to the channel, respecting context cancellation.
 		// Returns false if the context was cancelled and the goroutine should exit.
@@ -1746,6 +1867,10 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 					if eventData.ContentBlock != nil {
 						switch eventData.ContentBlock.Type {
 						case "tool_use":
+							// OTEL: record tool_use event on CLI span
+							cliSpan.AddEvent("tool_use", trace.WithAttributes(
+								attribute.String("tool.name", eventData.ContentBlock.Name),
+							))
 							// Track tool call start
 							activeToolCalls[eventData.Index] = &ToolCallData{
 								ID:        eventData.ContentBlock.ID,
@@ -1947,6 +2072,10 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 									return
 								}
 							} else if c.Name != "" {
+								// OTEL: record tool_use event on CLI span
+								cliSpan.AddEvent("tool_use", trace.WithAttributes(
+									attribute.String("tool.name", c.Name),
+								))
 								// Emit tool use event
 								if !safeSend(StreamChunkInference{
 									ID:        req.ID,
@@ -1981,6 +2110,10 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 				if claudeMsg.Message != nil {
 					for _, c := range claudeMsg.Message.Content {
 						if c.Type == "tool_result" && c.ToolUseID != "" {
+							// OTEL: record tool_result event on CLI span
+							cliSpan.AddEvent("tool_result", trace.WithAttributes(
+								attribute.String("tool.id", c.ToolUseID),
+							))
 							if DebugMode.Load() {
 								log.Printf("[DEBUG] Received tool_result for tool %s (isError=%v)", c.ToolUseID, c.IsError)
 							}
@@ -2058,6 +2191,7 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 			log.Printf("[ERROR] Scanner error while reading Claude CLI output: %v", err)
 			emitInferenceError(req.ID, "scanner error: "+err.Error())
 			clearInferenceActiveSignal()
+			cliSpan.End()
 			safeSend(StreamChunkInference{
 				ID:    req.ID,
 				Done:  true,
@@ -2075,6 +2209,20 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 		if DebugMode.Load() {
 			log.Printf("[DEBUG] Claude CLI exited (err=%v), will now emit Done chunk", waitErr)
 		}
+
+		// OTEL: end CLI span with exit code
+		if waitErr != nil {
+			cliSpan.SetAttributes(attribute.Int("exit_code", 1))
+		} else {
+			cliSpan.SetAttributes(attribute.Int("exit_code", 0))
+		}
+		cliSpan.End()
+
+		// OTEL: record token counts on the parent inference span
+		span.SetAttributes(
+			attribute.Int("tokens.input", promptTokens),
+			attribute.Int("tokens.output", completionTokens),
+		)
 
 		// Update registry status
 		if registry != nil {
