@@ -517,7 +517,7 @@ func cmdValidate(args []string) error {
 	artifactPath := args[0]
 	workspaceRoot := getWorkspaceRoot()
 
-	fmt.Printf("Validating: %s\n", artifactPath)
+	fmt.Printf("Validating: %s\n", PathToURI(workspaceRoot, artifactPath))
 
 	// Layer 1: Schema validation
 	schemaPath := filepath.Join(workspaceRoot, ".cog/schemas/cogdoc.cog")

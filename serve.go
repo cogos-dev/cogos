@@ -1613,6 +1613,22 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		inferReq.AllowedTools = tools
 	}
 
+	// Parse OpenClaw bridge headers for MCP bridge mode
+	if openClawURL := r.Header.Get("X-OpenClaw-URL"); openClawURL != "" {
+		inferReq.OpenClawURL = openClawURL
+		inferReq.OpenClawToken = r.Header.Get("X-OpenClaw-Token")
+		inferReq.SessionID = sessionID // Use already-resolved session ID from earlier parsing
+
+		// Generate MCP config for bridge mode
+		mcpConfig, err := generateMCPConfig(inferReq)
+		if err != nil {
+			log.Printf("[MCP] Failed to generate MCP config: %v", err)
+		} else {
+			inferReq.MCPConfig = mcpConfig
+			defer os.Remove(mcpConfig)
+		}
+	}
+
 	// Set UCP response headers if UCP was used
 	if ucpContext != nil {
 		if err := setUCPResponseHeaders(w, ucpContext); err != nil {
@@ -2545,7 +2561,7 @@ func cmdServeStart(port int) int {
 	}
 
 	fmt.Printf("Server started (PID %d) on port %d\n", cmd.Process.Pid, port)
-	fmt.Printf("Log file: %s\n", logFile)
+	fmt.Printf("Log file: %s\n", PathToURI(root, logFile))
 
 	// Detach - don't wait for the child process
 	// The child will be orphaned and adopted by init/launchd
@@ -2673,8 +2689,14 @@ func cmdServeStatus(port int) int {
 		fmt.Printf("Persistence: \033[33mDISABLED\033[0m (on-demand only)\n")
 	}
 
-	fmt.Printf("Log file:    %s\n", logFile)
-	fmt.Printf("PID file:    %s\n", pidFile)
+	// Show workspace-internal paths as cog:// URIs
+	if root, _, err := ResolveWorkspace(); err == nil {
+		fmt.Printf("Log file:    %s\n", PathToURI(root, logFile))
+		fmt.Printf("PID file:    %s\n", PathToURI(root, pidFile))
+	} else {
+		fmt.Printf("Log file:    %s\n", logFile)
+		fmt.Printf("PID file:    %s\n", pidFile)
+	}
 
 	if running {
 		return 0

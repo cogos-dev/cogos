@@ -2737,6 +2737,13 @@ func cmdReadURI(args []string) int {
 
 	uri := args[0]
 
+	// Strip URI fragment before resolution
+	fragment := ""
+	if idx := strings.Index(uri, "#"); idx != -1 {
+		fragment = uri[idx+1:]
+		uri = uri[:idx]
+	}
+
 	// Resolve URI to path
 	path, err := resolveURI(uri)
 	if err != nil {
@@ -2765,8 +2772,37 @@ func cmdReadURI(args []string) int {
 		}
 	}
 
+	content := string(data)
+
+	// If a fragment was specified, extract that section
+	if fragment != "" {
+		body := content
+		if doc, fmErr := ExtractFrontmatter(content); fmErr == nil {
+			body = doc.Body
+		}
+
+		// Try anchor match first, then title match
+		section, secErr := GetSection(body, "#"+fragment)
+		if secErr != nil {
+			section, secErr = GetSection(body, fragment)
+		}
+		if secErr != nil {
+			fmt.Fprintf(os.Stderr, "Section %q not found\n", fragment)
+			headings := ListHeadings(body)
+			if len(headings) > 0 {
+				fmt.Fprintln(os.Stderr, "Available sections:")
+				for _, h := range headings {
+					fmt.Fprintf(os.Stderr, "  %s\n", h)
+				}
+			}
+			return 1
+		}
+		fmt.Print(section)
+		return 0
+	}
+
 	// Output content
-	fmt.Print(string(data))
+	fmt.Print(content)
 	return 0
 }
 
@@ -3167,7 +3203,7 @@ func cmdOntology(args []string) int {
 		fmt.Printf("  Status:   %s\n", ont.Status)
 		fmt.Printf("\nTopology Primitives:\n")
 		for name, prim := range ont.Topology.Primitives {
-			fmt.Printf("  %s: %s (%s)\n", name, prim.Path, prim.Purpose)
+			fmt.Printf("  %s: %s (%s)\n", name, PathToURI(cogRoot, filepath.Join(".cog", prim.Path)), prim.Purpose)
 		}
 		fmt.Printf("\nCoherence:\n")
 		fmt.Printf("  Model:    %s\n", ont.Coherence.Model)
@@ -4959,12 +4995,14 @@ func cmdFrontmatter(args []string) error {
 
 func cmdMemory(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("Usage: cog memory {search|list|read|write|append|stats} [args]")
+		fmt.Println("Usage: cog memory {search|list|read|toc|index|write|append|stats} [args]")
 		fmt.Println()
 		fmt.Println("Commands:")
 		fmt.Println("  search <query> [--deep [depth]] [--raw]  Search memory with optional deep waypoint traversal")
 		fmt.Println("  list <sector> [subdir]                    List documents in a sector")
 		fmt.Println("  read <path>                               Read a memory document")
+		fmt.Println("  toc <path>                                Show section table of contents with sizes")
+		fmt.Println("  index <path>                              Generate/update sections: frontmatter index")
 		fmt.Println("  write <path> <title> [content]            Create a new memory document")
 		fmt.Println("  append <path> <content>                   Append to existing document")
 		fmt.Println("  stats                                     Show memory statistics")
@@ -5061,11 +5099,15 @@ func cmdMemory(args []string) error {
 				fmt.Println()
 			}
 
-			// Print result
+			// Print result — URI is the kernel-validated handle
+			displayID := result.URI
+			if displayID == "" {
+				displayID = result.Path // fallback for non-memory paths
+			}
 			if result.SourceType == "waypoint" {
-				fmt.Printf("  %.2f  %s  [activation: %.2f]\n", result.Score, result.Path, result.Score)
+				fmt.Printf("  %.2f  %s  [activation: %.2f]\n", result.Score, displayID, result.Score)
 			} else {
-				fmt.Printf("  %.2f  %s\n", result.Score, result.Path)
+				fmt.Printf("  %.2f  %s\n", result.Score, displayID)
 			}
 
 			fmt.Printf("        Title: %s | Type: %s\n", result.Title, result.Type)
@@ -5107,22 +5149,145 @@ func cmdMemory(args []string) error {
 		fmt.Printf("\nFound: %d documents\n\n", len(results))
 
 		for _, result := range results {
-			relPath, _ := filepath.Rel(root, result.Path)
-			fmt.Printf("  %s\n", relPath)
+			displayID := result.URI
+			if displayID == "" {
+				displayID, _ = filepath.Rel(root, result.Path)
+			}
+			fmt.Printf("  %s\n", displayID)
 			fmt.Printf("    Title: %s\n", result.Title)
 			fmt.Printf("    Type: %s\n\n", result.Type)
 		}
 
 		return nil
 
-	case "read":
+	case "toc":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: cog memory read <path>")
+			return fmt.Errorf("usage: cog memory toc <path>")
 		}
+
 		content, err := MemoryRead(root, args[1])
 		if err != nil {
 			return err
 		}
+
+		// Strip frontmatter before parsing sections
+		body := content
+		if doc, err := ExtractFrontmatter(content); err == nil {
+			body = doc.Body
+		}
+
+		sections := ParseSections(body)
+		if len(sections) == 0 {
+			fmt.Println("No sections found.")
+			return nil
+		}
+
+		// Resolve the absolute path for URI generation
+		memoryDir := filepath.Join(root, ".cog", "mem")
+		absPath := resolveMemoryPath(memoryDir, args[1])
+		uri := MemoryPathToURI(root, absPath)
+		fmt.Println(uri)
+		fmt.Println()
+
+		for _, s := range sections {
+			sizeStr := formatBytes(s.Size)
+
+			// Compute anchor slug: explicit {#anchor} or auto-generated
+			slug := s.Anchor
+			if slug == "" {
+				slug = titleToAnchor(s.Title)
+			}
+
+			// Indent based on level: level 2 = 2 spaces, level 3 = 4 spaces, etc.
+			indent := ""
+			if s.Level >= 2 {
+				indent = strings.Repeat(" ", (s.Level-1)*2)
+			}
+
+			label := indent + "#" + slug
+			// Right-align size
+			width := 55
+			padding := width - len(label)
+			if padding < 2 {
+				padding = 2
+			}
+			fmt.Printf("%s%s%s\n", label, strings.Repeat(" ", padding), sizeStr)
+		}
+
+		return nil
+
+	case "read":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: cog memory read <path> [--section <name>] [--frontmatter]")
+		}
+
+		// Parse flags: extract path and options from args[1:]
+		var path string
+		var wantFrontmatter bool
+		var sectionName string
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "--frontmatter":
+				wantFrontmatter = true
+			case "--section":
+				if i+1 >= len(args) {
+					return fmt.Errorf("--section requires a name argument")
+				}
+				i++
+				sectionName = args[i]
+			default:
+				if path == "" {
+					path = args[i]
+				}
+			}
+		}
+		if path == "" {
+			return fmt.Errorf("usage: cog memory read <path> [--section <name>] [--frontmatter]")
+		}
+
+		// --section and --frontmatter are mutually exclusive
+		if sectionName != "" && wantFrontmatter {
+			return fmt.Errorf("--section and --frontmatter are mutually exclusive")
+		}
+
+		content, err := MemoryRead(root, path)
+		if err != nil {
+			return err
+		}
+
+		if wantFrontmatter {
+			doc, err := ExtractFrontmatter(content)
+			if err != nil {
+				return fmt.Errorf("no frontmatter found in %s", path)
+			}
+			fmt.Println(doc.Frontmatter)
+			return nil
+		}
+
+		if sectionName != "" {
+			// Extract body (strip frontmatter if present)
+			body := content
+			if doc, err := ExtractFrontmatter(content); err == nil {
+				body = doc.Body
+			}
+
+			section, err := GetSection(body, sectionName)
+			if err != nil {
+				// Section not found — list available sections
+				fmt.Fprintf(os.Stderr, "Section not found: %q\n", sectionName)
+				headings := ListHeadings(body)
+				if len(headings) > 0 {
+					fmt.Fprintln(os.Stderr, "Available sections:")
+					for _, h := range headings {
+						fmt.Fprintf(os.Stderr, "  %s\n", h)
+					}
+				}
+				return fmt.Errorf("section %q not found", sectionName)
+			}
+			fmt.Println(section)
+			return nil
+		}
+
 		fmt.Print(content)
 		return nil
 
@@ -5148,6 +5313,30 @@ func cmdMemory(args []string) error {
 
 	case "stats":
 		return MemoryStats(root)
+
+	case "index":
+		if len(args) < 2 {
+			// No path argument — bulk index all docs
+			return MemoryIndexAll(root, false, false)
+		}
+		// Parse flags and optional path
+		path := ""
+		dryRun := false
+		force := false
+		for _, arg := range args[1:] {
+			switch arg {
+			case "--dry-run":
+				dryRun = true
+			case "--force":
+				force = true
+			default:
+				path = arg
+			}
+		}
+		if path == "" {
+			return MemoryIndexAll(root, dryRun, force)
+		}
+		return MemoryIndex(root, path)
 
 	default:
 		return fmt.Errorf("unknown memory subcommand: %s", args[0])
@@ -5406,6 +5595,8 @@ func main() {
 		code = cmdInfer(os.Args[2:])
 	case "inference":
 		code = cmdInference(os.Args[2:])
+	case "mcp":
+		code = cmdMCP(os.Args[2:])
 	case "serve":
 		code = cmdServe(os.Args[2:])
 	case "health":
@@ -5491,6 +5682,10 @@ func main() {
 		code = cmdVersion()
 	case "info":
 		code = cmdInfo()
+	case "__complete":
+		if err := cmdComplete(os.Args[2:]); err != nil {
+			code = 1
+		}
 	case "help", "-h", "--help":
 		cmdHelp()
 	default:

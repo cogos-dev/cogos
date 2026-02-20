@@ -70,6 +70,7 @@ type ComponentService struct {
 type ComponentBlob struct {
 	Version      int            `json:"version"`
 	Path         string         `json:"path"`
+	URI          string         `json:"uri"`
 	Kind         string         `json:"kind"`
 	TreeHash     string         `json:"tree_hash"`
 	CommitHash   string         `json:"commit_hash,omitempty"`
@@ -403,6 +404,7 @@ func buildComponentBlob(root, path string, reg *ComponentRegistry, submodules []
 	blob := &ComponentBlob{
 		Version: 1,
 		Path:    path,
+		URI:     PathToURI(root, path),
 	}
 
 	// Check if declared in registry
@@ -575,6 +577,7 @@ func cmdComponentsList(args []string) int {
 	// Build merged list
 	type componentInfo struct {
 		Path     string `json:"path"`
+		URI      string `json:"uri"`
 		Role     string `json:"role"`
 		Kind     string `json:"kind"`
 		Status   string `json:"status"`
@@ -597,6 +600,7 @@ func cmdComponentsList(args []string) int {
 			decl := reg.Components[path]
 			info := componentInfo{
 				Path:     path,
+				URI:      PathToURI(root, path),
 				Role:     decl.Role,
 				Kind:     decl.Kind,
 				Declared: true,
@@ -644,6 +648,7 @@ func cmdComponentsList(args []string) int {
 		}
 		info := componentInfo{
 			Path:     sm.Path,
+			URI:      PathToURI(root, sm.Path),
 			Role:     "unknown",
 			Kind:     "submodule",
 			Declared: false,
@@ -740,6 +745,7 @@ func cmdComponentsStatus(args []string) int {
 
 	type statusEntry struct {
 		Path       string `json:"path"`
+		URI        string `json:"uri"`
 		Role       string `json:"role"`
 		Kind       string `json:"kind"`
 		Required   bool   `json:"required"`
@@ -767,6 +773,7 @@ func cmdComponentsStatus(args []string) int {
 		decl := reg.Components[path]
 		entry := statusEntry{
 			Path:     path,
+			URI:      PathToURI(root, path),
 			Role:     decl.Role,
 			Kind:     decl.Kind,
 			Required: decl.Required,
@@ -806,7 +813,7 @@ func cmdComponentsStatus(args []string) int {
 	}
 
 	for _, e := range entries {
-		fmt.Printf("\n\033[1m%s\033[0m:\n", e.Path)
+		fmt.Printf("\n\033[1m%s\033[0m:\n", e.URI)
 		fmt.Printf("  Registry:  %s | %s", e.Role, e.Kind)
 		if e.Required {
 			fmt.Printf(" | \033[33mrequired\033[0m")

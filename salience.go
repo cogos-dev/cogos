@@ -557,13 +557,15 @@ func cmdSalienceMetrics(args []string) error {
 		return err
 	}
 
+	cogRoot := getWorkspaceRoot()
+
 	if score == nil || score.Total == 0.0 {
-		fmt.Printf("No git history for: %s\n", filePath)
+		fmt.Printf("No git history for: %s\n", PathToURI(cogRoot, filePath))
 		fmt.Println("  Salience: 0.00")
 		return nil
 	}
 
-	fmt.Printf("Salience metrics for: %s\n", filePath)
+	fmt.Printf("Salience metrics for: %s\n", PathToURI(cogRoot, filePath))
 	fmt.Printf("  Salience:   %.2f\n", score.Total)
 	fmt.Println("  ----------------------------------------")
 	fmt.Printf("  Recency:    %.2f (%dd ago, weight: %.2f)\n", score.Recency, score.DaysAgo, cfg.WeightRecency)
@@ -598,13 +600,15 @@ func cmdSalienceRank(args []string) error {
 	repoPath := ".."
 	cfg := LoadSalienceConfigFromEnv()
 
+	cogRoot := getWorkspaceRoot()
+
 	ranked, err := RankFilesBySalience(repoPath, scope, limit, daysWindow, cfg)
 	if err != nil {
 		return err
 	}
 
 	for _, fs := range ranked {
-		fmt.Printf("%.2f %s\n", fs.Score, fs.Path)
+		fmt.Printf("%.2f %s\n", fs.Score, PathToURI(cogRoot, fs.Path))
 	}
 
 	return nil
@@ -633,6 +637,8 @@ func cmdSalienceHot(args []string) error {
 	repoPath := ".."
 	cfg := LoadSalienceConfigFromEnv()
 
+	cogRoot := getWorkspaceRoot()
+
 	hot, err := GetHotFiles(repoPath, scope, limit, threshold, daysWindow, cfg)
 	if err != nil {
 		return err
@@ -640,7 +646,7 @@ func cmdSalienceHot(args []string) error {
 
 	fmt.Fprintf(os.Stderr, "=== Hot Files in %s (%d files) ===\n", scope, len(hot))
 	for _, path := range hot {
-		fmt.Println(path)
+		fmt.Println(PathToURI(cogRoot, path))
 	}
 
 	return nil
@@ -669,13 +675,15 @@ func cmdSalienceCold(args []string) error {
 	repoPath := ".."
 	cfg := LoadSalienceConfigFromEnv()
 
+	cogRoot := getWorkspaceRoot()
+
 	cold, err := GetColdFiles(repoPath, scope, limit, threshold, daysWindow, cfg)
 	if err != nil {
 		return err
 	}
 
 	for _, path := range cold {
-		fmt.Println(path)
+		fmt.Println(PathToURI(cogRoot, path))
 	}
 
 	return nil
@@ -696,13 +704,15 @@ func cmdSalienceStale(args []string) error {
 	repoPath := ".."
 	cfg := LoadSalienceConfigFromEnv()
 
+	cogRoot := getWorkspaceRoot()
+
 	stale, err := GetStaleFiles(repoPath, scope, daysWindow, cfg)
 	if err != nil {
 		return err
 	}
 
 	for _, path := range stale {
-		fmt.Println(path)
+		fmt.Println(PathToURI(cogRoot, path))
 	}
 
 	return nil
@@ -723,6 +733,8 @@ func cmdSalienceHealth(args []string) error {
 	repoPath := ".."
 	cfg := LoadSalienceConfigFromEnv()
 
+	cogRoot := getWorkspaceRoot()
+
 	stats, err := ComputeHealthStats(repoPath, scope, daysWindow, cfg)
 	if err != nil {
 		return err
@@ -741,13 +753,13 @@ func cmdSalienceHealth(args []string) error {
 
 	fmt.Println("=== Top 5 Hot Files ===")
 	for _, fs := range stats.TopHot {
-		fmt.Printf("%.2f %s\n", fs.Score, fs.Path)
+		fmt.Printf("%.2f %s\n", fs.Score, PathToURI(cogRoot, fs.Path))
 	}
 
 	fmt.Println()
 	fmt.Println("=== Top 5 Cold Files ===")
 	for _, fs := range stats.TopCold {
-		fmt.Printf("%.2f %s\n", fs.Score, fs.Path)
+		fmt.Printf("%.2f %s\n", fs.Score, PathToURI(cogRoot, fs.Path))
 	}
 
 	return nil

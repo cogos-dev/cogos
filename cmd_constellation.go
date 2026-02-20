@@ -85,7 +85,7 @@ func constellationSearch(workspaceRoot, query string) error {
 		if node.Sector != "" {
 			fmt.Printf("   Sector: %s\n", node.Sector)
 		}
-		fmt.Printf("   Path: %s\n", node.Path)
+		fmt.Printf("   URI: %s\n", PathToURI(workspaceRoot, node.Path))
 		fmt.Printf("   Rank: %.2f\n\n", node.Rank)
 	}
 

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/cogos-dev/cogos/sdk/constellation"
+	"gopkg.in/yaml.v3"
 )
 
 // === WAYPOINT GRAPH STRUCTURES ===
@@ -54,6 +55,7 @@ type WaypointNode struct {
 // MemorySearchResult represents a single search result
 type MemorySearchResult struct {
 	Path            string
+	URI             string // cog://mem/ URI — the kernel-validated handle
 	Score           float64
 	Title           string
 	Type            string
@@ -62,6 +64,161 @@ type MemorySearchResult struct {
 	KeywordStrength float64
 	Depth           int
 	SourceType      string
+}
+
+// MemoryPathToURI converts an absolute memory file path to a cog://mem/ URI.
+// Example: /Users/foo/cog-workspace/.cog/mem/semantic/insights/topic.cog.md → cog://mem/semantic/insights/topic
+func MemoryPathToURI(cogRoot, absPath string) string {
+	memDir := filepath.Join(cogRoot, ".cog", "mem") + "/"
+	if !strings.HasPrefix(absPath, memDir) {
+		return absPath // Not a memory path — return as-is
+	}
+	relPath := strings.TrimPrefix(absPath, memDir)
+	// Strip file extensions for clean URIs
+	relPath = strings.TrimSuffix(relPath, ".cog.md")
+	relPath = strings.TrimSuffix(relPath, ".md")
+	return "cog://mem/" + relPath
+}
+
+// URIToMemoryPath converts a cog://mem/ URI back to an absolute file path.
+// Tries .cog.md first, then .md, then bare path.
+func URIToMemoryPath(cogRoot, uri string) (string, error) {
+	if !strings.HasPrefix(uri, "cog://mem/") {
+		return "", fmt.Errorf("not a memory URI: %s", uri)
+	}
+	relPath := strings.TrimPrefix(uri, "cog://mem/")
+	memDir := filepath.Join(cogRoot, ".cog", "mem")
+
+	// Try .cog.md first (canonical), then .md, then bare
+	candidates := []string{
+		filepath.Join(memDir, relPath+".cog.md"),
+		filepath.Join(memDir, relPath+".md"),
+		filepath.Join(memDir, relPath),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("memory URI not found: %s (tried %s.{cog.md,md})", uri, relPath)
+}
+
+// === GENERAL PATH ↔ URI CONVERSION ===
+
+// uriMapping defines a filesystem prefix → cog:// namespace mapping.
+type uriMapping struct {
+	// pathPrefix is relative to cogRoot (e.g., ".cog/mem/")
+	pathPrefix string
+	// uriPrefix is the cog:// namespace (e.g., "cog://mem/")
+	uriPrefix string
+	// stripExt controls whether .cog.md/.md extensions are stripped from URIs
+	stripExt bool
+}
+
+// uriMappings is ordered by specificity — longest prefix first wins.
+var uriMappings = []uriMapping{
+	// Memory (most specific .cog/ subtree first)
+	{pathPrefix: ".cog/mem/", uriPrefix: "cog://mem/", stripExt: true},
+	// ADRs
+	{pathPrefix: ".cog/adr/", uriPrefix: "cog://adr/", stripExt: true},
+	// Hooks
+	{pathPrefix: ".cog/hooks/", uriPrefix: "cog://hooks/", stripExt: true},
+	// Agents (under .cog/bin/agents/)
+	{pathPrefix: ".cog/bin/agents/", uriPrefix: "cog://agents/", stripExt: true},
+	// Skills (under .cog/bin/skills/)
+	{pathPrefix: ".cog/bin/skills/", uriPrefix: "cog://skills/", stripExt: true},
+	// Roles
+	{pathPrefix: ".cog/conf/roles/", uriPrefix: "cog://roles/", stripExt: true},
+	// Ontology
+	{pathPrefix: ".cog/ontology/", uriPrefix: "cog://kernel/ontology/", stripExt: true},
+	// Specs
+	{pathPrefix: ".cog/conf/spec/", uriPrefix: "cog://spec/", stripExt: true},
+	// Milestones
+	{pathPrefix: ".cog/milestones/", uriPrefix: "cog://kernel/milestones/", stripExt: true},
+	// Configuration (generic .cog/conf/ catch-all after specific subtrees)
+	{pathPrefix: ".cog/conf/", uriPrefix: "cog://kernel/conf/", stripExt: true},
+	// Coordination
+	{pathPrefix: ".cog/claims/", uriPrefix: "cog://kernel/coordination/claims/", stripExt: false},
+	{pathPrefix: ".cog/handoffs/", uriPrefix: "cog://kernel/coordination/handoffs/", stripExt: false},
+	{pathPrefix: ".cog/broadcasts/", uriPrefix: "cog://kernel/coordination/broadcasts/", stripExt: false},
+	// Ledger
+	{pathPrefix: ".cog/ledger/", uriPrefix: "cog://ledger/", stripExt: false},
+	// Runtime (PID files, sockets)
+	{pathPrefix: ".cog/run/", uriPrefix: "cog://kernel/run/", stripExt: false},
+	// Logs
+	{pathPrefix: ".cog/logs/", uriPrefix: "cog://kernel/logs/", stripExt: false},
+	// Status
+	{pathPrefix: ".cog/.state/", uriPrefix: "cog://status/", stripExt: false},
+	// Components (apps/)
+	{pathPrefix: "apps/", uriPrefix: "cog://kernel/components/apps/", stripExt: false},
+}
+
+// PathToURI converts any workspace path to the appropriate cog:// URI.
+// The path can be absolute or relative to cogRoot. If no namespace matches,
+// it returns the workspace-relative path unchanged.
+func PathToURI(cogRoot, path string) string {
+	// Normalize to workspace-relative
+	relPath := path
+	if strings.HasPrefix(path, cogRoot) {
+		relPath = strings.TrimPrefix(path, cogRoot)
+		relPath = strings.TrimPrefix(relPath, "/")
+	}
+
+	for _, m := range uriMappings {
+		if strings.HasPrefix(relPath, m.pathPrefix) {
+			suffix := strings.TrimPrefix(relPath, m.pathPrefix)
+			if m.stripExt {
+				suffix = strings.TrimSuffix(suffix, ".cog.md")
+				suffix = strings.TrimSuffix(suffix, ".md")
+				suffix = strings.TrimSuffix(suffix, ".yaml")
+				suffix = strings.TrimSuffix(suffix, ".yml")
+			}
+			// Trim trailing slash for clean URIs
+			suffix = strings.TrimSuffix(suffix, "/")
+			return m.uriPrefix + suffix
+		}
+	}
+
+	// No namespace match — return workspace-relative path
+	return relPath
+}
+
+// URIToPath converts a cog:// URI back to an absolute filesystem path.
+// Probes for .cog.md, .md, .yaml, and bare path in that order.
+func URIToPath(cogRoot, uri string) (string, error) {
+	if !strings.HasPrefix(uri, "cog://") {
+		return "", fmt.Errorf("not a cog URI: %s", uri)
+	}
+
+	for _, m := range uriMappings {
+		if strings.HasPrefix(uri, m.uriPrefix) {
+			suffix := strings.TrimPrefix(uri, m.uriPrefix)
+			baseDir := filepath.Join(cogRoot, m.pathPrefix)
+
+			if m.stripExt {
+				// Probe for file with extensions
+				candidates := []string{
+					filepath.Join(baseDir, suffix+".cog.md"),
+					filepath.Join(baseDir, suffix+".md"),
+					filepath.Join(baseDir, suffix+".yaml"),
+					filepath.Join(baseDir, suffix+".yml"),
+					filepath.Join(baseDir, suffix),
+				}
+				for _, c := range candidates {
+					if _, err := os.Stat(c); err == nil {
+						return c, nil
+					}
+				}
+				// Default to .cog.md for write operations
+				return filepath.Join(baseDir, suffix+".cog.md"), nil
+			}
+
+			// No extension stripping — return direct path
+			return filepath.Join(baseDir, suffix), nil
+		}
+	}
+
+	return "", fmt.Errorf("unresolvable URI: %s", uri)
 }
 
 // === WAYPOINT GRAPH LOADING ===
@@ -225,6 +382,7 @@ func TraverseWaypoints(
 
 		results = append(results, MemorySearchResult{
 			Path:           path,
+			URI:            MemoryPathToURI(cogRoot, path),
 			Score:          node.Activation,
 			Title:          title,
 			Type:           docType,
@@ -313,6 +471,7 @@ func constellationMemorySearch(cogRoot string, query string, rawMode bool) ([]Me
 
 		result := MemorySearchResult{
 			Path:            n.Path,
+			URI:             MemoryPathToURI(cogRoot, n.Path),
 			Score:           score,
 			Title:           title,
 			Type:            docType,
@@ -382,6 +541,7 @@ func grepMemorySearch(cogRoot string, query string, rawMode bool) ([]MemorySearc
 		for i, path := range searchResults {
 			results[i] = MemorySearchResult{
 				Path:       path,
+				URI:        MemoryPathToURI(cogRoot, path),
 				Score:      1.0,
 				Title:      ExtractTitleFromFilename(path),
 				Type:       "unknown",
@@ -407,6 +567,7 @@ func grepMemorySearch(cogRoot string, query string, rawMode bool) ([]MemorySearc
 
 			result := MemorySearchResult{
 				Path:       path,
+				URI:        MemoryPathToURI(cogRoot, path),
 				Score:      0.0,
 				SourceType: "direct",
 				Depth:      0,
@@ -637,6 +798,7 @@ func MemoryList(cogRoot string, sector string, subdir string) ([]MemorySearchRes
 
 		results = append(results, MemorySearchResult{
 			Path:  path,
+			URI:   MemoryPathToURI(cogRoot, path),
 			Title: title,
 			Type:  docType,
 		})
@@ -655,6 +817,7 @@ func MemoryList(cogRoot string, sector string, subdir string) ([]MemorySearchRes
 
 // resolveMemoryPath normalizes a path to an absolute path within the memory directory.
 // Handles all input formats:
+//   - cog:// URI:          "cog://mem/semantic/insights/topic"
 //   - Memory-relative:    "semantic/insights/topic.md"
 //   - Workspace-relative: ".cog/mem/semantic/insights/topic.md"
 //   - Absolute:           "/Users/.../cog-workspace/.cog/mem/semantic/insights/topic.md"
@@ -662,6 +825,24 @@ func MemoryList(cogRoot string, sector string, subdir string) ([]MemorySearchRes
 // This prevents double-nesting (e.g., .cog/mem/.cog/mem/...) which occurs when
 // a .cog/mem/ prefixed path is blindly joined with the memory directory.
 func resolveMemoryPath(memoryDir, path string) string {
+	// cog://mem/ URI — resolve to filesystem path with extension probing
+	if strings.HasPrefix(path, "cog://mem/") {
+		relPath := strings.TrimPrefix(path, "cog://mem/")
+		// Try .cog.md first (canonical), then .md, then bare
+		candidates := []string{
+			filepath.Join(memoryDir, relPath+".cog.md"),
+			filepath.Join(memoryDir, relPath+".md"),
+			filepath.Join(memoryDir, relPath),
+		}
+		for _, candidate := range candidates {
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+		// None found — return .cog.md as default (for write operations)
+		return filepath.Join(memoryDir, relPath+".cog.md")
+	}
+
 	// Absolute path containing .cog/mem/ — extract the memory-relative portion
 	// Use LastIndex to handle double-nesting: .cog/mem/.cog/mem/foo → takes "foo"
 	if idx := strings.LastIndex(path, "/.cog/mem/"); idx >= 0 {
@@ -680,14 +861,33 @@ func resolveMemoryPath(memoryDir, path string) string {
 		return path
 	}
 
-	// Memory-relative path (the common case)
-	return filepath.Join(memoryDir, path)
+	// Memory-relative path (the common case) — probe extensions
+	direct := filepath.Join(memoryDir, path)
+	if _, err := os.Stat(direct); err == nil {
+		return direct
+	}
+	// Probe .cog.md, then .md
+	for _, ext := range []string{".cog.md", ".md"} {
+		candidate := direct + ext
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return direct // fall through for write operations
 }
 
 // === MEMORY READ ===
 
-// MemoryRead reads a memory document and updates last_accessed timestamp
+// MemoryRead reads a memory document and updates last_accessed timestamp.
+// Supports URI fragment syntax: path#section-name extracts only that section.
 func MemoryRead(cogRoot string, path string) (string, error) {
+	// Strip URI fragment before path resolution
+	fragment := ""
+	if idx := strings.Index(path, "#"); idx != -1 {
+		fragment = path[idx+1:]
+		path = path[:idx]
+	}
+
 	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
 	fullPath := resolveMemoryPath(memoryDir, path)
 
@@ -724,7 +924,28 @@ func MemoryRead(cogRoot string, path string) (string, error) {
 		}
 	}()
 
-	return string(content), nil
+	result := string(content)
+
+	// If a fragment was specified, extract that section
+	if fragment != "" {
+		body := result
+		if doc, fmErr := ExtractFrontmatter(result); fmErr == nil {
+			body = doc.Body
+		}
+
+		// Try anchor match first (prepend # for anchor-style lookup)
+		section, secErr := GetSection(body, "#"+fragment)
+		if secErr != nil {
+			// Fall back to title match (without # prefix)
+			section, secErr = GetSection(body, fragment)
+		}
+		if secErr != nil {
+			return "", fmt.Errorf("section %q not found in %s", fragment, path)
+		}
+		return section, nil
+	}
+
+	return result, nil
 }
 
 // UpdateLastAccessed updates the last_accessed field in frontmatter
@@ -824,7 +1045,24 @@ func MemoryWrite(cogRoot string, path string, title string, content string) erro
 		return fmt.Errorf("failed to write memory: %w", err)
 	}
 
-	fmt.Printf("Written: %s\n", fullPath)
+	fmt.Printf("Written: %s\n", MemoryPathToURI(cogRoot, fullPath))
+
+	// Auto-generate sections: frontmatter if the document has 2+ level-2+ headings
+	if doc, fmErr := ExtractFrontmatter(document); fmErr == nil {
+		sections := ParseSections(doc.Body)
+		level2PlusCount := 0
+		for _, s := range sections {
+			if s.Level >= 2 {
+				level2PlusCount++
+			}
+		}
+		if level2PlusCount >= 2 {
+			if idxErr := MemoryIndex(cogRoot, path); idxErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: section auto-index failed: %v\n", idxErr)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -852,7 +1090,7 @@ func MemoryAppend(cogRoot string, path string, content string) error {
 		return fmt.Errorf("failed to append: %w", err)
 	}
 
-	fmt.Printf("Appended to: %s\n", fullPath)
+	fmt.Printf("Appended to: %s\n", MemoryPathToURI(cogRoot, fullPath))
 	return nil
 }
 
@@ -885,6 +1123,219 @@ func MemoryStats(cogRoot string) error {
 		})
 
 		fmt.Printf("%s: %d documents\n", sector, count)
+	}
+
+	return nil
+}
+
+// === MEMORY INDEX ===
+
+// sectionIndexEntry is a structured section entry for YAML marshaling in frontmatter.
+type sectionIndexEntry struct {
+	Title  string `yaml:"title"`
+	Anchor string `yaml:"anchor,omitempty"`
+	Line   int    `yaml:"line"`
+	Size   int    `yaml:"size"`
+}
+
+// titleToAnchor generates a URL-friendly anchor from a section title.
+// Lowercases, replaces spaces with hyphens, strips non-alphanumeric characters
+// except hyphens, and truncates to 64 chars at a hyphen boundary.
+func titleToAnchor(title string) string {
+	const maxLen = 64
+
+	anchor := strings.ToLower(title)
+	anchor = strings.ReplaceAll(anchor, " ", "-")
+	var buf strings.Builder
+	for _, r := range anchor {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			buf.WriteRune(r)
+		}
+	}
+	anchor = strings.Trim(buf.String(), "-")
+
+	if len(anchor) > maxLen {
+		anchor = anchor[:maxLen]
+		// Trim at last hyphen to avoid cutting mid-word
+		if idx := strings.LastIndex(anchor, "-"); idx > maxLen/2 {
+			anchor = anchor[:idx]
+		}
+	}
+
+	return anchor
+}
+
+// MemoryIndex generates or updates the sections: frontmatter for a cogdoc.
+// It parses the markdown body for headings (level 2+), builds structured section
+// entries, and rewrites the frontmatter with the updated sections field.
+func MemoryIndex(cogRoot, path string) error {
+	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
+	fullPath := resolveMemoryPath(memoryDir, path)
+
+	// Validate path stays within memory directory
+	cleanFull := filepath.Clean(fullPath)
+	cleanMem := filepath.Clean(memoryDir)
+	if !strings.HasPrefix(cleanFull, cleanMem+string(filepath.Separator)) && cleanFull != cleanMem {
+		return fmt.Errorf("path traversal blocked: %s escapes memory directory", path)
+	}
+
+	// Read file content
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Extract frontmatter
+	doc, err := ExtractFrontmatter(string(content))
+	if err != nil {
+		return fmt.Errorf("no frontmatter found in %s: %w", path, err)
+	}
+
+	// Parse sections from body
+	sections := ParseSections(doc.Body)
+
+	// Filter to level 2+ only (skip level 1 = document title)
+	var entries []sectionIndexEntry
+	for _, s := range sections {
+		if s.Level < 2 {
+			continue
+		}
+		anchor := s.Anchor
+		if anchor == "" {
+			anchor = titleToAnchor(s.Title)
+		}
+		entries = append(entries, sectionIndexEntry{
+			Title:  s.Title,
+			Anchor: anchor,
+			Line:   s.Line,
+			Size:   s.Size,
+		})
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No sections to index")
+		return nil
+	}
+
+	// Parse existing frontmatter YAML as map
+	fmData := make(map[string]interface{})
+	if err := yaml.Unmarshal([]byte(doc.Frontmatter), &fmData); err != nil {
+		return fmt.Errorf("failed to parse frontmatter YAML: %w", err)
+	}
+
+	// Update/replace the sections key with new section entries
+	fmData["sections"] = entries
+
+	// Re-marshal the full frontmatter map
+	newFM, err := yaml.Marshal(fmData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal frontmatter: %w", err)
+	}
+
+	// Rewrite the file: new frontmatter + original body
+	newContent := "---\n" + string(newFM) + "---\n" + doc.Body
+
+	if err := os.WriteFile(fullPath, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	uri := MemoryPathToURI(cogRoot, fullPath)
+	fmt.Printf("Indexed: %s (%d sections)\n", uri, len(entries))
+	return nil
+}
+
+// MemoryIndexAll walks all cogdocs under .cog/mem/ and bulk-generates section
+// indexes in their frontmatter. Files without frontmatter or without level-2+
+// headings are skipped. When force is false, files that already have a
+// "sections" key in their frontmatter are also skipped.
+func MemoryIndexAll(cogRoot string, dryRun, force bool) error {
+	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
+
+	indexed := 0
+	skippedNoHeadings := 0
+	skippedAlreadyIndexed := 0
+
+	err := filepath.WalkDir(memoryDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip errors, keep walking
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+
+		// Read file content
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil // skip unreadable files
+		}
+
+		// Extract frontmatter — skip files without it
+		doc, err := ExtractFrontmatter(string(content))
+		if err != nil {
+			return nil
+		}
+
+		// Parse sections from body
+		sections := ParseSections(doc.Body)
+
+		// Filter to level 2+ only
+		hasHeadings := false
+		for _, s := range sections {
+			if s.Level >= 2 {
+				hasHeadings = true
+				break
+			}
+		}
+		if !hasHeadings {
+			skippedNoHeadings++
+			return nil
+		}
+
+		// If not forcing, check if sections already exist in frontmatter
+		if !force {
+			fmData := make(map[string]interface{})
+			if err := yaml.Unmarshal([]byte(doc.Frontmatter), &fmData); err == nil {
+				if _, exists := fmData["sections"]; exists {
+					skippedAlreadyIndexed++
+					return nil
+				}
+			}
+		}
+
+		// Compute relative path from memory dir
+		relPath, err := filepath.Rel(memoryDir, path)
+		if err != nil {
+			return nil
+		}
+
+		if dryRun {
+			indexed++
+			return nil
+		}
+
+		// Call single-file MemoryIndex
+		if err := MemoryIndex(cogRoot, relPath); err != nil {
+			// Log but don't abort the walk
+			fmt.Fprintf(os.Stderr, "warning: failed to index %s: %v\n", relPath, err)
+			return nil
+		}
+		indexed++
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("walk failed: %w", err)
+	}
+
+	if dryRun {
+		fmt.Printf("Dry run: would index %d docs (%d skipped — no headings, %d already indexed)\n",
+			indexed, skippedNoHeadings, skippedAlreadyIndexed)
+	} else {
+		fmt.Printf("Indexed: %d docs (%d skipped — no headings, %d skipped — already indexed)\n",
+			indexed, skippedNoHeadings, skippedAlreadyIndexed)
 	}
 
 	return nil

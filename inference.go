@@ -193,6 +193,12 @@ type InferenceRequest struct {
 	Tools        []json.RawMessage // OpenAI-format tool definitions from client
 	AllowedTools []string          // Claude CLI --allowed-tools patterns (e.g. "Bash", "Bash(git:*)")
 
+	// MCP bridge configuration
+	MCPConfig     string // Path to generated --mcp-config JSON file
+	OpenClawURL   string // OpenClaw gateway URL for bridge proxy
+	OpenClawToken string // Auth token for OpenClaw
+	SessionID     string // Session context for tool execution
+
 	// Retry configuration
 	MaxRetries int           // Max retry attempts (0 = use default)
 	Timeout    time.Duration // Request timeout (0 = use default)
@@ -661,7 +667,72 @@ func buildClaudeArgs(req *InferenceRequest) []string {
 		}
 	}
 
+	// MCP bridge configuration
+	if req.MCPConfig != "" {
+		args = append(args, "--mcp-config", req.MCPConfig)
+	}
+
 	return args
+}
+
+// generateMCPConfig creates a temporary MCP config JSON file for Claude CLI's --mcp-config flag.
+// The config tells Claude CLI to spawn `cog mcp serve --bridge` as an MCP server,
+// enabling access to both CogOS and OpenClaw tools.
+func generateMCPConfig(req *InferenceRequest) (string, error) {
+	if req.OpenClawURL == "" {
+		return "", fmt.Errorf("OpenClawURL required for MCP bridge")
+	}
+
+	// Find the cog binary path
+	cogBin, err := os.Executable()
+	if err != nil {
+		cogBin = "cog" // Fallback to PATH lookup
+	}
+
+	// Resolve workspace root for COG_ROOT env var
+	root, _, err := ResolveWorkspace()
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace: %w", err)
+	}
+
+	config := map[string]interface{}{
+		"mcpServers": map[string]interface{}{
+			"cogos-bridge": map[string]interface{}{
+				"command": cogBin,
+				"args":    []string{"mcp", "serve", "--bridge"},
+				"env": map[string]string{
+					"COG_ROOT":      root,
+					"OPENCLAW_URL":   req.OpenClawURL,
+					"OPENCLAW_TOKEN": req.OpenClawToken,
+					"SESSION_ID":     req.SessionID,
+				},
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal config: %w", err)
+	}
+
+	// Write to temp file
+	tmpFile, err := os.CreateTemp("", "cog-mcp-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("write config: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("close config: %w", err)
+	}
+
+	return tmpFile.Name(), nil
 }
 
 // mapToolsToCLINames extracts function names from OpenAI-format tool definitions

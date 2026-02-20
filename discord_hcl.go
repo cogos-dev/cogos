@@ -390,7 +390,7 @@ func cmdDiscordMigrate(root string) error {
 		return fmt.Errorf("writing %s: %w", outPath, err)
 	}
 
-	fmt.Printf("Migrated %s → %s\n", configPath, outPath)
+	fmt.Printf("Migrated %s → %s\n", PathToURI(root, configPath), PathToURI(root, outPath))
 	fmt.Println("\nReview server.hcl, then run `cog plan discord` to verify zero diff.")
 	return nil
 }

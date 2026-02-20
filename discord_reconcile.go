@@ -723,13 +723,13 @@ func hexColorToInt(hex string) int {
 
 // ─── Plan output formatting ─────────────────────────────────────────────────
 
-func formatPlanText(plan *Plan) string {
+func formatPlanText(root string, plan *Plan) string {
 	var b strings.Builder
 
 	b.WriteString("Discord Reconciliation Plan\n")
 	b.WriteString("============================\n")
 	fmt.Fprintf(&b, "Guild: %s (%s)\n", plan.GuildName, plan.GuildID)
-	fmt.Fprintf(&b, "Config: %s\n", plan.ConfigPath)
+	fmt.Fprintf(&b, "Config: %s\n", PathToURI(root, plan.ConfigPath))
 	fmt.Fprintf(&b, "Generated: %s\n\n", plan.GeneratedAt)
 
 	// Group actions by resource type
@@ -1465,7 +1465,7 @@ func cmdDiscordPlan(root, flagToken string, jsonOutput bool) error {
 	planJSON, _ := json.MarshalIndent(plan, "", "  ")
 	os.WriteFile(filepath.Join(planDir, ".last-plan.json"), planJSON, 0644)
 
-	planText := formatPlanText(plan)
+	planText := formatPlanText(root, plan)
 	os.WriteFile(filepath.Join(planDir, ".last-plan.md"), []byte(planText), 0644)
 
 	// Output
@@ -1583,11 +1583,11 @@ func cmdDiscordApply(root, flagToken string) error {
 func cmdDiscordStatus(root, flagToken string) error {
 	cfg, configPath, err := loadDiscordServerConfig(root)
 	if err != nil {
-		fmt.Printf("Config: %s (not found or invalid: %v)\n", configPath, err)
+		fmt.Printf("Config: %s (not found or invalid: %v)\n", PathToURI(root, configPath), err)
 		return nil
 	}
 
-	fmt.Printf("Config: %s\n", configPath)
+	fmt.Printf("Config: %s\n", PathToURI(root, configPath))
 	fmt.Printf("Guild: %s (%s)\n", cfg.Guild.Name, cfg.Guild.ID)
 	fmt.Printf("Roles declared: %d\n", len(cfg.Guild.Roles))
 
@@ -1629,7 +1629,7 @@ func cmdDiscordStatus(root, flagToken string) error {
 	// Check for saved plan
 	planPath := filepath.Join(root, ".cog", "config", "discord", ".last-plan.json")
 	if _, err := os.Stat(planPath); err == nil {
-		fmt.Printf("\nPending plan: %s\n", planPath)
+		fmt.Printf("\nPending plan: %s\n", PathToURI(root, planPath))
 		fmt.Println("Run 'cog apply discord' to execute.")
 	}
 
@@ -1910,7 +1910,7 @@ func cmdDiscordSnapshot(root, flagToken string) error {
 		return fmt.Errorf("writing %s: %w", outPath, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Snapshot written to %s\n", outPath)
+	fmt.Fprintf(os.Stderr, "Snapshot written to %s\n", PathToURI(root, outPath))
 	fmt.Fprintf(os.Stderr, "  Roles: %d (excluding @everyone and bot-managed)\n", len(roleCfgs))
 	fmt.Fprintf(os.Stderr, "  Categories: %d\n", len(catCfgs))
 	totalCh := 0

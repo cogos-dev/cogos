@@ -93,7 +93,7 @@ func CreateClaim(workspaceRoot, path, reason string) error {
 		return fmt.Errorf("failed to write claim: %w", err)
 	}
 
-	fmt.Printf("Claimed: %s\n", path)
+	fmt.Printf("Claimed: %s\n", PathToURI(workspaceRoot, path))
 	return nil
 }
 
@@ -110,7 +110,7 @@ func ReleaseClaim(workspaceRoot, path string) error {
 		return fmt.Errorf("failed to release claim: %w", err)
 	}
 
-	fmt.Printf("Released: %s\n", path)
+	fmt.Printf("Released: %s\n", PathToURI(workspaceRoot, path))
 	return nil
 }
 
