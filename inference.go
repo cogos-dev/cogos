@@ -1413,9 +1413,12 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 
 	// Set working directory for Claude CLI.
 	// Priority: request-specific workspace (e.g., OpenClaw workspace via UCP)
+	// → DEFAULT_CLIENT_WORKSPACE env var (for callers that don't send UCP)
 	// → kernel workspace (ResolveWorkspace) → inherit from parent process.
 	if req.WorkspaceRoot != "" {
 		cmd.Dir = req.WorkspaceRoot
+	} else if defaultWs := os.Getenv("DEFAULT_CLIENT_WORKSPACE"); defaultWs != "" {
+		cmd.Dir = defaultWs
 	} else if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
 		cmd.Dir = wsRoot
 	}
@@ -1863,9 +1866,12 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 
 	// Set working directory for Claude CLI.
 	// Priority: request-specific workspace (e.g., OpenClaw workspace via UCP)
+	// → DEFAULT_CLIENT_WORKSPACE env var (for callers that don't send UCP)
 	// → kernel workspace (ResolveWorkspace) → inherit from parent process.
 	if req.WorkspaceRoot != "" {
 		cmd.Dir = req.WorkspaceRoot
+	} else if defaultWs := os.Getenv("DEFAULT_CLIENT_WORKSPACE"); defaultWs != "" {
+		cmd.Dir = defaultWs
 	} else if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
 		cmd.Dir = wsRoot
 	}
