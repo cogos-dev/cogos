@@ -1603,6 +1603,13 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		Tools:        req.Tools,
 	}
 
+	// Use UCP workspace root as Claude CLI working directory when provided.
+	// This lets callers (e.g., OpenClaw) specify which workspace the backend
+	// should operate in, rather than always using the kernel's workspace.
+	if ucpContext != nil && ucpContext.Workspace != nil && ucpContext.Workspace.Root != "" {
+		inferReq.WorkspaceRoot = ucpContext.Workspace.Root
+	}
+
 	// Parse X-Allowed-Tools header for explicit tool control
 	if allowedToolsHeader := r.Header.Get("X-Allowed-Tools"); allowedToolsHeader != "" {
 		var tools []string

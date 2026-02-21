@@ -193,6 +193,11 @@ type InferenceRequest struct {
 	Tools        []json.RawMessage // OpenAI-format tool definitions from client
 	AllowedTools []string          // Claude CLI --allowed-tools patterns (e.g. "Bash", "Bash(git:*)")
 
+	// Workspace override — when set, Claude CLI runs in this directory
+	// instead of the kernel's workspace. Used for per-request workspace
+	// targeting (e.g., OpenClaw workspace via UCP).
+	WorkspaceRoot string
+
 	// MCP bridge configuration
 	MCPConfig     string // Path to generated --mcp-config JSON file
 	OpenClawURL   string // OpenClaw gateway URL for bridge proxy
@@ -1406,9 +1411,12 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 	// Create command with context for cancellation
 	cmd := exec.CommandContext(ctx, claudeCommand, args...)
 
-	// Set working directory to workspace root so Claude CLI operates
-	// in the correct project context (not wherever the kernel was launched from)
-	if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
+	// Set working directory for Claude CLI.
+	// Priority: request-specific workspace (e.g., OpenClaw workspace via UCP)
+	// → kernel workspace (ResolveWorkspace) → inherit from parent process.
+	if req.WorkspaceRoot != "" {
+		cmd.Dir = req.WorkspaceRoot
+	} else if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
 		cmd.Dir = wsRoot
 	}
 
@@ -1853,9 +1861,12 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 	// Create command with context for cancellation
 	cmd := exec.CommandContext(ctx, claudeCommand, args...)
 
-	// Set working directory to workspace root so Claude CLI operates
-	// in the correct project context (not wherever the kernel was launched from)
-	if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
+	// Set working directory for Claude CLI.
+	// Priority: request-specific workspace (e.g., OpenClaw workspace via UCP)
+	// → kernel workspace (ResolveWorkspace) → inherit from parent process.
+	if req.WorkspaceRoot != "" {
+		cmd.Dir = req.WorkspaceRoot
+	} else if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
 		cmd.Dir = wsRoot
 	}
 
