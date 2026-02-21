@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -98,6 +99,17 @@ func RunWatch(cfg WatchConfig) error {
 	fmt.Fprintf(os.Stderr, "[watch] Starting continuous reconciliation for %s (interval: %s, auto-apply: %v)\n",
 		cfg.ResourceType, cfg.Interval, cfg.AutoApply)
 
+	// Load field-reactive conditions from hook-config.yaml.
+	// These are evaluated at the end of each cycle — zero cost if none defined.
+	fieldConditions, err := LoadFieldConditions(cfg.Root)
+	if err != nil {
+		log.Printf("[watch] Warning: failed to load field conditions: %v", err)
+	}
+	if len(fieldConditions) > 0 {
+		fmt.Fprintf(os.Stderr, "[watch] Loaded %d field-reactive conditions\n", len(fieldConditions))
+	}
+	condState := &FieldConditionState{CyclesSinceFired: make(map[string]int)}
+
 	// Setup signal handling for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -126,6 +138,11 @@ func RunWatch(cfg WatchConfig) error {
 			fmt.Fprintf(os.Stderr, "[watch] Cycle %d error: %v\n", cycle, err)
 			// Don't exit on error — continue watching
 		}
+
+		// Evaluate field-reactive conditions after each reconcile cycle.
+		// Runs against the current cognitive field graph and dispatches
+		// hooks for any conditions that match.
+		EvaluateAndDispatchFieldConditions(cfg.Root, fieldConditions, condState)
 
 		// Wait for interval or shutdown
 		select {

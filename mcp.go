@@ -28,6 +28,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // === JSON-RPC 2.0 TYPES ===
@@ -211,63 +218,136 @@ func NewOpenClawBridge(baseURL, token, sessionKey string) *OpenClawBridge {
 		Token:      token,
 		SessionKey: sessionKey,
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 60 * time.Second, // Browser/canvas actions can take 10-30s
 		},
 	}
 }
 
-// OpenClawToolManifest represents the response from GET /tools/list
-type OpenClawToolManifest struct {
-	Tools []OpenClawToolDef `json:"tools"`
+// openAIFunctionTool represents an OpenAI-format tool definition for deserialization.
+type openAIFunctionTool struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string                 `json:"name"`
+		Description string                 `json:"description"`
+		Parameters  map[string]interface{} `json:"parameters"`
+	} `json:"function"`
 }
 
-// OpenClawToolDef represents a tool definition from OpenClaw
-type OpenClawToolDef struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	InputSchema map[string]interface{} `json:"inputSchema"`
-}
-
-// FetchToolManifest retrieves the tool manifest from OpenClaw's GET /tools/list
-func (b *OpenClawBridge) FetchToolManifest() ([]MCPTool, error) {
-	req, err := http.NewRequest("GET", b.BaseURL+"/tools/list", nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+// convertOpenAIToolsToMCP converts OpenAI-format tool definitions (from request body)
+// into MCP tool format. This is the bridge between the standard tool convention
+// (tools sent in POST /v1/chat/completions body) and the MCP protocol.
+func convertOpenAIToolsToMCP(tools []json.RawMessage) []MCPTool {
+	var mcpTools []MCPTool
+	for _, raw := range tools {
+		var oaiTool openAIFunctionTool
+		if err := json.Unmarshal(raw, &oaiTool); err != nil {
+			continue // skip malformed
+		}
+		if oaiTool.Type != "function" || oaiTool.Function.Name == "" {
+			continue
+		}
+		schema := oaiTool.Function.Parameters
+		if schema == nil {
+			schema = map[string]interface{}{"type": "object"}
+		}
+		mcpTools = append(mcpTools, MCPTool{
+			Name:        oaiTool.Function.Name,
+			Description: oaiTool.Function.Description,
+			InputSchema: schema,
+		})
 	}
+	return mcpTools
+}
+
+// LoadToolRegistry reads external tool definitions from the TOOL_REGISTRY env var.
+// Tools are serialized as JSON by generateMCPConfig from the request body's tools field.
+// This is the push-based alternative to the old pull-based FetchToolManifest approach:
+// tools flow FROM the caller's request body, not from an HTTP discovery endpoint.
+func (s *MCPServer) LoadToolRegistry() {
+	regJSON := os.Getenv("TOOL_REGISTRY")
+	if regJSON == "" {
+		return
+	}
+	var tools []MCPTool
+	if err := json.Unmarshal([]byte(regJSON), &tools); err != nil {
+		fmt.Fprintf(os.Stderr, "[MCP Bridge] Failed to parse TOOL_REGISTRY: %v\n", err)
+		return
+	}
+	s.externalTools = tools
+	fmt.Fprintf(os.Stderr, "[MCP Bridge] Loaded %d tools from registry\n", len(tools))
+	for _, t := range tools {
+		fmt.Fprintf(os.Stderr, "[MCP Bridge]   - %s\n", t.Name)
+	}
+}
+
+// ProbeGateway verifies connectivity to the OpenClaw gateway.
+// Returns nil if the gateway is reachable and authenticated.
+func (b *OpenClawBridge) ProbeGateway(ctx context.Context) error {
+	ctx, span := tracer.Start(ctx, "mcp.bridge.probe_gateway",
+		trace.WithAttributes(
+			attribute.String("openclaw.url", b.BaseURL),
+		),
+	)
+	defer span.End()
+
+	probeBody, _ := json.Marshal(map[string]interface{}{
+		"tool":   "agents_list",
+		"action": "json",
+		"args":   map[string]interface{}{},
+	})
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", b.BaseURL+"/tools/invoke", bytes.NewReader(probeBody))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "create probe request")
+		return fmt.Errorf("create probe request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
 	if b.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+b.Token)
 	}
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch tool manifest: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "gateway unreachable")
+		return fmt.Errorf("gateway probe failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+
+	if resp.StatusCode == 401 {
+		err := fmt.Errorf("gateway auth failed (401) — check OPENCLAW_TOKEN")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "auth failed")
+		return err
+	}
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("tools/list returned %d: %s", resp.StatusCode, string(body))
+		err := fmt.Errorf("gateway probe returned %d: %s", resp.StatusCode, string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "probe failed")
+		return err
 	}
 
-	var manifest OpenClawToolManifest
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-
-	// Convert to MCP tools
-	var tools []MCPTool
-	for _, t := range manifest.Tools {
-		tools = append(tools, MCPTool{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: t.InputSchema,
-		})
-	}
-	return tools, nil
+	span.SetStatus(codes.Ok, "gateway reachable")
+	return nil
 }
 
 // ExecuteTool calls a tool on the OpenClaw gateway via POST /tools/invoke
-func (b *OpenClawBridge) ExecuteTool(name string, args map[string]interface{}) (*MCPToolCallResult, error) {
+func (b *OpenClawBridge) ExecuteTool(ctx context.Context, name string, args map[string]interface{}) (*MCPToolCallResult, error) {
+	ctx, span := tracer.Start(ctx, "openclaw.tool.execute",
+		trace.WithAttributes(
+			attribute.String("tool.name", name),
+			attribute.String("openclaw.url", b.BaseURL),
+		),
+	)
+	defer span.End()
+
 	body := map[string]interface{}{
 		"tool": name,
 		"args": args,
@@ -278,11 +358,14 @@ func (b *OpenClawBridge) ExecuteTool(name string, args map[string]interface{}) (
 
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
+		span.RecordError(err)
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
+	span.SetAttributes(attribute.Int("request.size", len(jsonBody)))
 
-	req, err := http.NewRequest("POST", b.BaseURL+"/tools/invoke", bytes.NewReader(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", b.BaseURL+"/tools/invoke", bytes.NewReader(jsonBody))
 	if err != nil {
+		span.RecordError(err)
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -290,18 +373,30 @@ func (b *OpenClawBridge) ExecuteTool(name string, args map[string]interface{}) (
 		req.Header.Set("Authorization", "Bearer "+b.Token)
 	}
 
+	// Inject trace context into outgoing HTTP request for distributed tracing
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+
 	resp, err := b.client.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "tool invocation failed")
 		return nil, fmt.Errorf("invoke tool: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		span.RecordError(err)
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
+	span.SetAttributes(
+		attribute.Int("http.status_code", resp.StatusCode),
+		attribute.Int("response.size", len(respBody)),
+	)
+
 	if resp.StatusCode != 200 {
+		span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", resp.StatusCode))
 		return &MCPToolCallResult{
 			Content: []MCPToolContent{
 				{Type: "text", Text: fmt.Sprintf("Tool error (HTTP %d): %s", resp.StatusCode, string(respBody))},
@@ -328,6 +423,8 @@ func (b *OpenClawBridge) ExecuteTool(name string, args map[string]interface{}) (
 	}
 
 	if !ocResp.OK && ocResp.Error != nil {
+		span.SetAttributes(attribute.String("tool.error", ocResp.Error.Message))
+		span.SetStatus(codes.Error, "tool returned error")
 		return &MCPToolCallResult{
 			Content: []MCPToolContent{
 				{Type: "text", Text: fmt.Sprintf("Tool error: %s", ocResp.Error.Message)},
@@ -335,6 +432,8 @@ func (b *OpenClawBridge) ExecuteTool(name string, args map[string]interface{}) (
 			IsError: true,
 		}, nil
 	}
+
+	span.SetStatus(codes.Ok, "tool executed")
 
 	// Convert result to text
 	resultText, err := json.MarshalIndent(ocResp.Result, "", "  ")
@@ -359,8 +458,12 @@ type MCPServer struct {
 	debug  bool
 
 	// Bridge mode
-	bridge    *OpenClawBridge // Non-nil when --bridge is active
-	bridgeOn  bool           // Whether bridge mode is enabled
+	bridge        *OpenClawBridge // Non-nil when --bridge is active
+	bridgeOn      bool           // Whether bridge mode is enabled
+	externalTools []MCPTool      // Tools registered from external sources (e.g., OpenClaw request body)
+
+	// Tracing — propagated from parent process via TRACEPARENT env var
+	traceCtx context.Context
 }
 
 // NewMCPServer creates a new MCP server
@@ -933,34 +1036,21 @@ func GetMCPTools() []MCPTool {
 	}
 }
 
-// bridgeExcludedTools lists OpenClaw tools excluded from bridge mode
-// (Phase 3 — deep session state required)
-var bridgeExcludedTools = map[string]bool{
-	"browser": true,
-	"canvas":  true,
-}
-
-// handleToolsList returns available tools, merging local + remote in bridge mode
+// handleToolsList returns available tools, merging local + external in bridge mode.
+// External tools come from the tool registry (populated from the request body's tools field),
+// not from an HTTP discovery endpoint.
 func (s *MCPServer) handleToolsList(params json.RawMessage) (interface{}, *JSONRPCError) {
 	tools := GetMCPTools()
 
-	if s.bridgeOn {
-		remotTools, err := s.bridge.FetchToolManifest()
-		if err != nil {
-			s.log("Bridge: failed to fetch remote tools: %v", err)
-			// Continue with local tools only — don't fail the whole list
-		} else {
-			for _, rt := range remotTools {
-				// Skip excluded tools
-				if bridgeExcludedTools[rt.Name] {
-					continue
-				}
-				// Prefix with openclaw_ to avoid namespace collisions
-				rt.Name = "openclaw_" + rt.Name
-				tools = append(tools, rt)
-			}
-			s.log("Bridge: merged %d remote tools (total: %d)", len(remotTools), len(tools))
+	if s.bridgeOn && len(s.externalTools) > 0 {
+		for _, rt := range s.externalTools {
+			// Namespace external tools with openclaw_ prefix
+			namespaced := rt
+			namespaced.Name = "openclaw_" + rt.Name
+			tools = append(tools, namespaced)
 		}
+		fmt.Fprintf(os.Stderr, "[MCP Bridge] tools/list: %d local + %d external = %d total\n",
+			len(GetMCPTools()), len(s.externalTools), len(tools))
 	}
 
 	return &MCPToolsListResult{Tools: tools}, nil
@@ -975,29 +1065,67 @@ func (s *MCPServer) handleToolsCall(params json.RawMessage) (interface{}, *JSONR
 
 	s.log("Tool call: %s with %v", p.Name, p.Arguments)
 
+	ctx := s.traceCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// In bridge mode, dispatch openclaw_* to remote
 	if s.bridgeOn && strings.HasPrefix(p.Name, "openclaw_") {
+		_, span := tracer.Start(ctx, "mcp.tool.call",
+			trace.WithAttributes(
+				attribute.String("tool.name", p.Name),
+				attribute.String("tool.routing", "remote"),
+			),
+		)
+		defer span.End()
+
 		remoteName := strings.TrimPrefix(p.Name, "openclaw_")
-		result, err := s.bridge.ExecuteTool(remoteName, p.Arguments)
+		result, err := s.bridge.ExecuteTool(ctx, remoteName, p.Arguments)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "bridge call failed")
 			return nil, &JSONRPCError{Code: InternalError, Message: "Bridge call failed", Data: err.Error()}
+		}
+		if result.IsError {
+			span.SetStatus(codes.Error, "tool returned error")
+		} else {
+			span.SetStatus(codes.Ok, "tool executed")
 		}
 		return result, nil
 	}
 
 	// Handle local CogOS tools
+	_, span := tracer.Start(ctx, "mcp.tool.call",
+		trace.WithAttributes(
+			attribute.String("tool.name", p.Name),
+			attribute.String("tool.routing", "local"),
+		),
+	)
+	defer span.End()
+
+	var result interface{}
+	var rpcErr *JSONRPCError
 	switch p.Name {
 	case "cogos_memory_search":
-		return s.toolMemorySearch(p.Arguments)
+		result, rpcErr = s.toolMemorySearch(p.Arguments)
 	case "cogos_memory_read":
-		return s.toolMemoryRead(p.Arguments)
+		result, rpcErr = s.toolMemoryRead(p.Arguments)
 	case "cogos_memory_write":
-		return s.toolMemoryWrite(p.Arguments)
+		result, rpcErr = s.toolMemoryWrite(p.Arguments)
 	case "cogos_coherence_check":
-		return s.toolCoherenceCheck(p.Arguments)
+		result, rpcErr = s.toolCoherenceCheck(p.Arguments)
 	default:
+		span.SetStatus(codes.Error, "unknown tool")
 		return nil, &JSONRPCError{Code: MethodNotFound, Message: fmt.Sprintf("Unknown tool: %s", p.Name)}
 	}
+
+	if rpcErr != nil {
+		span.SetStatus(codes.Error, rpcErr.Message)
+	} else {
+		span.SetStatus(codes.Ok, "tool executed")
+	}
+	return result, rpcErr
 }
 
 // toolMemorySearch searches memory using ripgrep
@@ -1246,20 +1374,91 @@ func runMCPServe(bridgeMode bool) error {
 		return fmt.Errorf("no workspace found: %w", err)
 	}
 
+	// Initialize OTEL tracing for the bridge subprocess.
+	// Uses the same OTEL_EXPORTER_OTLP_ENDPOINT passed via MCP config env vars.
+	tp, otelErr := initTracer()
+	if otelErr != nil {
+		fmt.Fprintf(os.Stderr, "[MCP Bridge] otel: failed to init tracer: %v\n", otelErr)
+	} else if tp != nil {
+		fmt.Fprintf(os.Stderr, "[MCP Bridge] otel: tracing enabled (endpoint=%s)\n", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+		defer shutdownTracer(tp)
+	}
+
+	// Extract parent trace context from TRACEPARENT env var (W3C Trace Context).
+	// This links bridge spans to the parent CogOS serve.go trace.
+	ctx := context.Background()
+	if traceparent := os.Getenv("TRACEPARENT"); traceparent != "" {
+		carrier := propagation.MapCarrier{"traceparent": traceparent}
+		ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
+		fmt.Fprintf(os.Stderr, "[MCP Bridge] otel: linked to parent trace via TRACEPARENT\n")
+	}
+
+	// Bridge diagnostics always go to stderr (not gated by MCP_DEBUG)
+	logBridge := func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, "[MCP Bridge] "+format+"\n", args...)
+	}
+
 	server := NewMCPServer(root, os.Stdin, os.Stdout)
+	server.traceCtx = ctx
 
 	if bridgeMode {
+		_, span := tracer.Start(ctx, "mcp.bridge.activate",
+			trace.WithAttributes(
+				attribute.String("openclaw.url", os.Getenv("OPENCLAW_URL")),
+				attribute.Bool("bridge.mode", true),
+			),
+		)
+
 		openclawURL := os.Getenv("OPENCLAW_URL")
 		openclawToken := os.Getenv("OPENCLAW_TOKEN")
 		sessionID := os.Getenv("SESSION_ID")
 
+		logBridge("Activating bridge mode")
+		logBridge("  OPENCLAW_URL=%s", openclawURL)
+		logBridge("  OPENCLAW_TOKEN=%s", maskToken(openclawToken))
+		logBridge("  SESSION_ID=%s", sessionID)
+		logBridge("  COG_ROOT=%s", os.Getenv("COG_ROOT"))
+
 		if openclawURL == "" {
+			logBridge("ERROR: OPENCLAW_URL is empty — bridge cannot activate")
+			logBridge("  Set OPENCLAW_URL env var or pass via MCP config")
+			span.SetStatus(codes.Error, "missing OPENCLAW_URL")
+			span.End()
 			return fmt.Errorf("OPENCLAW_URL environment variable required for bridge mode")
 		}
 
 		bridge := NewOpenClawBridge(openclawURL, openclawToken, sessionID)
+
+		// Probe the gateway to verify connectivity (non-blocking — tools come from registry)
+		logBridge("Probing gateway at %s/tools/invoke ...", openclawURL)
+		if err := bridge.ProbeGateway(ctx); err != nil {
+			logBridge("WARNING: Gateway probe failed: %v", err)
+			logBridge("  Bridge enabled but tool execution may fail")
+		} else {
+			logBridge("Gateway probe OK — tool execution endpoint reachable")
+		}
+
 		server.EnableBridge(bridge)
+
+		// Load external tools from registry (populated by generateMCPConfig from request body)
+		server.LoadToolRegistry()
+		logBridge("Bridge enabled: %d external tools registered", len(server.externalTools))
+
+		span.SetAttributes(attribute.Int("tools.external_count", len(server.externalTools)))
+		span.SetStatus(codes.Ok, "bridge activated")
+		span.End()
 	}
 
 	return server.Run()
+}
+
+// maskToken returns a masked version of a token for safe logging
+func maskToken(token string) string {
+	if token == "" {
+		return "(empty)"
+	}
+	if len(token) <= 8 {
+		return "***"
+	}
+	return token[:4] + "..." + token[len(token)-4:]
 }

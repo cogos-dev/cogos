@@ -542,6 +542,7 @@ func (s *serveServer) Start() error {
 
 	// CogField graph endpoint
 	mux.HandleFunc("GET /api/cogfield/graph", s.handleCogFieldGraph)
+	mux.HandleFunc("GET /api/cogfield/query", s.handleCogFieldQuery)
 	mux.HandleFunc("/api/cogfield/sessions/", s.handleSessionDetail)
 	mux.HandleFunc("/api/cogfield/buses/", s.handleBusDetail)
 	mux.HandleFunc("/api/cogfield/expand/", s.handleExpandNode)
@@ -1613,10 +1614,17 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		inferReq.AllowedTools = tools
 	}
 
-	// Parse OpenClaw bridge headers for MCP bridge mode
-	if openClawURL := r.Header.Get("X-OpenClaw-URL"); openClawURL != "" {
+	// Parse OpenClaw bridge headers for MCP bridge mode (headers override env vars)
+	openClawURL := r.Header.Get("X-OpenClaw-URL")
+	if openClawURL == "" {
+		openClawURL = os.Getenv("OPENCLAW_URL")
+	}
+	if openClawURL != "" {
 		inferReq.OpenClawURL = openClawURL
 		inferReq.OpenClawToken = r.Header.Get("X-OpenClaw-Token")
+		if inferReq.OpenClawToken == "" {
+			inferReq.OpenClawToken = os.Getenv("OPENCLAW_TOKEN")
+		}
 		inferReq.SessionID = sessionID // Use already-resolved session ID from earlier parsing
 
 		// Generate MCP config for bridge mode

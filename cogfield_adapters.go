@@ -57,7 +57,7 @@ type BlockTypeConfig struct {
 }
 
 // adapters is the registry of all block adapters.
-var adapters = []BlockAdapter{&BusAdapter{}, &SessionAdapter{}, &ComponentAdapter{}}
+var adapters = []BlockAdapter{&BusAdapter{}, &SessionAdapter{}, &ComponentAdapter{}, &SignalAdapter{}, &ReconcileAdapter{}}
 
 // cogBlockToNode converts a CogBlock into a CogFieldNode for graph rendering.
 func cogBlockToNode(block CogBlock) CogFieldNode {

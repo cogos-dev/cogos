@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -715,6 +716,245 @@ type busRegistryEntry struct {
 	LastEventSeq int      `json:"last_event_seq"`
 	LastEventAt  string   `json:"last_event_at"`
 	EventCount   int      `json:"event_count"`
+}
+
+// handleCogFieldQuery handles GET /api/cogfield/query
+// Builds the full graph then filters by type, sector, tag, min_strength,
+// and optionally performs a BFS subgraph extraction from a given node.
+func (s *serveServer) handleCogFieldQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	start := time.Now()
+
+	c, err := getConstellation()
+	if err != nil {
+		log.Printf("cogfield: query: failed to open constellation: %v", err)
+		http.Error(w, "Failed to open constellation database", http.StatusInternalServerError)
+		return
+	}
+
+	graph, err := buildCogFieldGraph(c)
+	if err != nil {
+		log.Printf("cogfield: query: failed to build graph: %v", err)
+		http.Error(w, "Failed to build graph", http.StatusInternalServerError)
+		return
+	}
+
+	// Parse filter params
+	typeFilter := r.URL.Query().Get("type")
+	sectorFilter := r.URL.Query().Get("sector")
+	tagFilter := r.URL.Query().Get("tag")
+	minStrengthStr := r.URL.Query().Get("min_strength")
+	connectedTo := r.URL.Query().Get("connected")
+	depthStr := r.URL.Query().Get("depth")
+
+	// Build filter sets from comma-separated values
+	typeSet := parseCSVSet(typeFilter)
+	sectorSet := parseCSVSet(sectorFilter)
+	tagSet := parseCSVSet(tagFilter)
+
+	var minStrength float64
+	if minStrengthStr != "" {
+		if v, err := strconv.ParseFloat(minStrengthStr, 64); err == nil {
+			minStrength = v
+		}
+	}
+
+	depth := 1
+	if depthStr != "" {
+		if v, err := strconv.Atoi(depthStr); err == nil && v > 0 {
+			depth = v
+		}
+	}
+
+	// Filter nodes by type, sector, tag, and strength
+	filtered := filterCogFieldNodes(graph.Nodes, typeSet, sectorSet, tagSet, minStrength)
+
+	// If connected parameter is set, apply BFS subgraph extraction
+	if connectedTo != "" {
+		filtered = bfsCogFieldSubgraph(filtered, graph.Edges, connectedTo, depth)
+	}
+
+	// Build node ID set from filtered nodes
+	nodeIDs := make(map[string]bool, len(filtered))
+	for _, n := range filtered {
+		nodeIDs[n.ID] = true
+	}
+
+	// Filter edges: keep only edges where both source and target are in filtered set
+	var filteredEdges []CogFieldEdge
+	for _, e := range graph.Edges {
+		if nodeIDs[e.Source] && nodeIDs[e.Target] {
+			filteredEdges = append(filteredEdges, e)
+		}
+	}
+
+	// Compute stats for the filtered result
+	stats := computeCogFieldStats(filtered, filteredEdges)
+
+	result := CogFieldGraph{
+		Nodes: filtered,
+		Edges: filteredEdges,
+		Stats: stats,
+	}
+
+	log.Printf("cogfield: query returned %d nodes, %d edges (from %d/%d) in %v",
+		len(filtered), len(filteredEdges), graph.Stats.TotalNodes, graph.Stats.TotalEdges, time.Since(start))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// parseCSVSet splits a comma-separated string into a set for O(1) lookup.
+// Returns nil if the input is empty (meaning "no filter").
+func parseCSVSet(csv string) map[string]bool {
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	set := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			set[p] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+// filterCogFieldNodes returns nodes matching all provided filters (AND logic).
+// A nil/empty filter set means "accept all" for that dimension.
+func filterCogFieldNodes(nodes []CogFieldNode, types, sectors, tags map[string]bool, minStrength float64) []CogFieldNode {
+	var result []CogFieldNode
+	for _, n := range nodes {
+		// Type filter
+		if len(types) > 0 && !types[n.EntityType] {
+			continue
+		}
+		// Sector filter
+		if len(sectors) > 0 && !sectors[n.Sector] {
+			continue
+		}
+		// Tag filter: node must have at least one matching tag
+		if len(tags) > 0 {
+			match := false
+			for _, t := range n.Tags {
+				if tags[t] {
+					match = true
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+		// Strength filter
+		if minStrength > 0 && n.Strength < minStrength {
+			continue
+		}
+		result = append(result, n)
+	}
+	return result
+}
+
+// bfsCogFieldSubgraph performs a BFS from startID up to maxDepth hops,
+// returning only nodes from the input set that are reachable.
+// Edges are treated as undirected for traversal.
+func bfsCogFieldSubgraph(nodes []CogFieldNode, edges []CogFieldEdge, startID string, maxDepth int) []CogFieldNode {
+	// Build adjacency list from edges (both directions for undirected BFS)
+	adj := make(map[string][]string)
+	for _, e := range edges {
+		adj[e.Source] = append(adj[e.Source], e.Target)
+		adj[e.Target] = append(adj[e.Target], e.Source)
+	}
+
+	// Also build set of input node IDs so BFS only visits filtered nodes
+	nodeSet := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		nodeSet[n.ID] = true
+	}
+
+	// BFS
+	type bfsEntry struct {
+		id    string
+		depth int
+	}
+	visited := map[string]bool{startID: true}
+	queue := []bfsEntry{{startID, 0}}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		if curr.depth >= maxDepth {
+			continue
+		}
+		for _, neighbor := range adj[curr.id] {
+			if !visited[neighbor] && nodeSet[neighbor] {
+				visited[neighbor] = true
+				queue = append(queue, bfsEntry{neighbor, curr.depth + 1})
+			}
+		}
+	}
+
+	// Return only visited nodes
+	var result []CogFieldNode
+	for _, n := range nodes {
+		if visited[n.ID] {
+			result = append(result, n)
+		}
+	}
+	return result
+}
+
+// computeCogFieldStats builds a CogFieldStats from the given nodes and edges.
+func computeCogFieldStats(nodes []CogFieldNode, edges []CogFieldEdge) CogFieldStats {
+	nodesByType := make(map[string]int)
+	nodesBySector := make(map[string]int)
+	edgesByRelation := make(map[string]int)
+	edgesByThread := make(map[string]int)
+
+	type scored struct {
+		id    string
+		score int
+	}
+	var topNodes []scored
+
+	for _, n := range nodes {
+		nodesByType[n.EntityType]++
+		nodesBySector[n.Sector]++
+		topNodes = append(topNodes, scored{n.ID, n.BackrefCount})
+	}
+
+	for _, e := range edges {
+		edgesByRelation[e.Relation]++
+		edgesByThread[e.Thread]++
+	}
+
+	// Top 10 most connected
+	sort.Slice(topNodes, func(i, j int) bool {
+		return topNodes[i].score > topNodes[j].score
+	})
+	mostConnected := make([]string, 0, 10)
+	for i := 0; i < len(topNodes) && i < 10; i++ {
+		if topNodes[i].score > 0 {
+			mostConnected = append(mostConnected, topNodes[i].id)
+		}
+	}
+
+	return CogFieldStats{
+		TotalNodes:      len(nodes),
+		TotalEdges:      len(edges),
+		NodesByType:     nodesByType,
+		NodesBySector:   nodesBySector,
+		EdgesByRelation: edgesByRelation,
+		EdgesByThread:   edgesByThread,
+		MostConnected:   mostConnected,
+	}
 }
 
 // buildBusNodes reads .cog/.state/buses/registry.json and creates a CogFieldNode per bus

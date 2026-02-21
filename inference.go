@@ -683,6 +683,19 @@ func generateMCPConfig(req *InferenceRequest) (string, error) {
 		return "", fmt.Errorf("OpenClawURL required for MCP bridge")
 	}
 
+	ctx := req.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	_, span := tracer.Start(ctx, "mcp.config.generate",
+		trace.WithAttributes(
+			attribute.String("openclaw.url", req.OpenClawURL),
+			attribute.Int("tools.count", len(req.Tools)),
+		),
+	)
+	defer span.End()
+
 	// Find the cog binary path
 	cogBin, err := os.Executable()
 	if err != nil {
@@ -692,7 +705,51 @@ func generateMCPConfig(req *InferenceRequest) (string, error) {
 	// Resolve workspace root for COG_ROOT env var
 	root, _, err := ResolveWorkspace()
 	if err != nil {
+		span.RecordError(err)
 		return "", fmt.Errorf("resolve workspace: %w", err)
+	}
+
+	env := map[string]string{
+		"COG_ROOT":       root,
+		"OPENCLAW_URL":   req.OpenClawURL,
+		"OPENCLAW_TOKEN": req.OpenClawToken,
+		"SESSION_ID":     req.SessionID,
+	}
+
+	// Propagate trace context to the bridge subprocess via TRACEPARENT env var.
+	// This enables distributed tracing: the bridge creates child spans linked
+	// to the parent trace from serve.go's HTTP handler.
+	spanCtx := span.SpanContext()
+	if spanCtx.IsValid() {
+		traceparent := fmt.Sprintf("00-%s-%s-%s",
+			spanCtx.TraceID().String(),
+			spanCtx.SpanID().String(),
+			spanCtx.TraceFlags().String(),
+		)
+		env["TRACEPARENT"] = traceparent
+		span.SetAttributes(attribute.String("traceparent", traceparent))
+	}
+
+	// Pass OTEL exporter endpoint so the bridge subprocess can also export traces
+	if otelEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); otelEndpoint != "" {
+		env["OTEL_EXPORTER_OTLP_ENDPOINT"] = otelEndpoint
+	}
+
+	// Convert OpenAI-format tools from request body into MCP format for the bridge.
+	// This is the push path: tools declared by the caller flow into the MCP bridge
+	// via the TOOL_REGISTRY env var, rather than the bridge pulling from an endpoint.
+	if len(req.Tools) > 0 {
+		mcpTools := convertOpenAIToolsToMCP(req.Tools)
+		if len(mcpTools) > 0 {
+			toolsJSON, err := json.Marshal(mcpTools)
+			if err != nil {
+				log.Printf("[MCP] Warning: failed to serialize tool registry: %v", err)
+			} else {
+				env["TOOL_REGISTRY"] = string(toolsJSON)
+				log.Printf("[MCP] Tool registry: %d tools from request body", len(mcpTools))
+				span.SetAttributes(attribute.Int("tools.registry_count", len(mcpTools)))
+			}
+		}
 	}
 
 	config := map[string]interface{}{
@@ -700,12 +757,7 @@ func generateMCPConfig(req *InferenceRequest) (string, error) {
 			"cogos-bridge": map[string]interface{}{
 				"command": cogBin,
 				"args":    []string{"mcp", "serve", "--bridge"},
-				"env": map[string]string{
-					"COG_ROOT":      root,
-					"OPENCLAW_URL":   req.OpenClawURL,
-					"OPENCLAW_TOKEN": req.OpenClawToken,
-					"SESSION_ID":     req.SessionID,
-				},
+				"env":     env,
 			},
 		},
 	}
@@ -732,6 +784,7 @@ func generateMCPConfig(req *InferenceRequest) (string, error) {
 		return "", fmt.Errorf("close config: %w", err)
 	}
 
+	log.Printf("[MCP] Generated bridge config: %s (cog=%s, url=%s, session=%s)", tmpFile.Name(), cogBin, req.OpenClawURL, req.SessionID)
 	return tmpFile.Name(), nil
 }
 
@@ -1353,6 +1406,12 @@ func RunInference(req *InferenceRequest, registry *RequestRegistry) (*InferenceR
 	// Create command with context for cancellation
 	cmd := exec.CommandContext(ctx, claudeCommand, args...)
 
+	// Set working directory to workspace root so Claude CLI operates
+	// in the correct project context (not wherever the kernel was launched from)
+	if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
+		cmd.Dir = wsRoot
+	}
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		if registry != nil {
@@ -1793,6 +1852,12 @@ func RunInferenceStream(req *InferenceRequest, registry *RequestRegistry) (<-cha
 
 	// Create command with context for cancellation
 	cmd := exec.CommandContext(ctx, claudeCommand, args...)
+
+	// Set working directory to workspace root so Claude CLI operates
+	// in the correct project context (not wherever the kernel was launched from)
+	if wsRoot, _, wsErr := ResolveWorkspace(); wsErr == nil {
+		cmd.Dir = wsRoot
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
