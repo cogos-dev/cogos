@@ -164,7 +164,7 @@ func registerBuiltinProjectors(k *Kernel) {
 	k.RegisterProjector(&srcProjector{BaseProjector: NewBaseProjector("src")})
 	k.RegisterProjector(&identityProjector{BaseProjector: NewBaseProjector("identity"), kernel: k})
 	k.RegisterProjector(&coherenceProjector{BaseProjector: NewBaseProjector("coherence"), kernel: k})
-	k.RegisterProjector(&memoryProjector{BaseProjector: NewBaseProjector("memory"), kernel: k})
+	k.RegisterProjector(&memoryProjector{BaseProjector: NewBaseProjector("mem"), kernel: k})
 
 	// Phase 2 mutable projectors
 	k.RegisterProjector(&signalProjector{BaseProjector: NewBaseProjector("signals"), kernel: k})

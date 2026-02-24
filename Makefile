@@ -8,7 +8,7 @@
 #   make all      - Build for all platforms (cog-{os}-{arch})
 #   make test     - Run tests
 #   make clean    - Remove build artifacts
-#   make install  - Install to current directory
+#   make install  - Install to ~/.cog/bin/cogos
 
 VERSION := 2.1.1
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -53,23 +53,23 @@ linux-arm64:
 android-arm64:
 	GOOS=android GOARCH=arm64 $(GO) build -tags "$(BUILD_TAGS)" -buildmode=pie -ldflags="$(LDFLAGS)" -o $(BINARY)-android-arm64 .
 
-# Workspace root (two levels up from apps/cogos/)
-WORKSPACE_ROOT := $(shell cd ../.. && pwd)
-INSTALL_TARGET := $(WORKSPACE_ROOT)/.cog/cog
+INSTALL_DIR := $(HOME)/.cog/bin
+INSTALL_TARGET := $(INSTALL_DIR)/cogos
 
-# Install to .cog/cog (atomic: build, verify, checksum, move)
+# Install to ~/.cog/bin/cogos (atomic: build, verify, checksum, move)
 install: build
 	@echo "=== Installing to $(INSTALL_TARGET) ==="
 	@./$(BINARY) version > /dev/null 2>&1 || (echo "ERROR: built binary fails version check" && exit 1)
+	@mkdir -p "$(INSTALL_DIR)"
 	@if [ -f "$(INSTALL_TARGET)" ]; then \
 		cp "$(INSTALL_TARGET)" "$(INSTALL_TARGET).bak"; \
-		echo "  Backed up existing binary to .cog/cog.bak"; \
+		echo "  Backed up existing binary to $(INSTALL_TARGET).bak"; \
 	fi
 	@cp $(BINARY) "$(INSTALL_TARGET).tmp"
 	@chmod +x "$(INSTALL_TARGET).tmp"
 	@mv "$(INSTALL_TARGET).tmp" "$(INSTALL_TARGET)"
 	@NEW_SHA=$$(shasum -a 256 "$(INSTALL_TARGET)" | cut -d' ' -f1); \
-		echo "  Installed $(BINARY) $(VERSION) ($(GOOS)/$(GOARCH))"; \
+		echo "  Installed cogos $(VERSION) ($(GOOS)/$(GOARCH))"; \
 		echo "  SHA-256: $$NEW_SHA"
 
 # Run tests
