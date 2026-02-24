@@ -106,8 +106,9 @@ type InferenceRequest struct {
 	ContextState *ContextState // Four-tier context for context-aware invocation
 
 	// Tool definitions
-	Tools        []json.RawMessage // OpenAI-format tool definitions from client
-	AllowedTools []string          // Claude CLI --allowed-tools patterns (e.g. "Bash", "Bash(git:*)")
+	Tools           []json.RawMessage // OpenAI-format tool definitions from client
+	AllowedTools    []string          // Claude CLI --allowed-tools patterns (e.g. "Bash", "Bash(git:*)")
+	SkipPermissions bool              // Pass --dangerously-skip-permissions to Claude CLI
 
 	// Workspace override — when set, Claude CLI runs in this directory
 	// instead of the kernel's workspace.

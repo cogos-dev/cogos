@@ -210,6 +210,9 @@ func (m *mockKernel) ResolveWorkDir(requestWorkspace string) string {
 func (m *mockKernel) ConvertOpenAIToolsToMCP(tools []json.RawMessage) []MCPTool {
 	return m.mcpTools
 }
+func (m *mockKernel) GetAgentToolPolicy(agentID string) (*AgentToolPolicy, error) {
+	return nil, nil
+}
 
 func TestGenerateMCPConfig_Basic(t *testing.T) {
 	kernel := &mockKernel{workspaceRoot: "/tmp/test-ws"}

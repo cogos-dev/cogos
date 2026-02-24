@@ -50,7 +50,11 @@ func BuildClaudeArgs(req *InferenceRequest) []string {
 		"--output-format", "stream-json",
 		"--include-partial-messages", // Enable rich streaming with content_block_delta events
 		"--verbose",
-		"--dangerously-skip-permissions", // Allow tool execution without prompts
+	}
+
+	// Only skip permissions when the agent CRD allows it (or when no CRD policy exists)
+	if req.SkipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
 	}
 
 	// Build system prompt: chain TAA context + client system prompt

@@ -1784,6 +1784,26 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		inferReq.AllowedTools = tools
 	}
 
+	// Agent-aware tool policy enforcement from CRD.
+	// If no explicit X-Allowed-Tools header was provided, look up the agent's
+	// CRD and apply its modelConfig.allowedTools. The UCP Identity packet
+	// carries the agent name (e.g., "Sentinel", "Whirl").
+	inferReq.SkipPermissions = true // default: skip permissions (backward compatible)
+	if ucpContext != nil && ucpContext.Identity != nil && ucpContext.Identity.Name != "" {
+		agentName := strings.ToLower(ucpContext.Identity.Name)
+		policy, err := GetAgentCRDToolPolicy(workspaceRoot, agentName)
+		if err != nil {
+			log.Printf("[CRD] Warning: failed to load agent CRD for %q: %v", agentName, err)
+		} else if policy != nil {
+			// CRD-defined tools — only apply if no explicit header override
+			if len(inferReq.AllowedTools) == 0 && len(policy.AllowedTools) > 0 {
+				inferReq.AllowedTools = policy.AllowedTools
+				log.Printf("[CRD] Applied tool policy for agent %q: %v", agentName, policy.AllowedTools)
+			}
+			inferReq.SkipPermissions = policy.DangerouslySkipPermissions
+		}
+	}
+
 	// Parse OpenClaw bridge headers for MCP bridge mode (headers override env vars).
 	// The harness auto-generates the MCP config when it sees OpenClawURL set.
 	openClawURL := r.Header.Get("X-OpenClaw-URL")

@@ -110,6 +110,22 @@ func (k *kernelServicesAdapter) ResolveWorkDir(requestWorkspace string) string {
 	return ""
 }
 
+func (k *kernelServicesAdapter) GetAgentToolPolicy(agentID string) (*harness.AgentToolPolicy, error) {
+	root, _, err := ResolveWorkspace()
+	if err != nil {
+		return nil, nil // No workspace = no CRD lookup
+	}
+	result, err := GetAgentCRDToolPolicy(root, agentID)
+	if err != nil || result == nil {
+		return nil, err
+	}
+	return &harness.AgentToolPolicy{
+		AllowedTools:               result.AllowedTools,
+		DenyTools:                  result.DenyTools,
+		DangerouslySkipPermissions: result.DangerouslySkipPermissions,
+	}, nil
+}
+
 func (k *kernelServicesAdapter) ConvertOpenAIToolsToMCP(tools []json.RawMessage) []harness.MCPTool {
 	mcpTools := convertOpenAIToolsToMCP(tools)
 	// Convert from main.MCPTool to harness.MCPTool
@@ -183,8 +199,9 @@ func toHarnessRequest(req *InferenceRequest) *harness.InferenceRequest {
 		Stream:        req.Stream,
 		Context:       req.Context,
 		ContextState:  toHarnessContextState(req.ContextState),
-		Tools:         req.Tools,
-		AllowedTools:  req.AllowedTools,
+		Tools:           req.Tools,
+		AllowedTools:    req.AllowedTools,
+		SkipPermissions: req.SkipPermissions,
 		WorkspaceRoot: req.WorkspaceRoot,
 		MCPConfig:     req.MCPConfig,
 		OpenClawURL:   req.OpenClawURL,

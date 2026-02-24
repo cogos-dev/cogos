@@ -22,6 +22,7 @@ import "encoding/json"
 //   - Signal field: DepositSignal, RemoveSignal
 //   - State: ReadContinuationState (eigenfield persistence)
 //   - Tools: ConvertOpenAIToolsToMCP (bridge config generation)
+//   - Agents: GetAgentToolPolicy (CRD-based tool policy enforcement)
 type KernelServices interface {
 	// WorkspaceRoot returns the resolved workspace root path.
 	// Used for MCP config generation and default working directory.
@@ -55,6 +56,18 @@ type KernelServices interface {
 	// ConvertOpenAIToolsToMCP converts OpenAI-format tool definitions to MCP
 	// format for the bridge subprocess. Delegates to mcp.go in the kernel.
 	ConvertOpenAIToolsToMCP(tools []json.RawMessage) []MCPTool
+
+	// GetAgentToolPolicy returns the tool policy for an agent from its CRD.
+	// Returns nil if no CRD is found (backward-compatible — no restriction).
+	// Used by the inference path to enforce agent-specific tool restrictions.
+	GetAgentToolPolicy(agentID string) (*AgentToolPolicy, error)
+}
+
+// AgentToolPolicy contains the resolved tool policy for an agent from its CRD.
+type AgentToolPolicy struct {
+	AllowedTools               []string // Claude CLI --allowed-tools patterns
+	DenyTools                  []string // Tools explicitly denied
+	DangerouslySkipPermissions bool     // Whether to pass --dangerously-skip-permissions
 }
 
 // HookResult represents the result of a hook dispatch
