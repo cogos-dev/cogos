@@ -1852,12 +1852,22 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 		return
 	}
 
+	// Rolling write deadline — prevents the server's global WriteTimeout
+	// (5 min) from killing long-running inference streams.  Each call pushes
+	// the deadline forward by sseWriteWindow so the timeout becomes per-idle
+	// rather than absolute.
+	rc := http.NewResponseController(w)
+	extendDeadline := func() {
+		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteWindow))
+	}
+
 	// Store TAA context for /v1/taa endpoint and emit as SSE event
 	// Deep copy to prevent data races — the original may be mutated concurrently.
 	if inferReq.ContextState != nil {
 		s.taaStateMutex.Lock()
 		s.lastTAAState = deepCopyContextState(inferReq.ContextState)
 		s.taaStateMutex.Unlock()
+		extendDeadline()
 		s.emitTAAContext(w, flusher, inferReq.ContextState, inferReq.Model)
 	}
 
@@ -1879,6 +1889,8 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 
 	// Process chunks from the inference engine
 	for chunk := range chunks {
+		extendDeadline()
+
 		if chunk.Error != nil {
 			s.writeSSEError(w, flusher, "Inference error: "+chunk.Error.Error())
 			return
