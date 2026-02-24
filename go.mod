@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/coder/websocket v1.8.14
+	github.com/cogos-dev/cogos/harness v0.0.0
 	github.com/cogos-dev/cogos/sdk v0.0.0
 	github.com/go-git/go-git/v5 v5.16.4
 	github.com/hashicorp/hcl/v2 v2.24.0
@@ -15,6 +16,7 @@ require (
 	go.opentelemetry.io/otel v1.40.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.40.0
 	go.opentelemetry.io/otel/sdk v1.40.0
+	go.opentelemetry.io/otel/trace v1.40.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -65,7 +67,6 @@ require (
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.40.0 // indirect
 	go.opentelemetry.io/otel/metric v1.40.0 // indirect
-	go.opentelemetry.io/otel/trace v1.40.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.9.0 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
 	golang.org/x/mod v0.31.0 // indirect
@@ -82,3 +83,5 @@ require (
 )
 
 replace github.com/cogos-dev/cogos/sdk => ./sdk
+
+replace github.com/cogos-dev/cogos/harness => ./harness

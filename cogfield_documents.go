@@ -54,8 +54,14 @@ func (s *serveServer) handleDocumentDetail(w http.ResponseWriter, r *http.Reques
 	}
 	docID := path
 
-	// Open constellation DB (singleton)
-	c, err := getConstellation()
+	// Open constellation DB (per-request workspace or singleton fallback)
+	var c *constellation.Constellation
+	var err error
+	if ws := workspaceFromRequest(r); ws != nil {
+		c, err = getConstellationForWorkspace(ws.root)
+	} else {
+		c, err = getConstellation()
+	}
 	if err != nil {
 		log.Printf("cogfield: failed to open constellation: %v", err)
 		http.Error(w, "Failed to open constellation database", http.StatusInternalServerError)

@@ -219,10 +219,15 @@ type InferenceResponse struct {
 	Error            error  `json:"-"`
 	ErrorMessage     string `json:"error,omitempty"`
 
-	// Context metrics (new - from context pipeline)
+	// Anthropic cache metrics (zero for non-Claude providers)
+	CacheReadTokens   int     `json:"cache_read_input_tokens,omitempty"`
+	CacheCreateTokens int     `json:"cache_creation_input_tokens,omitempty"`
+	CostUSD           float64 `json:"cost_usd,omitempty"`
+
+	// Context metrics (from context pipeline)
 	ContextMetrics *ContextMetrics `json:"context_metrics,omitempty"`
 
-	// Error classification (new - for smart recovery)
+	// Error classification (for smart recovery)
 	ErrorType ErrorType `json:"error_type,omitempty"`
 }
 
@@ -2607,8 +2612,8 @@ func cmdInfer(args []string) int {
 		ContextState: contextState,
 	}
 
-	// Run inference
-	resp, err := RunInference(req, nil) // No registry for CLI
+	// Run inference via harness
+	resp, err := HarnessRunInference(req, nil)
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

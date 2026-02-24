@@ -237,8 +237,10 @@ func (r *ChatCompletionRequest) GetTAAProfileWithHeader(header string) (string, 
 // ChatMessage represents a single message in the conversation
 // Content can be either a string or an array of content parts (OpenAI SDK format)
 type ChatMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"` // Can be string or array
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`               // Can be string or array
+	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`  // Assistant tool call requests
+	ToolCallID string          `json:"tool_call_id,omitempty"` // For role:"tool" — which call this answers
 }
 
 // GetContent extracts the text content from a ChatMessage
@@ -273,6 +275,44 @@ func (m *ChatMessage) GetContent() string {
 	return string(m.Content)
 }
 
+// GetToolCallsSummary extracts a text summary of tool calls from an assistant message.
+// Returns empty string if no tool calls are present.
+func (m *ChatMessage) GetToolCallsSummary() string {
+	if len(m.ToolCalls) == 0 {
+		return ""
+	}
+	var calls []struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(m.ToolCalls, &calls); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, call := range calls {
+		if call.Function.Name != "" {
+			sb.WriteString("[Tool call: ")
+			sb.WriteString(call.Function.Name)
+			// Include a truncated version of args for context
+			args := call.Function.Arguments
+			if len(args) > 200 {
+				args = args[:200] + "..."
+			}
+			if args != "" {
+				sb.WriteString("(")
+				sb.WriteString(args)
+				sb.WriteString(")")
+			}
+			sb.WriteString("]")
+		}
+	}
+	return sb.String()
+}
+
 // StringToRawContent converts a string to json.RawMessage for ChatMessage.Content
 func StringToRawContent(s string) json.RawMessage {
 	b, _ := json.Marshal(s)
@@ -303,11 +343,51 @@ type ChatChoice struct {
 	FinishReason string       `json:"finish_reason,omitempty"`
 }
 
-// UsageInfo represents token usage
+// StreamToolCallDelta represents a tool call delta in the OpenAI streaming format.
+// First chunk includes ID, Type, and Function.Name; subsequent chunks only include
+// Function.Arguments (partial JSON fragments).
+type StreamToolCallDelta struct {
+	Index    int                      `json:"index"`
+	ID       string                   `json:"id,omitempty"`
+	Type     string                   `json:"type,omitempty"` // "function" on first chunk
+	Function *StreamToolCallFunction  `json:"function,omitempty"`
+}
+
+// StreamToolCallFunction carries either the function name (first chunk) or
+// an arguments fragment (subsequent chunks).
+type StreamToolCallFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments"`
+}
+
+// StreamDelta is like ChatMessage but with typed tool_calls for streaming.
+// OpenAI SDKs expect choices[].delta.tool_calls to be an array of objects,
+// not a raw JSON blob.
+type StreamDelta struct {
+	Role      string                `json:"role,omitempty"`
+	Content   json.RawMessage       `json:"content,omitempty"`
+	ToolCalls []StreamToolCallDelta `json:"tool_calls,omitempty"`
+}
+
+// StreamChoiceDelta is a ChatChoice variant that uses StreamDelta instead of ChatMessage.
+type StreamChoiceDelta struct {
+	Index        int          `json:"index"`
+	Delta        StreamDelta  `json:"delta"`
+	FinishReason *string      `json:"finish_reason"` // Pointer so null serializes explicitly
+}
+
+// UsageInfo represents token usage in the OpenAI-compatible response format.
+// The cache and cost fields are Anthropic extensions — they're omitted for
+// non-Claude providers, so standard OpenAI clients ignore them gracefully.
 type UsageInfo struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+
+	// Anthropic extensions (omitted when zero)
+	CacheReadTokens   int     `json:"cache_read_input_tokens,omitempty"`
+	CacheCreateTokens int     `json:"cache_creation_input_tokens,omitempty"`
+	CostUSD           float64 `json:"cost_usd,omitempty"`
 }
 
 // StreamChunk represents a streaming response chunk
@@ -465,10 +545,25 @@ type DeltaContent struct {
 // DebugMode controls verbose logging in inference
 var DebugMode atomic.Bool
 
+// ctxKey is a typed key for context.WithValue to avoid collisions.
+type ctxKey string
+
+const ctxWorkspaceKey ctxKey = "workspace"
+
+// workspaceContext holds per-workspace state for multi-workspace serving.
+type workspaceContext struct {
+	root    string
+	name    string
+	kernel  *sdk.Kernel
+	busChat *busChat
+}
+
 type serveServer struct {
 	port          int
-	kernel        *sdk.Kernel
-	lastTAAState  *ContextState // Most recent TAA context for debugging
+	kernel        *sdk.Kernel                  // default workspace kernel (backward compat)
+	workspaces    map[string]*workspaceContext  // name → workspace context
+	defaultWS     string                       // default workspace name
+	lastTAAState  *ContextState                // Most recent TAA context for debugging
 	taaStateMutex sync.RWMutex
 	busChat       *busChat        // Bus event emission for chat (nil if no workspace)
 	busBroker     *busEventBroker // SSE subscriber broker for bus events
@@ -476,6 +571,71 @@ type serveServer struct {
 
 func newServeServer(port int, kernel *sdk.Kernel) *serveServer {
 	return &serveServer{port: port, kernel: kernel, busBroker: newBusEventBroker()}
+}
+
+// getWorkspace returns workspace context by name or path. Falls back to default.
+func (s *serveServer) getWorkspace(nameOrPath string) *workspaceContext {
+	if nameOrPath == "" {
+		nameOrPath = s.defaultWS
+	}
+	// Try by name first
+	if ws, ok := s.workspaces[nameOrPath]; ok {
+		return ws
+	}
+	// Try by path
+	for _, ws := range s.workspaces {
+		if ws.root == nameOrPath {
+			return ws
+		}
+	}
+	// Fall back to default
+	if ws, ok := s.workspaces[s.defaultWS]; ok {
+		return ws
+	}
+	return nil
+}
+
+// workspaceMiddleware extracts workspace selection from each request and injects
+// the resolved workspaceContext into the request context.
+func (s *serveServer) workspaceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wsRoot string
+
+		// Resolution order:
+		// 1. X-UCP-Workspace header (Root field)
+		if wsHeader := r.Header.Get("X-UCP-Workspace"); wsHeader != "" {
+			var wsPacket struct {
+				Root string `json:"root"`
+			}
+			if json.Unmarshal([]byte(wsHeader), &wsPacket) == nil && wsPacket.Root != "" {
+				wsRoot = wsPacket.Root
+			}
+		}
+
+		// 2. ?workspace= query parameter
+		if wsRoot == "" {
+			wsRoot = r.URL.Query().Get("workspace")
+		}
+
+		// Resolve to workspaceContext
+		ws := s.getWorkspace(wsRoot)
+		if ws == nil {
+			// No workspace found at all — proceed without workspace context
+			// (health, debug endpoints don't need it)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), ctxWorkspaceKey, ws)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// workspaceFromRequest returns the workspace context injected by workspaceMiddleware.
+// Returns nil if no workspace context is available.
+func workspaceFromRequest(r *http.Request) *workspaceContext {
+	ws, _ := r.Context().Value(ctxWorkspaceKey).(*workspaceContext)
+	return ws
 }
 
 // deepCopyContextState creates a deep copy of a ContextState so that the copy
@@ -512,6 +672,9 @@ func deepCopyContextState(src *ContextState) *ContextState {
 func (s *serveServer) Start() error {
 	StartRegistryCleanup()
 
+	// Initialize the harness (inference engine)
+	initHarness()
+
 	mux := http.NewServeMux()
 
 	// Inference routes (keep custom streaming implementation)
@@ -529,6 +692,11 @@ func (s *serveServer) Start() error {
 	// Bus event streaming (SSE) and REST endpoints
 	mux.HandleFunc("GET /v1/events/stream", s.handleEventsStream)
 	mux.HandleFunc("GET /v1/bus/", s.handleBusEventsREST)
+
+	// Bus messaging API (inter-workspace)
+	mux.HandleFunc("POST /v1/bus/send", s.handleBusSend)
+	mux.HandleFunc("POST /v1/bus/open", s.handleBusOpen)
+	mux.HandleFunc("GET /v1/bus/list", s.handleBusList)
 
 	// SDK routes (universal cog:// access)
 	if s.kernel != nil {
@@ -569,7 +737,7 @@ func (s *serveServer) Start() error {
 
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      s.corsMiddleware(mux),
+		Handler:      s.workspaceMiddleware(s.corsMiddleware(mux)),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 5 * time.Minute, // Long timeout for streaming
 	}
@@ -1443,7 +1611,10 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	// Extract system prompt and user messages
+	// Extract system prompt and user messages.
+	// Conversation history is flattened into a single prompt string because
+	// Claude CLI's -p flag is one-shot. Tool call/result history from prior
+	// turns is preserved as text context so the model sees what happened.
 	systemPrompt := req.SystemPrompt
 	var userPrompt strings.Builder
 
@@ -1462,11 +1633,35 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 			}
 			userPrompt.WriteString(content)
 		case "assistant":
-			// Include prior assistant messages as context
+			// Include prior assistant messages as context.
+			// Handle both text content and tool_calls (which may have null content).
 			if userPrompt.Len() > 0 {
 				userPrompt.WriteString("\n\nAssistant: ")
-				userPrompt.WriteString(content)
+				if content != "" {
+					userPrompt.WriteString(content)
+				}
+				// Include tool calls so the model knows what tools were used
+				if toolSummary := msg.GetToolCallsSummary(); toolSummary != "" {
+					if content != "" {
+						userPrompt.WriteString("\n")
+					}
+					userPrompt.WriteString(toolSummary)
+				}
 				userPrompt.WriteString("\n\nUser: ")
+			}
+		case "tool":
+			// Include tool results so the model sees the full tool interaction.
+			// Format: [Tool result for <call_id>: <content>]
+			if userPrompt.Len() > 0 && content != "" {
+				toolResult := content
+				if len(toolResult) > 500 {
+					toolResult = toolResult[:500] + "...(truncated)"
+				}
+				if msg.ToolCallID != "" {
+					userPrompt.WriteString(fmt.Sprintf("\n[Tool result (%s): %s]", msg.ToolCallID, toolResult))
+				} else {
+					userPrompt.WriteString(fmt.Sprintf("\n[Tool result: %s]", toolResult))
+				}
 			}
 		}
 	}
@@ -1621,7 +1816,8 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		inferReq.AllowedTools = tools
 	}
 
-	// Parse OpenClaw bridge headers for MCP bridge mode (headers override env vars)
+	// Parse OpenClaw bridge headers for MCP bridge mode (headers override env vars).
+	// The harness auto-generates the MCP config when it sees OpenClawURL set.
 	openClawURL := r.Header.Get("X-OpenClaw-URL")
 	if openClawURL == "" {
 		openClawURL = os.Getenv("OPENCLAW_URL")
@@ -1633,15 +1829,6 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 			inferReq.OpenClawToken = os.Getenv("OPENCLAW_TOKEN")
 		}
 		inferReq.SessionID = sessionID // Use already-resolved session ID from earlier parsing
-
-		// Generate MCP config for bridge mode
-		mcpConfig, err := generateMCPConfig(inferReq)
-		if err != nil {
-			log.Printf("[MCP] Failed to generate MCP config: %v", err)
-		} else {
-			inferReq.MCPConfig = mcpConfig
-			defer os.Remove(mcpConfig)
-		}
 	}
 
 	// Set UCP response headers if UCP was used
@@ -1706,8 +1893,8 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 		s.emitTAAContext(w, flusher, inferReq.ContextState, inferReq.Model)
 	}
 
-	// Use shared inference engine
-	chunks, err := RunInferenceStream(inferReq, GlobalRegistry)
+	// Delegate to harness inference engine
+	chunks, err := HarnessRunInferenceStream(inferReq, GlobalRegistry)
 	if err != nil {
 		s.writeSSEError(w, flusher, "Failed to start inference: "+err.Error())
 		return
@@ -1760,58 +1947,97 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			continue
 
 		case "tool_use", "tool_use_start":
-			// Emit tool call as custom event
+			// Emit tool call start in OpenAI streaming format:
+			// choices[0].delta.tool_calls[{index, id, type:"function", function:{name, arguments:""}}]
 			if chunk.ToolCall != nil {
-				toolChunk := map[string]any{
-					"id":         chunk.ID,
-					"object":     "chat.completion.chunk",
-					"created":    created,
-					"model":      model,
-					"choices":    []any{}, // Required for OpenAI SDK compatibility
-					"event_type": "tool_call",
-					"tool_call": map[string]any{
-						"id":        chunk.ToolCall.ID,
-						"name":      chunk.ToolCall.Name,
-						"arguments": chunk.ToolCall.Arguments,
-					},
+				toolStartChunk := struct {
+					ID        string              `json:"id"`
+					Object    string              `json:"object"`
+					Created   int64               `json:"created"`
+					Model     string              `json:"model"`
+					Choices   []StreamChoiceDelta  `json:"choices"`
+					EventType string              `json:"event_type,omitempty"` // CogOS extension
+				}{
+					ID:        chunk.ID,
+					Object:    "chat.completion.chunk",
+					Created:   created,
+					Model:     model,
+					EventType: "tool_call",
+					Choices: []StreamChoiceDelta{{
+						Index: 0,
+						Delta: StreamDelta{
+							ToolCalls: []StreamToolCallDelta{{
+								Index: 0,
+								ID:    chunk.ToolCall.ID,
+								Type:  "function",
+								Function: &StreamToolCallFunction{
+									Name:      chunk.ToolCall.Name,
+									Arguments: "",
+								},
+							}},
+						},
+					}},
 				}
-				data, _ := json.Marshal(toolChunk)
+				data, _ := json.Marshal(toolStartChunk)
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
 			}
 			continue
 
 		case "tool_use_delta":
-			// Emit tool call delta (partial args)
+			// Emit tool call argument fragment in OpenAI streaming format:
+			// choices[0].delta.tool_calls[{index, function:{arguments:"partial..."}}]
 			if chunk.ToolCall != nil {
-				deltaChunk := map[string]any{
-					"id":         chunk.ID,
-					"object":     "chat.completion.chunk",
-					"created":    created,
-					"model":      model,
-					"choices":    []any{}, // Required for OpenAI SDK compatibility
-					"event_type": "tool_call_delta",
-					"tool_call": map[string]any{
-						"id":              chunk.ToolCall.ID,
-						"name":            chunk.ToolCall.Name,
-						"arguments_delta": string(chunk.ToolCall.Arguments),
-					},
+				argsDelta := string(chunk.ToolCall.Arguments)
+				toolDeltaChunk := struct {
+					ID        string              `json:"id"`
+					Object    string              `json:"object"`
+					Created   int64               `json:"created"`
+					Model     string              `json:"model"`
+					Choices   []StreamChoiceDelta  `json:"choices"`
+					EventType string              `json:"event_type,omitempty"` // CogOS extension
+				}{
+					ID:        chunk.ID,
+					Object:    "chat.completion.chunk",
+					Created:   created,
+					Model:     model,
+					EventType: "tool_call_delta",
+					Choices: []StreamChoiceDelta{{
+						Index: 0,
+						Delta: StreamDelta{
+							ToolCalls: []StreamToolCallDelta{{
+								Index: 0,
+								Function: &StreamToolCallFunction{
+									Arguments: argsDelta,
+								},
+							}},
+						},
+					}},
 				}
-				data, _ := json.Marshal(deltaChunk)
+				data, _ := json.Marshal(toolDeltaChunk)
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
 			}
 			continue
 		}
 
-		// Handle tool result
+		// Handle tool result — no OpenAI standard for streaming tool results,
+		// so this remains a CogOS extension. We include a choices entry with the
+		// result content so SDKs don't silently drop the event.
 		if chunk.ToolResult != nil {
 			resultChunk := map[string]any{
-				"id":         chunk.ID,
-				"object":     "chat.completion.chunk",
-				"created":    created,
-				"model":      model,
-				"choices":    []any{}, // Required for OpenAI SDK compatibility
+				"id":      chunk.ID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []map[string]any{{
+					"index": 0,
+					"delta": map[string]any{
+						"role":    "assistant",
+						"content": nil,
+					},
+					"finish_reason": nil,
+				}},
 				"event_type": "tool_result",
 				"tool_result": map[string]any{
 					"tool_call_id": chunk.ToolResult.ToolCallID,
@@ -1863,9 +2089,12 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			var usageInfo *UsageInfo
 			if chunk.Usage != nil {
 				usageInfo = &UsageInfo{
-					PromptTokens:     chunk.Usage.InputTokens,
-					CompletionTokens: chunk.Usage.OutputTokens,
-					TotalTokens:      chunk.Usage.InputTokens + chunk.Usage.OutputTokens,
+					PromptTokens:      chunk.Usage.InputTokens,
+					CompletionTokens:  chunk.Usage.OutputTokens,
+					TotalTokens:       chunk.Usage.InputTokens + chunk.Usage.OutputTokens,
+					CacheReadTokens:   chunk.Usage.CacheReadTokens,
+					CacheCreateTokens: chunk.Usage.CacheCreateTokens,
+					CostUSD:           chunk.Usage.CostUSD,
 				}
 			}
 
@@ -1935,8 +2164,8 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 		s.taaStateMutex.Unlock()
 	}
 
-	// Use shared inference engine
-	resp, err := RunInference(inferReq, GlobalRegistry)
+	// Delegate to harness inference engine
+	resp, err := HarnessRunInference(inferReq, GlobalRegistry)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Inference failed: "+err.Error(), "server_error")
 		return
@@ -1956,9 +2185,12 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 	}
 
 	usage := UsageInfo{
-		PromptTokens:     resp.PromptTokens,
-		CompletionTokens: resp.CompletionTokens,
-		TotalTokens:      resp.PromptTokens + resp.CompletionTokens,
+		PromptTokens:      resp.PromptTokens,
+		CompletionTokens:  resp.CompletionTokens,
+		TotalTokens:       resp.PromptTokens + resp.CompletionTokens,
+		CacheReadTokens:   resp.CacheReadTokens,
+		CacheCreateTokens: resp.CacheCreateTokens,
+		CostUSD:           resp.CostUSD,
 	}
 
 	finishReason := resp.FinishReason
@@ -2216,7 +2448,12 @@ func (s *serveServer) checkSummarization(sessionID string) {
 
 // handleResolve handles GET /resolve?uri=cog://...
 func (s *serveServer) handleResolve(w http.ResponseWriter, r *http.Request) {
-	if s.kernel == nil {
+	// Use per-request workspace kernel, fall back to default
+	kernel := s.kernel
+	if ws := workspaceFromRequest(r); ws != nil {
+		kernel = ws.kernel
+	}
+	if kernel == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "SDK not initialized", "server_error")
 		return
 	}
@@ -2227,7 +2464,7 @@ func (s *serveServer) handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resource, err := s.kernel.ResolveContext(r.Context(), uri)
+	resource, err := kernel.ResolveContext(r.Context(), uri)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
@@ -2245,7 +2482,12 @@ func (s *serveServer) handleResolve(w http.ResponseWriter, r *http.Request) {
 
 // handleMutate handles POST /mutate
 func (s *serveServer) handleMutate(w http.ResponseWriter, r *http.Request) {
-	if s.kernel == nil {
+	// Use per-request workspace kernel, fall back to default
+	kernel := s.kernel
+	if ws := workspaceFromRequest(r); ws != nil {
+		kernel = ws.kernel
+	}
+	if kernel == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "SDK not initialized", "server_error")
 		return
 	}
@@ -2285,7 +2527,7 @@ func (s *serveServer) handleMutate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.kernel.MutateContext(r.Context(), req.URI, mutation); err != nil {
+	if err := kernel.MutateContext(r.Context(), req.URI, mutation); err != nil {
 		status := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "not found") {
 			status = http.StatusNotFound
@@ -2305,7 +2547,12 @@ func (s *serveServer) handleMutate(w http.ResponseWriter, r *http.Request) {
 
 // handleWatch handles GET /ws/watch?uri=cog://... (WebSocket)
 func (s *serveServer) handleWatch(w http.ResponseWriter, r *http.Request) {
-	if s.kernel == nil {
+	// Use per-request workspace kernel, fall back to default
+	kernel := s.kernel
+	if ws := workspaceFromRequest(r); ws != nil {
+		kernel = ws.kernel
+	}
+	if kernel == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "SDK not initialized", "server_error")
 		return
 	}
@@ -2328,7 +2575,7 @@ func (s *serveServer) handleWatch(w http.ResponseWriter, r *http.Request) {
 
 	// Create watcher
 	ctx := r.Context()
-	watcher, err := s.kernel.WatchURI(ctx, uri)
+	watcher, err := kernel.WatchURI(ctx, uri)
 	if err != nil {
 		c.Close(websocket.StatusInternalError, err.Error())
 		return
@@ -2373,13 +2620,18 @@ func (s *serveServer) handleWatch(w http.ResponseWriter, r *http.Request) {
 
 // handleState returns full workspace state via SDK
 func (s *serveServer) handleState(w http.ResponseWriter, r *http.Request) {
-	if s.kernel == nil {
+	// Use per-request workspace kernel, fall back to default
+	kernel := s.kernel
+	if ws := workspaceFromRequest(r); ws != nil {
+		kernel = ws.kernel
+	}
+	if kernel == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "SDK not initialized", "server_error")
 		return
 	}
 
 	// Resolve cog://status for full workspace state
-	resource, err := s.kernel.Resolve("cog://status")
+	resource, err := kernel.Resolve("cog://status")
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error(), "resolve_error")
 		return
@@ -2391,13 +2643,18 @@ func (s *serveServer) handleState(w http.ResponseWriter, r *http.Request) {
 
 // handleSignals returns signal field via SDK
 func (s *serveServer) handleSignals(w http.ResponseWriter, r *http.Request) {
-	if s.kernel == nil {
+	// Use per-request workspace kernel, fall back to default
+	kernel := s.kernel
+	if ws := workspaceFromRequest(r); ws != nil {
+		kernel = ws.kernel
+	}
+	if kernel == nil {
 		s.writeError(w, http.StatusServiceUnavailable, "SDK not initialized", "server_error")
 		return
 	}
 
 	// Resolve cog://signals for signal field
-	resource, err := s.kernel.Resolve("cog://signals")
+	resource, err := kernel.Resolve("cog://signals")
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, err.Error(), "resolve_error")
 		return
@@ -2496,6 +2753,39 @@ func cmdServeForeground(port int) int {
 		}
 		log.Printf("[bus-chat] initialized (taa_profile=%s, context_from_bus=%v)",
 			server.busChat.config.TAAProfile, server.busChat.config.Features.ContextFromBus)
+	}
+
+	// Load workspace registry for multi-workspace support
+	server.workspaces = make(map[string]*workspaceContext)
+	if globalCfg, err := loadGlobalConfig(); err == nil && len(globalCfg.Workspaces) > 0 {
+		server.defaultWS = globalCfg.CurrentWorkspace
+		for wsName, wsEntry := range globalCfg.Workspaces {
+			wsKernel, wsErr := sdk.Connect(wsEntry.Path)
+			if wsErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to connect workspace %q (%s): %v\n", wsName, wsEntry.Path, wsErr)
+				continue
+			}
+			server.workspaces[wsName] = &workspaceContext{
+				root:    wsEntry.Path,
+				name:    wsName,
+				kernel:  wsKernel,
+				busChat: newBusChat(wsEntry.Path),
+			}
+		}
+		fmt.Fprintf(os.Stderr, "Loaded %d workspaces\n", len(server.workspaces))
+	}
+
+	// Register the primary workspace too (from ResolveWorkspace) if not already in registry
+	if root != "" {
+		if _, exists := server.workspaces[root]; !exists {
+			// Use root path as key if not in named registry
+			server.workspaces[root] = &workspaceContext{
+				root:    root,
+				name:    root,
+				kernel:  kernel,
+				busChat: server.busChat,
+			}
+		}
 	}
 
 	// Initialize OpenTelemetry tracing (noop if OTEL_EXPORTER_OTLP_ENDPOINT is not set)

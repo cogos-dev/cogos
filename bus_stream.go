@@ -95,6 +95,12 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Resolve per-workspace busChat; fall back to server default.
+	busChat := s.busChat
+	if ws := workspaceFromRequest(r); ws != nil && ws.busChat != nil {
+		busChat = ws.busChat
+	}
+
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -112,8 +118,8 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 	flusher.Flush()
 
 	// Replay existing events for the bus
-	if s.busChat != nil {
-		events, err := s.busChat.manager.readBusEvents(busID)
+	if busChat != nil {
+		events, err := busChat.manager.readBusEvents(busID)
 		if err == nil {
 			for i := range events {
 				envelope := busEventEnvelope{
@@ -188,13 +194,19 @@ func (s *serveServer) handleBusEventsREST(w http.ResponseWriter, r *http.Request
 	}
 	busID := parts[0]
 
-	if s.busChat == nil {
+	// Resolve per-workspace busChat; fall back to server default.
+	busChat := s.busChat
+	if ws := workspaceFromRequest(r); ws != nil && ws.busChat != nil {
+		busChat = ws.busChat
+	}
+
+	if busChat == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte("[]"))
 		return
 	}
 
-	events, err := s.busChat.manager.readBusEvents(busID)
+	events, err := busChat.manager.readBusEvents(busID)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte("[]"))

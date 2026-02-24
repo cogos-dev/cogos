@@ -1,7 +1,7 @@
-// constellation_singleton.go - Singleton constellation DB connection
+// constellation_singleton.go - Per-workspace constellation DB connection pool
 //
 // Avoids 2-5ms overhead per request from repeated Open/PRAGMA/migration checks.
-// The connection stays open for the process lifetime.
+// Connections are cached per workspace root and stay open for the process lifetime.
 
 package main
 
@@ -11,34 +11,45 @@ import (
 	"github.com/cogos-dev/cogos/sdk/constellation"
 )
 
-var (
-	constellationOnce sync.Once
-	constellationDB   *constellation.Constellation
-	constellationErr  error
-)
+var constellationCache sync.Map // map[string]*constellation.Constellation
 
-// getConstellation returns a shared constellation database connection.
-// The connection is lazily initialized on first call and reused thereafter.
-// Callers must NOT call Close() on the returned Constellation.
-func getConstellation() (*constellation.Constellation, error) {
-	constellationOnce.Do(func() {
-		root, _, err := ResolveWorkspace()
-		if err != nil {
-			constellationErr = err
-			return
-		}
-		constellationDB, constellationErr = constellation.Open(root)
-	})
-	if constellationErr != nil {
-		return nil, constellationErr
+// getConstellationForWorkspace returns a constellation connection for the given workspace root.
+// Connections are cached per-workspace and created lazily on first access.
+func getConstellationForWorkspace(root string) (*constellation.Constellation, error) {
+	if v, ok := constellationCache.Load(root); ok {
+		return v.(*constellation.Constellation), nil
 	}
-	return constellationDB, nil
+	db, err := constellation.Open(root)
+	if err != nil {
+		return nil, err
+	}
+	// Use LoadOrStore for thread-safety — if another goroutine raced us, use theirs
+	actual, loaded := constellationCache.LoadOrStore(root, db)
+	if loaded {
+		// Another goroutine won the race, close our duplicate
+		db.Close()
+	}
+	return actual.(*constellation.Constellation), nil
 }
 
-// CloseConstellation closes the singleton constellation connection.
+// getConstellation returns the constellation for the default workspace.
+// For multi-workspace use, prefer getConstellationForWorkspace().
+func getConstellation() (*constellation.Constellation, error) {
+	root, _, err := ResolveWorkspace()
+	if err != nil {
+		return nil, err
+	}
+	return getConstellationForWorkspace(root)
+}
+
+// CloseConstellation closes all cached constellation connections.
 // Call this during graceful shutdown if needed.
 func CloseConstellation() {
-	if constellationDB != nil {
-		constellationDB.Close()
-	}
+	constellationCache.Range(func(key, value any) bool {
+		if db, ok := value.(*constellation.Constellation); ok {
+			db.Close()
+		}
+		constellationCache.Delete(key)
+		return true
+	})
 }

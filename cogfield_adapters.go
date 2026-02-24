@@ -391,10 +391,16 @@ func (s *serveServer) handleExpandNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	root, _, err := ResolveWorkspace()
-	if err != nil {
-		http.Error(w, "Failed to resolve workspace", http.StatusInternalServerError)
-		return
+	var root string
+	if ws := workspaceFromRequest(r); ws != nil {
+		root = ws.root
+	} else {
+		var err error
+		root, _, err = ResolveWorkspace()
+		if err != nil {
+			http.Error(w, "Failed to resolve workspace", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Try each adapter

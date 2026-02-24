@@ -185,15 +185,23 @@ func (s *serveServer) handleCogFieldGraph(w http.ResponseWriter, r *http.Request
 
 	start := time.Now()
 
-	// Open constellation DB (singleton)
-	c, err := getConstellation()
+	// Open constellation DB (per-request workspace or singleton fallback)
+	var c *constellation.Constellation
+	var err error
+	var wsRoot string
+	if ws := workspaceFromRequest(r); ws != nil {
+		c, err = getConstellationForWorkspace(ws.root)
+		wsRoot = ws.root
+	} else {
+		c, err = getConstellation()
+	}
 	if err != nil {
 		log.Printf("cogfield: failed to open constellation: %v", err)
 		http.Error(w, "Failed to open constellation database", http.StatusInternalServerError)
 		return
 	}
 
-	graph, err := buildCogFieldGraph(c)
+	graph, err := buildCogFieldGraph(c, wsRoot)
 	if err != nil {
 		log.Printf("cogfield: failed to build graph: %v", err)
 		http.Error(w, "Failed to build graph", http.StatusInternalServerError)
@@ -208,8 +216,9 @@ func (s *serveServer) handleCogFieldGraph(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(graph)
 }
 
-// buildCogFieldGraph queries constellation.db and assembles the full graph
-func buildCogFieldGraph(c *constellation.Constellation) (*CogFieldGraph, error) {
+// buildCogFieldGraph queries constellation.db and assembles the full graph.
+// wsRoot, if non-empty, overrides ResolveWorkspace() for adapter summary nodes.
+func buildCogFieldGraph(c *constellation.Constellation, wsRoot string) (*CogFieldGraph, error) {
 	db := c.DB()
 
 	// --- Query all documents ---
@@ -490,7 +499,10 @@ func buildCogFieldGraph(c *constellation.Constellation) (*CogFieldGraph, error) 
 	}
 
 	// --- Add session + bus nodes via adapters ---
-	root, _, _ := ResolveWorkspace()
+	root := wsRoot
+	if root == "" {
+		root, _, _ = ResolveWorkspace()
+	}
 	if root != "" {
 		for _, adapter := range adapters {
 			summaryNodes, summaryEdges := adapter.SummaryNodes(root)
@@ -729,14 +741,22 @@ func (s *serveServer) handleCogFieldQuery(w http.ResponseWriter, r *http.Request
 
 	start := time.Now()
 
-	c, err := getConstellation()
+	var c *constellation.Constellation
+	var err error
+	var wsRoot string
+	if ws := workspaceFromRequest(r); ws != nil {
+		c, err = getConstellationForWorkspace(ws.root)
+		wsRoot = ws.root
+	} else {
+		c, err = getConstellation()
+	}
 	if err != nil {
 		log.Printf("cogfield: query: failed to open constellation: %v", err)
 		http.Error(w, "Failed to open constellation database", http.StatusInternalServerError)
 		return
 	}
 
-	graph, err := buildCogFieldGraph(c)
+	graph, err := buildCogFieldGraph(c, wsRoot)
 	if err != nil {
 		log.Printf("cogfield: query: failed to build graph: %v", err)
 		http.Error(w, "Failed to build graph", http.StatusInternalServerError)

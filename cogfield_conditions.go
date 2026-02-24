@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cogos-dev/cogos/sdk/constellation"
 	"gopkg.in/yaml.v3"
 )
 
@@ -162,14 +163,20 @@ func EvaluateAndDispatchFieldConditions(root string, conditions []FieldCondition
 		state.CyclesSinceFired[name]++
 	}
 
-	// Build field graph via constellation singleton
-	c, err := getConstellation()
+	// Build field graph via workspace-specific constellation
+	var c *constellation.Constellation
+	var err error
+	if root != "" {
+		c, err = getConstellationForWorkspace(root)
+	} else {
+		c, err = getConstellation()
+	}
 	if err != nil {
 		log.Printf("[Field] Failed to open constellation for condition eval: %v", err)
 		return
 	}
 
-	graph, err := buildCogFieldGraph(c)
+	graph, err := buildCogFieldGraph(c, root)
 	if err != nil {
 		log.Printf("[Field] Failed to build graph for condition eval: %v", err)
 		return
