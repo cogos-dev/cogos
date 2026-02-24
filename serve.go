@@ -343,38 +343,6 @@ type ChatChoice struct {
 	FinishReason string       `json:"finish_reason,omitempty"`
 }
 
-// StreamToolCallDelta represents a tool call delta in the OpenAI streaming format.
-// First chunk includes ID, Type, and Function.Name; subsequent chunks only include
-// Function.Arguments (partial JSON fragments).
-type StreamToolCallDelta struct {
-	Index    int                      `json:"index"`
-	ID       string                   `json:"id,omitempty"`
-	Type     string                   `json:"type,omitempty"` // "function" on first chunk
-	Function *StreamToolCallFunction  `json:"function,omitempty"`
-}
-
-// StreamToolCallFunction carries either the function name (first chunk) or
-// an arguments fragment (subsequent chunks).
-type StreamToolCallFunction struct {
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments"`
-}
-
-// StreamDelta is like ChatMessage but with typed tool_calls for streaming.
-// OpenAI SDKs expect choices[].delta.tool_calls to be an array of objects,
-// not a raw JSON blob.
-type StreamDelta struct {
-	Role      string                `json:"role,omitempty"`
-	Content   json.RawMessage       `json:"content,omitempty"`
-	ToolCalls []StreamToolCallDelta `json:"tool_calls,omitempty"`
-}
-
-// StreamChoiceDelta is a ChatChoice variant that uses StreamDelta instead of ChatMessage.
-type StreamChoiceDelta struct {
-	Index        int          `json:"index"`
-	Delta        StreamDelta  `json:"delta"`
-	FinishReason *string      `json:"finish_reason"` // Pointer so null serializes explicitly
-}
 
 // UsageInfo represents token usage in the OpenAI-compatible response format.
 // The cache and cost fields are Anthropic extensions — they're omitted for
@@ -1947,36 +1915,21 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			continue
 
 		case "tool_use", "tool_use_start":
-			// Emit tool call start in OpenAI streaming format:
-			// choices[0].delta.tool_calls[{index, id, type:"function", function:{name, arguments:""}}]
+			// Claude CLI handles tool calls internally. Emit as informational
+			// events (empty choices) so OpenAI-compatible clients don't try to
+			// execute them. CogOS-aware clients can use the event_type field.
 			if chunk.ToolCall != nil {
-				toolStartChunk := struct {
-					ID        string              `json:"id"`
-					Object    string              `json:"object"`
-					Created   int64               `json:"created"`
-					Model     string              `json:"model"`
-					Choices   []StreamChoiceDelta  `json:"choices"`
-					EventType string              `json:"event_type,omitempty"` // CogOS extension
-				}{
-					ID:        chunk.ID,
-					Object:    "chat.completion.chunk",
-					Created:   created,
-					Model:     model,
-					EventType: "tool_call",
-					Choices: []StreamChoiceDelta{{
-						Index: 0,
-						Delta: StreamDelta{
-							ToolCalls: []StreamToolCallDelta{{
-								Index: 0,
-								ID:    chunk.ToolCall.ID,
-								Type:  "function",
-								Function: &StreamToolCallFunction{
-									Name:      chunk.ToolCall.Name,
-									Arguments: "",
-								},
-							}},
-						},
-					}},
+				toolStartChunk := map[string]any{
+					"id":         chunk.ID,
+					"object":     "chat.completion.chunk",
+					"created":    created,
+					"model":      model,
+					"choices":    []any{},
+					"event_type": "tool_call",
+					"tool_call": map[string]any{
+						"id":   chunk.ToolCall.ID,
+						"name": chunk.ToolCall.Name,
+					},
 				}
 				data, _ := json.Marshal(toolStartChunk)
 				fmt.Fprintf(w, "data: %s\n\n", data)
@@ -1985,34 +1938,18 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			continue
 
 		case "tool_use_delta":
-			// Emit tool call argument fragment in OpenAI streaming format:
-			// choices[0].delta.tool_calls[{index, function:{arguments:"partial..."}}]
+			// Informational only — tool is being executed by Claude CLI internally.
 			if chunk.ToolCall != nil {
-				argsDelta := string(chunk.ToolCall.Arguments)
-				toolDeltaChunk := struct {
-					ID        string              `json:"id"`
-					Object    string              `json:"object"`
-					Created   int64               `json:"created"`
-					Model     string              `json:"model"`
-					Choices   []StreamChoiceDelta  `json:"choices"`
-					EventType string              `json:"event_type,omitempty"` // CogOS extension
-				}{
-					ID:        chunk.ID,
-					Object:    "chat.completion.chunk",
-					Created:   created,
-					Model:     model,
-					EventType: "tool_call_delta",
-					Choices: []StreamChoiceDelta{{
-						Index: 0,
-						Delta: StreamDelta{
-							ToolCalls: []StreamToolCallDelta{{
-								Index: 0,
-								Function: &StreamToolCallFunction{
-									Arguments: argsDelta,
-								},
-							}},
-						},
-					}},
+				toolDeltaChunk := map[string]any{
+					"id":         chunk.ID,
+					"object":     "chat.completion.chunk",
+					"created":    created,
+					"model":      model,
+					"choices":    []any{},
+					"event_type": "tool_call_delta",
+					"tool_call": map[string]any{
+						"arguments": string(chunk.ToolCall.Arguments),
+					},
 				}
 				data, _ := json.Marshal(toolDeltaChunk)
 				fmt.Fprintf(w, "data: %s\n\n", data)
