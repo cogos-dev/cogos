@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -368,22 +369,22 @@ func (p *OpenClawAgentProjector) ApplyPlan(ctx context.Context, plan *ReconcileP
 		return results, nil
 	}
 
-	// Write back
-	listJSON, err := json.Marshal(agentList)
+	// Write back by replacing the "list" value inside "agents" in the raw JSON.
+	// This preserves the original key ordering of the config file.
+	listJSON, err := json.MarshalIndent(agentList, "    ", "  ")
 	if err != nil {
 		return results, fmt.Errorf("openclaw-agents: marshal list: %w", err)
 	}
-	agentsSection["list"] = listJSON
 
-	agentsJSON, err := json.Marshal(agentsSection)
+	// Re-read the file to get the exact bytes (avoids stale data from map operations)
+	rawData, err := os.ReadFile(configPath)
 	if err != nil {
-		return results, fmt.Errorf("openclaw-agents: marshal agents: %w", err)
+		return results, fmt.Errorf("openclaw-agents: re-read config: %w", err)
 	}
-	fullConfig["agents"] = agentsJSON
 
-	output, err := json.MarshalIndent(fullConfig, "", "  ")
+	output, err := replaceJSONValue(rawData, "list", listJSON)
 	if err != nil {
-		return results, fmt.Errorf("openclaw-agents: marshal config: %w", err)
+		return results, fmt.Errorf("openclaw-agents: replace agents.list: %w", err)
 	}
 
 	if err := os.WriteFile(configPath, output, 0644); err != nil {
@@ -452,6 +453,55 @@ func (p *OpenClawAgentProjector) resolveConfigPath() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".openclaw", "openclaw.json")
+}
+
+// replaceJSONValue searches for `"key": <value>` in raw JSON bytes and replaces
+// <value> with replacement. Only replaces the first occurrence. This preserves
+// the surrounding file structure (key ordering, whitespace, comments) byte-for-byte.
+func replaceJSONValue(data []byte, key string, replacement []byte) ([]byte, error) {
+	// Find "key" followed by :
+	needle := fmt.Sprintf("%q", key)
+	idx := -1
+	for i := 0; i < len(data)-len(needle); i++ {
+		if string(data[i:i+len(needle)]) == needle {
+			// Verify it's followed by optional whitespace then colon
+			j := i + len(needle)
+			for j < len(data) && (data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r') {
+				j++
+			}
+			if j < len(data) && data[j] == ':' {
+				idx = j + 1
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("key %q not found in JSON", key)
+	}
+
+	// Skip whitespace after colon
+	for idx < len(data) && (data[idx] == ' ' || data[idx] == '\t' || data[idx] == '\n' || data[idx] == '\r') {
+		idx++
+	}
+
+	// Use decoder to find exact end of the value at this position
+	dec := json.NewDecoder(strings.NewReader(string(data[idx:])))
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("parse value for %q: %w", key, err)
+	}
+	valueEnd := idx + int(dec.InputOffset())
+
+	// Trim trailing whitespace consumed by decoder but not part of value
+	for valueEnd > idx && (data[valueEnd-1] == ' ' || data[valueEnd-1] == '\t' || data[valueEnd-1] == '\n' || data[valueEnd-1] == '\r') {
+		valueEnd--
+	}
+
+	result := make([]byte, 0, len(data)-valueEnd+idx+len(replacement))
+	result = append(result, data[:idx]...)
+	result = append(result, replacement...)
+	result = append(result, data[valueEnd:]...)
+	return result, nil
 }
 
 // agentEntriesEqual compares two agent entries for drift.
