@@ -109,13 +109,17 @@ func (d *DiscordProvider) ApplyPlan(ctx context.Context, plan *ReconcilePlan) ([
 
 	client := newDiscordClient(d.Token, maxCalls)
 
-	// Need roles for apply (role name→ID resolution)
+	// Need roles and channels for apply (name→ID resolution)
 	roles, err := client.fetchRoles(guildID)
 	if err != nil {
 		return nil, fmt.Errorf("discord: fetching roles for apply: %w", err)
 	}
+	channels, err := client.fetchChannels(guildID)
+	if err != nil {
+		return nil, fmt.Errorf("discord: fetching channels for apply: %w", err)
+	}
 
-	results, err := applyPlan(client, discordPlan, guildID, roles)
+	results, err := applyPlan(client, discordPlan, guildID, roles, channels)
 	if err != nil {
 		return nil, err
 	}

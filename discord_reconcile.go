@@ -849,13 +849,21 @@ type ApplyResult struct {
 	CreatedID string `json:"created_id,omitempty"`
 }
 
-func applyPlan(client *discordClient, plan *Plan, guildID string, roles []DiscordRole) ([]ApplyResult, error) {
+func applyPlan(client *discordClient, plan *Plan, guildID string, roles []DiscordRole, channels []DiscordChannel) ([]ApplyResult, error) {
 	var results []ApplyResult
 
 	// Build role name→ID map for permission resolution
 	roleNameToID := map[string]string{}
 	for _, r := range roles {
 		roleNameToID[strings.ToLower(r.Name)] = r.ID
+	}
+
+	// Build live category name→ID map for parent resolution
+	liveCategoryIDs := map[string]string{}
+	for _, ch := range channels {
+		if ch.Type == 4 { // category
+			liveCategoryIDs[strings.ToLower(ch.Name)] = ch.ID
+		}
 	}
 
 	// Track newly created IDs
@@ -978,14 +986,14 @@ func applyPlan(client *discordClient, plan *Plan, guildID string, roles []Discor
 				payload["rate_limit_per_user"] = sm
 			}
 
-			// Resolve parent category ID
+			// Resolve parent category ID (newly created or pre-existing)
 			if catName != "" {
 				catLower := strings.ToLower(catName)
 				if id, ok := createdCategoryIDs[catLower]; ok {
 					payload["parent_id"] = id
+				} else if id, ok := liveCategoryIDs[catLower]; ok {
+					payload["parent_id"] = id
 				}
-				// If the category already existed, we need its ID from live state
-				// This is handled by the caller passing the full channel list
 			}
 
 			body, err := client.doMutation("POST", fmt.Sprintf("/guilds/%s/channels", guildID), payload)
@@ -1520,18 +1528,22 @@ func cmdDiscordApply(root, flagToken string) error {
 		maxCalls = cfg.Reconciler.MaxAPICalls
 	}
 
-	// Fetch current roles for ID resolution
+	// Fetch current roles and channels for ID resolution
 	client := newDiscordClient(token, maxCalls)
 	roles, err := client.fetchRoles(plan.GuildID)
 	if err != nil {
 		return fmt.Errorf("fetching roles for ID resolution: %w", err)
+	}
+	channels, err := client.fetchChannels(plan.GuildID)
+	if err != nil {
+		return fmt.Errorf("fetching channels for parent ID resolution: %w", err)
 	}
 
 	// Load state for post-apply update
 	state, _ := loadState(root)
 
 	// Apply
-	results, err := applyPlan(client, &plan, plan.GuildID, roles)
+	results, err := applyPlan(client, &plan, plan.GuildID, roles, channels)
 	if err != nil {
 		return fmt.Errorf("apply failed: %w", err)
 	}
@@ -2365,13 +2377,15 @@ func computePlanWithState(cfg *DiscordServerConfig, channels []DiscordChannel, r
 						liveCh = &c
 					}
 				}
-				// Name-based fallback (within this category)
+				// Name-based fallback (within this category, or orphaned)
 				if liveCh == nil {
 					for _, c := range channels {
-						if c.Type != 4 && c.ParentID != nil && *c.ParentID == liveCat.ID &&
-							strings.EqualFold(c.Name, ch.Name) {
-							liveCh = &c
-							break
+						if c.Type != 4 && strings.EqualFold(c.Name, ch.Name) {
+							// Match if already in the right category, or if orphaned (no parent)
+							if (c.ParentID != nil && *c.ParentID == liveCat.ID) || c.ParentID == nil {
+								liveCh = &c
+								break
+							}
 						}
 					}
 				}
@@ -2379,9 +2393,13 @@ func computePlanWithState(cfg *DiscordServerConfig, channels []DiscordChannel, r
 				if liveCh != nil {
 					matchedChannelIDs[liveCh.ID] = true
 
-					// Detect move: channel exists but parent changed
-					if liveCh.ParentID != nil && *liveCh.ParentID != liveCat.ID {
-						oldCatName := categoryIDToName[*liveCh.ParentID]
+					// Detect move: channel exists but parent is wrong or missing
+					needsMove := liveCh.ParentID == nil || *liveCh.ParentID != liveCat.ID
+					if needsMove {
+						oldCatName := "(none)"
+						if liveCh.ParentID != nil {
+							oldCatName = categoryIDToName[*liveCh.ParentID]
+						}
 						plan.Actions = append(plan.Actions, PlanAction{
 							Action:       "move",
 							ResourceType: "channel",
