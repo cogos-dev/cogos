@@ -1,6 +1,8 @@
 // bus_stream.go - SSE event stream and REST events endpoint for CogBus
 //
 // GET /v1/events/stream?bus_id={id} - SSE stream of bus events (long-lived)
+//   bus_id is optional — when omitted, the client subscribes to ALL buses
+//   via the wildcard key "*".
 // GET /v1/bus/{bus_id}/events        - REST: returns all events as JSON array
 
 package main
@@ -172,19 +174,31 @@ func (b *busEventBroker) touchWrite(busID string, ch chan *CogBlock) {
 	}
 }
 
-// publish sends an event to all subscribers of a bus. Non-blocking: drops if channel full.
+// publish sends an event to all subscribers of a bus AND to wildcard ("*")
+// subscribers. Non-blocking: drops if channel full.
 func (b *busEventBroker) publish(busID string, evt *CogBlock) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	subs, ok := b.subscribers[busID]
-	if !ok {
-		return
+
+	// Deliver to bus-specific subscribers.
+	if subs, ok := b.subscribers[busID]; ok {
+		for ch := range subs {
+			select {
+			case ch <- evt:
+			default:
+			}
+		}
 	}
-	for ch := range subs {
-		select {
-		case ch <- evt:
-		default:
-			// subscriber too slow, drop event
+
+	// Deliver to wildcard subscribers (connected without bus_id).
+	if busID != "*" {
+		if subs, ok := b.subscribers["*"]; ok {
+			for ch := range subs {
+				select {
+				case ch <- evt:
+				default:
+				}
+			}
 		}
 	}
 }
@@ -207,8 +221,7 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 
 	busID := r.URL.Query().Get("bus_id")
 	if busID == "" {
-		http.Error(w, "bus_id query parameter required", http.StatusBadRequest)
-		return
+		busID = "*" // wildcard — receive events from all buses
 	}
 
 	flusher, ok := w.(http.Flusher)
@@ -257,8 +270,8 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 	fmt.Fprintf(w, "data: %s\n\n", connData)
 	flusher.Flush()
 
-	// Replay existing events for the bus
-	if busChat != nil {
+	// Replay existing events for the bus (skip for wildcard subscribers).
+	if busChat != nil && busID != "*" {
 		events, err := busChat.manager.readBusEvents(busID)
 		if err == nil {
 			extendDeadline()
