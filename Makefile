@@ -9,6 +9,7 @@
 #   make test     - Run tests
 #   make clean    - Remove build artifacts
 #   make install  - Install to ~/.cog/bin/cogos
+#   make push     - Build + push to OCI layout (triggers kernel auto-reload)
 
 VERSION := 2.1.1
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -24,7 +25,7 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64
 
-.PHONY: all build clean test install $(PLATFORMS)
+.PHONY: all build clean test install push $(PLATFORMS)
 
 # Default: build for current platform
 build: $(BINARY)
@@ -71,6 +72,11 @@ install: build
 	@NEW_SHA=$$(shasum -a 256 "$(INSTALL_TARGET)" | cut -d' ' -f1); \
 		echo "  Installed cogos $(VERSION) ($(GOOS)/$(GOARCH))"; \
 		echo "  SHA-256: $$NEW_SHA"
+
+# Push to OCI layout — running kernel auto-reloads
+push: build
+	@echo "=== Pushing to OCI layout ==="
+	@./$(BINARY) oci push ./$(BINARY)
 
 # Run tests
 test: build

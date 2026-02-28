@@ -12,6 +12,8 @@ require (
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/go-git/go-git/v5 v5.16.4
 	github.com/hashicorp/hcl/v2 v2.24.0
+	github.com/opencontainers/go-digest v1.0.0
+	github.com/opencontainers/image-spec v1.1.1
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/zclconf/go-cty v1.17.0
 	go.opentelemetry.io/otel v1.40.0
@@ -20,6 +22,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.40.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
+	oras.land/oras-go/v2 v2.6.0
 )
 
 require (

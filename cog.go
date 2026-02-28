@@ -3536,6 +3536,15 @@ func cmdVersion() int {
 		if len(data) > 0 {
 			fmt.Printf("kernel: %s\n", hashShort(data))
 		}
+		// Show OCI layer digest if layout exists
+		store := NewOCIStore(root)
+		if d, resolveErr := store.ResolveLayerDigest(context.Background()); resolveErr == nil && d != "" {
+			digestShort := d
+			if len(digestShort) > 23 {
+				digestShort = digestShort[:23]
+			}
+			fmt.Printf("oci:    %s\n", digestShort)
+		}
 	}
 	return 0
 }
@@ -5692,6 +5701,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			code = 1
 		}
+	case "oci":
+		code = cmdOCI(os.Args[2:])
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":

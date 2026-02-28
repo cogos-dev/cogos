@@ -41,6 +41,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	sdk "github.com/cogos-dev/cogos/sdk"
+	"github.com/fsnotify/fsnotify"
 	"github.com/cogos-dev/cogos/sdk/httputil"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -237,7 +238,7 @@ func (r *ChatCompletionRequest) GetTAAProfileWithHeader(header string) (string, 
 // ChatMessage represents a single message in the conversation
 // Content can be either a string or an array of content parts (OpenAI SDK format)
 type ChatMessage struct {
-	Role       string          `json:"role"`
+	Role       string          `json:"role,omitempty"`
 	Content    json.RawMessage `json:"content"`               // Can be string or array
 	ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`  // Assistant tool call requests
 	ToolCallID string          `json:"tool_call_id,omitempty"` // For role:"tool" — which call this answers
@@ -535,10 +536,16 @@ type serveServer struct {
 	taaStateMutex sync.RWMutex
 	busChat       *busChat        // Bus event emission for chat (nil if no workspace)
 	busBroker     *busEventBroker // SSE subscriber broker for bus events
+	toolBridge    *ToolBridge     // Synchronous tool bridge for client-driven agent loops
+
+	// OCI auto-reload: kernel watches .cog/oci/index.json for new digests
+	ociStore  *OCIStore  // nil if no OCI layout exists
+	ociDigest string     // manifest digest at startup (for comparison)
+	reexecCh  chan string // signals graceful re-exec with new digest
 }
 
 func newServeServer(port int, kernel *sdk.Kernel) *serveServer {
-	return &serveServer{port: port, kernel: kernel, busBroker: newBusEventBroker()}
+	return &serveServer{port: port, kernel: kernel, busBroker: newBusEventBroker(), toolBridge: NewToolBridge()}
 }
 
 // getWorkspace returns workspace context by name or path. Falls back to default.
@@ -652,7 +659,8 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/v1/providers/", s.handleProviderByID) // Provider activate/test
 	mux.HandleFunc("/v1/requests", s.handleRequests)
 	mux.HandleFunc("/v1/requests/", s.handleRequestByID)
-	mux.HandleFunc("/v1/taa", s.handleTAA) // TAA context visibility endpoint
+	mux.HandleFunc("/v1/taa", s.handleTAA)                    // TAA context visibility endpoint
+	mux.HandleFunc("POST /v1/tool-bridge/pending", s.handleToolBridgePending) // Synchronous tool bridge
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/debug", s.handleDebug)
 	mux.HandleFunc("/services", s.handleServices)
@@ -710,18 +718,41 @@ func (s *serveServer) Start() error {
 		WriteTimeout: 5 * time.Minute, // Long timeout for streaming
 	}
 
-	// Graceful shutdown
+	// Graceful shutdown / OCI re-exec
 	done := make(chan bool, 1)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-quit
-		fmt.Println("\nShutting down server...")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
-		close(done)
+		select {
+		case <-quit:
+			fmt.Println("\nShutting down server...")
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			server.Shutdown(ctx)
+			close(done)
+
+		case newDigest := <-s.reexecCh:
+			digestShort := newDigest
+			if len(digestShort) > 23 {
+				digestShort = digestShort[:23]
+			}
+			log.Printf("[oci] initiating graceful re-exec (new digest: %s)", digestShort)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			server.Shutdown(ctx)
+
+			// Re-exec: replace this process with the new binary
+			selfPath, _ := os.Executable()
+			selfPath, _ = filepath.EvalSymlinks(selfPath)
+			log.Printf("[oci] re-exec: %s %v", selfPath, os.Args)
+
+			execErr := syscall.Exec(selfPath, os.Args, os.Environ())
+			// If Exec fails, we're still running the old binary
+			log.Printf("[oci] re-exec failed: %v (continuing with current binary)", execErr)
+			close(done)
+		}
 	}()
 
 	fmt.Printf("CogOS unified server starting on http://localhost:%d\n", s.port)
@@ -752,6 +783,139 @@ func (s *serveServer) Start() error {
 
 	<-done
 	return nil
+}
+
+// === OCI AUTO-RELOAD ===
+
+// startOCIWatcher watches .cog/oci/index.json for changes and triggers re-exec
+// when a new digest is detected. Returns a stop function.
+func (s *serveServer) startOCIWatcher() func() {
+	if s.ociStore == nil || s.reexecCh == nil {
+		return func() {}
+	}
+
+	indexPath := s.ociStore.IndexPath()
+	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
+		log.Printf("[oci] no index.json yet at %s — watcher will detect creation", filepath.Dir(indexPath))
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("[oci] fsnotify unavailable: %v, auto-reload disabled", err)
+		return func() {}
+	}
+
+	// Watch the directory (not the file) because index.json may be atomically
+	// replaced (write to tmp + rename), which creates a new inode.
+	ociDir := filepath.Dir(indexPath)
+	if err := watcher.Add(ociDir); err != nil {
+		log.Printf("[oci] cannot watch %s: %v, auto-reload disabled", ociDir, err)
+		watcher.Close()
+		return func() {}
+	}
+
+	stopCh := make(chan struct{})
+	go s.runOCIWatcher(watcher, stopCh)
+
+	log.Printf("[oci] watching %s for digest changes", ociDir)
+	return func() {
+		close(stopCh)
+		watcher.Close()
+	}
+}
+
+// runOCIWatcher is the fsnotify event loop for OCI digest changes.
+func (s *serveServer) runOCIWatcher(w *fsnotify.Watcher, stopCh chan struct{}) {
+	const debounce = 500 * time.Millisecond
+	var timer *time.Timer
+
+	for {
+		select {
+		case <-stopCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			return
+
+		case event, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if filepath.Base(event.Name) != "index.json" {
+				continue
+			}
+
+			// Debounce: oras-go may write index.json multiple times per push
+			if timer != nil {
+				timer.Stop()
+			}
+			timer = time.AfterFunc(debounce, func() {
+				s.checkOCIDigest()
+			})
+
+		case err, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("[oci] fsnotify error: %v", err)
+		}
+	}
+}
+
+// checkOCIDigest compares the latest OCI digest against the running digest.
+// If different, pulls the new binary and signals re-exec.
+func (s *serveServer) checkOCIDigest() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Compare layer (binary) digests, not manifest digests — manifests change
+	// on every push due to timestamp annotations even if the binary is identical
+	newDigest, err := s.ociStore.ResolveLayerDigest(ctx)
+	if err != nil {
+		log.Printf("[oci] resolve failed: %v (keeping current binary)", err)
+		return
+	}
+
+	if newDigest == "" || newDigest == s.ociDigest {
+		return
+	}
+
+	digestShort := newDigest
+	if len(digestShort) > 23 {
+		digestShort = digestShort[:23]
+	}
+	oldShort := s.ociDigest
+	if len(oldShort) > 23 {
+		oldShort = oldShort[:23]
+	}
+	log.Printf("[oci] new binary detected: %s (was %s)", digestShort, oldShort)
+
+	// Pull binary to self-path
+	selfPath, err := os.Executable()
+	if err != nil {
+		log.Printf("[oci] cannot determine self path: %v", err)
+		return
+	}
+	selfPath, err = filepath.EvalSymlinks(selfPath)
+	if err != nil {
+		log.Printf("[oci] cannot resolve symlinks: %v", err)
+		return
+	}
+
+	pulledDigest, err := s.ociStore.Pull(ctx, selfPath)
+	if err != nil {
+		log.Printf("[oci] pull failed: %v (keeping current binary)", err)
+		return
+	}
+
+	log.Printf("[oci] pulled new kernel to %s (layer digest: %s)", selfPath, pulledDigest[:min(23, len(pulledDigest))])
+
+	// Signal re-exec
+	select {
+	case s.reexecCh <- newDigest:
+	default:
+		// Already signaled
+	}
 }
 
 func (s *serveServer) corsMiddleware(next http.Handler) http.Handler {
@@ -1784,6 +1948,16 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		schema = req.ResponseFormat.JSONSchema
 	}
 
+	// When tools are present, use a detached context instead of the HTTP
+	// request context. This prevents the CLI from being killed when Request 1's
+	// handler returns (tool bridge parks the channel across HTTP boundaries).
+	var inferCtx context.Context
+	if len(req.Tools) > 0 {
+		inferCtx = context.Background()
+	} else {
+		inferCtx = r.Context()
+	}
+
 	inferReq := &InferenceRequest{
 		Prompt:       userPrompt.String(),
 		SystemPrompt: systemPrompt,
@@ -1792,10 +1966,13 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		MaxTokens:    req.MaxTokens,
 		Origin:       "http",
 		Stream:       req.Stream,
-		Context:      r.Context(),
+		Context:      inferCtx,
 		ContextState: contextState,
 		Tools:        req.Tools,
 	}
+
+	// Always set session ID for the harness (needed by MCP bridge's SESSION_ID env var)
+	inferReq.SessionID = sessionID
 
 	// Use UCP workspace root as Claude CLI working directory when provided.
 	// This lets callers (e.g., OpenClaw) specify which workspace the backend
@@ -1896,8 +2073,19 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		SpanID:      r.Header.Get("X-Span-ID"),
 	}
 
-	// Handle streaming vs non-streaming
+	// Check for tool bridge continuation: if the request contains role:"tool"
+	// messages and there's an active bridge session, deliver results and resume
+	// streaming from the parked output channel instead of starting a new CLI.
 	startTime := time.Now()
+	if s.toolBridge != nil && s.hasToolMessages(req.Messages) {
+		if sess := s.toolBridge.GetSession(sessionID); sess != nil {
+			log.Printf("[tool-bridge] Continuation detected for session %s", sessionID)
+			s.handleToolBridgeContinuation(w, &req, sess, sessionID, bctx, startTime)
+			return
+		}
+	}
+
+	// Handle streaming vs non-streaming
 	if req.Stream {
 		s.handleStreamingResponse(w, inferReq, sessionID, bctx, startTime)
 	} else {
@@ -1969,6 +2157,14 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 		s.taaStateMutex.Unlock()
 		extendDeadline()
 		s.emitTAAContext(w, flusher, inferReq.ContextState, inferReq.Model)
+	}
+
+	// Pre-create tool bridge session if external tools are present.
+	// MCP bridges may POST to /v1/tool-bridge/pending before message_stop,
+	// since Claude CLI invokes MCP tools eagerly during streaming.
+	hasExternalTools := len(inferReq.Tools) > 0
+	if hasExternalTools && s.toolBridge != nil {
+		s.toolBridge.EnsureSession(sessionID)
 	}
 
 	// Delegate to harness inference engine
@@ -2059,6 +2255,22 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			// events (empty choices) so OpenAI-compatible clients don't try to
 			// execute them. CogOS-aware clients can use the event_type field.
 			if chunk.ToolCall != nil {
+				// Eagerly register external tool calls with the tool bridge.
+				// MCP bridges may arrive before message_stop, so calls must
+				// be registered as soon as content_block_stop events arrive.
+				if hasExternalTools && s.toolBridge != nil && chunk.EventType == "tool_use" {
+					const mcpPrefix = "mcp__cogos-bridge__"
+					if strings.HasPrefix(chunk.ToolCall.Name, mcpPrefix) {
+						origName := strings.TrimPrefix(chunk.ToolCall.Name, mcpPrefix)
+						s.toolBridge.RegisterCall(sessionID, &ToolBridgeCall{
+							ToolCallID: chunk.ToolCall.ID,
+							Name:       origName,
+							Arguments:  string(chunk.ToolCall.Arguments),
+							ResultCh:   make(chan ToolBridgeResult, 1),
+						})
+					}
+				}
+
 				toolStartChunk := map[string]any{
 					"id":         chunk.ID,
 					"object":     "chat.completion.chunk",
@@ -2152,6 +2364,79 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			flusher.Flush()
 		}
 
+		if chunk.Done && chunk.Suspended {
+			// CLI is suspended waiting for external tool results.
+			// Emit tool_calls to the client, park the output channel, and return.
+			log.Printf("[tool-bridge] Suspended stream: %d external tool calls, parking channel for session %s",
+				len(chunk.ExternalToolCalls), sessionID)
+
+			// Emit external tool_calls as OpenAI streaming deltas
+			for i, tc := range chunk.ExternalToolCalls {
+				toolCallStart := map[string]any{
+					"id":      chunk.ID,
+					"object":  "chat.completion.chunk",
+					"created": created,
+					"model":   model,
+					"choices": []map[string]any{{
+						"index": 0,
+						"delta": map[string]any{
+							"tool_calls": []map[string]any{{
+								"index": i,
+								"id":    tc.ID,
+								"type":  "function",
+								"function": map[string]any{
+									"name":      tc.Name,
+									"arguments": string(tc.Arguments),
+								},
+							}},
+						},
+					}},
+				}
+				data, _ := json.Marshal(toolCallStart)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+
+			// Emit finish chunk with tool_calls reason
+			var usageInfo *UsageInfo
+			if chunk.Usage != nil {
+				usageInfo = &UsageInfo{
+					PromptTokens:      chunk.Usage.InputTokens,
+					CompletionTokens:  chunk.Usage.OutputTokens,
+					TotalTokens:       chunk.Usage.InputTokens + chunk.Usage.OutputTokens,
+					CacheReadTokens:   chunk.Usage.CacheReadTokens,
+					CacheCreateTokens: chunk.Usage.CacheCreateTokens,
+					CostUSD:           chunk.Usage.CostUSD,
+				}
+			}
+			finishChunk := &StreamChunk{
+				ID:      chunk.ID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []ChatChoice{{
+					Index:        0,
+					Delta:        &ChatMessage{},
+					FinishReason: "tool_calls",
+				}},
+				Usage: usageInfo,
+			}
+			data, _ := json.Marshal(finishChunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+
+			// Park the output channel in the tool bridge for resumption.
+			// The harness goroutine is still running (CLI blocked on MCP bridge).
+			// When the client sends a follow-up request with tool results,
+			// handleToolBridgeContinuation will resume reading from this channel.
+			// Calls were already eagerly registered via tool_use events above.
+			s.toolBridge.RegisterSession(sessionID, chunks, inferReq, nil)
+			return
+		}
+
 		if chunk.Done {
 			// Persist accumulated assistant response to thread
 			if accumulatedContent.Len() > 0 {
@@ -2172,6 +2457,38 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 					CacheReadTokens:   chunk.Usage.CacheReadTokens,
 					CacheCreateTokens: chunk.Usage.CacheCreateTokens,
 					CostUSD:           chunk.Usage.CostUSD,
+				}
+			}
+
+			// Emit external tool_calls as proper OpenAI streaming deltas.
+			// Per the spec, tool_calls are emitted as delta chunks BEFORE
+			// the finish_reason chunk.
+			if len(chunk.ExternalToolCalls) > 0 {
+				for i, tc := range chunk.ExternalToolCalls {
+					// First chunk: tool call header (id, type, function name)
+					toolCallStart := map[string]any{
+						"id":      chunk.ID,
+						"object":  "chat.completion.chunk",
+						"created": created,
+						"model":   model,
+						"choices": []map[string]any{{
+							"index": 0,
+							"delta": map[string]any{
+								"tool_calls": []map[string]any{{
+									"index": i,
+									"id":    tc.ID,
+									"type":  "function",
+									"function": map[string]any{
+										"name":      tc.Name,
+										"arguments": string(tc.Arguments),
+									},
+								}},
+							},
+						}},
+					}
+					data, _ := json.Marshal(toolCallStart)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
 				}
 			}
 
@@ -2249,6 +2566,11 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 				}
 				s.busChat.emitResponse(respOpts)
 			}
+
+			// Clean up pre-created session if no suspension happened
+			if hasExternalTools && s.toolBridge != nil {
+				s.toolBridge.CleanupSession(sessionID)
+			}
 		}
 	}
 }
@@ -2309,6 +2631,29 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 		finishReason = "stop"
 	}
 
+	// Build the assistant message
+	assistantMsg := &ChatMessage{
+		Role:    "assistant",
+		Content: StringToRawContent(resp.Content),
+	}
+
+	// Include tool_calls in the response if the model called external tools
+	if len(resp.ToolCalls) > 0 {
+		var toolCalls []map[string]any
+		for _, tc := range resp.ToolCalls {
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   tc.ID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      tc.Name,
+					"arguments": string(tc.Arguments),
+				},
+			})
+		}
+		tcJSON, _ := json.Marshal(toolCalls)
+		assistantMsg.ToolCalls = json.RawMessage(tcJSON)
+	}
+
 	// Build response
 	response := ChatCompletionResponse{
 		ID:      resp.ID,
@@ -2317,11 +2662,8 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 		Model:   model,
 		Choices: []ChatChoice{
 			{
-				Index: 0,
-				Message: &ChatMessage{
-					Role:    "assistant",
-					Content: StringToRawContent(resp.Content),
-				},
+				Index:        0,
+				Message:      assistantMsg,
 				FinishReason: finishReason,
 			},
 		},
@@ -2357,6 +2699,377 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 		}
 		s.busChat.emitResponse(respOpts)
 	}
+}
+
+// === TOOL BRIDGE HANDLERS ===
+
+// hasToolMessages checks if any messages in the request have role:"tool".
+func (s *serveServer) hasToolMessages(messages []ChatMessage) bool {
+	for _, msg := range messages {
+		if msg.Role == "tool" {
+			return true
+		}
+	}
+	return false
+}
+
+// handleToolBridgePending handles POST /v1/tool-bridge/pending.
+// Called by the MCP bridge subprocess when a passthrough tool is invoked.
+// Blocks until the client delivers the real tool result via a follow-up request.
+func (s *serveServer) handleToolBridgePending(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		ToolName  string `json:"tool_name"`
+		Arguments string `json:"arguments"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[tool-bridge] MCP bridge arrived: session=%s tool=%s", req.SessionID, req.ToolName)
+
+	// Try immediate match, or register as waiter and block until call arrives.
+	// Claude CLI invokes MCP tools eagerly (before content_block_stop), so the
+	// MCP bridge often arrives before the harness registers the call.
+	call, waiterCh := s.toolBridge.WaitForPending(req.SessionID, req.ToolName)
+	if call == nil && waiterCh == nil {
+		log.Printf("[tool-bridge] No session for MCP bridge: session=%s tool=%s", req.SessionID, req.ToolName)
+		http.Error(w, "No session", http.StatusNotFound)
+		return
+	}
+
+	if call == nil {
+		// Block until RegisterCall wakes us or timeout
+		select {
+		case c, ok := <-waiterCh:
+			if !ok || c == nil {
+				log.Printf("[tool-bridge] Waiter cancelled: session=%s tool=%s", req.SessionID, req.ToolName)
+				http.Error(w, "Session cancelled", http.StatusGone)
+				return
+			}
+			call = c
+		case <-time.After(2 * time.Minute):
+			log.Printf("[tool-bridge] Waiter timeout: session=%s tool=%s", req.SessionID, req.ToolName)
+			http.Error(w, "Timeout waiting for call registration", http.StatusGatewayTimeout)
+			return
+		case <-r.Context().Done():
+			log.Printf("[tool-bridge] MCP bridge disconnected: session=%s tool=%s", req.SessionID, req.ToolName)
+			return
+		}
+	}
+
+	log.Printf("[tool-bridge] Blocking on result for: session=%s tool=%s id=%s", req.SessionID, req.ToolName, call.ToolCallID)
+
+	// Block until the client delivers the result (or timeout)
+	select {
+	case result := <-call.ResultCh:
+		log.Printf("[tool-bridge] Result delivered: session=%s tool=%s id=%s (len=%d)",
+			req.SessionID, req.ToolName, call.ToolCallID, len(result.Content))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	case <-time.After(10 * time.Minute):
+		log.Printf("[tool-bridge] Timeout waiting for result: session=%s tool=%s", req.SessionID, req.ToolName)
+		http.Error(w, "Timeout waiting for tool result", http.StatusGatewayTimeout)
+	case <-r.Context().Done():
+		log.Printf("[tool-bridge] Client disconnected: session=%s tool=%s", req.SessionID, req.ToolName)
+	}
+}
+
+// handleToolBridgeContinuation handles a follow-up request with role:"tool" results.
+// It delivers the results to the blocked MCP bridge and resumes streaming from
+// the parked output channel.
+func (s *serveServer) handleToolBridgeContinuation(w http.ResponseWriter, req *ChatCompletionRequest, sess *ToolBridgeSession, sessionID string, bctx busEventCtx, startTime time.Time) {
+	// Set SSE headers for streaming response
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.writeError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
+		return
+	}
+
+	rc := http.NewResponseController(w)
+	extendDeadline := func() {
+		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteWindow))
+	}
+
+	// Deliver tool results to the pending calls.
+	// Only deliver results for tool_call_ids that exist in this session's CallsByID.
+	// BrowserOS sends the full conversation history, so most role:"tool" messages
+	// are from previous turns and should be silently skipped.
+	delivered := 0
+	for _, msg := range req.Messages {
+		if msg.Role == "tool" && msg.ToolCallID != "" {
+			if sess.CallsByID[msg.ToolCallID] != nil {
+				content := msg.GetContent()
+				s.toolBridge.DeliverResult(sessionID, msg.ToolCallID, ToolBridgeResult{
+					Content: content,
+				})
+				delivered++
+			}
+		}
+	}
+	log.Printf("[tool-bridge] Delivered %d tool results for session %s", delivered, sessionID)
+
+	// Resume reading from the parked output channel.
+	// The harness goroutine is still running and will produce new chunks
+	// after the MCP bridge delivers the results to Claude CLI.
+	model := req.Model
+	if model == "" {
+		model = "claude"
+	}
+	created := time.Now().Unix()
+	var accumulatedContent strings.Builder
+
+	for chunk := range sess.OutputCh {
+		extendDeadline()
+
+		if chunk.Error != nil {
+			s.writeSSEError(w, flusher, "Inference error: "+chunk.Error.Error())
+			s.toolBridge.CleanupSession(sessionID)
+			return
+		}
+
+		// Handle rich event types (same as handleStreamingResponse)
+		switch chunk.EventType {
+		case "session_info", "session_start":
+			if chunk.SessionInfo != nil {
+				toolCount := 0
+				if chunk.SessionInfo.Tools != nil {
+					toolCount = len(chunk.SessionInfo.Tools)
+				}
+				sessionChunk := map[string]any{
+					"id":         chunk.ID,
+					"object":     "chat.completion.chunk",
+					"created":    created,
+					"model":      model,
+					"choices":    []any{},
+					"event_type": chunk.EventType,
+					"session": map[string]any{
+						"session_id": chunk.SessionInfo.SessionID,
+						"model":      chunk.SessionInfo.Model,
+						"tool_count": toolCount,
+					},
+				}
+				data, _ := json.Marshal(sessionChunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+			continue
+		case "tool_use", "tool_use_start":
+			if chunk.ToolCall != nil {
+				// Eagerly register external tool calls for re-suspension rounds
+				if s.toolBridge != nil && chunk.EventType == "tool_use" {
+					const mcpPrefix = "mcp__cogos-bridge__"
+					if strings.HasPrefix(chunk.ToolCall.Name, mcpPrefix) {
+						origName := strings.TrimPrefix(chunk.ToolCall.Name, mcpPrefix)
+						s.toolBridge.RegisterCall(sessionID, &ToolBridgeCall{
+							ToolCallID: chunk.ToolCall.ID,
+							Name:       origName,
+							Arguments:  string(chunk.ToolCall.Arguments),
+							ResultCh:   make(chan ToolBridgeResult, 1),
+						})
+					}
+				}
+
+				toolStartChunk := map[string]any{
+					"id":         chunk.ID,
+					"object":     "chat.completion.chunk",
+					"created":    created,
+					"model":      model,
+					"choices":    []any{},
+					"event_type": "tool_call",
+					"tool_call": map[string]any{
+						"id":   chunk.ToolCall.ID,
+						"name": chunk.ToolCall.Name,
+					},
+				}
+				data, _ := json.Marshal(toolStartChunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+			continue
+		case "tool_use_delta":
+			if chunk.ToolCall != nil {
+				toolDeltaChunk := map[string]any{
+					"id":         chunk.ID,
+					"object":     "chat.completion.chunk",
+					"created":    created,
+					"model":      model,
+					"choices":    []any{},
+					"event_type": "tool_call_delta",
+					"tool_call": map[string]any{
+						"arguments": string(chunk.ToolCall.Arguments),
+					},
+				}
+				data, _ := json.Marshal(toolDeltaChunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+			continue
+		}
+
+		// Tool result
+		if chunk.ToolResult != nil {
+			resultChunk := map[string]any{
+				"id":      chunk.ID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []map[string]any{{
+					"index": 0,
+					"delta": map[string]any{
+						"role":    "assistant",
+						"content": nil,
+					},
+					"finish_reason": nil,
+				}},
+				"event_type": "tool_result",
+				"tool_result": map[string]any{
+					"tool_call_id": chunk.ToolResult.ToolCallID,
+					"content":      chunk.ToolResult.Content,
+					"is_error":     chunk.ToolResult.IsError,
+				},
+			}
+			data, _ := json.Marshal(resultChunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+
+		// Content
+		if chunk.Content != "" {
+			accumulatedContent.WriteString(chunk.Content)
+			openAIChunk := &StreamChunk{
+				ID:      chunk.ID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []ChatChoice{{
+					Index: 0,
+					Delta: &ChatMessage{
+						Role:    "assistant",
+						Content: StringToRawContent(chunk.Content),
+					},
+				}},
+			}
+			data, _ := json.Marshal(openAIChunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+
+		// Suspended again — nested tool calls
+		if chunk.Done && chunk.Suspended {
+			log.Printf("[tool-bridge] Re-suspended: %d more external tool calls", len(chunk.ExternalToolCalls))
+			for i, tc := range chunk.ExternalToolCalls {
+				toolCallStart := map[string]any{
+					"id":      chunk.ID,
+					"object":  "chat.completion.chunk",
+					"created": created,
+					"model":   model,
+					"choices": []map[string]any{{
+						"index": 0,
+						"delta": map[string]any{
+							"tool_calls": []map[string]any{{
+								"index": i,
+								"id":    tc.ID,
+								"type":  "function",
+								"function": map[string]any{
+									"name":      tc.Name,
+									"arguments": string(tc.Arguments),
+								},
+							}},
+						},
+					}},
+				}
+				data, _ := json.Marshal(toolCallStart)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+
+			finishChunk := &StreamChunk{
+				ID:      chunk.ID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []ChatChoice{{
+					Index:        0,
+					Delta:        &ChatMessage{},
+					FinishReason: "tool_calls",
+				}},
+			}
+			data, _ := json.Marshal(finishChunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+
+			// Calls were already eagerly registered via tool_use events above.
+			return
+		}
+
+		// Final Done
+		if chunk.Done {
+			var usageInfo *UsageInfo
+			if chunk.Usage != nil {
+				usageInfo = &UsageInfo{
+					PromptTokens:      chunk.Usage.InputTokens,
+					CompletionTokens:  chunk.Usage.OutputTokens,
+					TotalTokens:       chunk.Usage.InputTokens + chunk.Usage.OutputTokens,
+					CacheReadTokens:   chunk.Usage.CacheReadTokens,
+					CacheCreateTokens: chunk.Usage.CacheCreateTokens,
+					CostUSD:           chunk.Usage.CostUSD,
+				}
+			}
+
+			finishReason := chunk.FinishReason
+			if finishReason == "" {
+				finishReason = "stop"
+			}
+			finishChunk := &StreamChunk{
+				ID:      chunk.ID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []ChatChoice{{
+					Index:        0,
+					Delta:        &ChatMessage{},
+					FinishReason: finishReason,
+				}},
+				Usage: usageInfo,
+			}
+			data, _ := json.Marshal(finishChunk)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+
+			if usageInfo != nil {
+				usageChunk := &StreamChunk{
+					ID:      chunk.ID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []ChatChoice{},
+					Usage:   usageInfo,
+				}
+				data, _ = json.Marshal(usageChunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
+
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+
+			// Clean up the bridge session — CLI has exited
+			s.toolBridge.CleanupSession(sessionID)
+			return
+		}
+	}
+
+	// Channel closed unexpectedly
+	s.toolBridge.CleanupSession(sessionID)
 }
 
 // handleRequests handles GET /v1/requests - list in-flight requests
@@ -2876,6 +3589,27 @@ func cmdServeForeground(port int) int {
 
 	server := newServeServer(port, kernel)
 
+	// Initialize OCI auto-reload
+	if root != "" {
+		store := NewOCIStore(root)
+		if err := store.EnsureLayout(); err == nil {
+			server.ociStore = store
+			server.reexecCh = make(chan string, 1)
+			// Use layer digest (binary content) for comparison — manifest digest
+			// changes on every push due to timestamp annotations
+			if d, resolveErr := store.ResolveLayerDigest(context.Background()); resolveErr == nil && d != "" {
+				server.ociDigest = d
+				digestShort := d
+				if len(digestShort) > 23 {
+					digestShort = digestShort[:23]
+				}
+				log.Printf("[oci] auto-reload enabled (current digest: %s)", digestShort)
+			} else {
+				log.Printf("[oci] auto-reload enabled (no artifact yet — push with: make push)")
+			}
+		}
+	}
+
 	// Initialize bus chat event emission if we have a workspace
 	if root != "" {
 		server.busChat = newBusChat(root)
@@ -3079,6 +3813,10 @@ func cmdServeForeground(port int) int {
 	} else if tp != nil {
 		log.Printf("[otel] tracing enabled (endpoint=%s)", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	}
+
+	// Start OCI watcher for auto-reload
+	stopOCIWatch := server.startOCIWatcher()
+	defer stopOCIWatch()
 
 	if err := server.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

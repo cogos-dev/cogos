@@ -26,12 +26,16 @@ type busEventEnvelope struct {
 }
 
 // maxSSEPerBus limits the number of concurrent SSE subscribers per bus.
-// When exceeded, new connections are still allowed but excess old ones are evicted.
-const maxSSEPerBus = 5
+// The openclaw-gateway opens many concurrent EventSource connections
+// (one per UI component, reconnection storm after kernel re-exec), so
+// this must be generous. Localhost-only, no external risk.
+const maxSSEPerBus = 50
 
 // sseIdleTimeout is the maximum duration a subscriber can go without a
 // successful write before it is considered stale and eligible for eviction.
-const sseIdleTimeout = 5 * time.Minute
+// Short timeout helps recover from reconnection storms where old
+// EventSource instances are abandoned without closing.
+const sseIdleTimeout = 2 * time.Minute
 
 // sseSubscriber tracks per-connection metadata for liveness detection.
 type sseSubscriber struct {
@@ -54,7 +58,8 @@ func newBusEventBroker() *busEventBroker {
 
 // subscribe registers a channel to receive events for a given bus.
 // If the bus is at the connection limit, it sweeps stale/dead subscribers
-// before rejecting. Returns false only if the bus is still full after cleanup.
+// first, then evicts the oldest subscriber to make room. New connections
+// always succeed — this prevents any single client from monopolizing all slots.
 func (b *busEventBroker) subscribe(busID string, ch chan *CogBlock, ctx context.Context) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -66,8 +71,9 @@ func (b *busEventBroker) subscribe(busID string, ch chan *CogBlock, ctx context.
 		b.sweepLocked(busID)
 	}
 
+	// If still at limit after sweep, evict the oldest subscriber
 	if len(b.subscribers[busID]) >= maxSSEPerBus {
-		return false
+		b.evictOldestLocked(busID)
 	}
 
 	b.subscribers[busID][ch] = &sseSubscriber{
@@ -107,6 +113,32 @@ func (b *busEventBroker) sweepLocked(busID string) {
 	}
 	if len(subs) == 0 {
 		delete(b.subscribers, busID)
+	}
+}
+
+// evictOldestLocked removes the subscriber with the oldest lastWrite time.
+// Caller must hold b.mu (write lock).
+func (b *busEventBroker) evictOldestLocked(busID string) {
+	subs, ok := b.subscribers[busID]
+	if !ok || len(subs) == 0 {
+		return
+	}
+
+	var oldestCh chan *CogBlock
+	var oldestTime time.Time
+	first := true
+	for ch, sub := range subs {
+		if first || sub.lastWrite.Before(oldestTime) {
+			oldestCh = ch
+			oldestTime = sub.lastWrite
+			first = false
+		}
+	}
+	if oldestCh != nil {
+		delete(subs, oldestCh)
+		close(oldestCh)
+		log.Printf("[bus-stream] evicted oldest SSE subscriber for bus=%s (age=%s)",
+			busID, time.Since(oldestTime).Round(time.Second))
 	}
 }
 
@@ -196,15 +228,10 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteWindow))
 	}
 
-	// Subscribe for live events — check limit BEFORE writing any headers.
-	// Pass request context so the broker can detect dead connections.
+	// Subscribe for live events. If the bus is at capacity, the broker
+	// evicts the oldest subscriber to make room — new connections always succeed.
 	ch := make(chan *CogBlock, 64)
-	if !s.busBroker.subscribe(busID, ch, r.Context()) {
-		w.Header().Set("Retry-After", "5")
-		http.Error(w, "Too many SSE connections for this bus", http.StatusTooManyRequests)
-		log.Printf("[bus-stream] SSE connection rejected for bus=%s (limit=%d, after sweep)", busID, maxSSEPerBus)
-		return
-	}
+	s.busBroker.subscribe(busID, ch, r.Context())
 	defer s.busBroker.unsubscribe(busID, ch)
 
 	// Resolve per-workspace busChat; fall back to server default.
