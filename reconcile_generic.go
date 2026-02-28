@@ -345,12 +345,44 @@ func cmdGenericRefresh(resourceType string, args []string) int {
 	return 0
 }
 
+// ConfigExporter is an optional interface for providers that can generate
+// a declared config file (e.g., config.yaml) from live state.
+// When a provider implements this, `cog snapshot` will export config
+// in addition to refreshing state.
+type ConfigExporter interface {
+	ExportConfig(root string) error
+}
+
 // cmdGenericSnapshot crawls live and writes state for any registered provider.
+// If the provider implements ConfigExporter, also exports a config file.
 func cmdGenericSnapshot(resourceType string, args []string) int {
-	// Snapshot is essentially refresh + config export.
-	// For now, delegate to refresh (state-only). Provider-specific
-	// config export (e.g., generating YAML/HCL) remains in each provider's CLI.
-	fmt.Printf("Running snapshot for %s (state refresh)...\n", resourceType)
+	root, _, err := ResolveWorkspace()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	provider, err := GetProvider(resourceType)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	flagToken, _, _ := parseGenericFlags(args)
+	configureProvider(provider, resourceType, flagToken)
+
+	// If provider supports config export, do it first
+	if exporter, ok := provider.(ConfigExporter); ok {
+		fmt.Printf("Exporting %s config...\n", resourceType)
+		if err := exporter.ExportConfig(root); err != nil {
+			fmt.Fprintf(os.Stderr, "Error exporting config: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Config exported to .cog/config/%s/config.yaml\n", resourceType)
+	}
+
+	// Then refresh state
+	fmt.Printf("Refreshing %s state...\n", resourceType)
 	return cmdGenericRefresh(resourceType, args)
 }
 

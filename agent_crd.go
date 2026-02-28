@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,50 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// ─── Access Control Types ───────────────────────────────────────────────────────
+
+// AgentCRDAccess defines access control for agents and users.
+// Supports both legacy flat format (map[string]string) and the structured format
+// with separate agents/users blocks. The custom UnmarshalYAML detects which
+// shape is present and populates accordingly.
+type AgentCRDAccess struct {
+	// Agent-to-agent permissions (backward-compatible with legacy flat map)
+	Agents map[string]string `yaml:"agents,omitempty"`
+	// Per-user access rules
+	Users map[string]AgentCRDUserAccess `yaml:"users,omitempty"`
+	// Default access level for unlisted users: "none", "ro", "rw", "admin"
+	DefaultLevel string `yaml:"defaultLevel,omitempty"`
+}
+
+// AgentCRDUserAccess defines per-user access to an agent.
+type AgentCRDUserAccess struct {
+	Level       string `yaml:"level"`                 // "admin", "rw", "ro", "none"
+	MemoryScope string `yaml:"memoryScope,omitempty"` // user-specific memory path prefix
+}
+
+// UnmarshalYAML implements custom unmarshaling for AgentCRDAccess.
+// It tries the structured format first (with agents/users/defaultLevel keys),
+// then falls back to the legacy flat map[string]string format where all
+// top-level keys are agent names mapped to permission strings.
+func (a *AgentCRDAccess) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Try structured format first
+	type structured AgentCRDAccess
+	var s structured
+	if err := unmarshal(&s); err == nil && (s.Agents != nil || s.Users != nil || s.DefaultLevel != "") {
+		*a = AgentCRDAccess(s)
+		return nil
+	}
+
+	// Fall back to legacy flat map (agent→permission)
+	var flat map[string]string
+	if err := unmarshal(&flat); err == nil {
+		a.Agents = flat
+		return nil
+	}
+
+	return fmt.Errorf("cannot parse access: expected structured (agents/users/defaultLevel) or flat map[string]string")
+}
 
 // ─── CRD Types ──────────────────────────────────────────────────────────────────
 
@@ -36,7 +81,7 @@ type AgentCRDSpec struct {
 	Identity     AgentCRDIdentity       `yaml:"identity,omitempty"`
 	Context      AgentCRDContext        `yaml:"context,omitempty"`
 	Capabilities AgentCRDCapabilities   `yaml:"capabilities,omitempty"`
-	Access       map[string]string      `yaml:"access,omitempty"` // agent→permission
+	Access       AgentCRDAccess         `yaml:"access,omitempty"`
 	ModelConfig  AgentCRDModelConfig    `yaml:"modelConfig,omitempty"`
 	Runtime      AgentCRDRuntime        `yaml:"runtime,omitempty"`
 	Scheduling   AgentCRDScheduling     `yaml:"scheduling,omitempty"`
@@ -201,7 +246,7 @@ func ListAgentCRDs(root string) ([]AgentCRD, error) {
 func GetAgentCRDToolPolicy(root, agentName string) (*AgentCRDToolPolicyResult, error) {
 	crd, err := LoadAgentCRD(root, agentName)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil // No CRD = no policy = unrestricted
 		}
 		return nil, err

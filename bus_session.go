@@ -13,16 +13,69 @@ import (
 	"time"
 )
 
+// computeBlockHash computes the V2 content-addressed hash for a CogBlock.
+// It hashes the full canonical form: all fields except hash and sig.
+// The canonical form is a JSON object with fields in a deterministic order.
+func computeBlockHash(block *CogBlock) string {
+	canonical := struct {
+		V       int                    `json:"v"`
+		BusID   string                 `json:"bus_id,omitempty"`
+		Seq     int                    `json:"seq,omitempty"`
+		Ts      string                 `json:"ts"`
+		From    string                 `json:"from"`
+		To      string                 `json:"to,omitempty"`
+		Type    string                 `json:"type"`
+		Payload map[string]interface{} `json:"payload"`
+		Prev    []string               `json:"prev,omitempty"`
+		Merkle  string                 `json:"merkle,omitempty"`
+		Size    int                    `json:"size,omitempty"`
+	}{
+		V: block.V, BusID: block.BusID, Seq: block.Seq,
+		Ts: block.Ts, From: block.From, To: block.To,
+		Type: block.Type, Payload: block.Payload,
+		Prev: block.Prev, Merkle: block.Merkle, Size: block.Size,
+	}
+	data, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// busEventHandler is a named handler for bus events (CogBlocks).
+type busEventHandler struct {
+	name    string
+	handler func(busID string, block *CogBlock)
+}
+
 // busSessionManager manages CogBus operations for the chat pipeline.
 // It handles bus creation, event appending, and reading event history.
 type busSessionManager struct {
 	mu            sync.Mutex
 	workspaceRoot string
-	onEvent       func(busID string, evt *BusEventData) // optional callback for SSE broadcast
+	eventHandlers []busEventHandler // named handler list
 }
 
 func newBusSessionManager(root string) *busSessionManager {
 	return &busSessionManager{workspaceRoot: root}
+}
+
+// AddEventHandler registers a named handler for bus events.
+// Handlers are called in registration order when a bus event is appended.
+func (m *busSessionManager) AddEventHandler(name string, fn func(busID string, block *CogBlock)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventHandlers = append(m.eventHandlers, busEventHandler{name: name, handler: fn})
+}
+
+// RemoveEventHandler removes a named handler by name.
+func (m *busSessionManager) RemoveEventHandler(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, h := range m.eventHandlers {
+		if h.name == name {
+			m.eventHandlers = append(m.eventHandlers[:i], m.eventHandlers[i+1:]...)
+			return
+		}
+	}
 }
 
 // busesDir returns the path to the buses state directory.
@@ -127,57 +180,76 @@ func (m *busSessionManager) saveRegistry(entries []busRegistryEntry) error {
 	return os.WriteFile(m.registryPath(), data, 0644)
 }
 
-// appendBusEvent appends a new event to a bus's event chain.
-// It computes the hash chain: hash = sha256(prevHash + json(event)).
-func (m *busSessionManager) appendBusEvent(busID, eventType, from string, payload map[string]interface{}) (*BusEventData, error) {
+// appendBusEvent appends a new CogBlock to a bus's event chain.
+// V2 blocks hash the full canonical envelope (all fields except hash and sig).
+// Both prev ([]string) and prev_hash (string) are written for V1 compat.
+// Handlers are dispatched asynchronously to prevent re-entrant deadlocks
+// and event loops (a handler that calls appendBusEvent would otherwise
+// block or corrupt seq numbers).
+func (m *busSessionManager) appendBusEvent(busID, eventType, from string, payload map[string]interface{}) (*CogBlock, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Read last event to get seq and prevHash
 	lastSeq, lastHash := m.getLastEvent(busID)
 	newSeq := lastSeq + 1
 
-	evt := BusEventData{
-		V:        1,
+	// Build V2 block with both Prev (array) and PrevHash (string) for transition compat
+	var prev []string
+	if lastHash != "" {
+		prev = []string{lastHash}
+	}
+
+	evt := CogBlock{
+		V:        2,
 		BusID:    busID,
 		Seq:      newSeq,
 		Ts:       time.Now().UTC().Format(time.RFC3339Nano),
 		From:     from,
 		Type:     eventType,
 		Payload:  payload,
-		PrevHash: lastHash,
+		Prev:     prev,
+		PrevHash: lastHash, // V1 compat — written alongside Prev during transition
 	}
 
-	// Compute hash: sha256(prevHash + json(payload))
-	hashInput := evt.PrevHash
-	payloadBytes, _ := json.Marshal(evt.Payload)
-	hashInput += string(payloadBytes)
-	h := sha256.Sum256([]byte(hashInput))
-	evt.Hash = hex.EncodeToString(h[:])
+	// V2: hash full canonical form (all fields except hash and sig)
+	evt.Hash = computeBlockHash(&evt)
 
 	// Append to events file
 	line, err := json.Marshal(evt)
 	if err != nil {
+		m.mu.Unlock()
 		return nil, fmt.Errorf("marshal event: %w", err)
 	}
 
 	eventsFile := m.eventsPath(busID)
 	f, err := os.OpenFile(eventsFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
+		m.mu.Unlock()
 		return nil, fmt.Errorf("open events file: %w", err)
 	}
-	defer f.Close()
 
 	if _, err := f.WriteString(string(line) + "\n"); err != nil {
+		f.Close()
+		m.mu.Unlock()
 		return nil, fmt.Errorf("write event: %w", err)
 	}
+	f.Close()
 
 	// Update registry
 	m.updateRegistrySeq(busID, newSeq, evt.Ts)
 
-	// Notify SSE subscribers
-	if m.onEvent != nil {
-		m.onEvent(busID, &evt)
+	// Snapshot handlers while locked, then release BEFORE dispatching.
+	// This prevents deadlocks when handlers call appendBusEvent (e.g. tool
+	// router posting tool.result in response to tool.invoke).
+	handlers := make([]busEventHandler, len(m.eventHandlers))
+	copy(handlers, m.eventHandlers)
+	m.mu.Unlock()
+
+	// Dispatch handlers outside the lock — safe because each handler
+	// that needs to write back to the bus will re-acquire the lock via
+	// its own appendBusEvent call with a fresh seq number.
+	for _, h := range handlers {
+		h.handler(busID, &evt)
 	}
 
 	return &evt, nil
@@ -206,11 +278,11 @@ func (m *busSessionManager) getLastEvent(busID string) (int, string) {
 		return 0, ""
 	}
 
-	var evt BusEventData
-	if err := json.Unmarshal([]byte(lastLine), &evt); err != nil {
+	var block CogBlock
+	if err := json.Unmarshal([]byte(lastLine), &block); err != nil {
 		return 0, ""
 	}
-	return evt.Seq, evt.Hash
+	return block.Seq, block.Hash
 }
 
 // updateRegistrySeq updates the last event seq/timestamp in the registry.
@@ -230,7 +302,7 @@ func (m *busSessionManager) updateRegistrySeq(busID string, seq int, ts string) 
 }
 
 // readBusEvents reads all events from a bus.
-func (m *busSessionManager) readBusEvents(busID string) ([]BusEventData, error) {
+func (m *busSessionManager) readBusEvents(busID string) ([]CogBlock, error) {
 	eventsFile := m.eventsPath(busID)
 	f, err := os.Open(eventsFile)
 	if err != nil {
@@ -241,7 +313,7 @@ func (m *busSessionManager) readBusEvents(busID string) ([]BusEventData, error) 
 	}
 	defer f.Close()
 
-	var events []BusEventData
+	var events []CogBlock
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 	seen := make(map[int]bool)
@@ -251,15 +323,15 @@ func (m *busSessionManager) readBusEvents(busID string) ([]BusEventData, error) 
 		if line == "" {
 			continue
 		}
-		var evt BusEventData
-		if err := json.Unmarshal([]byte(line), &evt); err != nil {
+		var block CogBlock
+		if err := json.Unmarshal([]byte(line), &block); err != nil {
 			continue
 		}
-		if seen[evt.Seq] {
+		if seen[block.Seq] {
 			continue
 		}
-		seen[evt.Seq] = true
-		events = append(events, evt)
+		seen[block.Seq] = true
+		events = append(events, block)
 	}
 
 	return events, nil
@@ -274,10 +346,10 @@ func (m *busSessionManager) busEventsToMessages(busID string, maxHistory int) ([
 	}
 
 	// Filter to chat events only
-	var chatEvents []BusEventData
+	var chatEvents []CogBlock
 	for _, evt := range events {
 		switch evt.Type {
-		case "chat.request", "chat.response":
+		case BlockChatRequest, BlockChatResponse:
 			chatEvents = append(chatEvents, evt)
 		}
 	}
@@ -286,7 +358,7 @@ func (m *busSessionManager) busEventsToMessages(busID string, maxHistory int) ([
 	if maxHistory > 0 {
 		requestCount := 0
 		for i := len(chatEvents) - 1; i >= 0; i-- {
-			if chatEvents[i].Type == "chat.request" {
+			if chatEvents[i].Type == BlockChatRequest {
 				requestCount++
 			}
 			if requestCount > maxHistory {
@@ -306,9 +378,9 @@ func (m *busSessionManager) busEventsToMessages(busID string, maxHistory int) ([
 
 		var role string
 		switch evt.Type {
-		case "chat.request":
+		case BlockChatRequest:
 			role = "user"
-		case "chat.response":
+		case BlockChatResponse:
 			role = "assistant"
 		default:
 			continue
@@ -341,31 +413,43 @@ func (m *busSessionManager) listChatBuses() []busRegistryEntry {
 
 // resetBus archives the current event chain and starts fresh.
 func (m *busSessionManager) resetBus(busID string) error {
+	archiveName, err := m.archiveBus(busID)
+	if err != nil {
+		return err
+	}
+
+	// Write a chat.reset event as the genesis of the new chain.
+	// appendBusEvent manages its own locking, so call outside any lock.
+	_, err = m.appendBusEvent(busID, BlockChatReset, "kernel:cogos", map[string]interface{}{
+		"reason":  "manual_reset",
+		"archive": archiveName,
+	})
+	return err
+}
+
+// archiveBus does the locked portion of resetBus: archive + registry update.
+func (m *busSessionManager) archiveBus(busID string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	eventsFile := m.eventsPath(busID)
 
-	// Check if events file exists
 	if _, err := os.Stat(eventsFile); os.IsNotExist(err) {
-		return fmt.Errorf("bus %s not found", busID)
+		return "", fmt.Errorf("bus %s not found", busID)
 	}
 
-	// Archive current events
 	archiveName := fmt.Sprintf("events.jsonl.%d.bak", time.Now().Unix())
 	archivePath := filepath.Join(m.busesDir(), busID, archiveName)
 	if err := os.Rename(eventsFile, archivePath); err != nil {
-		return fmt.Errorf("archive events: %w", err)
+		return "", fmt.Errorf("archive events: %w", err)
 	}
 
-	// Create fresh events file
 	f, err := os.Create(eventsFile)
 	if err != nil {
-		return fmt.Errorf("create fresh events file: %w", err)
+		return "", fmt.Errorf("create fresh events file: %w", err)
 	}
 	f.Close()
 
-	// Update registry
 	registry := m.loadRegistry()
 	for i, entry := range registry {
 		if entry.BusID == busID {
@@ -379,13 +463,5 @@ func (m *busSessionManager) resetBus(busID string) error {
 		log.Printf("[bus] failed to update registry after reset: %v", err)
 	}
 
-	// Write a chat.reset event as the genesis of the new chain
-	m.mu.Unlock() // appendBusEvent re-acquires the lock
-	_, err = m.appendBusEvent(busID, "chat.reset", "kernel:cogos", map[string]interface{}{
-		"reason":  "manual_reset",
-		"archive": archiveName,
-	})
-	m.mu.Lock() // re-acquire for deferred unlock
-
-	return err
+	return archiveName, nil
 }

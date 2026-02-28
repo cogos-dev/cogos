@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -16,38 +17,108 @@ import (
 )
 
 // busEventEnvelope is the SSE envelope format expected by OpenClaw's CogBus monitor.
-// Format: {"id":"...","type":"bus.event","timestamp":"...","data":{...BusEventData...}}
+// Format: {"id":"...","type":"bus.event","timestamp":"...","data":{...CogBlock...}}
 type busEventEnvelope struct {
 	ID        string        `json:"id"`
 	Type      string        `json:"type"`
 	Timestamp string        `json:"timestamp"`
-	Data      *BusEventData `json:"data"`
+	Data      *CogBlock `json:"data"`
+}
+
+// maxSSEPerBus limits the number of concurrent SSE subscribers per bus.
+// When exceeded, new connections are still allowed but excess old ones are evicted.
+const maxSSEPerBus = 5
+
+// sseIdleTimeout is the maximum duration a subscriber can go without a
+// successful write before it is considered stale and eligible for eviction.
+const sseIdleTimeout = 5 * time.Minute
+
+// sseSubscriber tracks per-connection metadata for liveness detection.
+type sseSubscriber struct {
+	ch        chan *CogBlock
+	ctx       context.Context // request context — Done() when client disconnects
+	lastWrite time.Time       // last successful event/heartbeat write
 }
 
 // busEventBroker manages SSE subscribers for real-time bus event delivery.
 type busEventBroker struct {
 	mu          sync.RWMutex
-	subscribers map[string]map[chan *BusEventData]struct{} // busID -> set of channels
+	subscribers map[string]map[chan *CogBlock]*sseSubscriber // busID -> channel -> subscriber
 }
 
 func newBusEventBroker() *busEventBroker {
 	return &busEventBroker{
-		subscribers: make(map[string]map[chan *BusEventData]struct{}),
+		subscribers: make(map[string]map[chan *CogBlock]*sseSubscriber),
 	}
 }
 
 // subscribe registers a channel to receive events for a given bus.
-func (b *busEventBroker) subscribe(busID string, ch chan *BusEventData) {
+// If the bus is at the connection limit, it sweeps stale/dead subscribers
+// before rejecting. Returns false only if the bus is still full after cleanup.
+func (b *busEventBroker) subscribe(busID string, ch chan *CogBlock, ctx context.Context) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.subscribers[busID] == nil {
-		b.subscribers[busID] = make(map[chan *BusEventData]struct{})
+		b.subscribers[busID] = make(map[chan *CogBlock]*sseSubscriber)
 	}
-	b.subscribers[busID][ch] = struct{}{}
+
+	if len(b.subscribers[busID]) >= maxSSEPerBus {
+		b.sweepLocked(busID)
+	}
+
+	if len(b.subscribers[busID]) >= maxSSEPerBus {
+		return false
+	}
+
+	b.subscribers[busID][ch] = &sseSubscriber{
+		ch:        ch,
+		ctx:       ctx,
+		lastWrite: time.Now(),
+	}
+	return true
+}
+
+// sweepLocked removes dead or idle subscribers for a bus.
+// Caller must hold b.mu (write lock).
+func (b *busEventBroker) sweepLocked(busID string) {
+	subs, ok := b.subscribers[busID]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	for ch, sub := range subs {
+		dead := false
+		// Check if the client's request context has been cancelled.
+		select {
+		case <-sub.ctx.Done():
+			dead = true
+		default:
+		}
+		// Check idle timeout — no write in sseIdleTimeout.
+		if !dead && now.Sub(sub.lastWrite) > sseIdleTimeout {
+			dead = true
+		}
+		if dead {
+			log.Printf("[bus-stream] evicting stale SSE subscriber for bus=%s (lastWrite=%s ago)",
+				busID, now.Sub(sub.lastWrite).Round(time.Second))
+			delete(subs, ch)
+			close(ch)
+		}
+	}
+	if len(subs) == 0 {
+		delete(b.subscribers, busID)
+	}
+}
+
+// subscriberCount returns the number of active subscribers for a bus.
+func (b *busEventBroker) subscriberCount(busID string) int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subscribers[busID])
 }
 
 // unsubscribe removes a channel from a bus's subscriber set.
-func (b *busEventBroker) unsubscribe(busID string, ch chan *BusEventData) {
+func (b *busEventBroker) unsubscribe(busID string, ch chan *CogBlock) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if subs, ok := b.subscribers[busID]; ok {
@@ -58,8 +129,19 @@ func (b *busEventBroker) unsubscribe(busID string, ch chan *BusEventData) {
 	}
 }
 
+// touchWrite updates the lastWrite timestamp for a subscriber.
+func (b *busEventBroker) touchWrite(busID string, ch chan *CogBlock) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if subs, ok := b.subscribers[busID]; ok {
+		if sub, ok := subs[ch]; ok {
+			sub.lastWrite = time.Now()
+		}
+	}
+}
+
 // publish sends an event to all subscribers of a bus. Non-blocking: drops if channel full.
-func (b *busEventBroker) publish(busID string, evt *BusEventData) {
+func (b *busEventBroker) publish(busID string, evt *CogBlock) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	subs, ok := b.subscribers[busID]
@@ -114,6 +196,17 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteWindow))
 	}
 
+	// Subscribe for live events — check limit BEFORE writing any headers.
+	// Pass request context so the broker can detect dead connections.
+	ch := make(chan *CogBlock, 64)
+	if !s.busBroker.subscribe(busID, ch, r.Context()) {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "Too many SSE connections for this bus", http.StatusTooManyRequests)
+		log.Printf("[bus-stream] SSE connection rejected for bus=%s (limit=%d, after sweep)", busID, maxSSEPerBus)
+		return
+	}
+	defer s.busBroker.unsubscribe(busID, ch)
+
 	// Resolve per-workspace busChat; fall back to server default.
 	busChat := s.busChat
 	if ws := workspaceFromRequest(r); ws != nil && ws.busChat != nil {
@@ -156,18 +249,13 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Subscribe for live events
-	ch := make(chan *BusEventData, 64)
-	s.busBroker.subscribe(busID, ch)
-	defer s.busBroker.unsubscribe(busID, ch)
-
 	// Keep-alive ticker (30s heartbeat)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	ctx := r.Context()
 
-	log.Printf("[bus-stream] SSE client connected for bus=%s", busID)
+	log.Printf("[bus-stream] SSE client connected for bus=%s (active=%d)", busID, s.busBroker.subscriberCount(busID))
 
 	for {
 		select {
@@ -189,6 +277,7 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 			extendDeadline()
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
+			s.busBroker.touchWrite(busID, ch)
 
 		case <-ticker.C:
 			// SSE comment keep-alive — prevents proxy/client timeout without
@@ -196,6 +285,7 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 			extendDeadline()
 			fmt.Fprintf(w, ": keep-alive\n\n")
 			flusher.Flush()
+			s.busBroker.touchWrite(busID, ch)
 		}
 	}
 }
@@ -237,7 +327,7 @@ func (s *serveServer) handleBusEventsREST(w http.ResponseWriter, r *http.Request
 	}
 
 	if events == nil {
-		events = []BusEventData{}
+		events = []CogBlock{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

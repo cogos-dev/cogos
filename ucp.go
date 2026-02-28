@@ -90,6 +90,16 @@ type UCPHistory struct {
 	ParentMessageID   *string `json:"parent_message_id,omitempty"`
 }
 
+// UCPUser represents the X-UCP-User header — identifies the human driving the request.
+// Distinct from UCPIdentity which identifies the agent.
+type UCPUser struct {
+	Version     string `json:"version"`
+	ID          string `json:"id"`                        // CogOS user ID (canonical)
+	DiscordID   string `json:"discord_id,omitempty"`      // Discord snowflake ID
+	DisplayName string `json:"display_name,omitempty"`    // Human-readable display name
+	Source      string `json:"source,omitempty"`           // Origin platform: discord, telegram, web, etc.
+}
+
 // UCPWorkspace represents the X-UCP-Workspace header
 type UCPWorkspace struct {
 	Version      string            `json:"version"`
@@ -115,6 +125,7 @@ type UCPContext struct {
 	Memory    *UCPMemory    `json:"memory,omitempty"`
 	History   *UCPHistory   `json:"history,omitempty"`
 	Workspace *UCPWorkspace `json:"workspace,omitempty"`
+	User      *UCPUser      `json:"user,omitempty"`
 }
 
 // === SCHEMA VALIDATION ===
@@ -134,6 +145,7 @@ func loadUCPSchemas(workspaceRoot string) error {
 		"memory":    "ucp-memory-v1.schema.json",
 		"history":   "ucp-history-v1.schema.json",
 		"workspace": "ucp-workspace-v1.schema.json",
+		"user":      "ucp-user-v1.schema.json",
 	}
 
 	compiler := jsonschema.NewCompiler()
@@ -262,6 +274,18 @@ func parseUCPHeaders(r *http.Request, workspaceRoot string) (*UCPContext, error)
 			return nil, fmt.Errorf("failed to parse X-UCP-Workspace: %w", err)
 		}
 		ctx.Workspace = &workspace
+	}
+
+	// Parse X-UCP-User (human identity, distinct from agent identity)
+	if userJSON := r.Header.Get("X-UCP-User"); userJSON != "" {
+		if err := validateUCPPacket("user", []byte(userJSON), workspaceRoot); err != nil {
+			return nil, fmt.Errorf("invalid X-UCP-User: %w", err)
+		}
+		var user UCPUser
+		if err := json.Unmarshal([]byte(userJSON), &user); err != nil {
+			return nil, fmt.Errorf("failed to parse X-UCP-User: %w", err)
+		}
+		ctx.User = &user
 	}
 
 	return ctx, nil

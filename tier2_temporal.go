@@ -724,9 +724,9 @@ func readRecentExchanges(busesDir, busID string, charBudget, maxMsgChars int) []
 
 		var role string
 		switch evt.Type {
-		case "chat.request":
+		case BlockChatRequest:
 			role = "user"
-		case "chat.response":
+		case BlockChatResponse:
 			role = "assistant"
 		default:
 			continue

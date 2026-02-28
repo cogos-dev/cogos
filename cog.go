@@ -5678,6 +5678,20 @@ func main() {
 		code = cmdWatch(os.Args[2:])
 	case "reconcile":
 		code = cmdReconcile(os.Args[2:])
+	case "node":
+		if err := cmdNode(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			code = 1
+		}
+	case "bus":
+		code = cmdBus(os.Args[2:])
+	case "channel":
+		code = cmdChannel(os.Args[2:])
+	case "cluster":
+		if err := cmdCluster(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			code = 1
+		}
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":

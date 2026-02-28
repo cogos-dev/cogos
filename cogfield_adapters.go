@@ -1,4 +1,4 @@
-// cogfield_adapters.go - CogBlock adapter layer for CogField
+// cogfield_adapters.go - GraphBlock adapter layer for CogField
 //
 // Defines the BlockAdapter interface and implementations for bus and session
 // data sources. Each adapter can produce summary nodes for the main graph
@@ -20,9 +20,9 @@ import (
 	"strings"
 )
 
-// CogBlock is the intermediate representation from ADR-059.
-// Adapters convert their native data into CogBlocks for graph rendering.
-type CogBlock struct {
+// GraphBlock is the intermediate representation for CogField graph rendering.
+// Adapters convert their native data into GraphBlocks for visualization.
+type GraphBlock struct {
 	URI      string                 // cog://bus/{busID}/{seq}
 	Type     string                 // bus.message, session.turn, etc.
 	From     string
@@ -59,8 +59,8 @@ type BlockTypeConfig struct {
 // adapters is the registry of all block adapters.
 var adapters = []BlockAdapter{&BusAdapter{}, &SessionAdapter{}, &ComponentAdapter{}, &SignalAdapter{}, &ReconcileAdapter{}}
 
-// cogBlockToNode converts a CogBlock into a CogFieldNode for graph rendering.
-func cogBlockToNode(block CogBlock) CogFieldNode {
+// graphBlockToNode converts a GraphBlock into a CogFieldNode for graph rendering.
+func graphBlockToNode(block GraphBlock) CogFieldNode {
 	// Map type prefix to sector
 	sector := "sessions"
 	if strings.HasPrefix(block.Type, "bus.") {
@@ -158,7 +158,7 @@ func (a *BusAdapter) ExpandNode(root, nodeID string) ([]CogFieldNode, []CogField
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 
-	var blocks []CogBlock
+	var blocks []GraphBlock
 	seen := make(map[int]bool)
 
 	for scanner.Scan() {
@@ -166,7 +166,7 @@ func (a *BusAdapter) ExpandNode(root, nodeID string) ([]CogFieldNode, []CogField
 		if line == "" {
 			continue
 		}
-		var evt BusEventData
+		var evt CogBlock
 		if err := json.Unmarshal([]byte(line), &evt); err != nil {
 			continue
 		}
@@ -175,7 +175,7 @@ func (a *BusAdapter) ExpandNode(root, nodeID string) ([]CogFieldNode, []CogField
 		}
 		seen[evt.Seq] = true
 
-		blocks = append(blocks, busEventToCogBlock(busID, evt))
+		blocks = append(blocks, busEventToGraphBlock(busID, evt))
 	}
 
 	if len(blocks) == 0 {
@@ -186,7 +186,7 @@ func (a *BusAdapter) ExpandNode(root, nodeID string) ([]CogFieldNode, []CogField
 	var edges []CogFieldEdge
 
 	for i, block := range blocks {
-		node := cogBlockToNode(block)
+		node := graphBlockToNode(block)
 		nodes = append(nodes, node)
 
 		if i == 0 {
@@ -213,23 +213,23 @@ func (a *BusAdapter) ExpandNode(root, nodeID string) ([]CogFieldNode, []CogField
 	return nodes, edges, nil
 }
 
-// busEventToCogBlock converts a BusEventData into a CogBlock.
-func busEventToCogBlock(busID string, evt BusEventData) CogBlock {
+// busEventToGraphBlock converts a CogBlock into a GraphBlock for CogField visualization.
+func busEventToGraphBlock(busID string, evt CogBlock) GraphBlock {
 	blockType := "bus.message"
 	switch evt.Type {
 	case "open", "bus.open":
 		blockType = "bus.open"
 	case "close", "bus.close":
 		blockType = "bus.close"
-	case "chat.request":
+	case BlockChatRequest:
 		blockType = "bus.chat_request"
-	case "chat.response":
+	case BlockChatResponse:
 		blockType = "bus.chat_response"
-	case "chat.error":
+	case BlockChatError:
 		blockType = "bus.chat_error"
 	}
 
-	return CogBlock{
+	return GraphBlock{
 		URI:      fmt.Sprintf("bus:%s:%d", busID, evt.Seq),
 		Type:     blockType,
 		From:     evt.From,

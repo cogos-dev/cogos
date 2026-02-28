@@ -182,6 +182,10 @@ type InferenceRequest struct {
 	OpenClawToken string // Auth token for OpenClaw
 	SessionID     string // Session context for tool execution
 
+	// User identity (propagated from UCP or OpenClaw headers)
+	UserID   string // Canonical user ID (e.g., "chaz")
+	UserName string // Display name (e.g., "Chaz")
+
 	// Retry configuration
 	MaxRetries int           // Max retry attempts (0 = use default)
 	Timeout    time.Duration // Request timeout (0 = use default)
@@ -656,11 +660,17 @@ func cmdInfer(args []string) int {
 	// Emit chat.request event (before context construction so it appears in bus history)
 	var busID string
 	var requestSeq int
+	var requestHash string
 	if bc != nil {
-		var reqEvt *BusEventData
-		busID, reqEvt, _ = bc.emitRequest(sessionID, prompt, origin)
+		var reqEvt *CogBlock
+		busID, reqEvt, _ = bc.emitRequest(ChatRequestOpts{
+			SessionID: sessionID,
+			Content:   prompt,
+			Origin:    origin,
+		})
 		if reqEvt != nil {
 			requestSeq = reqEvt.Seq
+			requestHash = reqEvt.Hash
 		}
 	}
 
@@ -688,14 +698,30 @@ func cmdInfer(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		if bc != nil && busID != "" {
-			bc.emitError(busID, requestSeq, err.Error(), "inference_error")
+			bc.emitError(ChatErrorOpts{
+				BusID:        busID,
+				RequestSeq:   requestSeq,
+				RequestHash:  requestHash,
+				ErrorMessage: err.Error(),
+				ErrorType:    "inference_error",
+				Model:        model,
+			})
 		}
 		return 1
 	}
 
 	// Emit chat.response event so next invocation sees this exchange
 	if bc != nil && busID != "" && resp.Content != "" {
-		bc.emitResponse(busID, requestSeq, resp.Content, model, 0, 0)
+		bc.emitResponse(ChatResponseOpts{
+			BusID:            busID,
+			RequestSeq:       requestSeq,
+			Content:          resp.Content,
+			Model:            model,
+			RequestHash:      requestHash,
+			PromptTokens:     resp.PromptTokens,
+			CompletionTokens: resp.CompletionTokens,
+			FinishReason:     resp.FinishReason,
+		})
 	}
 
 	// Output result

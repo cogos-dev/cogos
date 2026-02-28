@@ -14,19 +14,30 @@ import (
 	"strings"
 )
 
-// BusEventData represents a single event in the bus hash chain
-type BusEventData struct {
+// CogBlock is the canonical content atom for the CogOS bus protocol (ADR-059).
+// V1 blocks use PrevHash (string); V2 blocks use Prev ([]string) for DAG-style linking.
+// Both fields are written during the transition period for backward compatibility.
+type CogBlock struct {
 	V        int                    `json:"v"`
-	BusID    string                 `json:"bus_id"`
-	Seq      int                    `json:"seq"`
+	ID       string                 `json:"id,omitempty"`
+	BusID    string                 `json:"bus_id,omitempty"`
+	Seq      int                    `json:"seq,omitempty"`
 	Ts       string                 `json:"ts"`
 	From     string                 `json:"from"`
 	To       string                 `json:"to,omitempty"`
 	Type     string                 `json:"type"`
 	Payload  map[string]interface{} `json:"payload"`
-	PrevHash string                 `json:"prev_hash"`
+	Prev     []string               `json:"prev,omitempty"`
+	PrevHash string                 `json:"prev_hash,omitempty"` // V1 compat — written alongside Prev during transition
 	Hash     string                 `json:"hash"`
+	Merkle   string                 `json:"merkle,omitempty"`
+	Sig      string                 `json:"sig,omitempty"`
+	Size     int                    `json:"size,omitempty"`
 }
+
+// BusEventData is a backward-compatible alias for CogBlock.
+// Existing code can continue using BusEventData until fully migrated.
+type BusEventData = CogBlock
 
 // BusDetail is the response for GET /api/cogfield/buses/{id}
 type BusDetail struct {
@@ -36,7 +47,7 @@ type BusDetail struct {
 	Created      string         `json:"created"`
 	Modified     string         `json:"modified"`
 	EventCount   int            `json:"event_count"`
-	Events       []BusEventData `json:"events"`
+	Events       []CogBlock     `json:"events"`
 }
 
 // handleBusDetail handles GET /api/cogfield/buses/{id}
@@ -105,7 +116,7 @@ func loadBusDetail(root, busID string) (*BusDetail, error) {
 
 	// Read events
 	eventsPath := filepath.Join(busesDir, busID, "events.jsonl")
-	events := make([]BusEventData, 0)
+	events := make([]CogBlock, 0)
 
 	f, err := os.Open(eventsPath)
 	if err == nil {
@@ -118,15 +129,15 @@ func loadBusDetail(root, busID string) (*BusDetail, error) {
 			if line == "" {
 				continue
 			}
-			var evt BusEventData
-			if err := json.Unmarshal([]byte(line), &evt); err != nil {
+			var block CogBlock
+			if err := json.Unmarshal([]byte(line), &block); err != nil {
 				continue
 			}
-			if seen[evt.Seq] {
+			if seen[block.Seq] {
 				continue
 			}
-			seen[evt.Seq] = true
-			events = append(events, evt)
+			seen[block.Seq] = true
+			events = append(events, block)
 		}
 		f.Close()
 	}

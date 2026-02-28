@@ -1574,6 +1574,9 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		if ucpContext.Workspace != nil {
 			packets = append(packets, "workspace")
 		}
+		if ucpContext.User != nil {
+			packets = append(packets, "user")
+		}
 		if len(packets) > 0 {
 			log.Printf("[UCP] Request with %d packets: %v", len(packets), packets)
 		}
@@ -1735,15 +1738,43 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	// Emit bus chat.request event (side-effect for CogField visibility)
 	var busID string
 	var requestSeq int
+	var requestHash string
 	if s.busChat != nil && sessionID != "" {
-		var reqEvt *BusEventData
 		origin := r.Header.Get("X-Origin")
 		if origin == "" {
 			origin = "http"
 		}
-		busID, reqEvt, _ = s.busChat.emitRequest(sessionID, userPrompt.String(), origin)
+
+		reqOpts := ChatRequestOpts{
+			SessionID: sessionID,
+			Content:   userPrompt.String(),
+			Origin:    origin,
+			Model:     req.Model,
+			Stream:    req.Stream,
+		}
+		// Identity from UCP or fallback headers
+		if ucpContext != nil && ucpContext.User != nil {
+			reqOpts.UserID = ucpContext.User.ID
+			reqOpts.UserName = ucpContext.User.DisplayName
+		} else {
+			reqOpts.UserID = r.Header.Get("X-OpenClaw-User-ID")
+			reqOpts.UserName = r.Header.Get("X-OpenClaw-User-Name")
+		}
+		if ucpContext != nil && ucpContext.Identity != nil {
+			reqOpts.AgentName = ucpContext.Identity.Name
+		}
+		// OTEL trace context from headers
+		reqOpts.TraceID = r.Header.Get("X-Trace-ID")
+		reqOpts.SpanID = r.Header.Get("X-Span-ID")
+		// TAA context
+		reqOpts.HasTAA = taaEnabled
+		reqOpts.TAAProfile = taaProfile
+
+		var reqEvt *CogBlock
+		busID, reqEvt, _ = s.busChat.emitRequest(reqOpts)
 		if reqEvt != nil {
 			requestSeq = reqEvt.Seq
+			requestHash = reqEvt.Hash
 		}
 	}
 
@@ -1817,6 +1848,38 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		inferReq.SessionID = sessionID // Use already-resolved session ID from earlier parsing
 	}
 
+	// Extract user identity from UCP or OpenClaw fallback headers.
+	// Priority: X-UCP-User header > X-OpenClaw-User-ID / X-OpenClaw-User-Name fallback
+	if ucpContext != nil && ucpContext.User != nil {
+		inferReq.UserID = ucpContext.User.ID
+		inferReq.UserName = ucpContext.User.DisplayName
+		log.Printf("[UCP] User identity: id=%s name=%s source=%s",
+			ucpContext.User.ID, ucpContext.User.DisplayName, ucpContext.User.Source)
+	} else {
+		// Fallback: OpenClaw sends user identity via simpler headers
+		if userID := r.Header.Get("X-OpenClaw-User-ID"); userID != "" {
+			inferReq.UserID = userID
+		}
+		if userName := r.Header.Get("X-OpenClaw-User-Name"); userName != "" {
+			inferReq.UserName = userName
+		}
+		if inferReq.UserID != "" {
+			log.Printf("[UCP] User identity (fallback headers): id=%s name=%s",
+				inferReq.UserID, inferReq.UserName)
+		}
+	}
+
+	// Wire user memory scope if we have a user identity and an agent CRD
+	if inferReq.UserID != "" && ucpContext != nil && ucpContext.Identity != nil {
+		agentName := strings.ToLower(ucpContext.Identity.Name)
+		if crd, err := LoadAgentCRD(workspaceRoot, agentName); err == nil {
+			if scope := BuildUserScope(crd, inferReq.UserID); scope != nil {
+				log.Printf("[memory-scope] user=%s agent=%s level=%s scope=%s",
+					inferReq.UserID, agentName, scope.Level, scope.UserScope)
+			}
+		}
+	}
+
 	// Set UCP response headers if UCP was used
 	if ucpContext != nil {
 		if err := setUCPResponseHeaders(w, ucpContext); err != nil {
@@ -1824,16 +1887,35 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	// Collect bus enrichment context for response/error handlers
+	bctx := busEventCtx{
+		BusID:       busID,
+		RequestSeq:  requestSeq,
+		RequestHash: requestHash,
+		TraceID:     r.Header.Get("X-Trace-ID"),
+		SpanID:      r.Header.Get("X-Span-ID"),
+	}
+
 	// Handle streaming vs non-streaming
 	startTime := time.Now()
 	if req.Stream {
-		s.handleStreamingResponse(w, inferReq, sessionID, busID, requestSeq, startTime)
+		s.handleStreamingResponse(w, inferReq, sessionID, bctx, startTime)
 	} else {
-		s.handleNonStreamingResponse(w, inferReq, sessionID, busID, requestSeq, startTime)
+		s.handleNonStreamingResponse(w, inferReq, sessionID, bctx, startTime)
 	}
 }
 
-func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID, busID string, requestSeq int, startTime time.Time) {
+// busEventCtx carries enrichment fields from the HTTP handler into streaming/non-streaming
+// response handlers for bus event emission. Avoids threading the full *http.Request.
+type busEventCtx struct {
+	BusID       string
+	RequestSeq  int
+	RequestHash string
+	TraceID     string
+	SpanID      string
+}
+
+func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID string, bctx busEventCtx, startTime time.Time) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1893,6 +1975,20 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 	chunks, err := HarnessRunInferenceStream(inferReq, GlobalRegistry)
 	if err != nil {
 		s.writeSSEError(w, flusher, "Failed to start inference: "+err.Error())
+		if s.busChat != nil && bctx.BusID != "" {
+			s.busChat.emitError(ChatErrorOpts{
+				BusID:        bctx.BusID,
+				RequestSeq:   bctx.RequestSeq,
+				RequestHash:  bctx.RequestHash,
+				ErrorMessage: err.Error(),
+				ErrorType:    "inference_start",
+				DurationMs:   time.Since(startTime).Milliseconds(),
+				Model:        inferReq.Model,
+				Stream:       true,
+				TraceID:      bctx.TraceID,
+				SpanID:       bctx.SpanID,
+			})
+		}
 		return
 	}
 
@@ -1911,6 +2007,20 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 
 		if chunk.Error != nil {
 			s.writeSSEError(w, flusher, "Inference error: "+chunk.Error.Error())
+			if s.busChat != nil && bctx.BusID != "" {
+				s.busChat.emitError(ChatErrorOpts{
+					BusID:        bctx.BusID,
+					RequestSeq:   bctx.RequestSeq,
+					RequestHash:  bctx.RequestHash,
+					ErrorMessage: chunk.Error.Error(),
+					ErrorType:    "inference_stream",
+					DurationMs:   time.Since(startTime).Milliseconds(),
+					Model:        inferReq.Model,
+					Stream:       true,
+					TraceID:      bctx.TraceID,
+					SpanID:       bctx.SpanID,
+				})
+			}
 			return
 		}
 
@@ -2111,18 +2221,39 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			flusher.Flush()
 
 			// Emit bus chat.response event
-			if s.busChat != nil && busID != "" && accumulatedContent.Len() > 0 {
-				tokensUsed := 0
-				if chunk.Usage != nil {
-					tokensUsed = chunk.Usage.InputTokens + chunk.Usage.OutputTokens
+			if s.busChat != nil && bctx.BusID != "" && accumulatedContent.Len() > 0 {
+				respOpts := ChatResponseOpts{
+					BusID:        bctx.BusID,
+					RequestSeq:   bctx.RequestSeq,
+					Content:      accumulatedContent.String(),
+					Model:        model,
+					DurationMs:   time.Since(startTime).Milliseconds(),
+					Stream:       true,
+					RequestHash:  bctx.RequestHash,
+					FinishReason: finishReason,
+					TraceID:      bctx.TraceID,
+					SpanID:       bctx.SpanID,
 				}
-				s.busChat.emitResponse(busID, requestSeq, accumulatedContent.String(), model, time.Since(startTime).Milliseconds(), tokensUsed)
+				if chunk.Usage != nil {
+					respOpts.PromptTokens = chunk.Usage.InputTokens
+					respOpts.CompletionTokens = chunk.Usage.OutputTokens
+					respOpts.TokensUsed = chunk.Usage.InputTokens + chunk.Usage.OutputTokens
+					respOpts.CacheReadTokens = chunk.Usage.CacheReadTokens
+					respOpts.CacheCreateTokens = chunk.Usage.CacheCreateTokens
+					respOpts.CostUSD = chunk.Usage.CostUSD
+				}
+				// TAA context metrics
+				if inferReq.ContextState != nil {
+					respOpts.TAATokens = inferReq.ContextState.TotalTokens
+					respOpts.TAACoherence = inferReq.ContextState.CoherenceScore
+				}
+				s.busChat.emitResponse(respOpts)
 			}
 		}
 	}
 }
 
-func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID, busID string, requestSeq int, startTime time.Time) {
+func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID string, bctx busEventCtx, startTime time.Time) {
 	// Store TAA context for /v1/taa endpoint
 	// Deep copy to prevent data races — the original may be mutated concurrently.
 	if inferReq.ContextState != nil {
@@ -2135,6 +2266,19 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 	resp, err := HarnessRunInference(inferReq, GlobalRegistry)
 	if err != nil {
 		s.writeError(w, http.StatusInternalServerError, "Inference failed: "+err.Error(), "server_error")
+		if s.busChat != nil && bctx.BusID != "" {
+			s.busChat.emitError(ChatErrorOpts{
+				BusID:        bctx.BusID,
+				RequestSeq:   bctx.RequestSeq,
+				RequestHash:  bctx.RequestHash,
+				ErrorMessage: err.Error(),
+				ErrorType:    "inference_error",
+				DurationMs:   time.Since(startTime).Milliseconds(),
+				Model:        inferReq.Model,
+				TraceID:      bctx.TraceID,
+				SpanID:       bctx.SpanID,
+			})
+		}
 		return
 	}
 
@@ -2188,9 +2332,30 @@ func (s *serveServer) handleNonStreamingResponse(w http.ResponseWriter, inferReq
 	json.NewEncoder(w).Encode(response)
 
 	// Emit bus chat.response event
-	if s.busChat != nil && busID != "" && resp.Content != "" {
-		tokensUsed := resp.PromptTokens + resp.CompletionTokens
-		s.busChat.emitResponse(busID, requestSeq, resp.Content, model, time.Since(startTime).Milliseconds(), tokensUsed)
+	if s.busChat != nil && bctx.BusID != "" && resp.Content != "" {
+		respOpts := ChatResponseOpts{
+			BusID:             bctx.BusID,
+			RequestSeq:        bctx.RequestSeq,
+			Content:           resp.Content,
+			Model:             model,
+			DurationMs:        time.Since(startTime).Milliseconds(),
+			PromptTokens:      resp.PromptTokens,
+			CompletionTokens:  resp.CompletionTokens,
+			TokensUsed:        resp.PromptTokens + resp.CompletionTokens,
+			CacheReadTokens:   resp.CacheReadTokens,
+			CacheCreateTokens: resp.CacheCreateTokens,
+			CostUSD:           resp.CostUSD,
+			FinishReason:      finishReason,
+			RequestHash:       bctx.RequestHash,
+			TraceID:           bctx.TraceID,
+			SpanID:            bctx.SpanID,
+		}
+		// TAA context metrics
+		if inferReq.ContextState != nil {
+			respOpts.TAATokens = inferReq.ContextState.TotalTokens
+			respOpts.TAACoherence = inferReq.ContextState.CoherenceScore
+		}
+		s.busChat.emitResponse(respOpts)
 	}
 }
 
@@ -2715,11 +2880,151 @@ func cmdServeForeground(port int) int {
 	if root != "" {
 		server.busChat = newBusChat(root)
 		// Wire SSE broker to bus event emission
-		server.busChat.manager.onEvent = func(busID string, evt *BusEventData) {
+		server.busChat.manager.AddEventHandler("sse-broker", func(busID string, evt *CogBlock) {
 			server.busBroker.publish(busID, evt)
-		}
+		})
+
+		// Wire block index — append-only hash index for all bus events
+		blkIndex := newBlockIndex(root)
+		server.busChat.manager.AddEventHandler("block-index", func(_ string, block *CogBlock) {
+			blkIndex.Append(block)
+		})
 		log.Printf("[bus-chat] initialized (taa_profile=%s, context_from_bus=%v)",
 			server.busChat.config.TAAProfile, server.busChat.config.Features.ContextFromBus)
+
+		// --- Wire Phase 5-10 components ---
+
+		// 0. Persistent OpenClawBridge for remote tool dispatch
+		var openclawBridge *OpenClawBridge
+		if ocURL := os.Getenv("OPENCLAW_URL"); ocURL != "" {
+			ocToken := os.Getenv("OPENCLAW_TOKEN")
+			openclawBridge = NewOpenClawBridge(ocURL, ocToken, "")
+			if err := openclawBridge.ProbeGateway(context.Background()); err != nil {
+				log.Printf("[bridge] OpenClaw gateway not available at %s: %v", ocURL, err)
+				openclawBridge = nil
+			} else {
+				log.Printf("[bridge] OpenClaw gateway connected at %s", ocURL)
+			}
+		}
+
+		// 1. ToolRouter: listens for tool.invoke events on the bus
+		toolRouter := NewToolRouter(server.busChat.manager, root, openclawBridge)
+		toolRouter.Start()
+		defer toolRouter.Stop()
+
+		// 2. CapabilityCache: TTL-based cache for agent capability advertisements
+		capCache := NewCapabilityCache()
+		stopSweeper := capCache.StartExpirySweeper(60 * time.Second)
+		defer stopSweeper()
+
+		// 3. CapabilityAdvertiser: advertise agent capabilities on startup
+		go func() {
+			if err := AdvertiseAgentCapabilities(root, server.busChat.manager); err != nil {
+				log.Printf("[cap-advert] startup advertise failed: %v", err)
+			}
+		}()
+
+		// 4. BEPProvider: file watcher for agent CRD changes
+		bepProvider := NewBEPProvider(root)
+		bepProvider.OnFileChange(func(filename string) {
+			log.Printf("[bep] CRD changed: %s — re-advertising capabilities", filename)
+			if err := AdvertiseAgentCapabilities(root, server.busChat.manager); err != nil {
+				log.Printf("[cap-advert] re-advertise after CRD change failed: %v", err)
+			}
+		})
+		if err := bepProvider.Start(); err != nil {
+			log.Printf("[bep] failed to start provider: %v", err)
+		} else {
+			defer bepProvider.Stop()
+		}
+
+		// 4b. BEPEngine: cross-node sync via BEP protocol (gated on cluster.enabled)
+		if bepCfg, cfgErr := bepProvider.LoadConfig(); cfgErr == nil && bepCfg.Enabled {
+			engine, engineErr := NewBEPEngine(root, bepCfg, bepProvider)
+			if engineErr != nil {
+				log.Printf("[bep-engine] failed to create: %v", engineErr)
+			} else {
+				engine.SetBus(server.busChat.manager)
+				bepProvider.AddChangeHandler(engine.NotifyLocalChange)
+				if startErr := engine.Start(); startErr != nil {
+					log.Printf("[bep-engine] failed to start: %v", startErr)
+				} else {
+					defer engine.Stop()
+				}
+			}
+		}
+
+		// 5. Node identity logging
+		if nodeIdent, nodeErr := LoadNodeIdentity(); nodeErr == nil {
+			log.Printf("[node] %s (%s/%s)", nodeIdent.Node.ID, nodeIdent.Node.OS, nodeIdent.Node.Arch)
+		}
+
+		// 6. Active reconciliation loop
+		reconciler := NewServeReconciler(root)
+		if startErr := reconciler.Start(); startErr != nil {
+			log.Printf("[reconciler] failed to start: %v", startErr)
+		} else {
+			defer reconciler.Stop()
+		}
+
+		// 7. EventDiscordBridge: forward bus events to Discord (only if configured)
+		if webhookURL := loadEventsWebhookURL(root); webhookURL != "" {
+			bridge := NewEventDiscordBridge(webhookURL, server.busBroker)
+			server.busChat.manager.AddEventHandler("event-discord-bridge", bridge.HandleEvent)
+			bridge.Start()
+			defer func() {
+				bridge.Stop()
+				server.busChat.manager.RemoveEventHandler("event-discord-bridge")
+			}()
+		}
+
+		// 8. Deterministic Reactor: fires rules on matching bus events (no LLM)
+		reactor := NewReactor(server.busChat.manager)
+
+		// Rule: system.startup → notify Discord #events via OpenClaw message tool.
+		// When bridge is unavailable, falls back to log-only.
+		bridge := openclawBridge // capture for closure
+		reactor.AddRule(ReactorRule{
+			Name:      "system.startup.notify",
+			EventType: BlockSystemStartup,
+			Action: func(block *CogBlock) {
+				shortHash := block.Hash
+				if len(shortHash) > 8 {
+					shortHash = shortHash[:8]
+				}
+				agent := block.From
+				if idx := strings.Index(agent, "@"); idx > 0 {
+					agent = agent[:idx]
+				}
+
+				log.Printf("[reactor] system.startup from=%s hash=%s", block.From, shortHash)
+
+				if bridge == nil {
+					log.Printf("[reactor] no OpenClaw bridge — skipping Discord notification")
+					return
+				}
+
+				msg := fmt.Sprintf("[%s · %s] Gateway online.", agent, shortHash)
+				_, err := bridge.ExecuteTool(context.Background(), "message", map[string]interface{}{
+					"action":  "send",
+					"channel": "discord",
+					"target":  "channel:1476656793659768978", // #events
+					"message": msg,
+					"silent":  true,
+				})
+				if err != nil {
+					log.Printf("[reactor] startup notification failed: %v", err)
+				} else {
+					log.Printf("[reactor] startup notification sent: %s", msg)
+				}
+			},
+		})
+
+		reactor.Start()
+		defer reactor.Stop()
+
+		// Suppress unused variable warnings for cache (used by capability resolver)
+		_ = capCache
 	}
 
 	// Load workspace registry for multi-workspace support
@@ -2742,10 +3047,22 @@ func cmdServeForeground(port int) int {
 		fmt.Fprintf(os.Stderr, "Loaded %d workspaces\n", len(server.workspaces))
 	}
 
-	// Register the primary workspace too (from ResolveWorkspace) if not already in registry
+	// Ensure the primary workspace uses server.busChat (which has event handlers wired).
+	// Named workspaces from the registry get their own newBusChat(), but the primary
+	// workspace must share server.busChat so block-index, reactor, SSE, and discord
+	// bridge handlers fire for events on this workspace's buses.
 	if root != "" {
-		if _, exists := server.workspaces[root]; !exists {
-			// Use root path as key if not in named registry
+		found := false
+		for wsName, ws := range server.workspaces {
+			if ws.root == root {
+				ws.busChat = server.busChat
+				found = true
+				log.Printf("[workspace] linked %q to primary busChat (handlers active)", wsName)
+				break
+			}
+		}
+		if !found {
+			// Primary workspace not in named registry — add by path
 			server.workspaces[root] = &workspaceContext{
 				root:    root,
 				name:    root,
