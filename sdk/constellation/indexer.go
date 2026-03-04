@@ -110,6 +110,20 @@ func (c *Constellation) IndexWorkspace() error {
 	}
 
 	fmt.Printf("Indexed %d cogdocs (%d skipped)\n", indexed, skipped)
+
+	// Async: trigger embedding backfill if embed client is configured
+	if c.embedClient != nil {
+		go func() {
+			indexer := NewEmbedIndexer(c, c.embedClient)
+			n, err := indexer.BackfillAll(20)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[embed-indexer] backfill error: %v\n", err)
+			} else if n > 0 {
+				fmt.Fprintf(os.Stderr, "[embed-indexer] backfilled %d documents\n", n)
+			}
+		}()
+	}
+
 	return indexErr
 }
 

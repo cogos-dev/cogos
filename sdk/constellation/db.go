@@ -11,8 +11,9 @@ import (
 
 // Constellation provides access to the cogdoc knowledge graph.
 type Constellation struct {
-	db   *sql.DB
-	root string
+	db          *sql.DB
+	root        string
+	embedClient *EmbedClient // optional — set via SetEmbedClient for async embedding on write
 }
 
 // Open opens the constellation database at the workspace root.
@@ -84,6 +85,10 @@ func (c *Constellation) runMigrations() error {
 		{"substance_ratio", "REAL DEFAULT 0.0"},
 		{"ref_count", "INTEGER DEFAULT 0"},
 		{"ref_density", "REAL DEFAULT 0.0"},
+		// Embedding columns (Phase A: context engine)
+		{"embedding_768", "BLOB"},
+		{"embedding_128", "BLOB"},
+		{"embedding_hash", "TEXT"},
 	}
 
 	for _, col := range substanceColumns {
@@ -106,6 +111,12 @@ func (c *Constellation) runMigrations() error {
 	}
 
 	return nil
+}
+
+// SetEmbedClient sets the embedding client for async embedding on document writes.
+// When set, newly indexed documents will be embedded asynchronously.
+func (c *Constellation) SetEmbedClient(client *EmbedClient) {
+	c.embedClient = client
 }
 
 // DB returns the underlying sql.DB for direct queries.

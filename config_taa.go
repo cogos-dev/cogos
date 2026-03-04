@@ -22,6 +22,9 @@ type TAAConfig struct {
 	Ranking   RankingConfig   `yaml:"ranking"`
 	Coherence CoherenceConfig `yaml:"coherence"`
 	Debug     DebugConfig     `yaml:"debug"`
+	Embedding     EmbeddingConfig     `yaml:"embedding"`
+	ShadowLog     ShadowLogConfig     `yaml:"shadow_log"`
+	DynamicBudget DynamicBudgetConfig `yaml:"dynamic_budget"`
 }
 
 // BudgetConfig controls token allocation per tier.
@@ -75,9 +78,10 @@ type SubstanceConfig struct {
 
 // RankingConfig controls combined scoring weights.
 type RankingConfig struct {
-	BM25Weight      float64 `yaml:"bm25_weight"`
-	SubstanceWeight float64 `yaml:"substance_weight"`
-	RecencyWeight   float64 `yaml:"recency_weight"`
+	BM25Weight       float64 `yaml:"bm25_weight"`
+	SubstanceWeight  float64 `yaml:"substance_weight"`
+	RecencyWeight    float64 `yaml:"recency_weight"`
+	ProbeBlendWeight float64 `yaml:"probe_blend_weight"` // 0.0 = heuristic only, 1.0 = probe only (Phase E.2b)
 }
 
 // CoherenceConfig controls context refresh triggers.
@@ -92,6 +96,31 @@ type DebugConfig struct {
 	TraceQueries   bool   `yaml:"trace_queries"`
 	TraceSubstance bool   `yaml:"trace_substance"`
 	TraceFile      string `yaml:"trace_file"`        // TODO: not yet wired — trace output file path
+}
+
+// DynamicBudgetConfig controls score-driven budget allocation with safety floors (Phase U.2).
+type DynamicBudgetConfig struct {
+	Enabled           bool `yaml:"enabled"`
+	IdentityFloor     int  `yaml:"identity_floor"`     // Minimum tokens for identity (default: 15000)
+	TemporalFloor     int  `yaml:"temporal_floor"`      // Minimum tokens for temporal (default: 10000)
+	PresentFloor      int  `yaml:"present_floor"`       // Minimum tokens for present (default: 20000)
+	SemanticFloor     int  `yaml:"semantic_floor"`      // Minimum tokens for semantic (default: 5000)
+}
+
+// EmbeddingConfig controls the embedding server for vector-based retrieval.
+type EmbeddingConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	ServerSocket   string `yaml:"server_socket"`
+	ServerHTTP     string `yaml:"server_http"`
+	DimsFull       int    `yaml:"dims_full"`
+	DimsCompressed int    `yaml:"dims_compressed"`
+	TimeoutMs      int    `yaml:"timeout_ms"`
+}
+
+// ShadowLogConfig controls dual-score shadow logging for Phase C.
+type ShadowLogConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
 }
 
 // Default configuration values
@@ -148,6 +177,25 @@ var defaultTAAConfig = TAAConfig{
 		TraceQueries:   false,
 		TraceSubstance: false,
 		TraceFile:      "",
+	},
+	Embedding: EmbeddingConfig{
+		Enabled:        false,
+		ServerSocket:   "/tmp/cogos-embed.sock",
+		ServerHTTP:     "http://localhost:11434",
+		DimsFull:       768,
+		DimsCompressed: 128,
+		TimeoutMs:      5000,
+	},
+	ShadowLog: ShadowLogConfig{
+		Enabled: false,
+		Path:    ".cog/.state/shadow_log.jsonl",
+	},
+	DynamicBudget: DynamicBudgetConfig{
+		Enabled:       false,
+		IdentityFloor: 15000,
+		TemporalFloor: 10000,
+		PresentFloor:  20000,
+		SemanticFloor: 5000,
 	},
 }
 

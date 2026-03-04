@@ -28,7 +28,11 @@ CREATE TABLE IF NOT EXISTS documents (
     content_bytes INTEGER DEFAULT 0,
     substance_ratio REAL DEFAULT 0.0,
     ref_count INTEGER DEFAULT 0,
-    ref_density REAL DEFAULT 0.0
+    ref_density REAL DEFAULT 0.0,
+    -- Embedding vectors (Phase A: context engine)
+    embedding_768 BLOB,        -- 768-dim float32 (3072 bytes) — full nomic-embed-text
+    embedding_128 BLOB,        -- 128-dim float32 (512 bytes) — Matryoshka compressed
+    embedding_hash TEXT         -- SHA256 of text that was embedded (for staleness check)
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(type);

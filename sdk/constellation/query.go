@@ -93,11 +93,14 @@ func DefaultSubstanceFilter() SubstanceFilterConfig {
 
 // NodeWithScore wraps a Node with its combined ranking score.
 type NodeWithScore struct {
-	Node          Node
-	BM25Score     float64
-	SubstanceScore float64
-	CombinedScore float64
-	IsLeaf        bool
+	Node                Node
+	BM25Score           float64
+	SubstanceScore      float64
+	EmbeddingSimilarity float64   // Cosine similarity between query and doc embeddings
+	ProbeScore          float64   // Trained probe relevance probability (Phase E)
+	CombinedScore       float64
+	IsLeaf              bool
+	Embedding128        []float32 // Cached 128-dim embedding (avoids re-query for probe scoring)
 }
 
 // QueryRelevantWithSubstance searches for documents with substance-aware ranking.
@@ -194,7 +197,7 @@ func (c *Constellation) QueryRelevantWithSubstance(anchor, goal string, maxCandi
 	}
 
 	// Sort by combined score (descending)
-	sortNodesByScore(candidates)
+	SortNodesByScore(candidates)
 
 	// Take top maxResults
 	if len(candidates) > maxResults {
@@ -210,8 +213,116 @@ func (c *Constellation) QueryRelevantWithSubstance(anchor, goal string, maxCandi
 	return nodes, nil
 }
 
-// sortNodesByScore sorts candidates by combined score (descending).
-func sortNodesByScore(candidates []NodeWithScore) {
+// QueryRelevantWithEmbedding is like QueryRelevantWithSubstance but also computes
+// embedding similarity for each candidate (shadow scoring for Phase C).
+// The heuristic score still controls final ranking — embedding scores are recorded
+// for shadow logging and eventual blend-in.
+func (c *Constellation) QueryRelevantWithEmbedding(anchor, goal string, maxCandidates, maxResults int, filter SubstanceFilterConfig, queryEmb128 []float32) ([]NodeWithScore, error) {
+	keywords := extractKeywords(anchor, goal)
+	if len(keywords) == 0 {
+		return nil, nil
+	}
+
+	ftsQuery := strings.Join(keywords, " OR ")
+
+	// Query with substance metrics + embedding BLOBs
+	querySQL := `
+		SELECT d.id, d.path, d.title, d.type, d.sector, d.status, d.content,
+		       bm25(documents_fts) AS rank,
+		       COALESCE(d.substance_ratio, 0.0) AS substance_ratio,
+		       COALESCE(d.ref_count, 0) AS ref_count,
+		       d.embedding_128
+		FROM documents_fts
+		JOIN documents d ON d.id = documents_fts.id
+		WHERE documents_fts MATCH ?
+		  AND d.status != 'deprecated'
+		ORDER BY rank
+		LIMIT ?
+	`
+
+	rows, err := c.db.Query(querySQL, ftsQuery, maxCandidates)
+	if err != nil {
+		return nil, fmt.Errorf("embedding search failed: %w", err)
+	}
+	defer rows.Close()
+
+	var candidates []NodeWithScore
+	var maxBM25 float64 = 1.0
+
+	for rows.Next() {
+		var n Node
+		var bm25Rank float64
+		var substanceRatio float64
+		var refCount int
+		var embBlob []byte
+
+		err := rows.Scan(&n.ID, &n.Path, &n.Title, &n.Type, &n.Sector, &n.Status, &n.Content,
+			&bm25Rank, &substanceRatio, &refCount, &embBlob)
+		if err != nil {
+			return nil, err
+		}
+
+		if substanceRatio < filter.MinSubstanceRatio {
+			continue
+		}
+
+		if bm25Rank < maxBM25 {
+			maxBM25 = bm25Rank
+		}
+
+		isLeaf := substanceRatio >= filter.LeafThreshold && refCount <= filter.LeafMaxRefs
+
+		// Compute embedding similarity if both embeddings exist
+		var embSim float64
+		var docEmb128 []float32
+		if len(queryEmb128) > 0 && len(embBlob) > 0 {
+			docEmb128 = BytesToFloat32(embBlob)
+			if len(docEmb128) == len(queryEmb128) {
+				embSim = CosineSimilarity(queryEmb128, docEmb128)
+			}
+		}
+
+		candidates = append(candidates, NodeWithScore{
+			Node:                n,
+			BM25Score:           bm25Rank,
+			SubstanceScore:      substanceRatio,
+			EmbeddingSimilarity: embSim,
+			IsLeaf:              isLeaf,
+			Embedding128:        docEmb128,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating embedding results: %w", err)
+	}
+
+	// Calculate combined scores (heuristic only — embedding is shadow)
+	for i := range candidates {
+		normalizedBM25 := 1.0
+		if maxBM25 < 0 {
+			normalizedBM25 = candidates[i].BM25Score / maxBM25
+		}
+
+		candidates[i].CombinedScore = filter.BM25Weight*normalizedBM25 +
+			filter.SubstanceWeight*candidates[i].SubstanceScore
+
+		if filter.PreferLeafNodes && candidates[i].IsLeaf {
+			candidates[i].CombinedScore *= 1.1
+		}
+	}
+
+	// Sort by combined score (heuristic controls ranking)
+	SortNodesByScore(candidates)
+
+	if len(candidates) > maxResults {
+		candidates = candidates[:maxResults]
+	}
+
+	return candidates, nil
+}
+
+// SortNodesByScore sorts candidates by combined score (descending).
+func SortNodesByScore(candidates []NodeWithScore) {
 	// Simple insertion sort (good enough for small lists)
 	for i := 1; i < len(candidates); i++ {
 		j := i

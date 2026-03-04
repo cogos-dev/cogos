@@ -206,6 +206,9 @@ type InferenceResponse struct {
 	CacheCreateTokens int     `json:"cache_creation_input_tokens,omitempty"`
 	CostUSD           float64 `json:"cost_usd,omitempty"`
 
+	// External tool calls — returned to client for execution
+	ToolCalls []ToolCallData `json:"tool_calls,omitempty"`
+
 	// Context metrics (from context pipeline)
 	ContextMetrics *ContextMetrics `json:"context_metrics,omitempty"`
 
@@ -227,6 +230,14 @@ type StreamChunkInference struct {
 	ToolResult  *ToolResultData `json:"tool_result,omitempty"`  // Tool result information
 	Usage       *UsageData      `json:"usage,omitempty"`        // Token usage data
 	SessionInfo *SessionInfo    `json:"session_info,omitempty"` // Session metadata
+
+	// External tool calls — populated on the Done chunk when the model called
+	// tools that require client-side execution (e.g., browser_*, strata).
+	ExternalToolCalls []ToolCallData `json:"external_tool_calls,omitempty"`
+
+	// Suspended indicates the CLI is blocked waiting for external tool results.
+	// When true, the output channel remains open and the CLI stays alive.
+	Suspended bool `json:"suspended,omitempty"`
 }
 
 // ToolCallData represents a tool call in streaming
@@ -790,7 +801,13 @@ func buildCLIContext(prompt, taaProfile, contextURI string, bc *busChat, session
 		if profile != "" {
 			state, err = ConstructContextStateWithProfile(messages, sessionID, workspaceRoot, profile)
 		} else {
-			state, err = ConstructContextState(messages, sessionID, workspaceRoot)
+			// Use dynamic budgets if enabled, otherwise fixed allocation
+			cfg := LoadTAAConfig(workspaceRoot)
+			if cfg.DynamicBudget.Enabled {
+				state, err = ConstructContextStateDynamic(messages, sessionID, workspaceRoot)
+			} else {
+				state, err = ConstructContextState(messages, sessionID, workspaceRoot)
+			}
 		}
 		if err != nil {
 			log.Printf("[TAA] CLI: context construction warning: %v", err)

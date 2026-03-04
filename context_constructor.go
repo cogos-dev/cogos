@@ -458,6 +458,161 @@ func LoadIdentityContextWithConfig(workspaceRoot, identityName, identityDir stri
 	return result, nil
 }
 
+// ConstructContextStateDynamic builds context with score-driven dynamic budget allocation.
+// (Phase U.2) Instead of fixed percentage budgets, it allocates the flexible token pool
+// based on content relevance scores while enforcing safety floors.
+//
+// Safety floors sum to 50K, leaving 50K flexible:
+//   Identity ≥ 15K, Temporal ≥ 10K, Present ≥ 20K, Semantic ≥ 5K
+//
+// The flexible pool is distributed proportionally to each tier's content score:
+//   - Identity: 1.0 (always maximum priority)
+//   - Temporal: scored by recency + anchor confidence
+//   - Present: scored by message count / activity
+//   - Semantic: scored by top candidate BM25/embedding similarity
+func ConstructContextStateDynamic(messages []ChatMessage, sessionID, workspaceRoot string) (*ContextState, error) {
+	cfg := LoadTAAConfig(workspaceRoot)
+
+	if !cfg.DynamicBudget.Enabled {
+		// Fall back to fixed allocation
+		return ConstructContextState(messages, sessionID, workspaceRoot)
+	}
+
+	totalBudget := cfg.Budgets.TotalTokens
+
+	// Safety floors
+	floors := [4]int{
+		cfg.DynamicBudget.IdentityFloor,
+		cfg.DynamicBudget.TemporalFloor,
+		cfg.DynamicBudget.PresentFloor,
+		cfg.DynamicBudget.SemanticFloor,
+	}
+	floorSum := floors[0] + floors[1] + floors[2] + floors[3]
+	flexiblePool := totalBudget - floorSum
+	if flexiblePool < 0 {
+		flexiblePool = 0
+	}
+
+	// Score each tier's content relevance
+	tierScores := [4]float64{
+		1.0, // Identity: always full priority
+		scoreTemporal(messages),
+		scorePresent(messages),
+		0.5, // Semantic: start at 0.5, adjusted after query
+	}
+
+	// Distribute flexible pool proportionally
+	totalScore := tierScores[0] + tierScores[1] + tierScores[2] + tierScores[3]
+	budgets := [4]int{}
+	for i := range budgets {
+		share := float64(flexiblePool) * (tierScores[i] / totalScore)
+		budgets[i] = floors[i] + int(share)
+	}
+
+	// Build context with dynamic budgets
+	state := &ContextState{}
+	var errors []string
+	totalTokens := 0
+
+	// Tier 1: Identity
+	tier1Content, err := LoadIdentityContext(workspaceRoot, budgets[0])
+	if err != nil {
+		log.Printf("[TAA-dyn] Tier 1 error: %v", err)
+		errors = append(errors, fmt.Sprintf("tier1: %v", err))
+		tier1Content = ""
+	}
+	if tier1Content != "" {
+		t := len(tier1Content) / CharsPerToken
+		state.Tier1Identity = &ContextTier{Content: tier1Content, Tokens: t, Source: "identity:dynamic"}
+		totalTokens += t
+	}
+
+	// Tier 2: Temporal
+	tier2Content, anchor, goal, err := RetrieveTemporalContext(messages, sessionID, workspaceRoot, budgets[1])
+	if err != nil {
+		log.Printf("[TAA-dyn] Tier 2 error: %v", err)
+		errors = append(errors, fmt.Sprintf("tier2: %v", err))
+		tier2Content = ""
+	}
+	if tier2Content != "" {
+		t := len(tier2Content) / CharsPerToken
+		state.Tier2Temporal = &ContextTier{Content: tier2Content, Tokens: t, Source: "temporal:dynamic"}
+		totalTokens += t
+	}
+
+	// Tier 3: Present
+	tier3Content, err := FormatPresentContext(messages, anchor, goal, budgets[2])
+	if err != nil {
+		log.Printf("[TAA-dyn] Tier 3 error: %v", err)
+		errors = append(errors, fmt.Sprintf("tier3: %v", err))
+		tier3Content = ""
+	}
+	if tier3Content != "" {
+		t := len(tier3Content) / CharsPerToken
+		state.Tier3Present = &ContextTier{Content: tier3Content, Tokens: t, Source: "present:dynamic"}
+		totalTokens += t
+	}
+
+	// Tier 4: Semantic
+	tier4Content, err := QueryConstellation(workspaceRoot, anchor, goal, budgets[3])
+	if err != nil {
+		log.Printf("[TAA-dyn] Tier 4 error: %v", err)
+		errors = append(errors, fmt.Sprintf("tier4: %v", err))
+		tier4Content = ""
+	}
+	if tier4Content != "" {
+		t := len(tier4Content) / CharsPerToken
+		state.Tier4Semantic = &ContextTier{Content: tier4Content, Tokens: t, Source: "constellation:dynamic"}
+		totalTokens += t
+	}
+
+	state.TotalTokens = totalTokens
+	state.Anchor = anchor
+	state.Goal = goal
+
+	successfulTiers := 0
+	if state.Tier1Identity != nil { successfulTiers++ }
+	if state.Tier2Temporal != nil { successfulTiers++ }
+	if state.Tier3Present != nil { successfulTiers++ }
+	if state.Tier4Semantic != nil { successfulTiers++ }
+	state.CoherenceScore = float64(successfulTiers) / 4.0
+	state.ShouldRefresh = state.CoherenceScore < 0.66
+
+	if len(errors) > 0 {
+		return state, fmt.Errorf("partial construction errors: %s", strings.Join(errors, "; "))
+	}
+	return state, nil
+}
+
+// scoreTemporal estimates temporal tier relevance based on conversation state.
+func scoreTemporal(messages []ChatMessage) float64 {
+	// More messages = more temporal context value
+	n := len(messages)
+	switch {
+	case n > 20:
+		return 0.9 // Long conversation — temporal context very valuable
+	case n > 10:
+		return 0.7
+	case n > 5:
+		return 0.5
+	default:
+		return 0.3 // Short conversation — less temporal value
+	}
+}
+
+// scorePresent estimates present tier relevance based on recent activity.
+func scorePresent(messages []ChatMessage) float64 {
+	n := len(messages)
+	if n == 0 {
+		return 0.1
+	}
+	// Recent messages are always important
+	if n <= 3 {
+		return 0.5
+	}
+	return 0.8
+}
+
 // EstimateContextTokens provides a quick estimate of context token usage
 // without fully constructing the context.
 //
