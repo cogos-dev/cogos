@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -398,5 +399,216 @@ func TestContextSummary(t *testing.T) {
 	}
 	if !strings.Contains(summary, "needs refresh") {
 		t.Error("Summary should indicate needs refresh")
+	}
+}
+
+// writeTAAProfile creates a TAA profile YAML inside the temp workspace.
+// budget is the percentage split per tier; totalTokens is the profile's total_tokens.
+func writeTAAProfile(t *testing.T, root, profileName string, totalTokens int) {
+	t.Helper()
+	profileDir := filepath.Join(root, ".cog", "config", "taa", "profiles")
+	os.MkdirAll(profileDir, 0o755)
+
+	yaml := `name: ` + profileName + `
+description: test profile
+tiers:
+  total_tokens: ` + strconv.Itoa(totalTokens) + `
+  tier1_identity:
+    enabled: true
+    budget: 33
+  tier2_temporal:
+    enabled: true
+    budget: 25
+    working_memory: .cog/mem/working.cog.md
+  tier3_present:
+    enabled: true
+    budget: 33
+  tier4_semantic:
+    enabled: true
+    budget: 6
+coherence:
+  min_score: 0.5
+  failure_mode: continue
+`
+	os.WriteFile(filepath.Join(profileDir, profileName+".yaml"), []byte(yaml), 0o644)
+}
+
+func TestConstructContextStateWithIris_BasicBudgetScaling(t *testing.T) {
+	root := makeTempWorkspace(t)
+	writeTAAProfile(t, root, "test-iris", 100000)
+
+	messages := []ChatMessage{
+		makeMsg("user", "testing iris budget scaling"),
+		makeMsg("assistant", "understood, running tests"),
+		makeMsg("user", "verify budget constraints"),
+	}
+
+	irisSize := 200000
+	irisUsed := 150000
+	irisAvailable := irisSize - irisUsed // 50000
+
+	state, err := ConstructContextStateWithIris(messages, "test-session", root, "test-iris", irisSize, irisUsed)
+	// Partial errors are expected (missing constellation, etc.) but state must exist
+	if state == nil {
+		t.Fatalf("ConstructContextStateWithIris returned nil state, err=%v", err)
+	}
+
+	// effectiveBudget = min(irisAvailable=50000, profileMax=100000) = 50000
+	// TotalTokens should be capped at or below irisAvailable
+	if state.TotalTokens > irisAvailable {
+		t.Errorf("TotalTokens=%d exceeds irisAvailable=%d — budget scaling violated", state.TotalTokens, irisAvailable)
+	}
+
+	// TotalTokens should be non-negative
+	if state.TotalTokens < 0 {
+		t.Errorf("TotalTokens=%d, expected non-negative", state.TotalTokens)
+	}
+
+	// CoherenceScore should be between 0 and 1
+	if state.CoherenceScore < 0 || state.CoherenceScore > 1 {
+		t.Errorf("CoherenceScore=%.2f, expected 0..1", state.CoherenceScore)
+	}
+}
+
+func TestConstructContextStateWithIris_MinimalBudget(t *testing.T) {
+	root := makeTempWorkspace(t)
+	writeTAAProfile(t, root, "test-iris-minimal", 100000)
+
+	messages := []ChatMessage{
+		makeMsg("user", "minimal budget test"),
+	}
+
+	// irisAvailable = 200000 - 199000 = 1000, which is < 2000
+	// Should fall back to ConstructContextStateMinimal
+	irisSize := 200000
+	irisUsed := 199000
+
+	state, err := ConstructContextStateWithIris(messages, "test-session", root, "test-iris-minimal", irisSize, irisUsed)
+	if err != nil {
+		t.Fatalf("unexpected error for minimal budget path: %v", err)
+	}
+	if state == nil {
+		t.Fatal("ConstructContextStateWithIris returned nil state for minimal budget")
+	}
+
+	// Minimal state: only Tier3 should be populated (from ConstructContextStateMinimal)
+	if state.Tier3Present == nil {
+		t.Error("Tier3Present should not be nil — minimal state should include present context")
+	}
+
+	// ShouldRefresh should be true for minimal state
+	if !state.ShouldRefresh {
+		t.Error("ShouldRefresh should be true for minimal fallback state")
+	}
+
+	// Tier 1 and Tier 2 should not be loaded in minimal state
+	if state.Tier1Identity != nil {
+		t.Error("Tier1Identity should be nil for minimal state fallback")
+	}
+	if state.Tier2Temporal != nil {
+		t.Error("Tier2Temporal should be nil for minimal state fallback")
+	}
+}
+
+func TestConstructContextStateWithIris_NoIrisSignals(t *testing.T) {
+	root := makeTempWorkspace(t)
+	// No profile written — irisSize=0 means the function should still work
+
+	messages := []ChatMessage{
+		makeMsg("user", "no iris signals test"),
+		makeMsg("assistant", "acknowledged"),
+	}
+
+	// irisSize=0, irisUsed=0 → irisAvailable=0
+	// effectiveBudget = profileMax (since irisAvailable is not > 0)
+	// But profile won't load (no file), so should fall back to ConstructContextState
+	state, err := ConstructContextStateWithIris(messages, "test-session", root, "nonexistent-profile", 0, 0)
+
+	// With no profile, it falls back to ConstructContextState which may
+	// return partial errors due to missing workspace files
+	if state == nil {
+		t.Fatalf("ConstructContextStateWithIris returned nil state with no iris signals, err=%v", err)
+	}
+
+	// TotalTokens should be non-negative
+	if state.TotalTokens < 0 {
+		t.Errorf("TotalTokens=%d, expected non-negative", state.TotalTokens)
+	}
+
+	// CoherenceScore should be valid
+	if state.CoherenceScore < 0 || state.CoherenceScore > 1 {
+		t.Errorf("CoherenceScore=%.2f, expected 0..1", state.CoherenceScore)
+	}
+}
+
+func TestConstructContextStateWithIris_HighPressure(t *testing.T) {
+	root := makeTempWorkspace(t)
+	writeTAAProfile(t, root, "test-iris-pressure", 100000)
+
+	messages := []ChatMessage{
+		makeMsg("user", "running under high context pressure"),
+		makeMsg("assistant", "I see the pressure is very high"),
+		makeMsg("user", "continue with constrained budget"),
+	}
+
+	// pressure = irisUsed/irisSize = 180000/200000 = 0.9
+	irisSize := 200000
+	irisUsed := 180000
+	irisAvailable := irisSize - irisUsed // 20000
+
+	state, err := ConstructContextStateWithIris(messages, "test-session", root, "test-iris-pressure", irisSize, irisUsed)
+	// Partial errors are expected but state must be non-nil
+	if state == nil {
+		t.Fatalf("ConstructContextStateWithIris returned nil state under high pressure, err=%v", err)
+	}
+
+	// TotalTokens should be within the available budget
+	if state.TotalTokens > irisAvailable {
+		t.Errorf("TotalTokens=%d exceeds irisAvailable=%d under high pressure", state.TotalTokens, irisAvailable)
+	}
+
+	// TotalTokens should be positive (20000 is above the 2000 minimum)
+	if state.TotalTokens < 0 {
+		t.Errorf("TotalTokens=%d, expected non-negative", state.TotalTokens)
+	}
+
+	// CoherenceScore should be valid
+	if state.CoherenceScore < 0 || state.CoherenceScore > 1 {
+		t.Errorf("CoherenceScore=%.2f, expected 0..1", state.CoherenceScore)
+	}
+}
+
+func TestConstructContextStateWithIris_ProfileFallback(t *testing.T) {
+	root := makeTempWorkspace(t)
+	// Do NOT write a profile for "missing-profile" — triggers fallback
+
+	messages := []ChatMessage{
+		makeMsg("user", "testing profile fallback"),
+		makeMsg("assistant", "profile fallback test in progress"),
+	}
+
+	// Profile doesn't exist → should fall back to ConstructContextState
+	state, err := ConstructContextStateWithIris(messages, "test-session", root, "missing-profile", 200000, 50000)
+
+	// May have partial errors from ConstructContextState fallback, but state should exist
+	if state == nil {
+		t.Fatalf("ConstructContextStateWithIris returned nil state on profile fallback, err=%v", err)
+	}
+
+	// Since it fell back to ConstructContextState, the tiers will have
+	// been constructed with workspace-based loading (which may partially fail)
+	// but the state itself should be valid
+	if state.TotalTokens < 0 {
+		t.Errorf("TotalTokens=%d, expected non-negative", state.TotalTokens)
+	}
+
+	// CoherenceScore should be valid
+	if state.CoherenceScore < 0 || state.CoherenceScore > 1 {
+		t.Errorf("CoherenceScore=%.2f, expected 0..1", state.CoherenceScore)
+	}
+
+	// Tier 3 (present) should still be loaded even on fallback
+	if state.Tier3Present == nil {
+		t.Error("Tier3Present should be loaded even on profile fallback")
 	}
 }

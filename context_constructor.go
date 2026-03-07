@@ -584,6 +584,166 @@ func ConstructContextStateDynamic(messages []ChatMessage, sessionID, workspaceRo
 	return state, nil
 }
 
+// ConstructContextStateWithIris builds context with iris-driven budget scaling.
+// The iris signals (size, used) from the agent's context window determine the
+// effective budget — CogOS renders at variable resolution within whatever
+// capacity the agent has left.
+//
+// effectiveBudget = min(irisSize - irisUsed, profileMaxTokens)
+//
+// This replaces the static TAA budget when iris signals are available,
+// enabling foveated rendering: wide iris → generous context, narrow iris → tight fovea.
+func ConstructContextStateWithIris(messages []ChatMessage, sessionID, workspaceRoot, profileName string, irisSize, irisUsed int) (*ContextState, error) {
+	// Load the profile for tier ratios
+	profile, err := LoadTAAProfile(workspaceRoot, profileName)
+	if err != nil {
+		log.Printf("[TAA-iris] Failed to load profile %s, falling back to default: %v", profileName, err)
+		return ConstructContextState(messages, sessionID, workspaceRoot)
+	}
+
+	profileMax := profile.Tiers.TotalTokens
+	if profileMax == 0 {
+		profileMax = TotalContextTokens
+	}
+
+	// Compute effective budget from iris signals
+	irisAvailable := irisSize - irisUsed
+	if irisAvailable < 0 {
+		irisAvailable = 0
+	}
+
+	// Use the smaller of: what the agent can fit, or what the profile allows
+	effectiveBudget := profileMax
+	if irisAvailable > 0 && irisAvailable < effectiveBudget {
+		effectiveBudget = irisAvailable
+	}
+
+	// Minimum viable context — below this, don't bother
+	if effectiveBudget < 2000 {
+		log.Printf("[TAA-iris] Effective budget too small (%d tokens), returning minimal context", effectiveBudget)
+		return ConstructContextStateMinimal(messages), nil
+	}
+
+	irisPressure := float64(0)
+	if irisSize > 0 {
+		irisPressure = float64(irisUsed) / float64(irisSize)
+	}
+
+	log.Printf("[TAA-iris] Budget: effective=%d (iris: size=%d used=%d available=%d pressure=%.1f%% profile_max=%d)",
+		effectiveBudget, irisSize, irisUsed, irisAvailable, irisPressure*100, profileMax)
+
+	// Scale tier budgets proportionally within the effective budget
+	state := &ContextState{}
+	var errors []string
+	usedTokens := 0
+	enabledTiers := 0
+	successfulTiers := 0
+
+	// Tier 1: Identity
+	if profile.Tiers.Tier1 != nil && profile.Tiers.Tier1.Enabled {
+		enabledTiers++
+		tier1Budget := (effectiveBudget * profile.Tiers.Tier1.Budget) / 100
+
+		var tier1Content string
+		if profile.Identity != nil && profile.Identity.Name != nil {
+			tier1Content, err = LoadIdentityContextWithConfig(
+				workspaceRoot, *profile.Identity.Name,
+				profile.Identity.Directory, profile.Identity.InjectPlugin, tier1Budget)
+		} else {
+			tier1Content, err = LoadIdentityContext(workspaceRoot, tier1Budget)
+		}
+		if err != nil {
+			log.Printf("[TAA-iris] Tier 1 error: %v", err)
+			errors = append(errors, fmt.Sprintf("tier1: %v", err))
+		} else if tier1Content != "" {
+			t := len(tier1Content) / CharsPerToken
+			state.Tier1Identity = &ContextTier{Content: tier1Content, Tokens: t, Source: "identity:iris"}
+			usedTokens += t
+			successfulTiers++
+		}
+	}
+
+	// Tier 2: Temporal
+	var anchor, goal string
+	if profile.Tiers.Tier2 != nil && profile.Tiers.Tier2.Enabled {
+		enabledTiers++
+		tier2Budget := (effectiveBudget * profile.Tiers.Tier2.Budget) / 100
+
+		var tier2Content string
+		tier2Content, anchor, goal, err = RetrieveTemporalContext(messages, sessionID, workspaceRoot, tier2Budget)
+		if err != nil {
+			log.Printf("[TAA-iris] Tier 2 error: %v", err)
+			errors = append(errors, fmt.Sprintf("tier2: %v", err))
+		} else if tier2Content != "" {
+			t := len(tier2Content) / CharsPerToken
+			state.Tier2Temporal = &ContextTier{Content: tier2Content, Tokens: t, Source: "temporal:iris"}
+			usedTokens += t
+			successfulTiers++
+		}
+	}
+
+	// Tier 3: Present
+	if profile.Tiers.Tier3 != nil && profile.Tiers.Tier3.Enabled {
+		enabledTiers++
+		tier3Budget := (effectiveBudget * profile.Tiers.Tier3.Budget) / 100
+
+		tier3Content, err := FormatPresentContext(messages, anchor, goal, tier3Budget)
+		if err != nil {
+			log.Printf("[TAA-iris] Tier 3 error: %v", err)
+			errors = append(errors, fmt.Sprintf("tier3: %v", err))
+		} else if tier3Content != "" {
+			t := len(tier3Content) / CharsPerToken
+			state.Tier3Present = &ContextTier{Content: tier3Content, Tokens: t, Source: "present:iris"}
+			usedTokens += t
+			successfulTiers++
+		}
+	}
+
+	// Tier 4: Semantic — pass iris pressure for score-based resolution
+	if profile.Tiers.Tier4 != nil && profile.Tiers.Tier4.Enabled {
+		enabledTiers++
+		tier4Budget := (effectiveBudget * profile.Tiers.Tier4.Budget) / 100
+
+		tier4Content, err := QueryConstellationWithIris(workspaceRoot, anchor, goal, tier4Budget, irisPressure)
+		if err != nil {
+			log.Printf("[TAA-iris] Tier 4 error: %v", err)
+			errors = append(errors, fmt.Sprintf("tier4: %v", err))
+			// Fall back to standard query
+			tier4Content, err = QueryConstellation(workspaceRoot, anchor, goal, tier4Budget)
+			if err != nil {
+				log.Printf("[TAA-iris] Tier 4 fallback also failed: %v", err)
+			}
+		}
+		if tier4Content != "" {
+			t := len(tier4Content) / CharsPerToken
+			state.Tier4Semantic = &ContextTier{Content: tier4Content, Tokens: t, Source: "constellation:iris"}
+			usedTokens += t
+			successfulTiers++
+		}
+	}
+
+	state.TotalTokens = usedTokens
+	state.Anchor = anchor
+	state.Goal = goal
+
+	if enabledTiers > 0 {
+		state.CoherenceScore = float64(successfulTiers) / float64(enabledTiers)
+	} else {
+		state.CoherenceScore = 1.0
+	}
+
+	minScore := 0.66
+	if profile.Coherence != nil && profile.Coherence.MinScore > 0 {
+		minScore = profile.Coherence.MinScore
+	}
+	state.ShouldRefresh = state.CoherenceScore < minScore
+
+	if len(errors) > 0 {
+		return state, fmt.Errorf("partial construction errors (iris, profile=%s): %s", profileName, strings.Join(errors, "; "))
+	}
+	return state, nil
+}
+
 // scoreTemporal estimates temporal tier relevance based on conversation state.
 func scoreTemporal(messages []ChatMessage) float64 {
 	// More messages = more temporal context value

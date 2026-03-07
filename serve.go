@@ -537,6 +537,7 @@ type serveServer struct {
 	busChat       *busChat        // Bus event emission for chat (nil if no workspace)
 	busBroker     *busEventBroker // SSE subscriber broker for bus events
 	toolBridge    *ToolBridge     // Synchronous tool bridge for client-driven agent loops
+	mcpManager    *MCPSessionManager // MCP Streamable HTTP session manager
 
 	// OCI auto-reload: kernel watches .cog/oci/index.json for new digests
 	ociStore  *OCIStore  // nil if no OCI layout exists
@@ -660,6 +661,8 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/v1/requests", s.handleRequests)
 	mux.HandleFunc("/v1/requests/", s.handleRequestByID)
 	mux.HandleFunc("/v1/taa", s.handleTAA)                    // TAA context visibility endpoint
+	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext) // Iris-driven foveated rendering
+	mux.HandleFunc("GET /v1/card", s.handleCard)              // ADR-048: Kernel capability card
 	mux.HandleFunc("POST /v1/tool-bridge/pending", s.handleToolBridgePending) // Synchronous tool bridge
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/debug", s.handleDebug)
@@ -682,6 +685,18 @@ func (s *serveServer) Start() error {
 		// Whirlpool endpoints via SDK
 		mux.HandleFunc("GET /state", s.handleState)
 		mux.HandleFunc("GET /signals", s.handleSignals)
+	}
+
+	// MCP Streamable HTTP endpoint
+	mcpRoot := ""
+	if ws := s.getWorkspace(""); ws != nil {
+		mcpRoot = ws.root
+	} else if s.kernel != nil {
+		mcpRoot = s.kernel.Root()
+	}
+	if mcpRoot != "" {
+		s.mcpManager = NewMCPSessionManager(s.workspaces, mcpRoot)
+		mux.Handle("/mcp", s.mcpManager)
 	}
 
 	// CogField graph endpoint
@@ -772,6 +787,11 @@ func (s *serveServer) Start() error {
 		fmt.Printf("  GET    /state               - Workspace state\n")
 		fmt.Printf("  GET    /signals             - Signal field\n")
 	}
+	if s.mcpManager != nil {
+		fmt.Printf("\nMCP (Streamable HTTP):\n")
+		fmt.Printf("  POST   /mcp                - JSON-RPC 2.0 (tools, resources)\n")
+		fmt.Printf("  DELETE /mcp                - End session\n")
+	}
 	fmt.Printf("\nHealth:\n")
 	fmt.Printf("  GET    /health              - Health check\n")
 	fmt.Println("\nPress Ctrl+C to stop")
@@ -782,6 +802,12 @@ func (s *serveServer) Start() error {
 	}
 
 	<-done
+
+	// Stop MCP session manager cleanup goroutine
+	if s.mcpManager != nil {
+		s.mcpManager.Stop()
+	}
+
 	return nil
 }
 
@@ -926,8 +952,8 @@ func (s *serveServer) corsMiddleware(next http.Handler) http.Handler {
 		} else {
 			w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5100")
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
@@ -945,7 +971,15 @@ func (s *serveServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"GET /v1/providers - List providers with health status",
 		"GET /v1/requests - List in-flight requests",
 		"DELETE /v1/requests/:id - Cancel request",
+		"GET /v1/card - Kernel capability card",
 		"GET /health - Health check",
+	}
+
+	// Add MCP endpoint if available
+	if s.mcpManager != nil {
+		endpoints = append(endpoints,
+			"POST /mcp - MCP Streamable HTTP (JSON-RPC 2.0)",
+		)
 	}
 
 	// Add SDK endpoints if kernel is available
@@ -966,6 +1000,59 @@ func (s *serveServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"sdk":       s.kernel != nil,
 		"endpoints": endpoints,
 	})
+}
+
+// handleCard returns the Kernel Card — a self-describing capability manifest (ADR-048).
+func (s *serveServer) handleCard(w http.ResponseWriter, r *http.Request) {
+	hasMCP := s.mcpManager != nil
+	hasSDK := s.kernel != nil
+
+	endpoints := map[string]string{
+		"inference": "/v1/chat/completions",
+		"models":    "/v1/models",
+		"providers": "/v1/providers",
+		"health":    "/health",
+	}
+	if hasMCP {
+		endpoints["mcp"] = "/mcp"
+	}
+	if hasSDK {
+		endpoints["resolve"] = "/resolve"
+		endpoints["mutate"] = "/mutate"
+	}
+
+	// Build workspace directory with per-workspace MCP URLs
+	wsDir := make(map[string]any, len(s.workspaces))
+	for name := range s.workspaces {
+		wsEntry := map[string]string{}
+		if hasMCP {
+			wsEntry["mcp"] = fmt.Sprintf("/mcp?workspace=%s", name)
+		}
+		wsDir[name] = wsEntry
+	}
+
+	card := map[string]any{
+		"schemaVersion":    "1.0",
+		"name":             "CogOS Kernel",
+		"humanReadableId":  "cogos/kernel",
+		"description":      "Workspace-aware inference routing with MCP tool access",
+		"url":              fmt.Sprintf("http://localhost:%d", s.port),
+		"version":          Version,
+		"protocolVersions": []string{"mcp/2025-03-26", "openai/v1"},
+		"provider": map[string]string{
+			"name": "CogOS",
+		},
+		"capabilities": map[string]bool{
+			"inference": true,
+			"mcp":       hasMCP,
+			"sdk":       hasSDK,
+		},
+		"endpoints":  endpoints,
+		"workspaces": wsDir,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(card)
 }
 
 // handleTAA returns the TAA context state for debugging/visibility
@@ -1025,6 +1112,141 @@ func (s *serveServer) handleTAA(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleFoveatedContext renders context at variable resolution driven by iris signals.
+//
+// The iris (agent's context window state) determines the effective budget,
+// and score-based thresholds determine which content gets full vs. reduced resolution.
+//
+// POST /v1/context/foveated
+// Body: { prompt, iris: { size, used }, profile, session_id, user_id }
+// Response: { context, tokens, anchor, goal, coherence_score, tier_breakdown, effective_budget, iris_pressure }
+func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse request
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<18) // 256KB limit
+	var req struct {
+		Prompt    string `json:"prompt"`
+		Iris      struct {
+			Size int `json:"size"`
+			Used int `json:"used"`
+		} `json:"iris"`
+		Profile   string `json:"profile"`
+		SessionID string `json:"session_id"`
+		UserID    string `json:"user_id"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error(), "invalid_request")
+		return
+	}
+
+	if req.Prompt == "" {
+		s.writeError(w, http.StatusBadRequest, "prompt is required", "invalid_request")
+		return
+	}
+
+	// Defaults
+	profileName := req.Profile
+	if profileName == "" {
+		profileName = "default"
+	}
+	sessionID := req.SessionID
+	if sessionID == "" {
+		sessionID = "foveated-" + nowISO()
+	}
+
+	workspaceRoot := ""
+	if s.kernel != nil {
+		workspaceRoot = s.kernel.Root()
+	} else if ws := s.getWorkspace(""); ws != nil {
+		workspaceRoot = ws.root
+	}
+
+	if workspaceRoot == "" {
+		s.writeError(w, http.StatusInternalServerError, "No workspace root available", "server_error")
+		return
+	}
+
+	// Build messages from prompt (minimal — the plugin sends just the prompt)
+	promptJSON, _ := json.Marshal(req.Prompt)
+	messages := []ChatMessage{
+		{Role: "user", Content: json.RawMessage(promptJSON)},
+	}
+
+	// Compute iris pressure
+	irisPressure := float64(0)
+	if req.Iris.Size > 0 {
+		irisPressure = float64(req.Iris.Used) / float64(req.Iris.Size)
+	}
+
+	log.Printf("[foveated] Request: iris_size=%d iris_used=%d pressure=%.1f%% profile=%s session=%s",
+		req.Iris.Size, req.Iris.Used, irisPressure*100, profileName, sessionID)
+
+	// Construct context with iris-driven budgets
+	var ctx *ContextState
+	var err error
+
+	if req.Iris.Size > 0 {
+		ctx, err = ConstructContextStateWithIris(messages, sessionID, workspaceRoot, profileName, req.Iris.Size, req.Iris.Used)
+	} else {
+		ctx, err = ConstructContextStateWithProfile(messages, sessionID, workspaceRoot, profileName)
+	}
+
+	if err != nil {
+		log.Printf("[foveated] Construction error (partial result returned): %v", err)
+		// Continue — partial results are still useful
+	}
+
+	if ctx == nil {
+		s.writeError(w, http.StatusInternalServerError, "Context construction returned nil", "server_error")
+		return
+	}
+
+	// Store as last TAA state for /v1/taa visibility
+	s.taaStateMutex.Lock()
+	s.lastTAAState = ctx
+	s.taaStateMutex.Unlock()
+
+	// Build response
+	contextStr := ctx.BuildContextString()
+	tierBreakdown := map[string]int{}
+	if ctx.Tier1Identity != nil {
+		tierBreakdown["tier1"] = ctx.Tier1Identity.Tokens
+	}
+	if ctx.Tier2Temporal != nil {
+		tierBreakdown["tier2"] = ctx.Tier2Temporal.Tokens
+	}
+	if ctx.Tier3Present != nil {
+		tierBreakdown["tier3"] = ctx.Tier3Present.Tokens
+	}
+	if ctx.Tier4Semantic != nil {
+		tierBreakdown["tier4"] = ctx.Tier4Semantic.Tokens
+	}
+
+	effectiveBudget := ctx.TotalTokens
+	if req.Iris.Size > 0 {
+		available := req.Iris.Size - req.Iris.Used
+		if available > 0 {
+			effectiveBudget = available
+		}
+	}
+
+	log.Printf("[foveated] Response: tokens=%d anchor=%q goal=%q coherence=%.2f pressure=%.1f%%",
+		ctx.TotalTokens, ctx.Anchor, ctx.Goal, ctx.CoherenceScore, irisPressure*100)
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"context":          contextStr,
+		"tokens":           ctx.TotalTokens,
+		"anchor":           ctx.Anchor,
+		"goal":             ctx.Goal,
+		"coherence_score":  ctx.CoherenceScore,
+		"tier_breakdown":   tierBreakdown,
+		"effective_budget": effectiveBudget,
+		"iris_pressure":    irisPressure,
+	})
+}
+
 func (s *serveServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// Check if claude CLI is available
 	_, err := exec.LookPath(claudeCommand)
@@ -1033,13 +1255,20 @@ func (s *serveServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		status = "degraded"
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	resp := map[string]any{
 		"status":    status,
 		"timestamp": nowISO(),
 		"claude":    err == nil,
 		"debug":     DebugMode.Load(),
-	})
+	}
+	if s.mcpManager != nil {
+		resp["mcp"] = map[string]any{
+			"sessions": s.mcpManager.SessionCount(),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *serveServer) handleDebug(w http.ResponseWriter, r *http.Request) {
@@ -3623,6 +3852,11 @@ func cmdServeForeground(port int) int {
 		server.busChat.manager.AddEventHandler("block-index", func(_ string, block *CogBlock) {
 			blkIndex.Append(block)
 		})
+
+		// Wire constellation bus indexer — index chat content into FTS5
+		// for cross-surface search (Discord, Claude Code, HTTP, Telegram)
+		server.busChat.manager.AddEventHandler("constellation-bus", newConstellationBusHandler(root))
+
 		log.Printf("[bus-chat] initialized (taa_profile=%s, context_from_bus=%v)",
 			server.busChat.config.TAAProfile, server.busChat.config.Features.ContextFromBus)
 
@@ -3701,6 +3935,16 @@ func cmdServeForeground(port int) int {
 			defer reconciler.Stop()
 		}
 
+		// 6b. Service health monitor: polls container health every 30s, emits bus events
+		svcMonitor := NewServiceHealthMonitor(root, server.busChat.manager)
+		svcMonitor.Start()
+		defer svcMonitor.Stop()
+
+		// 6c. Advertise service capabilities on the bus
+		if err := AdvertiseServiceCapabilities(root, server.busChat.manager); err != nil {
+			log.Printf("[service] capability advertisement failed: %v", err)
+		}
+
 		// 7. EventDiscordBridge: forward bus events to Discord (only if configured)
 		if webhookURL := loadEventsWebhookURL(root); webhookURL != "" {
 			bridge := NewEventDiscordBridge(webhookURL, server.busBroker)
@@ -3751,6 +3995,39 @@ func cmdServeForeground(port int) int {
 				} else {
 					log.Printf("[reactor] startup notification sent: %s", msg)
 				}
+			},
+		})
+
+		// Rule: chat.response → log agent activity across surfaces for cross-session awareness.
+		// Enables peripheral awareness to show "[agent] responded on [surface] Nm ago".
+		reactor.AddRule(ReactorRule{
+			Name:      "agent.activity.notify",
+			EventType: BlockChatResponse,
+			Action: func(block *CogBlock) {
+				agent, _ := block.Payload["agent"].(string)
+				origin, _ := block.Payload["origin"].(string)
+				if agent == "" && origin == "" {
+					return
+				}
+				log.Printf("[reactor] agent.activity: agent=%s origin=%s bus=%s seq=%d",
+					agent, origin, block.BusID, block.Seq)
+			},
+		})
+
+		// Rule: chat.request → detect cross-session patterns for context bridging.
+		// When requests arrive from different surfaces within a time window,
+		// logs the correlation for peripheral awareness enrichment.
+		reactor.AddRule(ReactorRule{
+			Name:      "session.context.bridge",
+			EventType: BlockChatRequest,
+			Action: func(block *CogBlock) {
+				origin, _ := block.Payload["origin"].(string)
+				agent, _ := block.Payload["agent"].(string)
+				if origin == "" {
+					return
+				}
+				log.Printf("[reactor] session.bridge: origin=%s agent=%s bus=%s seq=%d",
+					origin, agent, block.BusID, block.Seq)
 			},
 		})
 

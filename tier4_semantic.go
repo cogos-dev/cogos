@@ -243,6 +243,167 @@ func QueryConstellation(workspaceRoot, anchor, goal string, budget int) (string,
 	return sb.String(), nil
 }
 
+// QueryConstellationWithIris queries the constellation with iris-aware resolution.
+//
+// Unlike QueryConstellation which uses rank-based cutoffs (i < 5: full, i < 10: section),
+// this function uses score-based thresholds that slide with iris pressure:
+// - Wide iris (low pressure) → lower thresholds → more content at full resolution
+// - Narrow iris (high pressure) → higher thresholds → only peak signals at full resolution
+//
+// The scored candidates are preserved through the formatting loop (not stripped).
+func QueryConstellationWithIris(workspaceRoot, anchor, goal string, budget int, irisPressure float64) (string, error) {
+	cfg := LoadTAAConfig(workspaceRoot)
+
+	if cfg.Debug.TraceQueries {
+		fmt.Fprintf(os.Stderr, "[TAA-iris] Tier 4: querying with anchor=%q goal=%q budget=%d pressure=%.1f%%\n",
+			anchor, goal, budget, irisPressure*100)
+	}
+
+	c, err := getConstellation()
+	if err != nil || c == nil {
+		return "", nil
+	}
+	if anchor == "" && goal == "" {
+		return "", nil
+	}
+
+	// Query-time embedding
+	var queryEmb128 []float32
+	embedClient := getEmbedClient(workspaceRoot)
+	if embedClient != nil {
+		queryText := anchor + " " + goal
+		result, err := embedClient.EmbedOne(queryText, "search_query")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[TAA-iris] Tier 4: query embedding failed: %v\n", err)
+		} else {
+			queryEmb128 = result.Embedding128
+		}
+	}
+
+	// Score candidates
+	var scoredCandidates []constellation.NodeWithScore
+
+	if cfg.Embedding.Enabled && queryEmb128 != nil {
+		filter := constellation.SubstanceFilterConfig{
+			MinSubstanceRatio: cfg.Substance.MinRatio,
+			PreferLeafNodes:   cfg.Substance.PreferLeafNodes,
+			LeafThreshold:     cfg.Substance.LeafSubstanceThreshold,
+			LeafMaxRefs:       cfg.Substance.LeafMaxRefs,
+			BM25Weight:        cfg.Ranking.BM25Weight,
+			SubstanceWeight:   cfg.Ranking.SubstanceWeight,
+		}
+
+		maxResults := cfg.Semantic.MaxResults
+		if maxResults < 20 {
+			maxResults = 20
+		}
+
+		scoredCandidates, err = c.QueryRelevantWithEmbedding(
+			anchor, goal,
+			cfg.Semantic.MaxCandidates, maxResults, filter, queryEmb128,
+		)
+		if err != nil {
+			return "", fmt.Errorf("constellation query failed: %w", err)
+		}
+
+		// Apply probe blend if available
+		blendWeight := cfg.Ranking.ProbeBlendWeight
+		if blendWeight > 0 {
+			probe := getProbeScorer(workspaceRoot)
+			if probe != nil {
+				for i := range scoredCandidates {
+					docEmb128 := scoredCandidates[i].Embedding128
+					if len(docEmb128) == 128 {
+						probeScore := probe.ScoreProbe(queryEmb128, docEmb128)
+						scoredCandidates[i].ProbeScore = probeScore
+						scoredCandidates[i].CombinedScore =
+							(1-blendWeight)*scoredCandidates[i].CombinedScore +
+								blendWeight*probeScore
+					}
+				}
+				constellation.SortNodesByScore(scoredCandidates)
+			}
+		}
+	} else {
+		// Fall back to heuristic-only path
+		return QueryConstellation(workspaceRoot, anchor, goal, budget)
+	}
+
+	if len(scoredCandidates) == 0 {
+		return "", nil
+	}
+
+	// --- Score-based resolution thresholds ---
+	// These slide with iris pressure: high pressure raises thresholds.
+	//
+	// At low pressure (0.0):  fullThreshold=0.3, sectionThreshold=0.15
+	// At high pressure (0.9): fullThreshold=0.75, sectionThreshold=0.45
+	//
+	// The top score anchors the thresholds — they're relative to the best hit.
+	topScore := scoredCandidates[0].CombinedScore
+	if topScore <= 0 {
+		topScore = 1.0
+	}
+
+	// Base thresholds (fraction of top score)
+	fullBase := 0.6    // 60% of top score gets full content
+	sectionBase := 0.3 // 30% of top score gets section content
+
+	// Pressure scaling: as pressure increases, thresholds rise toward 1.0
+	pressureScale := irisPressure * irisPressure // Quadratic — gentle at low pressure, aggressive at high
+	fullThreshold := topScore * (fullBase + (1.0-fullBase)*pressureScale)
+	sectionThreshold := topScore * (sectionBase + (1.0-sectionBase)*pressureScale)
+
+	if cfg.Debug.TraceQueries {
+		fmt.Fprintf(os.Stderr, "[TAA-iris] Tier 4: score thresholds — full>=%.3f section>=%.3f (top=%.3f pressure=%.1f%%)\n",
+			fullThreshold, sectionThreshold, topScore, irisPressure*100)
+	}
+
+	// Format with score-based variable resolution
+	var sb strings.Builder
+	sb.WriteString("# Relevant Knowledge (Constellation)\n\n")
+
+	charsPerToken := cfg.Semantic.CharsPerToken
+	if charsPerToken <= 0 {
+		charsPerToken = 4
+	}
+	currentTokens := len(sb.String()) / charsPerToken
+	includedCount := 0
+
+	for _, sc := range scoredCandidates {
+		var nodeStr string
+
+		switch {
+		case sc.CombinedScore >= fullThreshold:
+			nodeStr = formatNodeWithConfig(sc.Node, cfg.Semantic.NodeTruncateChars)
+		case sc.CombinedScore >= sectionThreshold:
+			nodeStr = formatNodeSection(sc.Node, cfg.Semantic.NodeTruncateChars/2)
+		default:
+			nodeStr = formatNodeMetadataOnly(sc.Node)
+		}
+
+		nodeTokens := len(nodeStr) / charsPerToken
+		if currentTokens+nodeTokens > budget {
+			if cfg.Debug.TraceQueries {
+				fmt.Fprintf(os.Stderr, "[TAA-iris] Tier 4: budget exceeded, included %d nodes\n", includedCount)
+			}
+			break
+		}
+
+		sb.WriteString(nodeStr)
+		sb.WriteString("\n\n")
+		currentTokens += nodeTokens
+		includedCount++
+	}
+
+	// Shadow log
+	if cfg.ShadowLog.Enabled {
+		WriteShadowLog(workspaceRoot, anchor+" "+goal, queryEmb128, scoredCandidates, includedCount)
+	}
+
+	return sb.String(), nil
+}
+
 // formatNodeWithConfig formats a constellation node with configurable truncation.
 func formatNodeWithConfig(node constellation.Node, maxContentChars int) string {
 	var sb strings.Builder
