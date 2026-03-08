@@ -23,9 +23,9 @@ func cmdConstellation(args []string) error {
 		return nil
 	}
 
-	workspaceRoot := "."
-	if wd, err := os.Getwd(); err == nil {
-		workspaceRoot = wd
+	workspaceRoot, _, err := ResolveWorkspace()
+	if err != nil {
+		return fmt.Errorf("failed to resolve workspace: %w", err)
 	}
 
 	switch args[0] {

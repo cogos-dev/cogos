@@ -729,7 +729,22 @@ func extractKeywords(anchor, goal string) []string {
 			continue
 		}
 
-		keywords = append(keywords, word)
+		// FTS5 treats hyphens as NOT operator — quote terms containing
+		// special characters, or split hyphenated terms into parts
+		if strings.ContainsAny(word, "-+*") {
+			// Split hyphenated terms and add each part
+			parts := strings.FieldsFunc(word, func(r rune) bool {
+				return r == '-' || r == '+' || r == '*'
+			})
+			for _, part := range parts {
+				if len(part) >= 3 && !stopWords[part] && !seen[part] {
+					keywords = append(keywords, part)
+					seen[part] = true
+				}
+			}
+		} else {
+			keywords = append(keywords, word)
+		}
 		seen[word] = true
 	}
 

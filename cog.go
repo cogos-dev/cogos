@@ -1181,6 +1181,22 @@ func ResolveWorkspace() (string, string, error) {
 	return workspaceCache.root, workspaceCache.source, workspaceCache.err
 }
 
+// isRealWorkspace checks if dir has a .cog/ directory that looks like a real
+// CogOS workspace (has config/ or mem/), not just a bare .cog/ with .state/ only
+// (which submodules sometimes have).
+func isRealWorkspace(dir string) bool {
+	cogDir := filepath.Join(dir, ".cog")
+	info, err := os.Stat(cogDir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	// A real workspace has config/ subdirectory (not just mem/ or .state/)
+	if info, err := os.Stat(filepath.Join(cogDir, "config")); err == nil && info.IsDir() {
+		return true
+	}
+	return false
+}
+
 // resolveWorkspaceUncached implements the actual workspace resolution logic.
 // Called once per process via ResolveWorkspace().
 func resolveWorkspaceUncached() (string, string, error) {
@@ -1210,10 +1226,22 @@ func resolveWorkspaceUncached() (string, string, error) {
 	}
 
 	// 3. Local git detection (if inside a workspace)
+	// Walk up through git roots — a submodule might have a bare .cog/ directory
+	// (with only .state/) but the real workspace is the parent repo with config/ and mem/.
 	if root, err := gitRoot(); err == nil {
-		cogDir := filepath.Join(root, ".cog")
-		if info, err := os.Stat(cogDir); err == nil && info.IsDir() {
+		if isRealWorkspace(root) {
 			return root, "local", nil
+		}
+		// If git root has a .cog/ but it's not a real workspace (e.g. submodule),
+		// check the parent directory's git root (the superproject).
+		parentDir := filepath.Dir(root)
+		if parentDir != root { // not filesystem root
+			// Walk up looking for a real workspace
+			for dir := parentDir; dir != "/" && dir != "."; dir = filepath.Dir(dir) {
+				if isRealWorkspace(dir) {
+					return dir, "local", nil
+				}
+			}
 		}
 	}
 
@@ -5703,6 +5731,8 @@ func main() {
 		}
 	case "oci":
 		code = cmdOCI(os.Args[2:])
+	case "service":
+		code = cmdService(os.Args[2:])
 	case "version", "-v", "--version":
 		code = cmdVersion()
 	case "info":
