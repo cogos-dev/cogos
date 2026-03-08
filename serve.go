@@ -538,6 +538,7 @@ type serveServer struct {
 	busBroker     *busEventBroker // SSE subscriber broker for bus events
 	toolBridge    *ToolBridge     // Synchronous tool bridge for client-driven agent loops
 	mcpManager    *MCPSessionManager // MCP Streamable HTTP session manager
+	researchMgr   *researchManager   // Research orchestration (nil if no workspace)
 
 	// OCI auto-reload: kernel watches .cog/oci/index.json for new digests
 	ociStore  *OCIStore  // nil if no OCI layout exists
@@ -706,6 +707,17 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/api/cogfield/buses/", s.handleBusDetail)
 	mux.HandleFunc("/api/cogfield/expand/", s.handleExpandNode)
 	mux.HandleFunc("/api/cogfield/documents/", s.handleDocumentDetail)
+
+	// Research orchestration endpoints
+	mux.HandleFunc("POST /v1/research/start", s.handleResearchStart)
+	mux.HandleFunc("GET /v1/research/status", s.handleResearchStatus)
+	mux.HandleFunc("POST /v1/research/eval", s.handleResearchEval)
+	mux.HandleFunc("POST /v1/research/keep", s.handleResearchKeep)
+	mux.HandleFunc("POST /v1/research/discard", s.handleResearchDiscard)
+	mux.HandleFunc("POST /v1/research/pause", s.handleResearchPause)
+	mux.HandleFunc("POST /v1/research/resume", s.handleResearchResume)
+	mux.HandleFunc("POST /v1/research/stop", s.handleResearchStop)
+	mux.HandleFunc("GET /v1/research/results", s.handleResearchResults)
 
 	mux.HandleFunc("/", s.handleRoot)
 
@@ -3842,6 +3854,7 @@ func cmdServeForeground(port int) int {
 	// Initialize bus chat event emission if we have a workspace
 	if root != "" {
 		server.busChat = newBusChat(root)
+		server.researchMgr = newResearchManager(root, server.busChat.manager)
 		// Wire SSE broker to bus event emission
 		server.busChat.manager.AddEventHandler("sse-broker", func(busID string, evt *CogBlock) {
 			server.busBroker.publish(busID, evt)

@@ -5628,6 +5628,8 @@ func main() {
 		code = cmdCache(os.Args[2:])
 	case "fleet":
 		code = cmdFleet(os.Args[2:])
+	case "research":
+		code = cmdResearch(os.Args[2:])
 	case "infer":
 		code = cmdInfer(os.Args[2:])
 	case "inference":
