@@ -350,7 +350,10 @@ func QueryConstellationWithIris(workspaceRoot, anchor, goal string, budget int, 
 	sectionBase := 0.3 // 30% of top score gets section content
 
 	// Pressure scaling: as pressure increases, thresholds rise toward 1.0
-	pressureScale := irisPressure * irisPressure // Quadratic — gentle at low pressure, aggressive at high
+	// Isometry defect from SRC covariance: δ(p) = 1 - (1-p)² = 2p - p²
+	// Derived from ρ²(r) = (2/3)·e^(-2r) under mapping r = -ln(1-p)
+	// More aggressive than p² at moderate pressure (matches covariance decay)
+	pressureScale := 2*irisPressure - irisPressure*irisPressure
 	fullThreshold := topScore * (fullBase + (1.0-fullBase)*pressureScale)
 	sectionThreshold := topScore * (sectionBase + (1.0-sectionBase)*pressureScale)
 

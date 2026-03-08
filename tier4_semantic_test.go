@@ -123,13 +123,13 @@ func TestQueryConstellationWithIris_NoAnchor(t *testing.T) {
 
 func TestQueryConstellationWithIris_ScoreThresholdScaling(t *testing.T) {
 	// Verify the iris threshold math used inside QueryConstellationWithIris:
-	//   pressureScale = irisPressure^2
+	//   pressureScale = 2*irisPressure - irisPressure² (isometry defect from SRC covariance)
 	//   fullThreshold = topScore * (0.6 + 0.4 * pressureScale)
 	//   sectionThreshold = topScore * (0.3 + 0.7 * pressureScale)
 	//
-	// This tests the formula directly since the thresholds are computed
-	// internally and not exposed. We replicate the exact arithmetic from
-	// the function body and verify key properties.
+	// The isometry defect δ(p) = 2p - p² derives from ρ²(r) = (2/3)·e^(-2r)
+	// under the pressure-delay mapping r = -ln(1-p). It equals 1-(1-p)².
+	// More aggressive than p² at moderate pressure (front-loaded fidelity loss).
 
 	const (
 		fullBase    = 0.6
@@ -148,21 +148,21 @@ func TestQueryConstellationWithIris_ScoreThresholdScaling(t *testing.T) {
 			name:         "low pressure (0.1)",
 			topScore:     1.0,
 			irisPressure: 0.1,
-			// pressureScale = 0.01
-			// full  = 1.0 * (0.6 + 0.4*0.01) = 0.604
-			// section = 1.0 * (0.3 + 0.7*0.01) = 0.307
-			wantFull:    0.604,
-			wantSection: 0.307,
+			// pressureScale = 2*0.1 - 0.01 = 0.19
+			// full  = 1.0 * (0.6 + 0.4*0.19) = 0.676
+			// section = 1.0 * (0.3 + 0.7*0.19) = 0.433
+			wantFull:    0.676,
+			wantSection: 0.433,
 		},
 		{
 			name:         "high pressure (0.9)",
 			topScore:     1.0,
 			irisPressure: 0.9,
-			// pressureScale = 0.81
-			// full  = 1.0 * (0.6 + 0.4*0.81) = 0.924
-			// section = 1.0 * (0.3 + 0.7*0.81) = 0.867
-			wantFull:    0.924,
-			wantSection: 0.867,
+			// pressureScale = 2*0.9 - 0.81 = 0.99
+			// full  = 1.0 * (0.6 + 0.4*0.99) = 0.996
+			// section = 1.0 * (0.3 + 0.7*0.99) = 0.993
+			wantFull:    0.996,
+			wantSection: 0.993,
 		},
 		{
 			name:         "zero pressure",
@@ -178,7 +178,7 @@ func TestQueryConstellationWithIris_ScoreThresholdScaling(t *testing.T) {
 			name:         "max pressure (1.0)",
 			topScore:     1.0,
 			irisPressure: 1.0,
-			// pressureScale = 1.0
+			// pressureScale = 2*1.0 - 1.0 = 1.0
 			// full  = 1.0 * (0.6 + 0.4) = 1.0
 			// section = 1.0 * (0.3 + 0.7) = 1.0
 			wantFull:    1.0,
@@ -188,18 +188,19 @@ func TestQueryConstellationWithIris_ScoreThresholdScaling(t *testing.T) {
 			name:         "scaled top score (2.5) with mid pressure (0.5)",
 			topScore:     2.5,
 			irisPressure: 0.5,
-			// pressureScale = 0.25
-			// full  = 2.5 * (0.6 + 0.4*0.25) = 2.5 * 0.7 = 1.75
-			// section = 2.5 * (0.3 + 0.7*0.25) = 2.5 * 0.475 = 1.1875
-			wantFull:    1.75,
-			wantSection: 1.1875,
+			// pressureScale = 2*0.5 - 0.25 = 0.75
+			// full  = 2.5 * (0.6 + 0.4*0.75) = 2.5 * 0.9 = 2.25
+			// section = 2.5 * (0.3 + 0.7*0.75) = 2.5 * 0.825 = 2.0625
+			wantFull:    2.25,
+			wantSection: 2.0625,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Replicate the exact formula from QueryConstellationWithIris
-			pressureScale := tc.irisPressure * tc.irisPressure
+			// Isometry defect: δ(p) = 2p - p²
+			pressureScale := 2*tc.irisPressure - tc.irisPressure*tc.irisPressure
 			fullThreshold := tc.topScore * (fullBase + (1.0-fullBase)*pressureScale)
 			sectionThreshold := tc.topScore * (sectionBase + (1.0-sectionBase)*pressureScale)
 
@@ -215,8 +216,7 @@ func TestQueryConstellationWithIris_ScoreThresholdScaling(t *testing.T) {
 				t.Errorf("fullThreshold (%f) should be >= sectionThreshold (%f)", fullThreshold, sectionThreshold)
 			}
 
-			// Key invariant: higher pressure produces higher thresholds
-			// (verified structurally — pressureScale is monotonically increasing)
+			// Key invariant: pressureScale in [0,1] for irisPressure in [0,1]
 			if pressureScale < 0 || pressureScale > 1 {
 				t.Errorf("pressureScale should be in [0,1], got %f", pressureScale)
 			}
@@ -224,11 +224,12 @@ func TestQueryConstellationWithIris_ScoreThresholdScaling(t *testing.T) {
 	}
 
 	// Verify monotonicity: increasing pressure produces increasing thresholds
+	// 2p - p² is monotonically increasing on [0,1] (derivative = 2-2p ≥ 0)
 	topScore := 1.0
 	prevFull := 0.0
 	prevSection := 0.0
 	for p := 0.0; p <= 1.0; p += 0.1 {
-		ps := p * p
+		ps := 2*p - p*p
 		full := topScore * (fullBase + (1.0-fullBase)*ps)
 		section := topScore * (sectionBase + (1.0-sectionBase)*ps)
 		if full < prevFull-tolerance {
