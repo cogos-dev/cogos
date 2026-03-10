@@ -6,6 +6,8 @@
 // - GET /v1/requests - List in-flight requests
 // - DELETE /v1/requests/:id - Cancel a request
 // - GET /v1/taa - TAA context visibility (debugging)
+// - GET /v1/sessions - List sessions with context metadata
+// - GET /v1/sessions/{session_id}/context - Per-session context state
 // - GET /health - Health check
 //
 // Daemon management commands:
@@ -535,8 +537,9 @@ type serveServer struct {
 	lastTAAState  *ContextState                // Most recent TAA context for debugging
 	taaStateMutex sync.RWMutex
 	busChat       *busChat        // Bus event emission for chat (nil if no workspace)
-	busBroker     *busEventBroker // SSE subscriber broker for bus events
-	toolBridge    *ToolBridge     // Synchronous tool bridge for client-driven agent loops
+	busBroker     *busEventBroker   // SSE subscriber broker for bus events
+	consumerReg   *consumerRegistry // Server-side consumer cursor tracking (ADR-061)
+	toolBridge    *ToolBridge       // Synchronous tool bridge for client-driven agent loops
 	mcpManager    *MCPSessionManager // MCP Streamable HTTP session manager
 	researchMgr   *researchManager   // Research orchestration (nil if no workspace)
 
@@ -663,6 +666,8 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/v1/requests/", s.handleRequestByID)
 	mux.HandleFunc("/v1/taa", s.handleTAA)                    // TAA context visibility endpoint
 	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext) // Iris-driven foveated rendering
+	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)            // Per-session context list
+	mux.HandleFunc("/v1/sessions/", s.handleSessionContext)             // Per-session context detail
 	mux.HandleFunc("GET /v1/card", s.handleCard)              // ADR-048: Kernel capability card
 	mux.HandleFunc("POST /v1/tool-bridge/pending", s.handleToolBridgePending) // Synchronous tool bridge
 	mux.HandleFunc("/health", s.handleHealth)
@@ -671,12 +676,18 @@ func (s *serveServer) Start() error {
 
 	// Bus event streaming (SSE) and REST endpoints
 	mux.HandleFunc("GET /v1/events/stream", s.handleEventsStream)
-	mux.HandleFunc("GET /v1/bus/", s.handleBusEventsREST)
+	mux.HandleFunc("GET /v1/bus/events", s.handleBusEventsGlobal) // Cross-bus event search
+	mux.HandleFunc("GET /v1/bus/", s.handleBusRoute)              // Catch-all: /{bus_id}/events, /events/{seq}, /stats
 
 	// Bus messaging API (inter-workspace)
 	mux.HandleFunc("POST /v1/bus/send", s.handleBusSend)
 	mux.HandleFunc("POST /v1/bus/open", s.handleBusOpen)
 	mux.HandleFunc("GET /v1/bus/list", s.handleBusList)
+
+	// Consumer cursor API (ADR-061)
+	mux.HandleFunc("GET /v1/bus/consumers", s.handleBusConsumers)
+	mux.HandleFunc("DELETE /v1/bus/consumers/", s.handleBusConsumerDelete)
+	mux.HandleFunc("POST /v1/bus/", s.handleBusAck) // catch-all POST for /v1/bus/{bus_id}/ack
 
 	// SDK routes (universal cog:// access)
 	if s.kernel != nil {
@@ -790,6 +801,8 @@ func (s *serveServer) Start() error {
 	fmt.Printf("  GET    /v1/requests         - List in-flight requests\n")
 	fmt.Printf("  DELETE /v1/requests/:id     - Cancel a request\n")
 	fmt.Printf("  GET    /v1/taa              - TAA context visibility\n")
+	fmt.Printf("  GET    /v1/sessions         - List sessions with context metadata\n")
+	fmt.Printf("  GET    /v1/sessions/:id/context - Per-session context state\n")
 	if s.kernel != nil {
 		fmt.Printf("\nSDK (universal cog:// access):\n")
 		fmt.Printf("  GET    /resolve?uri=cog://... - Resolve any URI\n")
@@ -984,6 +997,8 @@ func (s *serveServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"GET /v1/requests - List in-flight requests",
 		"DELETE /v1/requests/:id - Cancel request",
 		"GET /v1/card - Kernel capability card",
+		"GET /v1/sessions - List sessions with context metadata",
+		"GET /v1/sessions/:id/context - Per-session context state",
 		"GET /health - Health check",
 	}
 
@@ -1023,6 +1038,7 @@ func (s *serveServer) handleCard(w http.ResponseWriter, r *http.Request) {
 		"inference": "/v1/chat/completions",
 		"models":    "/v1/models",
 		"providers": "/v1/providers",
+		"sessions":  "/v1/sessions",
 		"health":    "/health",
 	}
 	if hasMCP {
@@ -1124,6 +1140,106 @@ func (s *serveServer) handleTAA(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// === PER-SESSION CONTEXT OBSERVABILITY ===
+
+// SessionContextState captures the context state for a single session's most recent foveated request.
+// This enables per-session observability via GET /v1/sessions/{session_id}/context.
+type SessionContextState struct {
+	SessionID      string         `json:"session_id"`
+	Profile        string         `json:"profile"`
+	TurnNumber     int            `json:"turn_number"`
+	IrisSize       int            `json:"iris_size"`
+	IrisUsed       int            `json:"iris_used"`
+	IrisPressure   float64        `json:"iris_pressure"`
+	TotalTokens    int            `json:"total_tokens"`
+	Blocks         []ContextBlock `json:"blocks"`
+	BlockCount     int            `json:"block_count"`
+	CacheHits      int            `json:"cache_hits"`
+	LastRequestAt  time.Time      `json:"last_request_at"`
+	CoherenceScore float64        `json:"coherence_score,omitempty"`
+}
+
+var (
+	sessionContextStore   = make(map[string]*SessionContextState)
+	sessionContextStoreMu sync.RWMutex
+)
+
+// recordSessionContext stores the latest context state for a session.
+func recordSessionContext(state *SessionContextState) {
+	sessionContextStoreMu.Lock()
+	defer sessionContextStoreMu.Unlock()
+	sessionContextStore[state.SessionID] = state
+}
+
+// handleListSessions returns summary metadata for all known sessions.
+// GET /v1/sessions
+func (s *serveServer) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	sessionContextStoreMu.RLock()
+	defer sessionContextStoreMu.RUnlock()
+
+	type sessionSummary struct {
+		SessionID      string    `json:"session_id"`
+		Profile        string    `json:"profile"`
+		TurnNumber     int       `json:"turn_number"`
+		IrisPressure   float64   `json:"iris_pressure"`
+		TotalTokens    int       `json:"total_tokens"`
+		BlockCount     int       `json:"block_count"`
+		CoherenceScore float64   `json:"coherence_score,omitempty"`
+		LastRequestAt  time.Time `json:"last_request_at"`
+	}
+
+	sessions := make([]sessionSummary, 0, len(sessionContextStore))
+	for _, state := range sessionContextStore {
+		sessions = append(sessions, sessionSummary{
+			SessionID:      state.SessionID,
+			Profile:        state.Profile,
+			TurnNumber:     state.TurnNumber,
+			IrisPressure:   state.IrisPressure,
+			TotalTokens:    state.TotalTokens,
+			BlockCount:     state.BlockCount,
+			CoherenceScore: state.CoherenceScore,
+			LastRequestAt:  state.LastRequestAt,
+		})
+	}
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"sessions": sessions,
+		"count":    len(sessions),
+	})
+}
+
+// handleSessionContext returns the full context state for a specific session.
+// GET /v1/sessions/{session_id}/context
+func (s *serveServer) handleSessionContext(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Extract session_id from URL path: /v1/sessions/{session_id}/context
+	path := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
+	// path is now "{session_id}/context" or "{session_id}"
+	sessionID := strings.TrimSuffix(path, "/context")
+	sessionID = strings.TrimSuffix(sessionID, "/")
+
+	if sessionID == "" {
+		s.writeError(w, http.StatusBadRequest, "session_id is required in path: /v1/sessions/{session_id}/context", "invalid_request")
+		return
+	}
+
+	sessionContextStoreMu.RLock()
+	state, ok := sessionContextStore[sessionID]
+	sessionContextStoreMu.RUnlock()
+
+	if !ok {
+		s.writeError(w, http.StatusNotFound,
+			fmt.Sprintf("No context found for session %q. Use GET /v1/sessions to list known sessions.", sessionID),
+			"not_found")
+		return
+	}
+
+	json.NewEncoder(w).Encode(state)
+}
+
 // handleFoveatedContext renders context at variable resolution driven by iris signals.
 //
 // The iris (agent's context window state) determines the effective budget,
@@ -1220,8 +1336,13 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 	s.lastTAAState = ctx
 	s.taaStateMutex.Unlock()
 
-	// Build response
-	contextStr := ctx.BuildContextString()
+	// Build response — stability-ordered blocks
+	contextStr, blocks := ctx.BuildOrderedContextString()
+	if contextStr == "" {
+		// Fallback to legacy tier-ordered output if decomposition yields nothing
+		contextStr = ctx.BuildContextString()
+	}
+
 	tierBreakdown := map[string]int{}
 	if ctx.Tier1Identity != nil {
 		tierBreakdown["tier1"] = ctx.Tier1Identity.Tokens
@@ -1244,8 +1365,42 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	log.Printf("[foveated] Response: tokens=%d anchor=%q goal=%q coherence=%.2f pressure=%.1f%%",
-		ctx.TotalTokens, ctx.Anchor, ctx.Goal, ctx.CoherenceScore, irisPressure*100)
+	// Record per-session context state for observability
+	turnNumber := 0
+	cacheHits := 0
+	sessionContextStoreMu.RLock()
+	if prev, ok := sessionContextStore[sessionID]; ok {
+		turnNumber = prev.TurnNumber + 1
+		// Count cache hits: blocks whose hash matches a block in the previous state
+		prevHashes := make(map[string]bool, len(prev.Blocks))
+		for _, b := range prev.Blocks {
+			prevHashes[b.Hash] = true
+		}
+		for _, b := range blocks {
+			if prevHashes[b.Hash] {
+				cacheHits++
+			}
+		}
+	}
+	sessionContextStoreMu.RUnlock()
+
+	recordSessionContext(&SessionContextState{
+		SessionID:      sessionID,
+		Profile:        profileName,
+		TurnNumber:     turnNumber,
+		IrisSize:       req.Iris.Size,
+		IrisUsed:       req.Iris.Used,
+		IrisPressure:   irisPressure,
+		TotalTokens:    ctx.TotalTokens,
+		Blocks:         blocks,
+		BlockCount:     len(blocks),
+		CacheHits:      cacheHits,
+		LastRequestAt:  time.Now(),
+		CoherenceScore: ctx.CoherenceScore,
+	})
+
+	log.Printf("[foveated] Response: tokens=%d blocks=%d anchor=%q goal=%q coherence=%.2f pressure=%.1f%%",
+		ctx.TotalTokens, len(blocks), ctx.Anchor, ctx.Goal, ctx.CoherenceScore, irisPressure*100)
 
 	json.NewEncoder(w).Encode(map[string]any{
 		"context":          contextStr,
@@ -1256,6 +1411,7 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 		"tier_breakdown":   tierBreakdown,
 		"effective_budget": effectiveBudget,
 		"iris_pressure":    irisPressure,
+		"blocks":           blocks,
 	})
 }
 
@@ -2222,6 +2378,15 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		inferReq.WorkspaceRoot = ucpContext.Workspace.Root
 	}
 
+	// Simple workspace override: X-Workspace-Root header sets the working
+	// directory without requiring a full UCP workspace packet. This is a
+	// lightweight alternative for callers that only need to specify the cwd.
+	if inferReq.WorkspaceRoot == "" {
+		if simpleRoot := r.Header.Get("X-Workspace-Root"); simpleRoot != "" {
+			inferReq.WorkspaceRoot = simpleRoot
+		}
+	}
+
 	// Parse X-Allowed-Tools header for explicit tool control
 	if allowedToolsHeader := r.Header.Get("X-Allowed-Tools"); allowedToolsHeader != "" {
 		var tools []string
@@ -2243,6 +2408,14 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		if err != nil {
 			log.Printf("[CRD] Warning: failed to load agent CRD for %q: %v", agentName, err)
 		} else if policy != nil {
+			// Headless agent gate: headless agents do NOT go through inference.
+			// They should only receive tool dispatch via the bus ToolRouter.
+			if policy.AgentType == "headless" {
+				log.Printf("[CRD] Agent %q is headless — rejecting inference request", agentName)
+				http.Error(w, `{"error":"headless agents do not support inference — use bus tool.invoke"}`, http.StatusBadRequest)
+				return
+			}
+
 			// CRD-defined tools — only apply if no explicit header override
 			if len(inferReq.AllowedTools) == 0 && len(policy.AllowedTools) > 0 {
 				inferReq.AllowedTools = policy.AllowedTools
@@ -3750,6 +3923,85 @@ func (s *serveServer) handleSignals(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resource)
 }
 
+// === Consumer Cursor Handlers (ADR-061) ===
+
+// handleBusAck handles POST /v1/bus/{bus_id}/ack — acknowledge an event.
+func (s *serveServer) handleBusAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract bus_id from path: /v1/bus/{bus_id}/ack
+	path := strings.TrimPrefix(r.URL.Path, "/v1/bus/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) < 2 || parts[1] != "ack" || parts[0] == "" {
+		http.Error(w, "Expected /v1/bus/{bus_id}/ack", http.StatusBadRequest)
+		return
+	}
+	busID := parts[0]
+
+	var req struct {
+		ConsumerID string `json:"consumer_id"`
+		Seq        int64  `json:"seq"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if req.ConsumerID == "" || req.Seq <= 0 {
+		http.Error(w, "consumer_id and seq (>0) are required", http.StatusBadRequest)
+		return
+	}
+
+	cursor, err := s.consumerReg.ack(busID, req.ConsumerID, req.Seq)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(cursor)
+}
+
+// handleBusConsumers handles GET /v1/bus/consumers — list all consumers.
+func (s *serveServer) handleBusConsumers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	busID := r.URL.Query().Get("bus_id") // optional filter
+	cursors := s.consumerReg.list(busID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"consumers": cursors,
+	})
+}
+
+// handleBusConsumerDelete handles DELETE /v1/bus/consumers/{consumer_id} — remove a consumer.
+func (s *serveServer) handleBusConsumerDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract consumer_id from path: /v1/bus/consumers/{consumer_id}
+	consumerID := strings.TrimPrefix(r.URL.Path, "/v1/bus/consumers/")
+	if consumerID == "" {
+		http.Error(w, "Consumer ID required", http.StatusBadRequest)
+		return
+	}
+
+	if !s.consumerReg.remove(consumerID) {
+		http.Error(w, "Consumer not found", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // === COMMAND HANDLER ===
 
 func cmdServe(args []string) int {
@@ -3860,6 +4112,13 @@ func cmdServeForeground(port int) int {
 			server.busBroker.publish(busID, evt)
 		})
 
+		// Initialize consumer cursor registry (ADR-061)
+		server.consumerReg = newConsumerRegistry(filepath.Join(root, ".cog", "run", "bus"))
+		if err := server.consumerReg.loadFromDisk(); err != nil {
+			log.Printf("[bus-cursor] Failed to load cursors from disk: %v", err)
+		}
+		go server.consumerReg.runLifecycle(context.Background())
+
 		// Wire block index — append-only hash index for all bus events
 		blkIndex := newBlockIndex(root)
 		server.busChat.manager.AddEventHandler("block-index", func(_ string, block *CogBlock) {
@@ -3888,24 +4147,54 @@ func cmdServeForeground(port int) int {
 			}
 		}
 
-		// 1. ToolRouter: listens for tool.invoke events on the bus
-		toolRouter := NewToolRouter(server.busChat.manager, root, openclawBridge)
-		toolRouter.Start()
-		defer toolRouter.Stop()
-
-		// 2. CapabilityCache: TTL-based cache for agent capability advertisements
+		// 1. CapabilityCache: TTL-based cache for agent capability advertisements
 		capCache := NewCapabilityCache()
 		stopSweeper := capCache.StartExpirySweeper(60 * time.Second)
 		defer stopSweeper()
 
-		// 3. CapabilityAdvertiser: advertise agent capabilities on startup
+		// Wire CapabilityCache as bus consumer for agent.capabilities events
+		server.busChat.manager.AddEventHandler("capability-cache", func(busID string, block *CogBlock) {
+			if block.Type != BlockAgentCapabilities {
+				return
+			}
+			// Parse payload
+			payloadBytes, err := json.Marshal(block.Payload)
+			if err != nil {
+				log.Printf("[cap-cache] failed to marshal payload: %v", err)
+				return
+			}
+			var caps AgentCapabilitiesPayload
+			if err := json.Unmarshal(payloadBytes, &caps); err != nil {
+				log.Printf("[cap-cache] failed to parse capabilities from %s: %v", block.From, err)
+				return
+			}
+			ttl := defaultCapabilityTTL
+			if caps.TTL != "" {
+				if parsed, parseErr := time.ParseDuration(caps.TTL); parseErr == nil {
+					ttl = parsed
+				}
+			}
+			capCache.Set(caps.AgentID, caps, ttl)
+			log.Printf("[cap-cache] cached capabilities for agent=%s tools_allow=%d tools_deny=%d ttl=%s",
+				caps.AgentID, len(caps.Tools.Allow), len(caps.Tools.Deny), ttl)
+		})
+
+		// 2. CapabilityResolver: wraps cache for URI resolution and tool validation
+		capResolver := NewCapabilityResolver(capCache)
+
+		// 3. ToolRouter: listens for tool.invoke events on the bus
+		toolRouter := NewToolRouter(server.busChat.manager, root, openclawBridge, capResolver)
+		toolRouter.Start()
+		defer toolRouter.Stop()
+
+		// 4. CapabilityAdvertiser: advertise agent capabilities on startup
 		go func() {
 			if err := AdvertiseAgentCapabilities(root, server.busChat.manager); err != nil {
 				log.Printf("[cap-advert] startup advertise failed: %v", err)
 			}
 		}()
 
-		// 4. BEPProvider: file watcher for agent CRD changes
+		// 5. BEPProvider: file watcher for agent CRD changes
 		bepProvider := NewBEPProvider(root)
 		bepProvider.OnFileChange(func(filename string) {
 			log.Printf("[bep] CRD changed: %s — re-advertising capabilities", filename)
@@ -3919,7 +4208,7 @@ func cmdServeForeground(port int) int {
 			defer bepProvider.Stop()
 		}
 
-		// 4b. BEPEngine: cross-node sync via BEP protocol (gated on cluster.enabled)
+		// 5b. BEPEngine: cross-node sync via BEP protocol (gated on cluster.enabled)
 		if bepCfg, cfgErr := bepProvider.LoadConfig(); cfgErr == nil && bepCfg.Enabled {
 			engine, engineErr := NewBEPEngine(root, bepCfg, bepProvider)
 			if engineErr != nil {
@@ -3935,13 +4224,14 @@ func cmdServeForeground(port int) int {
 			}
 		}
 
-		// 5. Node identity logging
+		// 6. Node identity logging
 		if nodeIdent, nodeErr := LoadNodeIdentity(); nodeErr == nil {
 			log.Printf("[node] %s (%s/%s)", nodeIdent.Node.ID, nodeIdent.Node.OS, nodeIdent.Node.Arch)
 		}
 
-		// 6. Active reconciliation loop
+		// 7. Active reconciliation loop
 		reconciler := NewServeReconciler(root)
+		reconciler.SetBus(server.busChat.manager)
 		if startErr := reconciler.Start(); startErr != nil {
 			log.Printf("[reconciler] failed to start: %v", startErr)
 		} else {
@@ -4043,6 +4333,32 @@ func cmdServeForeground(port int) int {
 					origin, agent, block.BusID, block.Seq)
 			},
 		})
+
+		// Rule: component.drift → structured logging for reconciliation drift events.
+		// Logs component name, action type, severity, and resource for observability.
+		reactor.AddRule(ReactorRule{
+			Name:      "component.drift.log",
+			EventType: BlockComponentDrift,
+			Action: func(block *CogBlock) {
+				component, _ := block.Payload["component"].(string)
+				action, _ := block.Payload["action"].(string)
+				severity, _ := block.Payload["severity"].(string)
+				resource, _ := block.Payload["resource"].(string)
+				reason, _ := block.Payload["reason"].(string)
+				log.Printf("[reactor] component.drift: component=%s action=%s severity=%s resource=%s reason=%q",
+					component, action, severity, resource, reason)
+			},
+		})
+
+		// CRD-generated subscription rules
+		if subRules, err := GenerateSubscriptionRules(root, server.busChat.manager); err != nil {
+			log.Printf("[reactor] subscription rule generation failed: %v", err)
+		} else {
+			for _, rule := range subRules {
+				reactor.AddRule(rule)
+			}
+			log.Printf("[reactor] added %d CRD subscription rules", len(subRules))
+		}
 
 		reactor.Start()
 		defer reactor.Stop()
@@ -4465,6 +4781,8 @@ Inference Endpoints (OpenAI-compatible):
   GET    /v1/requests/:id       Get specific request status
   DELETE /v1/requests/:id       Cancel a request
   GET    /v1/taa                TAA context visibility (debugging)
+  GET    /v1/sessions           List sessions with context metadata
+  GET    /v1/sessions/:id/context  Per-session context state
 
 SDK Endpoints (universal cog:// access):
   GET    /resolve?uri=cog://... Resolve any cog:// URI

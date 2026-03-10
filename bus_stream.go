@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -224,6 +226,8 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 		busID = "*" // wildcard — receive events from all buses
 	}
 
+	consumerID := r.URL.Query().Get("consumer")
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
@@ -270,12 +274,25 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 	fmt.Fprintf(w, "data: %s\n\n", connData)
 	flusher.Flush()
 
-	// Replay existing events for the bus (skip for wildcard subscribers).
+	// Replay existing events — cursor-aware if consumer is registered.
 	if busChat != nil && busID != "*" {
 		events, err := busChat.manager.readBusEvents(busID)
 		if err == nil {
+			var startSeq int64
+			if consumerID != "" {
+				// Cursor-based: get or create cursor, replay from cursor position
+				cursor := s.consumerReg.getOrCreate(busID, consumerID)
+				startSeq = cursor.LastAckedSeq
+				log.Printf("[bus-stream] Consumer %s connected to bus=%s, resuming from seq=%d",
+					consumerID, busID, startSeq)
+			}
+
 			extendDeadline()
 			for i := range events {
+				// Skip events the consumer has already acknowledged
+				if int64(events[i].Seq) <= startSeq {
+					continue
+				}
 				envelope := busEventEnvelope{
 					ID:        fmt.Sprintf("replay_%s_%d", busID, events[i].Seq),
 					Type:      "bus.event",
@@ -295,7 +312,13 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 
 	ctx := r.Context()
 
-	log.Printf("[bus-stream] SSE client connected for bus=%s (active=%d)", busID, s.busBroker.subscriberCount(busID))
+	if consumerID != "" {
+		log.Printf("[bus-stream] SSE consumer=%s connected for bus=%s (active=%d)",
+			consumerID, busID, s.busBroker.subscriberCount(busID))
+	} else {
+		log.Printf("[bus-stream] SSE client connected for bus=%s (active=%d)",
+			busID, s.busBroker.subscriberCount(busID))
+	}
 
 	for {
 		select {
@@ -303,7 +326,15 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 			log.Printf("[bus-stream] SSE client disconnected for bus=%s", busID)
 			return
 
-		case evt := <-ch:
+		case evt, ok := <-ch:
+			if !ok {
+				// Channel closed by broker (evicted as stale) — exit gracefully.
+				log.Printf("[bus-stream] SSE channel closed by broker for bus=%s, disconnecting", busID)
+				return
+			}
+			if evt == nil {
+				continue
+			}
 			envelope := busEventEnvelope{
 				ID:        fmt.Sprintf("live_%s_%d", busID, evt.Seq),
 				Type:      "bus.event",
@@ -330,46 +361,264 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// handleBusEventsREST serves GET /v1/bus/{bus_id}/events
-// Returns all events for a bus as a JSON array.
-func (s *serveServer) handleBusEventsREST(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+// ---------------------------------------------------------------------------
+// Consumer Cursors — ADR-061 server-side consumer position tracking
+// ---------------------------------------------------------------------------
 
-	// Extract bus_id from path: /v1/bus/{bus_id}/events
-	path := strings.TrimPrefix(r.URL.Path, "/v1/bus/")
-	parts := strings.SplitN(path, "/", 2)
-	if len(parts) < 2 || parts[1] != "events" || parts[0] == "" {
-		http.Error(w, "Expected /v1/bus/{bus_id}/events", http.StatusBadRequest)
-		return
-	}
-	busID := parts[0]
-
-	// Resolve per-workspace busChat; fall back to server default.
-	busChat := s.busChat
-	if ws := workspaceFromRequest(r); ws != nil && ws.busChat != nil {
-		busChat = ws.busChat
-	}
-
-	if busChat == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("[]"))
-		return
-	}
-
-	events, err := busChat.manager.readBusEvents(busID)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("[]"))
-		return
-	}
-
-	if events == nil {
-		events = []CogBlock{}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(events)
+// ConsumerCursor tracks a consumer's position in a bus event stream.
+// Persisted to {bus_id}.cursors.jsonl alongside events.
+type ConsumerCursor struct {
+	ConsumerID   string    `json:"consumer_id"`
+	BusID        string    `json:"bus_id"`
+	LastAckedSeq int64     `json:"last_acked_seq"`
+	ConnectedAt  time.Time `json:"connected_at"`
+	LastAckAt    time.Time `json:"last_ack_at"`
+	Stale        bool      `json:"stale"`
 }
+
+// consumerRegistry manages consumer cursors for all buses.
+// Thread-safe — all public methods acquire the mutex.
+type consumerRegistry struct {
+	mu      sync.RWMutex
+	cursors map[string]map[string]*ConsumerCursor // busID -> consumerID -> cursor
+	dataDir string                                // persistence directory (.cog/run/bus/)
+}
+
+func newConsumerRegistry(dataDir string) *consumerRegistry {
+	return &consumerRegistry{
+		cursors: make(map[string]map[string]*ConsumerCursor),
+		dataDir: dataDir,
+	}
+}
+
+// getOrCreate returns the cursor for a consumer, creating one at position 0 if it doesn't exist.
+func (cr *consumerRegistry) getOrCreate(busID, consumerID string) *ConsumerCursor {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if cr.cursors[busID] == nil {
+		cr.cursors[busID] = make(map[string]*ConsumerCursor)
+	}
+	cursor, ok := cr.cursors[busID][consumerID]
+	if !ok {
+		cursor = &ConsumerCursor{
+			ConsumerID:   consumerID,
+			BusID:        busID,
+			LastAckedSeq: 0,
+			ConnectedAt:  time.Now(),
+			Stale:        false,
+		}
+		cr.cursors[busID][consumerID] = cursor
+		log.Printf("[bus-cursor] Created cursor for consumer=%s bus=%s", consumerID, busID)
+	} else {
+		cursor.ConnectedAt = time.Now()
+		cursor.Stale = false
+	}
+	return cursor
+}
+
+// ack advances a consumer's cursor. Returns the updated cursor.
+// Returns nil if the consumer doesn't exist.
+// ACKs are monotonic — ignores seq <= current LastAckedSeq.
+func (cr *consumerRegistry) ack(busID, consumerID string, seq int64) (*ConsumerCursor, error) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if cr.cursors[busID] == nil {
+		return nil, fmt.Errorf("unknown bus: %s", busID)
+	}
+	cursor, ok := cr.cursors[busID][consumerID]
+	if !ok {
+		return nil, fmt.Errorf("unknown consumer: %s on bus %s", consumerID, busID)
+	}
+	if seq <= cursor.LastAckedSeq {
+		// Monotonic — silently ignore duplicate/stale ACKs
+		return cursor, nil
+	}
+	cursor.LastAckedSeq = seq
+	cursor.LastAckAt = time.Now()
+	cursor.Stale = false
+
+	// Persist cursor update
+	cr.persistLocked(busID, cursor)
+
+	return cursor, nil
+}
+
+// list returns all cursors, optionally filtered by busID (empty = all).
+func (cr *consumerRegistry) list(busID string) []*ConsumerCursor {
+	cr.mu.RLock()
+	defer cr.mu.RUnlock()
+	var result []*ConsumerCursor
+	for bid, consumers := range cr.cursors {
+		if busID != "" && bid != busID {
+			continue
+		}
+		for _, cursor := range consumers {
+			c := *cursor // copy
+			result = append(result, &c)
+		}
+	}
+	return result
+}
+
+// remove deletes a consumer's cursor.
+func (cr *consumerRegistry) remove(consumerID string) bool {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	found := false
+	for busID, consumers := range cr.cursors {
+		if _, ok := consumers[consumerID]; ok {
+			delete(consumers, consumerID)
+			found = true
+			log.Printf("[bus-cursor] Removed cursor for consumer=%s bus=%s", consumerID, busID)
+			if len(consumers) == 0 {
+				delete(cr.cursors, busID)
+			}
+		}
+	}
+	return found
+}
+
+// persistLocked writes a cursor snapshot to the cursors.jsonl file.
+// Caller must hold cr.mu.
+func (cr *consumerRegistry) persistLocked(busID string, cursor *ConsumerCursor) {
+	if cr.dataDir == "" {
+		return
+	}
+	path := filepath.Join(cr.dataDir, busID+".cursors.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[bus-cursor] Failed to open cursor file %s: %v", path, err)
+		return
+	}
+	defer f.Close()
+	data, _ := json.Marshal(cursor)
+	f.Write(append(data, '\n'))
+}
+
+// loadFromDisk reads all cursor files and reconstructs the latest state per consumer.
+func (cr *consumerRegistry) loadFromDisk() error {
+	if cr.dataDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(cr.dataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // no persistence dir yet
+		}
+		return fmt.Errorf("read cursor dir: %w", err)
+	}
+
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	loaded := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".cursors.jsonl") {
+			continue
+		}
+		busID := strings.TrimSuffix(entry.Name(), ".cursors.jsonl")
+		path := filepath.Join(cr.dataDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			log.Printf("[bus-cursor] Failed to read %s: %v", path, err)
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			var cursor ConsumerCursor
+			if err := json.Unmarshal([]byte(line), &cursor); err != nil {
+				continue
+			}
+			if cr.cursors[busID] == nil {
+				cr.cursors[busID] = make(map[string]*ConsumerCursor)
+			}
+			// Last entry wins (append-only log)
+			cr.cursors[busID][cursor.ConsumerID] = &cursor
+			loaded++
+		}
+	}
+	if loaded > 0 {
+		log.Printf("[bus-cursor] Loaded %d cursor entries from disk", loaded)
+	}
+	return nil
+}
+
+// sweepStale marks consumers as stale if they haven't ACKed within the staleness window.
+// connectedWindow: staleness timeout for connected consumers (default 5 min)
+// disconnectedWindow: staleness timeout for disconnected consumers (default 24h)
+func (cr *consumerRegistry) sweepStale(connectedWindow, disconnectedWindow time.Duration) int {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	now := time.Now()
+	marked := 0
+	for _, consumers := range cr.cursors {
+		for _, cursor := range consumers {
+			if cursor.Stale {
+				continue // already stale
+			}
+			window := disconnectedWindow
+			if !cursor.ConnectedAt.IsZero() && now.Sub(cursor.ConnectedAt) < connectedWindow {
+				window = connectedWindow
+			}
+			lastActivity := cursor.LastAckAt
+			if lastActivity.IsZero() {
+				lastActivity = cursor.ConnectedAt
+			}
+			if !lastActivity.IsZero() && now.Sub(lastActivity) > window {
+				cursor.Stale = true
+				marked++
+				log.Printf("[bus-cursor] Marked consumer=%s bus=%s as stale (last activity %s ago)",
+					cursor.ConsumerID, cursor.BusID, now.Sub(lastActivity).Round(time.Second))
+			}
+		}
+	}
+	return marked
+}
+
+// minAckedSeq returns the minimum LastAckedSeq across all active (non-stale) cursors for a bus.
+// Events with seq <= this value are safe to garbage-collect.
+// Returns 0 if no active cursors exist (nothing is safe to GC).
+func (cr *consumerRegistry) minAckedSeq(busID string) int64 {
+	cr.mu.RLock()
+	defer cr.mu.RUnlock()
+	consumers, ok := cr.cursors[busID]
+	if !ok || len(consumers) == 0 {
+		return 0
+	}
+	var minSeq int64
+	first := true
+	for _, cursor := range consumers {
+		if cursor.Stale {
+			continue // don't let stale cursors prevent GC
+		}
+		if first || cursor.LastAckedSeq < minSeq {
+			minSeq = cursor.LastAckedSeq
+			first = false
+		}
+	}
+	return minSeq
+}
+
+// runLifecycle runs the cursor lifecycle loop: periodic staleness sweep.
+// Runs until ctx is cancelled.
+func (cr *consumerRegistry) runLifecycle(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			marked := cr.sweepStale(5*time.Minute, 24*time.Hour)
+			if marked > 0 {
+				log.Printf("[bus-cursor] Staleness sweep: marked %d consumers as stale", marked)
+			}
+		}
+	}
+}
+
+// handleBusEventsREST is replaced by handleBusRoute in bus_api.go.
+// The new handler supports query filtering, single event lookup, stats, and cross-bus search.

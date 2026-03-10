@@ -18,9 +18,10 @@ import (
 // execution, and posts tool.result responses back onto the bus.
 // When a bridge is configured, unknown tools are dispatched to OpenClaw.
 type ToolRouter struct {
-	manager *busSessionManager
-	root    string           // workspace root for kernel operations
-	bridge  *OpenClawBridge  // remote tool dispatch (nil = local only)
+	manager  *busSessionManager
+	root     string               // workspace root for kernel operations
+	bridge   *OpenClawBridge      // remote tool dispatch (nil = local only)
+	resolver *CapabilityResolver  // agent capability lookups (nil = skip)
 
 	mu      sync.Mutex
 	running bool
@@ -29,13 +30,15 @@ type ToolRouter struct {
 
 // NewToolRouter creates a new ToolRouter bound to the given bus session manager
 // and workspace root. If bridge is non-nil, unknown tools fall through to
-// remote dispatch via the OpenClaw gateway.
-func NewToolRouter(manager *busSessionManager, root string, bridge *OpenClawBridge) *ToolRouter {
+// remote dispatch via the OpenClaw gateway. If resolver is non-nil, bridge
+// dispatch validates agent capabilities before forwarding.
+func NewToolRouter(manager *busSessionManager, root string, bridge *OpenClawBridge, resolver *CapabilityResolver) *ToolRouter {
 	return &ToolRouter{
-		manager: manager,
-		root:    root,
-		bridge:  bridge,
-		stopCh:  make(chan struct{}),
+		manager:  manager,
+		root:     root,
+		bridge:   bridge,
+		resolver: resolver,
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -127,15 +130,26 @@ func (tr *ToolRouter) handleToolInvokeEvent(busID string, evt *CogBlock) {
 		}
 	}
 
+	// Determine if this is a headless agent dispatch. When a target agent is
+	// specified and is headless, we use the optimized path that skips inference
+	// and logs the dispatch separately for observability.
+	headless := invoke.TargetAgent != "" && tr.isHeadlessAgent(invoke.TargetAgent)
+	executedBy := "kernel:tool-router"
+	if headless {
+		executedBy = "kernel:tool-router:headless"
+		log.Printf("[tool-router] bus=%s reqID=%s headless dispatch for agent=%s tool=%s",
+			busID, invoke.RequestID, invoke.TargetAgent, invoke.Tool)
+	}
+
 	// Dispatch tool execution.
-	result, dispatch, execErr := tr.executeTool(invoke.Tool, invoke.Args)
+	result, dispatch, execErr := tr.executeTool(invoke.Tool, invoke.Args, busID, invoke.CallerAgent)
 
 	durationMs := time.Since(start).Milliseconds()
 
 	// Build the result payload.
 	resultPayload := ToolResultPayload{
 		RequestID:  invoke.RequestID,
-		ExecutedBy: "kernel:tool-router",
+		ExecutedBy: executedBy,
 		DurationMs: durationMs,
 		Tool:       invoke.Tool,
 		Dispatch:   dispatch,
@@ -150,8 +164,8 @@ func (tr *ToolRouter) handleToolInvokeEvent(busID string, evt *CogBlock) {
 		if resultBytes, err := json.Marshal(result); err == nil {
 			resultPayload.ResultSize = len(resultBytes)
 		}
-		log.Printf("[tool-router] bus=%s reqID=%s tool=%s success duration=%dms size=%d",
-			busID, invoke.RequestID, invoke.Tool, durationMs, resultPayload.ResultSize)
+		log.Printf("[tool-router] bus=%s reqID=%s tool=%s success duration=%dms size=%d headless=%v",
+			busID, invoke.RequestID, invoke.Tool, durationMs, resultPayload.ResultSize, headless)
 	}
 
 	// Post tool.result back onto the bus.
@@ -225,7 +239,9 @@ func matchToolPattern(pattern, tool string) bool {
 
 // executeTool dispatches to the appropriate built-in tool implementation.
 // Returns (result, dispatch_path, error). dispatch is "builtin" or "bridge".
-func (tr *ToolRouter) executeTool(tool string, args map[string]any) (any, string, error) {
+// busID and callerAgent are used to derive a session key for bridge dispatch
+// so the gateway can track which session/agent initiated the call.
+func (tr *ToolRouter) executeTool(tool string, args map[string]any, busID, callerAgent string) (any, string, error) {
 	switch tool {
 	case "memory_search":
 		r, err := tr.toolMemorySearch(args)
@@ -242,9 +258,28 @@ func (tr *ToolRouter) executeTool(tool string, args map[string]any) (any, string
 	default:
 		// Remote dispatch via OpenClaw bridge
 		if tr.bridge != nil {
-			result, err := tr.bridge.ExecuteTool(
-				context.Background(), tool, args,
-			)
+			// Resolver-based capability validation: if we know who the caller
+			// is and a resolver is wired, verify the agent can invoke this tool.
+			if callerAgent != "" && tr.resolver != nil {
+				if _, known := tr.resolver.ResolveAgent(callerAgent); known {
+					if !tr.resolver.CanInvokeTool(callerAgent, tool) {
+						return nil, "bridge", fmt.Errorf("agent %q is not capable of tool %q", callerAgent, tool)
+					}
+				}
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			// Derive session key from bus event context for gateway tracking.
+			// Format: "busID:callerAgent" — identifies which bus channel and
+			// agent initiated this tool call.
+			sessionKey := tr.bridge.SessionKey // fall back to bridge default
+			if busID != "" || callerAgent != "" {
+				sessionKey = busID + ":" + callerAgent
+			}
+
+			result, err := tr.bridge.ExecuteToolWithSession(ctx, tool, args, sessionKey)
 			if err != nil {
 				return nil, "bridge", fmt.Errorf("remote tool %q: %w", tool, err)
 			}
@@ -252,6 +287,46 @@ func (tr *ToolRouter) executeTool(tool string, args map[string]any) (any, string
 		}
 		return nil, "", fmt.Errorf("unknown tool: %s", tool)
 	}
+}
+
+// ─── Headless Agent Tool Dispatch ────────────────────────────────────────────────
+
+// HandleHeadlessTool dispatches a tool call for a headless agent without inference.
+// Returns the tool result directly, bypassing the LLM pipeline. This is the public
+// API for components (e.g., reactor subscriptions) that know they are targeting a
+// headless agent and want direct tool-as-RPC without going through bus events.
+func (tr *ToolRouter) HandleHeadlessTool(agentID, tool string, args map[string]any) (any, error) {
+	// Validate the agent is headless.
+	if !tr.isHeadlessAgent(agentID) {
+		return nil, fmt.Errorf("agent %q is not headless or not found", agentID)
+	}
+
+	result, path, err := tr.executeTool(tool, args, "", agentID)
+	if err != nil {
+		return nil, fmt.Errorf("headless tool dispatch via %s: %w", path, err)
+	}
+
+	log.Printf("[tool-router] headless dispatch agent=%s tool=%s via=%s", agentID, tool, path)
+	return result, nil
+}
+
+// isHeadlessAgent checks whether the given agent is of type "headless" by
+// consulting the capability resolver cache first, then falling back to loading
+// the agent CRD from disk. Returns false if the agent cannot be found.
+func (tr *ToolRouter) isHeadlessAgent(agentID string) bool {
+	// Fast path: check the in-memory capability cache.
+	if tr.resolver != nil {
+		if caps, ok := tr.resolver.ResolveAgent(agentID); ok {
+			return caps.AgentType == "headless"
+		}
+	}
+
+	// Slow path: load the CRD from disk.
+	crd, err := LoadAgentCRD(tr.root, agentID)
+	if err != nil {
+		return false
+	}
+	return crd.Spec.Type == "headless"
 }
 
 // ─── Built-in Tool Implementations ──────────────────────────────────────────────

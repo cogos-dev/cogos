@@ -1,10 +1,14 @@
 package main
 
-// bus_api.go — HTTP API for inter-workspace bus messaging.
+// bus_api.go — HTTP API for inter-workspace bus messaging and event visibility.
 //
-// POST /v1/bus/send — Send a message on a bus (general-purpose, not chat-specific)
-// POST /v1/bus/open — Create/register a bus for inter-workspace communication
-// GET  /v1/bus/list — List all known buses
+// POST /v1/bus/send                     — Send a message on a bus
+// POST /v1/bus/open                     — Create/register a bus
+// GET  /v1/bus/list                     — List all known buses
+// GET  /v1/bus/events                   — Cross-bus event search
+// GET  /v1/bus/{bus_id}/events          — Query events (type, from, after, before, since, until, limit)
+// GET  /v1/bus/{bus_id}/events/{seq}    — Single event lookup
+// GET  /v1/bus/{bus_id}/stats           — Bus statistics
 
 import (
 	"encoding/json"
@@ -12,6 +16,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 )
 
 // busSendRequest is the JSON body for POST /v1/bus/send.
@@ -192,4 +199,297 @@ func (s *serveServer) handleBusList(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(entries)
+}
+
+// =============================================================================
+// EVENT QUERY API
+// =============================================================================
+
+// eventQueryParams holds parsed query parameters for event filtering.
+type eventQueryParams struct {
+	Type   string // filter by event type
+	From   string // filter by sender
+	After  int    // events with seq > this
+	Before int    // events with seq < this
+	Limit  int    // max events to return
+	Since  string // ISO8601 — events after this time
+	Until  string // ISO8601 — events before this time
+}
+
+// parseEventQuery extracts query params from the request URL.
+func parseEventQuery(r *http.Request) eventQueryParams {
+	q := r.URL.Query()
+	params := eventQueryParams{
+		Type:  q.Get("type"),
+		From:  q.Get("from"),
+		Since: q.Get("since"),
+		Until: q.Get("until"),
+		Limit: 100,
+	}
+	if v := q.Get("after"); v != "" {
+		params.After, _ = strconv.Atoi(v)
+	}
+	if v := q.Get("before"); v != "" {
+		params.Before, _ = strconv.Atoi(v)
+	}
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			params.Limit = n
+		}
+	}
+	if params.Limit > 1000 {
+		params.Limit = 1000
+	}
+	return params
+}
+
+// filterEvents applies query params to an event list.
+func filterEvents(events []CogBlock, p eventQueryParams) []CogBlock {
+	var result []CogBlock
+	for _, e := range events {
+		if p.Type != "" && e.Type != p.Type {
+			continue
+		}
+		if p.From != "" && e.From != p.From {
+			continue
+		}
+		if p.After > 0 && e.Seq <= p.After {
+			continue
+		}
+		if p.Before > 0 && e.Seq >= p.Before {
+			continue
+		}
+		if p.Since != "" && e.Ts < p.Since {
+			continue
+		}
+		if p.Until != "" && e.Ts > p.Until {
+			continue
+		}
+		result = append(result, e)
+		if len(result) >= p.Limit {
+			break
+		}
+	}
+	if result == nil {
+		result = []CogBlock{}
+	}
+	return result
+}
+
+// handleBusRoute is the catch-all handler for GET /v1/bus/{bus_id}/...
+// It dispatches to events (with query/pagination), single event lookup, or stats.
+func (s *serveServer) handleBusRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse path: /v1/bus/{bus_id}/events, /v1/bus/{bus_id}/events/{seq}, /v1/bus/{bus_id}/stats
+	path := strings.TrimPrefix(r.URL.Path, "/v1/bus/")
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, `{"error":"expected /v1/bus/{bus_id}/{action}"}`, http.StatusBadRequest)
+		return
+	}
+	busID := parts[0]
+	action := ""
+	extra := ""
+	if len(parts) >= 2 {
+		action = parts[1]
+	}
+	if len(parts) >= 3 {
+		extra = parts[2]
+	}
+
+	switch action {
+	case "events":
+		if extra != "" {
+			s.handleBusEventBySeq(w, r, busID, extra)
+		} else {
+			s.handleBusEvents(w, r, busID)
+		}
+	case "stats":
+		s.handleBusStats(w, r, busID)
+	default:
+		http.Error(w, `{"error":"expected /v1/bus/{bus_id}/events or /v1/bus/{bus_id}/stats"}`, http.StatusBadRequest)
+	}
+}
+
+// resolveBusManager resolves the bus session manager from the request.
+func (s *serveServer) resolveBusManager(r *http.Request) *busSessionManager {
+	busChat := s.busChat
+	if ws := workspaceFromRequest(r); ws != nil && ws.busChat != nil {
+		busChat = ws.busChat
+	}
+	if busChat == nil {
+		return nil
+	}
+	return busChat.manager
+}
+
+// handleBusEvents serves GET /v1/bus/{bus_id}/events with query params.
+func (s *serveServer) handleBusEvents(w http.ResponseWriter, r *http.Request, busID string) {
+	mgr := s.resolveBusManager(r)
+	if mgr == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+		return
+	}
+
+	events, err := mgr.readBusEvents(busID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+		return
+	}
+
+	params := parseEventQuery(r)
+	filtered := filterEvents(events, params)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(filtered)
+}
+
+// handleBusEventBySeq serves GET /v1/bus/{bus_id}/events/{seq}.
+func (s *serveServer) handleBusEventBySeq(w http.ResponseWriter, r *http.Request, busID, seqStr string) {
+	seq, err := strconv.Atoi(seqStr)
+	if err != nil {
+		http.Error(w, `{"error":"seq must be an integer"}`, http.StatusBadRequest)
+		return
+	}
+
+	mgr := s.resolveBusManager(r)
+	if mgr == nil {
+		http.Error(w, `{"error":"event not found"}`, http.StatusNotFound)
+		return
+	}
+
+	events, err := mgr.readBusEvents(busID)
+	if err != nil {
+		http.Error(w, `{"error":"event not found"}`, http.StatusNotFound)
+		return
+	}
+
+	for _, e := range events {
+		if e.Seq == seq {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(e)
+			return
+		}
+	}
+
+	http.Error(w, `{"error":"event not found"}`, http.StatusNotFound)
+}
+
+// busStatsResponse is the response for GET /v1/bus/{bus_id}/stats.
+type busStatsResponse struct {
+	BusID        string         `json:"bus_id"`
+	EventCount   int            `json:"event_count"`
+	FirstEventAt string         `json:"first_event_at,omitempty"`
+	LastEventAt  string         `json:"last_event_at,omitempty"`
+	Types        map[string]int `json:"types"`
+	Senders      map[string]int `json:"senders"`
+}
+
+// handleBusStats serves GET /v1/bus/{bus_id}/stats.
+func (s *serveServer) handleBusStats(w http.ResponseWriter, r *http.Request, busID string) {
+	mgr := s.resolveBusManager(r)
+	if mgr == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(busStatsResponse{BusID: busID, Types: map[string]int{}, Senders: map[string]int{}})
+		return
+	}
+
+	events, _ := mgr.readBusEvents(busID)
+
+	stats := busStatsResponse{
+		BusID:      busID,
+		EventCount: len(events),
+		Types:      make(map[string]int),
+		Senders:    make(map[string]int),
+	}
+
+	for i, e := range events {
+		stats.Types[e.Type]++
+		stats.Senders[e.From]++
+		if i == 0 {
+			stats.FirstEventAt = e.Ts
+		}
+		stats.LastEventAt = e.Ts
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+// =============================================================================
+// CROSS-BUS EVENT SEARCH
+// =============================================================================
+
+// crossBusEvent wraps a CogBlock with its bus_id for cross-bus results.
+type crossBusEvent struct {
+	CogBlock
+	BusID string `json:"bus_id"`
+}
+
+// handleBusEventsGlobal serves GET /v1/bus/events — cross-bus event search.
+func (s *serveServer) handleBusEventsGlobal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	mgr := s.resolveBusManager(r)
+	if mgr == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+		return
+	}
+
+	params := parseEventQuery(r)
+
+	// Load all buses from registry
+	entries := mgr.loadRegistry()
+	var allEvents []crossBusEvent
+
+	for _, entry := range entries {
+		events, err := mgr.readBusEvents(entry.BusID)
+		if err != nil {
+			continue
+		}
+		filtered := filterEvents(events, eventQueryParams{
+			Type:  params.Type,
+			From:  params.From,
+			Since: params.Since,
+			Until: params.Until,
+			Limit: params.Limit, // per-bus limit to avoid reading too many
+		})
+		for _, e := range filtered {
+			evt := crossBusEvent{CogBlock: e}
+			// BusID might already be set on the event; ensure it's present
+			if evt.CogBlock.BusID == "" {
+				evt.BusID = entry.BusID
+			} else {
+				evt.BusID = evt.CogBlock.BusID
+			}
+			allEvents = append(allEvents, evt)
+		}
+	}
+
+	// Sort by timestamp descending (most recent first)
+	sort.Slice(allEvents, func(i, j int) bool {
+		return allEvents[i].Ts > allEvents[j].Ts
+	})
+
+	// Apply global limit
+	if len(allEvents) > params.Limit {
+		allEvents = allEvents[:params.Limit]
+	}
+
+	if allEvents == nil {
+		allEvents = []crossBusEvent{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(allEvents)
 }

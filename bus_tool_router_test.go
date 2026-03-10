@@ -14,16 +14,21 @@
 //   9. decodeToolInvokePayload round-trip fidelity
 //  10. Path-escape prevention on read tool
 //  11. os.IsNotExist unwrap bug detection in GetAgentCRDToolPolicy
+//  12. Remote tool dispatch via OpenClawBridge (F2: test gaps 2+3)
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -106,7 +111,7 @@ func createTestBusAndRouter(t *testing.T, root string) (string, *busSessionManag
 	t.Helper()
 
 	manager := newBusSessionManager(root)
-	router := NewToolRouter(manager, root, nil)
+	router := NewToolRouter(manager, root, nil, nil)
 	router.Start()
 
 	busID, err := manager.createChatBus("test-session", "test")
@@ -856,10 +861,10 @@ func TestToolRouter_MultipleInvocations(t *testing.T) {
 func TestToolRouter_ExecuteTool_Direct(t *testing.T) {
 	root := setupToolRouterTestEnv(t)
 	manager := newBusSessionManager(root)
-	router := NewToolRouter(manager, root, nil)
+	router := NewToolRouter(manager, root, nil, nil)
 
 	t.Run("read valid file", func(t *testing.T) {
-		result, dispatch, err := router.executeTool("read", map[string]any{"path": "hello.txt"})
+		result, dispatch, err := router.executeTool("read", map[string]any{"path": "hello.txt"}, "", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -877,14 +882,14 @@ func TestToolRouter_ExecuteTool_Direct(t *testing.T) {
 	})
 
 	t.Run("read missing file", func(t *testing.T) {
-		_, _, err := router.executeTool("read", map[string]any{"path": "nonexistent.txt"})
+		_, _, err := router.executeTool("read", map[string]any{"path": "nonexistent.txt"}, "", "")
 		if err == nil {
 			t.Fatal("expected error for missing file")
 		}
 	})
 
 	t.Run("read empty path", func(t *testing.T) {
-		_, _, err := router.executeTool("read", map[string]any{})
+		_, _, err := router.executeTool("read", map[string]any{}, "", "")
 		if err == nil {
 			t.Fatal("expected error for empty path")
 		}
@@ -894,7 +899,7 @@ func TestToolRouter_ExecuteTool_Direct(t *testing.T) {
 	})
 
 	t.Run("unknown tool", func(t *testing.T) {
-		_, dispatch, err := router.executeTool("bogus_tool", nil)
+		_, dispatch, err := router.executeTool("bogus_tool", nil, "", "")
 		if err == nil {
 			t.Fatal("expected error for unknown tool")
 		}
@@ -909,7 +914,7 @@ func TestToolRouter_ExecuteTool_Direct(t *testing.T) {
 	t.Run("memory_get valid", func(t *testing.T) {
 		result, dispatch, err := router.executeTool("memory_get", map[string]any{
 			"path": "semantic/insights/test-topic",
-		})
+		}, "", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -929,14 +934,14 @@ func TestToolRouter_ExecuteTool_Direct(t *testing.T) {
 	t.Run("memory_get missing", func(t *testing.T) {
 		_, _, err := router.executeTool("memory_get", map[string]any{
 			"path": "semantic/insights/no-such-thing",
-		})
+		}, "", "")
 		if err == nil {
 			t.Fatal("expected error for missing doc")
 		}
 	})
 
 	t.Run("memory_get empty path", func(t *testing.T) {
-		_, _, err := router.executeTool("memory_get", map[string]any{})
+		_, _, err := router.executeTool("memory_get", map[string]any{}, "", "")
 		if err == nil {
 			t.Fatal("expected error for empty path")
 		}
@@ -1040,5 +1045,767 @@ func TestToolInvokePayload_JSONRoundTrip(t *testing.T) {
 	}
 	if decoded.Args["query"] != "eigenform" {
 		t.Errorf("args.query = %v, want 'eigenform'", decoded.Args["query"])
+	}
+}
+
+// ─── F2: Remote Tool Dispatch E2E Tests ─────────────────────────────────────────
+//
+// These tests validate the full remote tool dispatch path through the ToolRouter:
+//   tool.invoke → ToolRouter.executeTool → OpenClawBridge.ExecuteToolWithSession
+//
+// Coverage:
+//   - Non-built-in tools dispatch to the bridge
+//   - Session key is derived as "busID:callerAgent"
+//   - CapabilityResolver validates agent tool access (fail-open if unknown)
+//   - 30s context timeout is applied to bridge dispatch
+//   - Error handling: bridge HTTP errors, tool not found, malformed events
+
+// newMockGateway creates an httptest.Server that simulates the OpenClaw gateway.
+// Returns the server; the caller's t.Cleanup handles shutdown.
+func newMockGateway(t *testing.T, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// gatewayRequest captures a parsed request body from the mock gateway.
+type gatewayRequest struct {
+	Tool       string                 `json:"tool"`
+	Args       map[string]interface{} `json:"args"`
+	SessionKey string                 `json:"sessionKey"`
+}
+
+// newRecordingGateway creates a mock gateway that records requests and returns
+// a configurable response. Thread-safe for concurrent access.
+func newRecordingGateway(t *testing.T, statusCode int, responseBody string) (*httptest.Server, *[]gatewayRequest) {
+	t.Helper()
+	var mu sync.Mutex
+	requests := &[]gatewayRequest{}
+
+	srv := newMockGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		var body gatewayRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Logf("mock gateway decode error: %v", err)
+			http.Error(w, "bad request", 400)
+			return
+		}
+		mu.Lock()
+		*requests = append(*requests, body)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		w.Write([]byte(responseBody))
+	})
+
+	return srv, requests
+}
+
+// createBridgeRouter creates a ToolRouter wired to a real OpenClawBridge
+// pointing at the given test server URL. Optionally accepts a resolver.
+func createBridgeRouter(t *testing.T, root string, gatewayURL string, resolver *CapabilityResolver) (string, *busSessionManager, *ToolRouter) {
+	t.Helper()
+
+	bridge := NewOpenClawBridge(gatewayURL, "test-token", "default-session")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, resolver)
+	router.Start()
+
+	busID, err := manager.createChatBus("test-session", "test")
+	if err != nil {
+		t.Fatalf("create chat bus: %v", err)
+	}
+
+	return busID, manager, router
+}
+
+// ─── Test: Non-built-in tool dispatches to bridge ────────────────────────────────
+
+func TestRemoteDispatch_NonBuiltinToolGoesToBridge(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"remote result"}]}}`)
+
+	busID, manager, router := createBridgeRouter(t, root, srv.URL, nil)
+	defer router.Stop()
+
+	reqID := "remote-001"
+	postToolInvoke(t, manager, busID, ToolInvokePayload{
+		RequestID:   reqID,
+		Tool:        "custom_remote_tool",
+		CallerAgent: "test-agent",
+		Args:        map[string]any{"key": "value"},
+	})
+
+	result := waitForToolResult(t, manager, busID, reqID, 5*time.Second)
+
+	// Should succeed — no error
+	errMsg, _ := result["error"].(string)
+	if errMsg != "" {
+		t.Fatalf("expected no error, got: %s", errMsg)
+	}
+
+	// Dispatch should be "bridge"
+	dispatch, _ := result["dispatch"].(string)
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+
+	// Verify the gateway received exactly one request
+	reqs := *requests
+	if len(reqs) != 1 {
+		t.Fatalf("gateway received %d requests, want 1", len(reqs))
+	}
+	if reqs[0].Tool != "custom_remote_tool" {
+		t.Errorf("gateway request tool = %q, want %q", reqs[0].Tool, "custom_remote_tool")
+	}
+}
+
+// ─── Test: Session key derivation ────────────────────────────────────────────────
+
+func TestSessionKey_Derivation(t *testing.T) {
+	tests := []struct {
+		name    string
+		busID   string
+		caller  string
+		wantKey string
+	}{
+		{
+			name:    "both busID and callerAgent",
+			busID:   "bus-abc123",
+			caller:  "sandy",
+			wantKey: "bus-abc123:sandy",
+		},
+		{
+			name:    "busID only, empty caller",
+			busID:   "bus-xyz",
+			caller:  "",
+			wantKey: "bus-xyz:",
+		},
+		{
+			name:    "caller only, empty busID",
+			busID:   "",
+			caller:  "cog",
+			wantKey: ":cog",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := setupToolRouterTestEnv(t)
+
+			srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"ok"}]}}`)
+
+			bridge := NewOpenClawBridge(srv.URL, "test-token", "default-session")
+			manager := newBusSessionManager(root)
+			router := NewToolRouter(manager, root, bridge, nil)
+
+			// Call executeTool directly to control busID and callerAgent precisely.
+			_, dispatch, err := router.executeTool("some_remote_tool", map[string]any{}, tt.busID, tt.caller)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if dispatch != "bridge" {
+				t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+			}
+
+			reqs := *requests
+			if len(reqs) != 1 {
+				t.Fatalf("gateway received %d requests, want 1", len(reqs))
+			}
+			if reqs[0].SessionKey != tt.wantKey {
+				t.Errorf("sessionKey = %q, want %q", reqs[0].SessionKey, tt.wantKey)
+			}
+		})
+	}
+}
+
+func TestSessionKey_FallsBackToDefault(t *testing.T) {
+	// When both busID and callerAgent are empty, the session key should fall
+	// back to the bridge's default SessionKey.
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"ok"}]}}`)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "my-default-key")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, nil)
+
+	_, _, err := router.executeTool("remote_tool", map[string]any{}, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	reqs := *requests
+	if len(reqs) != 1 {
+		t.Fatalf("gateway received %d requests, want 1", len(reqs))
+	}
+	if reqs[0].SessionKey != "my-default-key" {
+		t.Errorf("sessionKey = %q, want %q", reqs[0].SessionKey, "my-default-key")
+	}
+}
+
+// ─── Test: Resolver validates agent capabilities (fail-open if unknown) ──────────
+
+func TestRemoteDispatch_ResolverBlocksKnownAgentWithoutTool(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	// The gateway should NOT be called, but set it up in case of bugs.
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"should not reach"}]}}`)
+
+	cache := NewCapabilityCache()
+	// Register "sandy" as a known agent that can only use "memory_search".
+	cache.Set("sandy", AgentCapabilitiesPayload{
+		AgentID:   "sandy",
+		AgentType: "interactive",
+		Tools: CapTools{
+			Allow: []string{"memory_search"},
+		},
+	}, time.Hour)
+	resolver := NewCapabilityResolver(cache)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, resolver)
+
+	// "sandy" is known and does NOT have "custom_tool" — should be rejected.
+	_, dispatch, err := router.executeTool("custom_tool", map[string]any{}, "bus1", "sandy")
+	if err == nil {
+		t.Fatal("expected error when known agent lacks tool capability")
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q (error still comes from bridge path)", dispatch, "bridge")
+	}
+	if !strings.Contains(err.Error(), "not capable") {
+		t.Errorf("error = %v, want to contain 'not capable'", err)
+	}
+
+	// Gateway should NOT have been called.
+	reqs := *requests
+	if len(reqs) != 0 {
+		t.Errorf("gateway received %d requests, want 0 (resolver should block)", len(reqs))
+	}
+}
+
+func TestRemoteDispatch_ResolverAllowsKnownAgentWithTool(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"allowed"}]}}`)
+
+	cache := NewCapabilityCache()
+	cache.Set("sandy", AgentCapabilitiesPayload{
+		AgentID:   "sandy",
+		AgentType: "interactive",
+		Tools: CapTools{
+			Allow: []string{"custom_tool", "memory_search"},
+		},
+	}, time.Hour)
+	resolver := NewCapabilityResolver(cache)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, resolver)
+
+	// "sandy" is known and HAS "custom_tool" — should proceed to gateway.
+	_, dispatch, err := router.executeTool("custom_tool", map[string]any{}, "bus1", "sandy")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+
+	reqs := *requests
+	if len(reqs) != 1 {
+		t.Fatalf("gateway received %d requests, want 1", len(reqs))
+	}
+}
+
+func TestRemoteDispatch_ResolverFailOpenForUnknownAgent(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"fail-open"}]}}`)
+
+	cache := NewCapabilityCache()
+	// Do NOT register "unknown-agent" — it is not in the cache.
+	resolver := NewCapabilityResolver(cache)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, resolver)
+
+	// "unknown-agent" is NOT in the cache — resolver should fail-open
+	// and the call should proceed to the gateway.
+	_, dispatch, err := router.executeTool("any_tool", map[string]any{}, "bus1", "unknown-agent")
+	if err != nil {
+		t.Fatalf("expected fail-open for unknown agent, got error: %v", err)
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+
+	reqs := *requests
+	if len(reqs) != 1 {
+		t.Fatalf("gateway received %d requests, want 1 (fail-open)", len(reqs))
+	}
+}
+
+func TestRemoteDispatch_ResolverSkippedWhenCallerEmpty(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"no-caller"}]}}`)
+
+	cache := NewCapabilityCache()
+	// Even though the cache has restrictive entries, empty callerAgent skips the resolver.
+	cache.Set("sandy", AgentCapabilitiesPayload{
+		AgentID: "sandy",
+		Tools:   CapTools{Allow: []string{"nothing"}},
+	}, time.Hour)
+	resolver := NewCapabilityResolver(cache)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, resolver)
+
+	// Empty callerAgent — resolver check should be skipped entirely.
+	_, dispatch, err := router.executeTool("any_tool", map[string]any{}, "bus1", "")
+	if err != nil {
+		t.Fatalf("expected success with empty caller, got error: %v", err)
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+
+	reqs := *requests
+	if len(reqs) != 1 {
+		t.Fatalf("gateway received %d requests, want 1", len(reqs))
+	}
+}
+
+func TestRemoteDispatch_ResolverSkippedWhenNil(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"no-resolver"}]}}`)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	// nil resolver — should dispatch directly to bridge without validation.
+	router := NewToolRouter(manager, root, bridge, nil)
+
+	_, dispatch, err := router.executeTool("any_tool", map[string]any{}, "bus1", "sandy")
+	if err != nil {
+		t.Fatalf("expected success with nil resolver, got error: %v", err)
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+
+	reqs := *requests
+	if len(reqs) != 1 {
+		t.Fatalf("gateway received %d requests, want 1", len(reqs))
+	}
+}
+
+// ─── Test: Bridge error handling ─────────────────────────────────────────────────
+
+func TestRemoteDispatch_BridgeReturnsHTTPError(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	// Gateway returns 500 Internal Server Error.
+	srv := newMockGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+		w.Write([]byte(`{"error":"internal server error"}`))
+	})
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, nil)
+
+	// Bridge returns a result with IsError=true for non-200 status codes (see mcp.go).
+	// The executeTool method does NOT treat this as a Go error — it returns the
+	// MCPToolCallResult as the result value.
+	result, dispatch, err := router.executeTool("failing_tool", map[string]any{}, "bus1", "agent1")
+	if err != nil {
+		t.Fatalf("executeTool should not return Go error for HTTP errors (bridge wraps them): %v", err)
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+
+	// The result should be an MCPToolCallResult with IsError=true.
+	mcpResult, ok := result.(*MCPToolCallResult)
+	if !ok {
+		t.Fatalf("result type = %T, want *MCPToolCallResult", result)
+	}
+	if !mcpResult.IsError {
+		t.Error("expected MCPToolCallResult.IsError = true")
+	}
+	if len(mcpResult.Content) == 0 {
+		t.Fatal("expected non-empty content in error result")
+	}
+	if !strings.Contains(mcpResult.Content[0].Text, "500") {
+		t.Errorf("error text = %q, want to contain '500'", mcpResult.Content[0].Text)
+	}
+}
+
+func TestRemoteDispatch_BridgeConnectionRefused(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	// Point bridge at a URL that will refuse connections.
+	bridge := NewOpenClawBridge("http://127.0.0.1:1", "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, nil)
+
+	_, dispatch, err := router.executeTool("unreachable_tool", map[string]any{}, "bus1", "agent1")
+	if err == nil {
+		t.Fatal("expected error for connection refused, got nil")
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+	if !strings.Contains(err.Error(), "remote tool") {
+		t.Errorf("error = %v, want to contain 'remote tool'", err)
+	}
+}
+
+func TestRemoteDispatch_NoBridge_UnknownToolError(t *testing.T) {
+	// When no bridge is configured, unknown tools should return "unknown tool" error.
+	root := setupToolRouterTestEnv(t)
+
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, nil, nil) // nil bridge
+
+	_, dispatch, err := router.executeTool("nonexistent_tool", map[string]any{}, "bus1", "agent1")
+	if err == nil {
+		t.Fatal("expected error for unknown tool with no bridge")
+	}
+	if dispatch != "" {
+		t.Errorf("dispatch = %q, want empty string", dispatch)
+	}
+	if !strings.Contains(err.Error(), "unknown tool") {
+		t.Errorf("error = %v, want to contain 'unknown tool'", err)
+	}
+}
+
+// ─── Test: Built-in tools never dispatch to bridge ───────────────────────────────
+
+func TestRemoteDispatch_BuiltinToolsNeverHitBridge(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"should not see this"}]}}`)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, nil)
+
+	builtins := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"read", map[string]any{"path": "hello.txt"}},
+		{"memory_get", map[string]any{"path": "semantic/insights/test-topic"}},
+		{"memory_search", map[string]any{"query": "test"}},
+		{"memory_write", map[string]any{"path": "semantic/insights/builtin-test.md", "content": "test content"}},
+	}
+
+	for _, bt := range builtins {
+		t.Run(bt.tool, func(t *testing.T) {
+			_, dispatch, err := router.executeTool(bt.tool, bt.args, "bus1", "test-agent")
+			if err != nil {
+				t.Fatalf("built-in tool %q error: %v", bt.tool, err)
+			}
+			if dispatch != "builtin" {
+				t.Errorf("dispatch = %q, want %q for built-in tool %q", dispatch, "builtin", bt.tool)
+			}
+		})
+	}
+
+	// Gateway should have received zero requests.
+	reqs := *requests
+	if len(reqs) != 0 {
+		t.Errorf("gateway received %d requests for built-in tools, want 0", len(reqs))
+	}
+}
+
+// ─── Test: Full bus E2E with bridge dispatch ─────────────────────────────────────
+
+func TestRemoteDispatch_FullBusE2E(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"remote bus result"}]}}`)
+
+	busID, manager, router := createBridgeRouter(t, root, srv.URL, nil)
+	defer router.Stop()
+
+	reqID := "bus-remote-001"
+	postToolInvoke(t, manager, busID, ToolInvokePayload{
+		RequestID:   reqID,
+		Tool:        "openclaw_canvas_create",
+		CallerAgent: "test-agent",
+		Args:        map[string]any{"title": "Test Canvas"},
+	})
+
+	result := waitForToolResult(t, manager, busID, reqID, 5*time.Second)
+
+	// Should succeed
+	errMsg, _ := result["error"].(string)
+	if errMsg != "" {
+		t.Fatalf("unexpected error: %s", errMsg)
+	}
+
+	// Dispatch should be "bridge"
+	dispatch, _ := result["dispatch"].(string)
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+
+	// Tool name should be echoed back
+	toolName, _ := result["tool"].(string)
+	if toolName != "openclaw_canvas_create" {
+		t.Errorf("tool = %q, want %q", toolName, "openclaw_canvas_create")
+	}
+
+	// Verify gateway saw the right session key (busID:callerAgent)
+	reqs := *requests
+	if len(reqs) != 1 {
+		t.Fatalf("gateway received %d requests, want 1", len(reqs))
+	}
+	wantKey := busID + ":test-agent"
+	if reqs[0].SessionKey != wantKey {
+		t.Errorf("gateway sessionKey = %q, want %q", reqs[0].SessionKey, wantKey)
+	}
+
+	// Verify args were forwarded
+	title, _ := reqs[0].Args["title"].(string)
+	if title != "Test Canvas" {
+		t.Errorf("gateway args.title = %q, want %q", title, "Test Canvas")
+	}
+}
+
+func TestRemoteDispatch_FullBusE2E_BridgeError(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	// Gateway that always returns connection errors (unreachable port).
+	bridge := NewOpenClawBridge("http://127.0.0.1:1", "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, nil)
+	router.Start()
+	defer router.Stop()
+
+	busID, err := manager.createChatBus("test-session", "test")
+	if err != nil {
+		t.Fatalf("create chat bus: %v", err)
+	}
+
+	reqID := "bus-error-001"
+	postToolInvoke(t, manager, busID, ToolInvokePayload{
+		RequestID:   reqID,
+		Tool:        "remote_failing_tool",
+		CallerAgent: "test-agent",
+	})
+
+	result := waitForToolResult(t, manager, busID, reqID, 10*time.Second)
+
+	errMsg, _ := result["error"].(string)
+	if errMsg == "" {
+		t.Fatal("expected error from unreachable bridge, got none")
+	}
+	if !strings.Contains(errMsg, "remote tool") {
+		t.Errorf("error = %q, want to contain 'remote tool'", errMsg)
+	}
+
+	// Dispatch should still be "bridge" even on error
+	dispatch, _ := result["dispatch"].(string)
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+}
+
+// ─── Test: Resolver + bridge E2E on bus ──────────────────────────────────────────
+
+func TestRemoteDispatch_FullBusE2E_ResolverBlocks(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	srv, requests := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"should not reach"}]}}`)
+
+	cache := NewCapabilityCache()
+	cache.Set("test-agent", AgentCapabilitiesPayload{
+		AgentID:   "test-agent",
+		AgentType: "headless",
+		Tools: CapTools{
+			Allow: []string{"memory_search"},
+		},
+	}, time.Hour)
+	resolver := NewCapabilityResolver(cache)
+
+	busID, manager, router := createBridgeRouter(t, root, srv.URL, resolver)
+	defer router.Stop()
+
+	reqID := "bus-resolver-block-001"
+	postToolInvoke(t, manager, busID, ToolInvokePayload{
+		RequestID:   reqID,
+		Tool:        "forbidden_remote_tool",
+		CallerAgent: "test-agent",
+	})
+
+	result := waitForToolResult(t, manager, busID, reqID, 5*time.Second)
+
+	errMsg, _ := result["error"].(string)
+	if errMsg == "" {
+		t.Fatal("expected error from resolver blocking, got none")
+	}
+	if !strings.Contains(errMsg, "not capable") {
+		t.Errorf("error = %q, want to contain 'not capable'", errMsg)
+	}
+
+	// Gateway should NOT have been called.
+	reqs := *requests
+	if len(reqs) != 0 {
+		t.Errorf("gateway received %d requests, want 0 (resolver blocked)", len(reqs))
+	}
+}
+
+// ─── Test: Context timeout applied to bridge dispatch ────────────────────────────
+
+func TestRemoteDispatch_ContextTimeoutCancelsStalledBridge(t *testing.T) {
+	// Verifies that bridge dispatch uses a bounded context timeout.
+	// The executeTool method uses context.WithTimeout(ctx, 30*time.Second).
+	// We verify this indirectly: ExecuteToolWithSession respects context
+	// cancellation, and a stalled server results in a context deadline error.
+	//
+	// To keep the test fast, we call ExecuteToolWithSession directly with
+	// a very short context timeout, proving the mechanism works.
+
+	handlerDone := make(chan struct{})
+	srv := newMockGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		// Block until signalled to exit. The client will cancel via context.
+		<-handlerDone
+	})
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+
+	// Use a very short context to verify cancellation propagates.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := bridge.ExecuteToolWithSession(ctx, "stalled_tool", map[string]any{}, "test-key")
+
+	// Unblock the handler so httptest.Server.Close() does not hang.
+	close(handlerDone)
+
+	if err == nil {
+		t.Fatal("expected error from context timeout on stalled bridge, got nil")
+	}
+	// The error should indicate context deadline or cancellation.
+	errStr := err.Error()
+	if !strings.Contains(errStr, "context deadline exceeded") && !strings.Contains(errStr, "context canceled") {
+		t.Errorf("error = %v, want to contain context deadline/cancel message", err)
+	}
+}
+
+func TestRemoteDispatch_FastBridgeRespondsBeforeTimeout(t *testing.T) {
+	// Complementary test: a fast-responding gateway completes within the
+	// 30s timeout window, confirming the timeout does not interfere with
+	// normal operation.
+	root := setupToolRouterTestEnv(t)
+
+	srv, _ := newRecordingGateway(t, 200, `{"ok":true,"result":{"content":[{"type":"text","text":"fast response"}]}}`)
+
+	bridge := NewOpenClawBridge(srv.URL, "test-token", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, nil)
+
+	start := time.Now()
+	_, dispatch, err := router.executeTool("fast_tool", map[string]any{}, "bus1", "agent1")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dispatch != "bridge" {
+		t.Errorf("dispatch = %q, want %q", dispatch, "bridge")
+	}
+	// Should complete very quickly (well under the 30s timeout).
+	if elapsed > 5*time.Second {
+		t.Errorf("bridge dispatch took %v, expected well under 30s", elapsed)
+	}
+}
+
+// ─── Test: Malformed event handling ──────────────────────────────────────────────
+
+func TestRemoteDispatch_MalformedEvent_NoPayload(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+	busID, manager, router := createTestBusAndRouter(t, root)
+	defer router.Stop()
+
+	// Post a raw tool.invoke event with nil/empty payload.
+	_, err := manager.appendBusEvent(busID, BlockToolInvoke, "test", nil)
+	if err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+
+	// The router should post a tool.result with a decode error.
+	// Since requestId is empty, we look for any tool.result.
+	result := waitForToolResult(t, manager, busID, "", 5*time.Second)
+
+	errMsg, _ := result["error"].(string)
+	if errMsg == "" {
+		t.Fatal("expected error for malformed event, got none")
+	}
+	t.Logf("malformed event error: %s", errMsg)
+}
+
+func TestRemoteDispatch_MalformedEvent_InvalidFieldTypes(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+	busID, manager, router := createTestBusAndRouter(t, root)
+	defer router.Stop()
+
+	// Payload with wrong types: requestId as int, tool as bool.
+	// JSON decode is lenient so fields will be zero-valued strings,
+	// which triggers validation errors.
+	badPayload := map[string]interface{}{
+		"requestId": 12345,
+		"tool":      true,
+	}
+	_, err := manager.appendBusEvent(busID, BlockToolInvoke, "test", badPayload)
+	if err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+
+	result := waitForToolResult(t, manager, busID, "", 5*time.Second)
+
+	errMsg, _ := result["error"].(string)
+	if errMsg == "" {
+		t.Fatal("expected error for bad payload types, got none")
+	}
+	t.Logf("bad payload error: %s", errMsg)
+}
+
+// ─── Test: Gateway receives correct auth headers ─────────────────────────────────
+
+func TestRemoteDispatch_AuthHeaderForwarded(t *testing.T) {
+	root := setupToolRouterTestEnv(t)
+
+	var receivedAuth string
+	srv := newMockGateway(t, func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"ok":true,"result":{"content":[{"type":"text","text":"authed"}]}}`))
+	})
+
+	bridge := NewOpenClawBridge(srv.URL, "secret-token-xyz", "default")
+	manager := newBusSessionManager(root)
+	router := NewToolRouter(manager, root, bridge, nil)
+
+	_, _, err := router.executeTool("authed_tool", map[string]any{}, "bus1", "agent1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantAuth := "Bearer secret-token-xyz"
+	if receivedAuth != wantAuth {
+		t.Errorf("Authorization header = %q, want %q", receivedAuth, wantAuth)
 	}
 }
