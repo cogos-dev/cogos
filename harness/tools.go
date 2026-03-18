@@ -7,7 +7,6 @@ package harness
 
 import (
 	"encoding/json"
-	"log"
 	"strings"
 )
 
@@ -29,7 +28,8 @@ func MapToolsToCLINames(tools []json.RawMessage) []string {
 
 		cliName := mapToolName(tool.Function.Name)
 		if cliName == "" {
-			log.Printf("[tools] Unknown tool name %q — skipping", tool.Function.Name)
+			// MCP and external tools are registered through --mcp-config, not
+			// --allowed-tools, so silently skip anything we don't recognise.
 			continue
 		}
 		if !seen[cliName] {
