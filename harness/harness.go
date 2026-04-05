@@ -276,6 +276,10 @@ func (h *Harness) RunInference(req *InferenceRequest) (*InferenceResponse, error
 	// Parse provider from model string
 	providerType, modelName, customConfig := ParseModelProvider(req.Model)
 
+	if providerType == ProviderCodex {
+		return h.runCodexInference(req, modelName)
+	}
+
 	// Route to HTTP providers for non-Claude models
 	if providerType != ProviderClaude {
 		startTime := time.Now()
@@ -679,6 +683,10 @@ func (h *Harness) RunInferenceStream(req *InferenceRequest) (<-chan StreamChunkI
 	}
 
 	providerType, modelName, customConfig := ParseModelProvider(req.Model)
+
+	if providerType == ProviderCodex {
+		return h.runCodexInferenceStream(req, modelName)
+	}
 
 	// Route to HTTP providers for non-Claude models
 	if providerType != ProviderClaude {

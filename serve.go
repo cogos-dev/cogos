@@ -37,6 +37,7 @@ import (
 const (
 	defaultServePort = 5100 // Registered: cog://conf/ports#kernel
 	claudeCommand    = "claude"
+	codexCommand     = "codex"
 	launchdLabel     = "com.cogos.kernel"
 )
 
@@ -61,14 +62,14 @@ type workspaceContext struct {
 type serveServer struct {
 	port          int
 	kernel        *sdk.Kernel                  // default workspace kernel (backward compat)
-	workspaces    map[string]*workspaceContext  // name → workspace context
+	workspaces    map[string]*workspaceContext // name → workspace context
 	defaultWS     string                       // default workspace name
 	lastTAAState  *ContextState                // Most recent TAA context for debugging
 	taaStateMutex sync.RWMutex
-	busChat       *busChat        // Bus event emission for chat (nil if no workspace)
-	busBroker     *busEventBroker   // SSE subscriber broker for bus events
-	consumerReg   *consumerRegistry // Server-side consumer cursor tracking (ADR-061)
-	toolBridge    *ToolBridge       // Synchronous tool bridge for client-driven agent loops
+	busChat       *busChat           // Bus event emission for chat (nil if no workspace)
+	busBroker     *busEventBroker    // SSE subscriber broker for bus events
+	consumerReg   *consumerRegistry  // Server-side consumer cursor tracking (ADR-061)
+	toolBridge    *ToolBridge        // Synchronous tool bridge for client-driven agent loops
 	mcpManager    *MCPSessionManager // MCP Streamable HTTP session manager
 	researchMgr   *researchManager   // Research orchestration (nil if no workspace)
 
@@ -85,8 +86,8 @@ type serveServer struct {
 	lifecycle *LifecycleManager
 
 	// OCI auto-reload: kernel watches .cog/oci/index.json for new digests
-	ociStore  *OCIStore  // nil if no OCI layout exists
-	ociDigest string     // manifest digest at startup (for comparison)
+	ociStore  *OCIStore   // nil if no OCI layout exists
+	ociDigest string      // manifest digest at startup (for comparison)
 	reexecCh  chan string // signals graceful re-exec with new digest
 }
 
@@ -214,11 +215,11 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/v1/providers/", s.handleProviderByID) // Provider activate/test
 	mux.HandleFunc("/v1/requests", s.handleRequests)
 	mux.HandleFunc("/v1/requests/", s.handleRequestByID)
-	mux.HandleFunc("/v1/taa", s.handleTAA)                    // TAA context visibility endpoint
-	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext) // Iris-driven foveated rendering
-	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)            // Per-session context list
-	mux.HandleFunc("/v1/sessions/", s.handleSessionContext)             // Per-session context detail
-	mux.HandleFunc("GET /v1/card", s.handleCard)              // ADR-048: Kernel capability card
+	mux.HandleFunc("/v1/taa", s.handleTAA)                                    // TAA context visibility endpoint
+	mux.HandleFunc("POST /v1/context/foveated", s.handleFoveatedContext)      // Iris-driven foveated rendering
+	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)                  // Per-session context list
+	mux.HandleFunc("/v1/sessions/", s.handleSessionContext)                   // Per-session context detail
+	mux.HandleFunc("GET /v1/card", s.handleCard)                              // ADR-048: Kernel capability card
 	mux.HandleFunc("POST /v1/tool-bridge/pending", s.handleToolBridgePending) // Synchronous tool bridge
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/debug", s.handleDebug)

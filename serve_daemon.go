@@ -107,6 +107,66 @@ func (w *rotatingLogWriter) Close() error {
 	return w.file.Close()
 }
 
+// redirectOutputToRotatingLog sets up a rotating log writer and redirects
+// os.Stdout, os.Stderr, and the default logger through it. This is used when
+// the process is launched by launchd (stdout is not a terminal) so that
+// launchd's StandardOutPath doesn't grow unbounded. Returns the writer so the
+// caller can close it on shutdown.
+func redirectOutputToRotatingLog(logPath string, maxSize int64, maxFiles int) (*rotatingLogWriter, error) {
+	w, err := newRotatingLogWriter(logPath, maxSize, maxFiles)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a pipe: writes to pw appear as reads on pr
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("os.Pipe: %w", err)
+	}
+
+	// Replace fd 1 (stdout) and fd 2 (stderr) with the pipe's write end
+	if err := syscall.Dup2(int(pw.Fd()), 1); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("dup2 stdout: %w", err)
+	}
+	if err := syscall.Dup2(int(pw.Fd()), 2); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("dup2 stderr: %w", err)
+	}
+
+	// Update Go-level references so fmt.Printf, log.Printf, etc. use the pipe
+	os.Stdout = pw
+	os.Stderr = pw
+	log.SetOutput(pw)
+
+	// Pump pipe reads → rotating writer in background
+	go func() {
+		buf := make([]byte, 32768)
+		for {
+			n, readErr := pr.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+			}
+			if readErr != nil {
+				break
+			}
+		}
+	}()
+
+	return w, nil
+}
+
+// isStdoutTerminal returns true if stdout is connected to a terminal (as
+// opposed to a file or pipe, which is the case under launchd).
+func isStdoutTerminal() bool {
+	stat, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (stat.Mode() & os.ModeCharDevice) != 0
+}
+
 // === DAEMON MANAGEMENT ===
 
 // getDaemonPaths returns node-level paths for PID file and log file.
@@ -285,10 +345,27 @@ func cmdServe(args []string) int {
 
 // cmdServeForeground runs the server in the foreground
 func cmdServeForeground(port int) int {
-	// Check if claude CLI is available
-	if _, err := exec.LookPath(claudeCommand); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Claude CLI not found in PATH\n")
-		fmt.Fprintf(os.Stderr, "Install: npm install -g @anthropic-ai/claude-code\n")
+	// When running under launchd (stdout is not a terminal), redirect all output
+	// through a rotating log writer so StandardOutPath doesn't grow unbounded.
+	if !isStdoutTerminal() {
+		if _, logFile, _, err := getDaemonPaths(); err == nil {
+			if rotLog, err := redirectOutputToRotatingLog(logFile, 100*1024*1024, 3); err == nil {
+				defer rotLog.Close()
+				log.Printf("[serve] Log rotation active: %s (100 MB max, 3 files)", logFile)
+			} else {
+				log.Printf("[serve] Warning: failed to set up log rotation: %v", err)
+			}
+		}
+	}
+
+	// At least one local CLI backend must be available.
+	_, claudeErr := exec.LookPath(claudeCommand)
+	_, codexErr := exec.LookPath(codexCommand)
+	if claudeErr != nil && codexErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: no local CLI inference backend found in PATH\n")
+		fmt.Fprintf(os.Stderr, "Install one of:\n")
+		fmt.Fprintf(os.Stderr, "  npm install -g @anthropic-ai/claude-code\n")
+		fmt.Fprintf(os.Stderr, "  npm install -g @openai/codex\n")
 		return 1
 	}
 

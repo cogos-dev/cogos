@@ -273,6 +273,13 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 
 	consumerID := r.URL.Query().Get("consumer")
 
+	// after_seq: client-provided hint to skip replay events at or below this sequence.
+	// Used as a fallback when no consumer cursor is available.
+	var afterSeq int64
+	if raw := r.URL.Query().Get("after_seq"); raw != "" {
+		fmt.Sscanf(raw, "%d", &afterSeq)
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
@@ -335,7 +342,8 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 	if busChat != nil && busID != "*" {
 		events, err := busChat.manager.readBusEvents(busID)
 		if err == nil {
-			var startSeq int64
+			// Determine replay start: consumer cursor takes priority, then after_seq hint.
+			startSeq := afterSeq
 			if consumerID != "" {
 				// Guard: consumerReg initialized asynchronously in serve_daemon.go
 				if s.consumerReg == nil {
@@ -343,7 +351,9 @@ func (s *serveServer) handleEventsStream(w http.ResponseWriter, r *http.Request)
 				} else {
 					// Cursor-based: get or create cursor, replay from cursor position
 					cursor := s.consumerReg.getOrCreate(busID, consumerID)
-					startSeq = cursor.LastAckedSeq
+					if cursor.LastAckedSeq > startSeq {
+						startSeq = cursor.LastAckedSeq
+					}
 					log.Printf("[bus-stream] Consumer %s connected to bus=%s, resuming from seq=%d",
 						consumerID, busID, startSeq)
 				}

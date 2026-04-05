@@ -142,24 +142,24 @@ func (cs *ContextState) BuildContextString() string {
 // ContextBlock is a discrete unit of rendered context with stability metadata.
 type ContextBlock struct {
 	Source    string `json:"source"`    // e.g. "tier2:working-memory", "tier4:constellation"
-	Label    string `json:"label"`     // Human-readable: "Working Memory", "Current Focus"
-	Content  string `json:"content"`   // The rendered markdown content
-	Tokens   int    `json:"tokens"`    // Estimated token count
-	Hash     string `json:"hash"`      // SHA-256 prefix for cache comparison
-	Stability int   `json:"stability"` // 0-100: higher = more stable = rendered first (periphery)
+	Label     string `json:"label"`     // Human-readable: "Working Memory", "Current Focus"
+	Content   string `json:"content"`   // The rendered markdown content
+	Tokens    int    `json:"tokens"`    // Estimated token count
+	Hash      string `json:"hash"`      // SHA-256 prefix for cache comparison
+	Stability int    `json:"stability"` // 0-100: higher = more stable = rendered first (periphery)
 }
 
 // blockStabilityScores maps block source labels to stability scores.
 // Higher = more stable = placed earlier in output (peripheral, cached).
 // Lower = more dynamic = placed later (foveal tip, adjacent to conversation).
 var blockStabilityScores = map[string]int{
-	"identity":          95, // Almost never changes within a session
-	"working-memory":    80, // Persistent state, changes slowly
-	"session-state":     70, // Session metadata, stable within session
-	"knowledge":         50, // Constellation results vary with anchor/goal
-	"peripheral-buses":  35, // Other sessions' activity, moderately dynamic
-	"recent-context":    15, // Recent exchanges, changes every turn
-	"focus":             10, // Current focus/intent, changes every turn
+	"identity":         95, // Almost never changes within a session
+	"working-memory":   80, // Persistent state, changes slowly
+	"session-state":    70, // Session metadata, stable within session
+	"knowledge":        50, // Constellation results vary with anchor/goal
+	"peripheral-buses": 35, // Other sessions' activity, moderately dynamic
+	"recent-context":   15, // Recent exchanges, changes every turn
+	"focus":            10, // Current focus/intent, changes every turn
 }
 
 // stabilityFor returns the stability score for a block source label.
@@ -471,6 +471,7 @@ type ProviderType string
 
 const (
 	ProviderClaude     ProviderType = "claude"     // Claude CLI (default)
+	ProviderCodex      ProviderType = "codex"      // Codex CLI
 	ProviderOpenAI     ProviderType = "openai"     // OpenAI API
 	ProviderOpenRouter ProviderType = "openrouter" // OpenRouter API
 	ProviderOllama     ProviderType = "ollama"     // Ollama (local)
@@ -746,9 +747,10 @@ func StartRegistryCleanup() {
 // cmdInfer handles the "cog infer" command.
 //
 // Three modes:
-//   --stateless          Zero bus interaction, like "claude -p". Nothing recorded, nothing read.
-//   (default)            Records to bus (visible in peripheral context), but no TAA history loaded.
-//   --profile <name>     Full continuity — bus history loaded into context assembly pipeline.
+//
+//	--stateless          Zero bus interaction, like "claude -p". Nothing recorded, nothing read.
+//	(default)            Records to bus (visible in peripheral context), but no TAA history loaded.
+//	--profile <name>     Full continuity — bus history loaded into context assembly pipeline.
 //
 // --session <slug> names the conversation thread (default: "cli"). Multiple slugs
 // give you parallel named conversations: --session debug, --session research, etc.
@@ -827,11 +829,20 @@ func cmdInfer(args []string) int {
 		return 1
 	}
 
-	// Check if claude CLI is available
-	if _, err := exec.LookPath(claudeCommand); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Claude CLI not found in PATH\n")
-		fmt.Fprintf(os.Stderr, "Install: npm install -g @anthropic-ai/claude-code\n")
-		return 1
+	// Validate required local CLI only for local CLI-backed models.
+	switch {
+	case model == "" || model == "claude":
+		if _, err := exec.LookPath(claudeCommand); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Claude CLI not found in PATH\n")
+			fmt.Fprintf(os.Stderr, "Install: npm install -g @anthropic-ai/claude-code\n")
+			return 1
+		}
+	case model == "codex" || strings.HasPrefix(model, "codex/"):
+		if _, err := exec.LookPath(codexCommand); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: Codex CLI not found in PATH\n")
+			fmt.Fprintf(os.Stderr, "Install: npm install -g @openai/codex\n")
+			return 1
+		}
 	}
 
 	// Load schema if specified

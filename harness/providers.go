@@ -19,6 +19,7 @@ type ProviderType string
 
 const (
 	ProviderClaude     ProviderType = "claude"     // Claude CLI (default)
+	ProviderCodex      ProviderType = "codex"      // Codex CLI
 	ProviderOpenAI     ProviderType = "openai"     // OpenAI API
 	ProviderOpenRouter ProviderType = "openrouter" // OpenRouter API
 	ProviderOllama     ProviderType = "ollama"     // Ollama (local)
@@ -80,6 +81,8 @@ func DefaultProviders() map[ProviderType]*ProviderConfig {
 // ParseModelProvider extracts the provider and model from a model string.
 // Formats:
 //   - "claude" or "" -> (ProviderClaude, "claude")
+//   - "codex" -> (ProviderCodex, "codex")
+//   - "codex/gpt-5-codex" -> (ProviderCodex, "gpt-5-codex")
 //   - "openai/gpt-4o" -> (ProviderOpenAI, "gpt-4o")
 //   - "openrouter/anthropic/claude-3-haiku" -> (ProviderOpenRouter, "anthropic/claude-3-haiku")
 //   - "ollama/llama3.2" -> (ProviderOllama, "llama3.2")
@@ -88,6 +91,9 @@ func DefaultProviders() map[ProviderType]*ProviderConfig {
 func ParseModelProvider(model string) (ProviderType, string, *ProviderConfig) {
 	if model == "" || model == "claude" {
 		return ProviderClaude, "claude", nil
+	}
+	if model == "codex" {
+		return ProviderCodex, "codex", nil
 	}
 
 	// Check for URL-based custom provider
@@ -112,6 +118,9 @@ func ParseModelProvider(model string) (ProviderType, string, *ProviderConfig) {
 	}
 	if strings.HasPrefix(model, "openrouter/") {
 		return ProviderOpenRouter, strings.TrimPrefix(model, "openrouter/"), nil
+	}
+	if strings.HasPrefix(model, "codex/") {
+		return ProviderCodex, strings.TrimPrefix(model, "codex/"), nil
 	}
 	if strings.HasPrefix(model, "ollama/") {
 		return ProviderOllama, strings.TrimPrefix(model, "ollama/"), nil

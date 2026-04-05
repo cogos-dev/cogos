@@ -187,8 +187,8 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 	// Parse request
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<18) // 256KB limit
 	var req struct {
-		Prompt    string `json:"prompt"`
-		Iris      struct {
+		Prompt string `json:"prompt"`
+		Iris   struct {
 			Size int `json:"size"`
 			Used int `json:"used"`
 		} `json:"iris"`
@@ -349,17 +349,18 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *serveServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	// Check if claude CLI is available
-	_, err := exec.LookPath(claudeCommand)
+	_, claudeErr := exec.LookPath(claudeCommand)
+	_, codexErr := exec.LookPath(codexCommand)
 	status := "healthy"
-	if err != nil {
+	if claudeErr != nil && codexErr != nil {
 		status = "degraded"
 	}
 
 	resp := map[string]any{
 		"status":    status,
 		"timestamp": nowISO(),
-		"claude":    err == nil,
+		"claude":    claudeErr == nil,
+		"codex":     codexErr == nil,
 		"debug":     DebugMode.Load(),
 	}
 	if s.mcpManager != nil {

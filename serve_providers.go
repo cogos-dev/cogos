@@ -31,6 +31,8 @@ func getProviderDisplayName(pt ProviderType) string {
 	switch pt {
 	case ProviderClaude:
 		return "Claude CLI"
+	case ProviderCodex:
+		return "Codex CLI"
 	case ProviderOpenAI:
 		return "OpenAI"
 	case ProviderOpenRouter:
@@ -51,6 +53,8 @@ func getProviderModels(pt ProviderType) []string {
 	switch pt {
 	case ProviderClaude:
 		return []string{"claude-opus-4-5", "claude-sonnet-4-5", "claude"}
+	case ProviderCodex:
+		return []string{"codex", "gpt-5-codex", "codex-mini-latest"}
 	case ProviderOpenAI:
 		return []string{"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"}
 	case ProviderOpenRouter:
@@ -81,13 +85,19 @@ func checkProviderHealth(pt ProviderType, config *ProviderConfig) *ProviderHealt
 	// Perform fresh health check
 	health := &ProviderHealth{}
 
-	// Special handling for Claude CLI - check if binary exists
-	if pt == ProviderClaude {
-		_, err := exec.LookPath(claudeCommand)
+	// Special handling for local CLIs - check if the binary exists
+	if pt == ProviderClaude || pt == ProviderCodex {
+		command := claudeCommand
+		errMsg := "Claude CLI not found in PATH"
+		if pt == ProviderCodex {
+			command = codexCommand
+			errMsg = "Codex CLI not found in PATH"
+		}
+
+		_, err := exec.LookPath(command)
 		now := nowISO()
 		health.LastCheck = &now
 		if err != nil {
-			errMsg := "Claude CLI not found in PATH"
 			health.Error = &errMsg
 		} else {
 			latency := 0 // CLI check is instant
@@ -172,7 +182,7 @@ func checkProviderHealth(pt ProviderType, config *ProviderConfig) *ProviderHealt
 // getProviderStatus determines the status string from health info
 func getProviderStatus(health *ProviderHealth, hasAPIKey bool, pt ProviderType) string {
 	// Claude CLI doesn't need API key check
-	if pt == ProviderClaude {
+	if pt == ProviderClaude || pt == ProviderCodex {
 		if health.Error != nil {
 			return "offline"
 		}
@@ -211,7 +221,7 @@ func (s *serveServer) handleProviders(w http.ResponseWriter, r *http.Request) {
 	// Build response
 	var data []ProviderInfo
 
-	// Always include Claude CLI as first provider
+	// Always include local CLI providers first
 	claudeHealth := checkProviderHealth(ProviderClaude, nil)
 	claudeStatus := getProviderStatus(claudeHealth, true, ProviderClaude)
 	data = append(data, ProviderInfo{
@@ -225,6 +235,21 @@ func (s *serveServer) handleProviders(w http.ResponseWriter, r *http.Request) {
 			HasAPIKey: true, // Claude CLI uses Anthropic API key internally
 		},
 		Health: *claudeHealth,
+	})
+
+	codexHealth := checkProviderHealth(ProviderCodex, nil)
+	codexStatus := getProviderStatus(codexHealth, true, ProviderCodex)
+	data = append(data, ProviderInfo{
+		ID:     string(ProviderCodex),
+		Name:   getProviderDisplayName(ProviderCodex),
+		Status: codexStatus,
+		Active: currentActive == ProviderCodex,
+		Models: getProviderModels(ProviderCodex),
+		Config: ProviderPublicConfig{
+			BaseURL:   "",
+			HasAPIKey: true,
+		},
+		Health: *codexHealth,
 	})
 
 	// Add HTTP providers
@@ -310,6 +335,8 @@ func (s *serveServer) handleProviderByID(w http.ResponseWriter, r *http.Request)
 	switch providerID {
 	case "claude":
 		providerType = ProviderClaude
+	case "codex":
+		providerType = ProviderCodex
 	case "openai":
 		providerType = ProviderOpenAI
 	case "openrouter":
@@ -362,17 +389,26 @@ func (s *serveServer) handleProviderTest(w http.ResponseWriter, r *http.Request,
 	providers := DefaultProviders()
 	config := providers[pt]
 
-	// For Claude CLI, we just check if the binary exists
-	if pt == ProviderClaude {
+	// For local CLI providers, we just check if the binary exists
+	if pt == ProviderClaude || pt == ProviderCodex {
 		start := time.Now()
-		_, err := exec.LookPath(claudeCommand)
+		command := claudeCommand
+		testModel := "claude"
+		errLabel := "Claude CLI not found in PATH"
+		if pt == ProviderCodex {
+			command = codexCommand
+			testModel = "codex"
+			errLabel = "Codex CLI not found in PATH"
+		}
+
+		_, err := exec.LookPath(command)
 		latency := int(time.Since(start).Milliseconds())
 
 		status := "online"
 		var errMsg *string
 		if err != nil {
 			status = "offline"
-			msg := "Claude CLI not found in PATH"
+			msg := errLabel
 			errMsg = &msg
 		}
 
@@ -381,7 +417,7 @@ func (s *serveServer) handleProviderTest(w http.ResponseWriter, r *http.Request,
 			"provider":   string(pt),
 			"status":     status,
 			"latency_ms": latency,
-			"test_model": "claude",
+			"test_model": testModel,
 			"error":      errMsg,
 		})
 		return
@@ -473,6 +509,18 @@ func (s *serveServer) handleModels(w http.ResponseWriter, r *http.Request) {
 				Object:  "model",
 				Created: time.Now().Unix(),
 				OwnedBy: "anthropic",
+			},
+			{
+				ID:      "codex",
+				Object:  "model",
+				Created: time.Now().Unix(),
+				OwnedBy: "openai",
+			},
+			{
+				ID:      "gpt-5-codex",
+				Object:  "model",
+				Created: time.Now().Unix(),
+				OwnedBy: "openai",
 			},
 		},
 	}

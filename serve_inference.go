@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	sdk "github.com/cogos-dev/cogos/sdk"
@@ -493,14 +494,18 @@ func (s *serveServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	if s.toolBridge != nil && s.hasToolMessages(req.Messages) {
 		if sess := s.toolBridge.GetSession(sessionID); sess != nil {
 			log.Printf("[tool-bridge] Continuation detected for session %s", sessionID)
-			s.handleToolBridgeContinuation(w, &req, sess, sessionID, bctx, startTime)
+			s.handleToolBridgeContinuation(w, &req, sess, sessionID, bctx, startTime, r.Context())
 			return
 		}
 	}
 
 	// Handle streaming vs non-streaming
+	// Pass the HTTP request context so streaming handlers can detect client
+	// disconnect and cancel the inference process (important when using
+	// context.Background() for tool bridge support).
+	httpCtx := r.Context()
 	if req.Stream {
-		s.handleStreamingResponse(w, inferReq, sessionID, bctx, startTime)
+		s.handleStreamingResponse(w, inferReq, sessionID, bctx, startTime, httpCtx)
 	} else {
 		s.handleNonStreamingResponse(w, inferReq, sessionID, bctx, startTime)
 	}
@@ -516,11 +521,25 @@ type busEventCtx struct {
 	SpanID      string
 }
 
-func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID string, bctx busEventCtx, startTime time.Time) {
+func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *InferenceRequest, sessionID string, bctx busEventCtx, startTime time.Time, httpCtx context.Context) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	// Track whether the handler exits normally (completion or tool bridge
+	// suspension) vs. abnormally (client disconnect). When the HTTP request
+	// context is cancelled and we haven't set normalExit, the client
+	// disconnected and the inference should be cancelled.
+	var normalExit atomic.Bool
+	go func() {
+		<-httpCtx.Done()
+		if !normalExit.Load() {
+			if GlobalRegistry.Cancel(inferReq.ID) {
+				log.Printf("[streaming] Client disconnected, cancelled request %s", inferReq.ID)
+			}
+		}
+	}()
 
 	// Add TAA context as headers (before streaming starts, so clients can read immediately)
 	if inferReq.ContextState != nil {
@@ -549,6 +568,7 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		normalExit.Store(true)
 		s.writeError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
 		return
 	}
@@ -583,6 +603,7 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 	// Delegate to harness inference engine
 	chunks, err := HarnessRunInferenceStream(inferReq, GlobalRegistry)
 	if err != nil {
+		normalExit.Store(true)
 		s.writeSSEError(w, flusher, "Failed to start inference: "+err.Error())
 		if s.busChat != nil && bctx.BusID != "" {
 			s.busChat.emitError(ChatErrorOpts{
@@ -615,6 +636,7 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 		extendDeadline()
 
 		if chunk.Error != nil {
+			normalExit.Store(true)
 			s.writeSSEError(w, flusher, "Inference error: "+chunk.Error.Error())
 			if s.busChat != nil && bctx.BusID != "" {
 				s.busChat.emitError(ChatErrorOpts{
@@ -856,6 +878,7 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			// When the client sends a follow-up request with tool results,
 			// handleToolBridgeContinuation will resume reading from this channel.
 			// Calls were already eagerly registered via tool_use events above.
+			normalExit.Store(true) // Prevent disconnect watcher from killing suspended process
 			s.toolBridge.RegisterSession(sessionID, chunks, inferReq, nil)
 			return
 		}
@@ -1017,6 +1040,8 @@ func (s *serveServer) handleStreamingResponse(w http.ResponseWriter, inferReq *I
 			if hasExternalTools && s.toolBridge != nil {
 				s.toolBridge.CleanupSession(sessionID)
 			}
+
+			normalExit.Store(true)
 		}
 	}
 }
@@ -1244,14 +1269,31 @@ func (s *serveServer) handleToolBridgePending(w http.ResponseWriter, r *http.Req
 // handleToolBridgeContinuation handles a follow-up request with role:"tool" results.
 // It delivers the results to the blocked MCP bridge and resumes streaming from
 // the parked output channel.
-func (s *serveServer) handleToolBridgeContinuation(w http.ResponseWriter, req *ChatCompletionRequest, sess *ToolBridgeSession, sessionID string, bctx busEventCtx, startTime time.Time) {
+func (s *serveServer) handleToolBridgeContinuation(w http.ResponseWriter, req *ChatCompletionRequest, sess *ToolBridgeSession, sessionID string, bctx busEventCtx, startTime time.Time, httpCtx context.Context) {
 	// Set SSE headers for streaming response
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// Detect client disconnect and cancel the inference process.
+	// The process was started with context.Background() so HTTP disconnects
+	// don't automatically kill it — we must cancel explicitly via the registry.
+	var normalExit atomic.Bool
+	if sess.InferReq != nil {
+		requestID := sess.InferReq.ID
+		go func() {
+			<-httpCtx.Done()
+			if !normalExit.Load() {
+				if GlobalRegistry.Cancel(requestID) {
+					log.Printf("[tool-bridge] Client disconnected, cancelled request %s", requestID)
+				}
+			}
+		}()
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		normalExit.Store(true)
 		s.writeError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
 		return
 	}
@@ -1293,6 +1335,7 @@ func (s *serveServer) handleToolBridgeContinuation(w http.ResponseWriter, req *C
 		extendDeadline()
 
 		if chunk.Error != nil {
+			normalExit.Store(true)
 			s.writeSSEError(w, flusher, "Inference error: "+chunk.Error.Error())
 			s.toolBridge.CleanupSession(sessionID)
 			return
@@ -1473,6 +1516,7 @@ func (s *serveServer) handleToolBridgeContinuation(w http.ResponseWriter, req *C
 			flusher.Flush()
 
 			// Calls were already eagerly registered via tool_use events above.
+			normalExit.Store(true) // Prevent disconnect watcher from killing re-suspended process
 			return
 		}
 
@@ -1528,12 +1572,14 @@ func (s *serveServer) handleToolBridgeContinuation(w http.ResponseWriter, req *C
 			flusher.Flush()
 
 			// Clean up the bridge session — CLI has exited
+			normalExit.Store(true)
 			s.toolBridge.CleanupSession(sessionID)
 			return
 		}
 	}
 
 	// Channel closed unexpectedly
+	normalExit.Store(true)
 	s.toolBridge.CleanupSession(sessionID)
 }
 
@@ -1763,3 +1809,4 @@ func (s *serveServer) checkSummarization(sessionID string) {
 		// This will be implemented by the Memory Integration Specialist
 	}
 }
+

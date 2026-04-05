@@ -623,7 +623,7 @@ func loadPeripheralContext(workspaceRoot, currentSessionID string) string {
 	// Read exchanges and build output
 	type busDigest struct {
 		origin    string
-		age       string
+		lastEvent string // stable ISO timestamp (not relative age — avoids cache busting)
 		exchanges []busExchange
 	}
 
@@ -644,14 +644,18 @@ func loadPeripheralContext(workspaceRoot, currentSessionID string) string {
 		}
 
 		origin := inferOrigin(cand.participants, cand.busID)
-		age := "unknown"
+
+		// Use a stable timestamp instead of volatile relative age ("47m ago").
+		// Relative age changes every turn and busts the KV cache prefix.
+		// The model can compute recency from the timestamp itself.
+		lastEvent := "unknown"
 		if !cand.lastEventAt.IsZero() {
-			age = formatAge(cand.lastEventAt.Format(time.RFC3339Nano))
+			lastEvent = cand.lastEventAt.Format("2006-01-02T15:04Z07:00") // minute-precision, stable
 		}
 
 		digests = append(digests, busDigest{
 			origin:    origin,
-			age:       age,
+			lastEvent: lastEvent,
 			exchanges: exchanges,
 		})
 	}
@@ -665,7 +669,7 @@ func loadPeripheralContext(workspaceRoot, currentSessionID string) string {
 	sb.WriteString("Other ongoing sessions you are participating in:\n\n")
 
 	for _, d := range digests {
-		sb.WriteString(fmt.Sprintf("### [%s] %s ago (%d exchanges)\n", d.origin, d.age, len(d.exchanges)))
+		sb.WriteString(fmt.Sprintf("### [%s] last_event:%s (%d exchanges)\n", d.origin, d.lastEvent, len(d.exchanges)))
 		for _, ex := range d.exchanges {
 			label := "**user:**"
 			if ex.Role == "assistant" {
