@@ -39,6 +39,9 @@ func Main() {
 	args := flag.Args()
 	if len(args) > 0 {
 		switch args[0] {
+		case "init":
+			runInitCmd(args[1:], *workspace)
+			return
 		case "serve":
 			runServeCmd(args[1:], *workspace, *port)
 			return
@@ -58,7 +61,7 @@ func Main() {
 			runLogsCmd(args[1:], *workspace, *port)
 			return
 		case "version":
-			fmt.Printf("cogos-v3 build=%s\n", BuildTime)
+			fmt.Printf("cogos build=%s\n", BuildTime)
 			return
 		case "health":
 			runHealthCheckCmd(args[1:], *workspace, *port)
@@ -83,6 +86,23 @@ func Main() {
 
 	// Compatibility path: plain `cogos-v3` still serves in the foreground.
 	runServe(*workspace, *port)
+}
+
+func runInitCmd(args []string, defaultWorkspace string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	workspace := fs.String("workspace", defaultWorkspace, "Workspace root path (default: current directory)")
+	_ = fs.Parse(args)
+
+	// Use positional arg if no --workspace flag.
+	target := *workspace
+	if target == "" && fs.NArg() > 0 {
+		target = fs.Arg(0)
+	}
+
+	if err := RunInit(target); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func setupLogger() {

@@ -1,0 +1,39 @@
+# CogOS E2E Test — builds the binary and runs the full cold-start test.
+#
+# Usage:
+#   docker build -f Dockerfile.e2e -t cogos-e2e-test .
+#   docker run --rm cogos-e2e-test
+#
+# The container exits 0 if all tests pass, 1 on any failure.
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM golang:1.24-alpine AS builder
+
+ARG BUILD_TIME=e2e-test
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+RUN CGO_ENABLED=0 go build \
+    -ldflags="-s -w -X github.com/cogos-dev/cogos/internal/engine.BuildTime=${BUILD_TIME}" \
+    -o /cogos ./cmd/cogos
+
+# ── Stage 2: Test ─────────────────────────────────────────────────────────────
+FROM alpine:3.21
+
+RUN apk add --no-cache bash curl git
+
+COPY --from=builder /cogos /usr/local/bin/cogos
+COPY scripts/e2e-test.sh /usr/local/bin/e2e-test.sh
+
+ENV COGOS_BIN=/usr/local/bin/cogos
+ENV E2E_WORKSPACE=/tmp/e2e-workspace
+ENV E2E_PORT=5299
+
+# Git needs a minimal config for salience scoring (git log).
+RUN git config --global user.email "test@cogos.dev" && \
+    git config --global user.name "CogOS E2E"
+
+CMD ["e2e-test.sh"]

@@ -1,0 +1,26 @@
+# Inference provider configuration
+# The router loads enabled providers at startup and routes requests
+# based on capability, availability, and the sovereignty gradient.
+
+providers:
+  ollama:
+    type: ollama
+    enabled: true
+    endpoint: "http://localhost:11434"
+    model: "llama3.2"
+    timeout: 120
+    context_window: 128000
+
+  anthropic:
+    type: anthropic
+    enabled: false   # Set ANTHROPIC_API_KEY and enable to use
+    api_key_env: ANTHROPIC_API_KEY
+    model: "claude-sonnet-4-20250514"
+    timeout: 120
+    context_window: 200000
+
+routing:
+  prefer_local: true
+  fallback_chain:
+    - ollama
+    - anthropic

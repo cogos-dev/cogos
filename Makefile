@@ -2,8 +2,10 @@
 #
 # Targets:
 #   make build      — compile the binary
-#   make test       — run tests
-#   make image      — build OCI image
+#   make test       — run unit tests
+#   make e2e        — run e2e test in a container (cold-start → serve → verify)
+#   make e2e-local  — run e2e test locally (requires built binary)
+#   make image      — build production OCI image
 #   make run        — run in Docker with workspace volume mount
 #   make clean      — remove build artifacts
 #   make tidy       — go mod tidy
@@ -16,7 +18,7 @@ WORKSPACE  ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo $$HOME/c
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS    := -s -w -X github.com/cogos-dev/cogos/internal/engine.BuildTime=$(BUILD_TIME)
 
-.PHONY: build test test-coverage test-integration bench install image run push clean tidy
+.PHONY: build test test-coverage test-integration bench install image run push clean tidy e2e e2e-local
 
 build:
 	go build -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/cogos
@@ -57,6 +59,13 @@ run: image
 
 push:
 	docker push $(IMAGE):$(TAG)
+
+e2e:
+	docker build -f Dockerfile.e2e -t cogos-e2e-test .
+	docker run --rm cogos-e2e-test
+
+e2e-local: build
+	COGOS_BIN=./$(BINARY) ./scripts/e2e-test.sh
 
 clean:
 	rm -f $(BINARY)

@@ -53,29 +53,31 @@ type identityFrontmatter struct {
 }
 
 // LoadNucleus reads the current identity from .cog/config/identity.yaml and
-// loads the corresponding identity card file.
+// loads the corresponding identity card file. Falls back to an embedded
+// default identity if no config or card exists.
 func LoadNucleus(cfg *Config) (*Nucleus, error) {
-	// Read identity config.
+	// Try to read identity config.
 	identCfgPath := filepath.Join(cfg.CogDir, "config", "identity.yaml")
 	identData, err := os.ReadFile(identCfgPath)
-	if err != nil {
-		return nil, fmt.Errorf("read identity config: %w", err)
+
+	var name string
+	var identDir string
+
+	if err == nil {
+		var identCfg identityYAML
+		if parseErr := yaml.Unmarshal(identData, &identCfg); parseErr == nil {
+			name = identCfg.DefaultIdentity
+			identDir = identCfg.IdentityDirectory
+		}
 	}
 
-	var identCfg identityYAML
-	if err := yaml.Unmarshal(identData, &identCfg); err != nil {
-		return nil, fmt.Errorf("parse identity config: %w", err)
-	}
-
-	name := identCfg.DefaultIdentity
 	if name == "" {
-		name = "cog"
+		name = "cogos"
 	}
 
 	// Resolve identity card path.
-	identDir := identCfg.IdentityDirectory
 	if identDir == "" {
-		identDir = filepath.Join(cfg.WorkspaceRoot, "projects", "cog_lab_package", "identities")
+		identDir = filepath.Join(cfg.WorkspaceRoot, ".cog", "agents", "identities")
 	} else if !filepath.IsAbs(identDir) {
 		identDir = filepath.Join(cfg.WorkspaceRoot, identDir)
 	}
@@ -83,7 +85,11 @@ func LoadNucleus(cfg *Config) (*Nucleus, error) {
 	cardPath := filepath.Join(identDir, fmt.Sprintf("identity_%s.md", strings.ToLower(name)))
 	cardData, err := os.ReadFile(cardPath)
 	if err != nil {
-		return nil, fmt.Errorf("read identity card %s: %w", cardPath, err)
+		// Fall back to embedded default identity.
+		cardData, err = defaultsFS.ReadFile("defaults/identity.md")
+		if err != nil {
+			return nil, fmt.Errorf("no identity card found and embedded default unavailable: %w", err)
+		}
 	}
 
 	// Parse frontmatter.

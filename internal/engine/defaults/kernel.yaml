@@ -1,0 +1,8 @@
+# CogOS kernel configuration
+# See docs for all options: https://github.com/cogos-dev/cogos
+
+port: 5200
+consolidation_interval: 900   # seconds between consolidation sweeps
+heartbeat_interval: 60         # seconds between dormant heartbeats
+salience_days_window: 90       # git history window for salience scoring
+output_reserve: 4096           # tokens reserved for model generation

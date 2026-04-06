@@ -1,0 +1,5 @@
+# Identity configuration
+# Points to which identity card the nucleus loads at startup.
+
+default_identity: cogos
+identity_directory: .cog/agents/identities
