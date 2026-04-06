@@ -172,3 +172,133 @@ graph TB
       merge (resolve distinction)
       die (distinction wasn't worth keeping)
 ```
+
+---
+
+## Diagram 4: Node vs Workspace (Clarification)
+
+The node is the runtime. The workspace is the cognitive state. They are distinct concepts.
+
+```
+    TERMINOLOGY:
+
+    Node      = the daemon process + its membrane
+                (one per machine, runs on a port)
+
+    Workspace = the cognitive state
+                (memory, identity, ledger, config)
+                Can span multiple nodes (via BEP)
+                Multiple can live on one node
+```
+
+### 4a: Single Node, Single Workspace (Day 1 — simplest case)
+
+```
+    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃  Node (laptop, port 5200)                      ┃
+    ┃                                                ┃
+    ┃  ┌───────────────────────────────────────────┐  ┃
+    ┃  │  Workspace: "my-project"                  │  ┃
+    ┃  │                                           │  ┃
+    ┃  │  ╭━━━━━━━━━━╮                             │  ┃
+    ┃  │  ┃ Nucleus  ┃  ┌─────────┐ ┌──────────┐  │  ┃
+    ┃  │  ┃ Identity ┃  │ Context │ │  Ledger  │  │  ┃
+    ┃  │  ╰━━━━━━━━━━╯  │ Engine  │ │  ██████  │  │  ┃
+    ┃  │                 └─────────┘ └──────────┘  │  ┃
+    ┃  │  · · · · · · substrate · · · · · · · ·   │  ┃
+    ┃  │  .cog/mem  .cog/config  .cog/ledger       │  ┃
+    ┃  └───────────────────────────────────────────┘  ┃
+    ┃                                                ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+### 4b: Single Node, Multiple Workspaces
+
+One kernel serves multiple workspaces. Each has its own identity, memory, and ledger.
+The nucleus loads the active workspace's identity. Workspaces are isolated — they don't share memory unless explicitly federated.
+
+```
+    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃  Node (laptop, port 5200)                                   ┃
+    ┃                                                             ┃
+    ┃  ╭━━━━━━━━━━━━━━╮                                           ┃
+    ┃  ┃   Kernel      ┃   (shared process, shared providers)     ┃
+    ┃  ╰━━━━━━━━━━━━━━╯                                           ┃
+    ┃       │                    │                                 ┃
+    ┃  ┌────▼──────────────┐  ┌──▼───────────────────┐            ┃
+    ┃  │ Workspace: "home" │  │ Workspace: "work"    │            ┃
+    ┃  │                   │  │                      │            ┃
+    ┃  │ Nucleus: Chaz     │  │ Nucleus: Team-Infra  │            ┃
+    ┃  │ Memory: personal  │  │ Memory: work docs    │            ┃
+    ┃  │ Ledger: ██████    │  │ Ledger: ██████       │            ┃
+    ┃  │ .cog/             │  │ .cog/                │            ┃
+    ┃  └───────────────────┘  └──────────────────────┘            ┃
+    ┃                                                             ┃
+    ┃  Workspaces are isolated. Different identity, different     ┃
+    ┃  memory, different ledger chain. Same kernel, same          ┃
+    ┃  providers.                                                 ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+### 4c: Multi-Node — Workspace Spanning Nodes (via BEP)
+
+The same workspace replicated across multiple nodes. BEP (Block Exchange Protocol) handles replication. Each ledger block is a BEP block. Coherence ensures consistency.
+
+```
+    ┏━━━━━━━━━━━━━━━━━━━━━━━┓         ┏━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃  Node A (laptop)        ┃   BEP   ┃  Node B (server)        ┃
+    ┃                         ┃ ◄─────► ┃                         ┃
+    ┃  ┌─────────────────┐    ┃  blocks  ┃    ┌─────────────────┐  ┃
+    ┃  │ Workspace: "cog"│    ┃ ◄─────► ┃    │ Workspace: "cog"│  ┃
+    ┃  │                 │    ┃         ┃    │                 │  ┃
+    ┃  │ Ledger: █1█2█3  │    ┃         ┃    │ Ledger: █1█2█3  │  ┃
+    ┃  │ Memory: synced  │    ┃         ┃    │ Memory: synced  │  ┃
+    ┃  │ Identity: same  │    ┃         ┃    │ Identity: same  │  ┃
+    ┃  └─────────────────┘    ┃         ┃    └─────────────────┘  ┃
+    ┃                         ┃         ┃                         ┃
+    ┃  Coherence ◄──────────────────────────► Coherence           ┃
+    ┃  (validates block        ┃         ┃    (validates block     ┃
+    ┃   integrity on sync)     ┃         ┃     integrity on sync)  ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━┛         ┗━━━━━━━━━━━━━━━━━━━━━━━┛
+
+    Key:
+    - BEP replicates blocks (ledger entries) between nodes
+    - Each ledger block IS a BEP block — same hash, same content
+    - Coherence validates integrity on both sides
+    - The workspace appears identical on both nodes
+    - Changes on either node propagate to the other
+```
+
+### 4d: Multi-Node, Multi-Workspace (Full Topology)
+
+The general case: multiple nodes, each hosting one or more workspaces, with some workspaces spanning nodes.
+
+```
+    ┏━━ Node A (laptop) ━━━━━━━━━━━━┓     ┏━━ Node B (server) ━━━━━━━━━━━━┓
+    ┃                                ┃     ┃                                ┃
+    ┃  ┌──────────┐  ┌──────────┐   ┃     ┃   ┌──────────┐                 ┃
+    ┃  │ ws:home  │  │ ws:cog   │◄──╂─BEP─╂──►│ ws:cog   │                 ┃
+    ┃  │ (local   │  │ (synced) │   ┃     ┃   │ (synced) │                 ┃
+    ┃  │  only)   │  └──────────┘   ┃     ┃   └──────────┘                 ┃
+    ┃  └──────────┘                 ┃     ┃                                ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛     ┃   ┌──────────┐                 ┃
+                                          ┃   │ ws:api   │                 ┃
+                                          ┃   │ (local   │                 ┃
+                                          ┃   │  only)   │                 ┃
+                                          ┃   └──────────┘                 ┃
+                                          ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+    - ws:home lives only on Node A (personal, never synced)
+    - ws:cog spans both nodes (synced via BEP)
+    - ws:api lives only on Node B (server-only workload)
+    - Each workspace has its own identity, memory, ledger
+    - BEP only syncs workspaces that are explicitly federated
+```
+
+### Visual principles for multi-node diagrams:
+- Nodes should look like distinct cells / membranes
+- BEP connections should look like channels or bridges between cells
+- Workspaces within a node should look like compartments or vacuoles
+- Synced workspaces should be visually linked across nodes (same color/label)
+- Local-only workspaces should be visually distinct (no external connections)
+- The overall layout should suggest a network of cells, not a centralized architecture
