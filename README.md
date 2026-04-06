@@ -26,36 +26,45 @@ CogOS sits underneath all of them and provides what they can't provide for thems
 
 ## Architecture
 
-CogOS is a continuous-process daemon, not a request handler. It has its own cognitive loop that runs regardless of whether anyone is talking to it:
+CogOS is structured like a cell, not a stack. Components (organelles) float in a shared cognitive substrate and coordinate through it — not through direct imports or message passing. The membrane controls what crosses the boundary.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     Agent Harnesses                      │
-│         Claude Code · Cursor · Gemini CLI · etc.         │
-└────────────────────────┬────────────────────────────────┘
-                         │ OpenAI / Anthropic / MCP
-┌────────────────────────▼────────────────────────────────┐
-│                      CogOS Kernel                        │
-│                                                          │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │ Nucleus  │  │   Process    │  │  Context Engine    │  │
-│  │ identity │  │  4-state loop│  │  foveated assembly │  │
-│  └──────────┘  └──────────────┘  └───────────────────┘  │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │  Ledger  │  │   Router     │  │  Salience          │  │
-│  │  hash-   │  │  local-first │  │  git-derived       │  │
-│  │  chained │  │  routing     │  │  attention          │  │
-│  └──────────┘  └──────────────┘  └───────────────────┘  │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │Coherence │  │  Blob Store  │  │  MCP Server        │  │
-│  └──────────┘  └──────────────┘  └───────────────────┘  │
-│  ┌──────────────────────────────────────────────────┐    │
-│  │    Providers: Anthropic · Ollama · Claude Code    │    │
-│  └──────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    External["Claude Code · Cursor · Gemini CLI · MCP Clients"]
+
+    subgraph Cell["CogOS Node"]
+        direction TB
+
+        Nucleus["<b>Nucleus</b><br/>Identity — always loaded"]
+
+        subgraph Substrate["&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Substrate (shared cognitive medium)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"]
+            direction LR
+            CTX["Context Engine<br/><i>foveated assembly</i>"]
+            PROC["Process Loop<br/><i>4 cognitive states</i>"]
+            LED["Ledger<br/><i>hash-chained</i>"]
+            RTR["Router<br/><i>local-first</i>"]
+            SAL["Salience<br/><i>git-derived</i>"]
+            COH["Coherence"]
+            BLOB["Blob Store"]
+            MCP_S["MCP Server"]
+        end
+    end
+
+    Providers["Anthropic · Ollama · Claude Code · Codex"]
+
+    External -->|"OpenAI / Anthropic / MCP"| Cell
+    Cell -->|"inference routing"| Providers
+
+    style Nucleus fill:#2d5aa0,color:#fff,stroke:#1a3d6e
+    style Substrate fill:#f5f0e8,stroke:#ccc,stroke-dasharray: 5 5
+    style Cell fill:#faf8f4,stroke:#8b7d6b,stroke-width:3px
+    style External fill:#e8e8e8,stroke:#999
+    style Providers fill:#e8e8e8,stroke:#999
 ```
 
-The daemon has four states — **Active** (processing a request), **Receptive** (idle, maintaining the attentional field), **Consolidating** (internal maintenance), and **Dormant** (heartbeat only). It's always aware of what changed, even between sessions.
+The kernel runs as a continuous process with four states — **Active** (processing a request), **Receptive** (idle, maintaining the attentional field), **Consolidating** (internal maintenance), and **Dormant** (heartbeat only). It's always aware of what changed, even between sessions.
+
+Organelles don't communicate directly. They read from and write to the substrate. Adding a new component requires zero changes to existing ones — it just starts participating in the shared medium.
 
 ## Core ideas
 
