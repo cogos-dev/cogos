@@ -195,7 +195,11 @@ Next: memory consolidation loop, multi-agent process management, Constellation i
 
 ## Deeper
 
-- [Architecture Diagrams](docs/architecture-diagram-source.md) — cell model, topology views, scale invariance
+- [System Specification](docs/SYSTEM-SPEC.md) — multi-level spec from ontology to deployment
+- [Architectural Principles](docs/architecture/principles.md) — delta, quantum, sampling, energy signatures, scale invariance
+- [Platform Thesis](docs/PLATFORM.md) — AWS-scale vision, autopoietic architecture, trajectory
+- [Cognitive GitOps](docs/architecture/cognitive-gitops.md) — substrate-coordinated repos, inference dial, mycelium model
+- [Architecture Diagrams](docs/architecture-diagram-source.md) — cell model, topology views, presence register
 - [Distributed Presence & Trust](docs/vision/distributed-presence-and-trust.md) — multi-device, learned boundaries, trust membrane
 - [Writing a Provider](docs/writing-a-provider.md) — extensibility guide
 - [MCP Specification](docs/MCP-SPEC.md) — MCP server contract
