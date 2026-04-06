@@ -52,7 +52,7 @@ func initTelemetry(ctx context.Context) func(context.Context) {
 
 	res, _ := resource.New(ctx,
 		resource.WithAttributes(semconv.ServiceNameKey.String(serviceName)),
-		resource.WithAttributes(attribute.String("cogos.version", "v3-skeleton")),
+		resource.WithAttributes(attribute.String("cogos.version", Version)),
 	)
 
 	var shutdowns []func(context.Context) error

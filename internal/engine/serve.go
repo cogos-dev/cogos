@@ -135,7 +135,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":   status,
-		"version":  "v3-skeleton",
+		"version":  Version,
 		"state":    s.process.State().String(),
 		"identity": identity,
 		"node_id":  s.process.NodeID,

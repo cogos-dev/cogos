@@ -16,7 +16,8 @@ TAG        := dev
 PORT       := 5200
 WORKSPACE  ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo $$HOME/cog-workspace)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS    := -s -w -X github.com/cogos-dev/cogos/internal/engine.BuildTime=$(BUILD_TIME)
+VERSION    ?= dev
+LDFLAGS    := -s -w -X github.com/cogos-dev/cogos/internal/engine.Version=$(VERSION) -X github.com/cogos-dev/cogos/internal/engine.BuildTime=$(BUILD_TIME)
 
 .PHONY: build test test-coverage test-integration bench install image run push clean tidy e2e e2e-local
 

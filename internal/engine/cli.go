@@ -26,6 +26,9 @@ import (
 )
 
 var (
+	// Version is injected at build time via -ldflags (e.g. "v0.1.0").
+	Version = "dev"
+
 	// BuildTime is injected at build time via -ldflags.
 	BuildTime = "unknown"
 )
@@ -61,7 +64,7 @@ func Main() {
 			runLogsCmd(args[1:], *workspace, *port)
 			return
 		case "version":
-			fmt.Printf("cogos build=%s\n", BuildTime)
+			fmt.Printf("cogos version=%s build=%s\n", Version, BuildTime)
 			return
 		case "health":
 			runHealthCheckCmd(args[1:], *workspace, *port)
