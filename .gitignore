@@ -1,0 +1,28 @@
+# Binaries
+cogos
+cogos-v3
+cog-v3
+*.exe
+*.dylib
+*.so
+
+# Build artifacts
+.tmp/
+*.test
+*.out
+coverage.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime
+*.log
+*.pid
+run/

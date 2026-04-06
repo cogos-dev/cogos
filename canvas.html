@@ -1,0 +1,2295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CogOS Mycelium — Canvas</title>
+<style>
+/* ── Root Variables ── */
+:root {
+  --bg: #0d1117;
+  --bg-surface: #161b22;
+  --bg-elevated: #1c2129;
+  --bg-lowest: #0a0e14;
+  --border: #30363d;
+  --border-subtle: rgba(255,255,255,0.05);
+  --border-light: rgba(255,255,255,0.1);
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --text-faint: rgba(255,255,255,0.4);
+  --text-ghost: rgba(255,255,255,0.2);
+  --accent: #58a6ff;
+  --accent-dim: rgba(88,166,255,0.2);
+  --green: #67df70;
+  --purple: #bc8cff;
+  --yellow: #d29922;
+  --red: #f85149;
+  --orange: #f0883e;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'SF Mono', ui-monospace, 'Fira Code', 'Cascadia Code', monospace;
+  --font-headline: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --grid-dot: #1e242c;
+}
+
+/* ── Reset ── */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+.scrollbar-hidden::-webkit-scrollbar { display: none; }
+
+/* ── Canvas ── */
+#canvas-container {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  position: relative;
+  cursor: grab;
+  background: var(--bg);
+}
+#canvas-container:active { cursor: grabbing; }
+#canvas-container.no-grab { cursor: default; }
+
+#canvas-viewport {
+  position: absolute;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.canvas-grid {
+  position: absolute;
+  top: -10000px;
+  left: -10000px;
+  width: 20000px;
+  height: 20000px;
+  background-image: radial-gradient(var(--grid-dot) 1px, transparent 1px);
+  background-size: 24px 24px;
+  pointer-events: none;
+}
+
+/* ── Edge Layer ── */
+#edge-layer {
+  position: absolute;
+  top: -10000px;
+  left: -10000px;
+  width: 20000px;
+  height: 20000px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.edge-path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-opacity: 0.3;
+  transition: stroke-opacity 0.3s;
+}
+.edge-path.active {
+  stroke-dasharray: 8 4;
+  animation: dash-flow 20s linear infinite;
+  stroke-opacity: 0.7;
+  stroke-width: 2;
+}
+.edge-path:hover { stroke-opacity: 0.6; }
+@keyframes dash-flow { to { stroke-dashoffset: -1000; } }
+
+/* ── Overlays ── */
+.fovea-glow {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(circle at center, rgba(88,166,255,0.025) 0%, transparent 65%);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.light-cone-mask {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 25%, rgba(13,17,23,0.35) 60%, rgba(13,17,23,0.75) 100%);
+  z-index: 4;
+  opacity: 0;
+  transition: opacity 0.5s ease;
+}
+body.light-cone-active .light-cone-mask { opacity: 1; }
+
+/* ── Nodes (base) ── */
+.node {
+  position: absolute;
+  pointer-events: auto;
+  user-select: none;
+  transition: box-shadow 0.2s, opacity 0.3s;
+  z-index: 10;
+}
+.node:hover {
+  box-shadow: 0 0 24px rgba(88,166,255,0.08);
+}
+
+.node-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: grab;
+  user-select: none;
+}
+.node-header:active { cursor: grabbing; }
+
+.node-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.node-header-right {
+  display: flex;
+  gap: 6px;
+}
+
+.node-label {
+  font-family: var(--font-headline);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text);
+}
+.node-label.green { color: var(--green); }
+.node-label.accent { color: var(--accent); }
+.node-label.yellow { color: var(--yellow); }
+.node-label.purple { color: var(--purple); }
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.live {
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+}
+.status-dot.idle { background: var(--text-dim); }
+.status-dot.error { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+/* ── Icon Buttons ── */
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+.icon-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+.icon-btn svg { width: 16px; height: 16px; }
+
+/* ── Chat Node ── */
+.node-chat {
+  width: 480px;
+  height: 540px;
+  min-width: 360px;
+  min-height: 300px;
+  background: rgba(28,32,38,0.92);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  backdrop-filter: blur(16px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 30;
+}
+.node-chat .node-header {
+  background: rgba(255,255,255,0.015);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  flex-shrink: 0;
+}
+
+.chat-messages {
+  flex: 1;
+  min-height: 0;  /* critical: allows flex child to scroll */
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  scroll-behavior: smooth;
+}
+
+/* ── Node Resize Handle ── */
+.node-resize {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 20px;
+  height: 20px;
+  cursor: nwse-resize;
+  z-index: 5;
+}
+.node-resize::after {
+  content: '';
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--text-faint);
+  border-bottom: 2px solid var(--text-faint);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.node:hover .node-resize::after { opacity: 1; }
+
+/* Messages */
+.msg { display: flex; flex-direction: column; gap: 4px; }
+.msg.user { align-items: flex-end; }
+.msg.assistant { align-items: flex-start; }
+
+.msg-bubble {
+  max-width: 88%;
+  padding: 10px 16px;
+  font-size: 14px;
+  line-height: 1.6;
+  word-wrap: break-word;
+}
+.msg.user .msg-bubble {
+  background: var(--accent-dim);
+  border: 1px solid rgba(88,166,255,0.2);
+  border-radius: 16px 16px 4px 16px;
+  white-space: pre-wrap;
+}
+.msg.assistant .msg-bubble {
+  background: rgba(38,42,49,0.6);
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px 16px 16px 4px;
+}
+
+.msg-role {
+  font-size: 9px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+  padding: 0 4px;
+}
+
+.msg-streaming::after {
+  content: '▊';
+  animation: cursor-blink 1s steps(2, start) infinite;
+  margin-left: 2px;
+  color: var(--green);
+}
+@keyframes cursor-blink { to { visibility: hidden; } }
+
+/* Markdown in assistant messages */
+.md-content h1, .md-content h2, .md-content h3 { margin: 10px 0 4px; font-weight: 700; color: var(--text); }
+.md-content h1 { font-size: 16px; }
+.md-content h2 { font-size: 15px; }
+.md-content h3 { font-size: 14px; }
+.md-content p { margin: 4px 0; }
+.md-content ul, .md-content ol { margin: 4px 0; padding-left: 20px; }
+.md-content li { margin: 2px 0; }
+.md-content code {
+  background: var(--bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.md-content pre {
+  background: var(--bg);
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin: 6px 0;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+}
+.md-content pre code { background: none; padding: 0; font-size: 12px; line-height: 1.5; }
+.md-content strong { font-weight: 700; color: var(--text); }
+.md-content em { font-style: italic; }
+.md-content a { color: var(--accent); text-decoration: none; }
+.md-content a:hover { text-decoration: underline; }
+.md-content blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+  margin: 6px 0;
+  color: var(--text-dim);
+}
+.md-content hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+.md-content table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+.md-content th, .md-content td { border: 1px solid var(--border); padding: 4px 8px; }
+.md-content th { background: var(--bg); font-weight: 600; }
+
+/* Chat status lines */
+.chat-status {
+  text-align: center;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+  padding: 4px 0;
+}
+.chat-status .status-pill {
+  display: inline-block;
+  background: rgba(103,223,112,0.15);
+  color: var(--green);
+  border: 1px solid rgba(103,223,112,0.25);
+  border-radius: 10px;
+  padding: 2px 10px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* Chat input */
+.chat-input-area {
+  padding: 12px 16px;
+  background: rgba(24,28,34,0.8);
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  flex-shrink: 0;
+}
+.chat-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(0,0,0,0.4);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: 6px 12px;
+}
+.chat-input-wrap textarea {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  resize: none;
+  outline: none;
+  min-height: 28px;
+  max-height: 120px;
+  line-height: 1.4;
+}
+.chat-input-wrap textarea::placeholder { color: var(--text-ghost); }
+.chat-input-wrap button {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s;
+}
+.chat-input-wrap button:hover { opacity: 0.8; }
+.chat-input-wrap button:disabled { opacity: 0.3; cursor: not-allowed; }
+.chat-input-wrap button svg { width: 20px; height: 20px; }
+
+/* ── CogDoc Node ── */
+.node-cogdoc {
+  width: 360px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+  border-left: 4px solid var(--green);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  overflow: hidden;
+  z-index: 20;
+}
+.node-cogdoc .node-header {
+  background: rgba(88,166,255,0.06);
+  padding: 8px 14px;
+}
+.cogdoc-uri {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.cogdoc-body {
+  padding: 14px 16px;
+}
+.cogdoc-title {
+  font-family: var(--font-headline);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+.cogdoc-preview {
+  position: relative;
+  max-height: 80px;
+  overflow: hidden;
+  font-size: 12px;
+  color: rgba(230,237,243,0.6);
+  line-height: 1.6;
+}
+.cogdoc-preview-fade {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 28px;
+  background: linear-gradient(to top, var(--bg-elevated), transparent);
+}
+.cogdoc-footer {
+  padding: 6px 14px;
+  background: rgba(0,0,0,0.2);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 9px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+
+/* ── Insight Node ── */
+.node-insight {
+  width: 260px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+  border-left: 4px solid var(--purple);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  padding: 14px;
+  z-index: 20;
+}
+.insight-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  cursor: grab;
+}
+.insight-header:active { cursor: grabbing; }
+.insight-icon { color: var(--purple); }
+.insight-icon svg { width: 18px; height: 18px; }
+.insight-text {
+  font-size: 12px;
+  color: rgba(230,237,243,0.7);
+  font-style: italic;
+  line-height: 1.5;
+}
+
+/* ── Terminal Node ── */
+.node-terminal {
+  width: 320px;
+  background: var(--bg-lowest);
+  border: 1px solid var(--border-light);
+  border-left: 4px solid var(--yellow);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.35);
+  overflow: hidden;
+  z-index: 10;
+}
+.node-terminal .node-header {
+  padding: 6px 12px;
+  background: rgba(255,255,255,0.03);
+}
+.terminal-output {
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgba(103,223,112,0.7);
+  max-height: 160px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+.term-line { margin-bottom: 2px; }
+.term-line.warn { color: var(--yellow); }
+.term-line.accent { color: var(--accent); }
+.term-line.error { color: var(--red); }
+.term-line.dim { color: var(--text-faint); }
+.terminal-progress {
+  margin-top: 8px;
+  height: 2px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.terminal-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 1px;
+  transition: width 0.5s ease;
+}
+
+/* ── Command Palette ── */
+.cmd-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.4);
+  z-index: 99;
+  display: none;
+}
+.cmd-backdrop.open { display: block; }
+
+.command-palette {
+  position: fixed;
+  top: 18%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 560px;
+  background: rgba(28,32,38,0.96);
+  backdrop-filter: blur(24px);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-xl);
+  box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+  z-index: 100;
+  display: none;
+  overflow: hidden;
+  padding: 8px;
+}
+.command-palette.open { display: block; }
+
+.cmd-search {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: rgba(0,0,0,0.25);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-subtle);
+}
+.cmd-search svg { width: 20px; height: 20px; color: var(--accent); flex-shrink: 0; }
+.cmd-search input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 15px;
+}
+.cmd-search input::placeholder { color: var(--text-ghost); }
+.cmd-hint {
+  font-size: 10px;
+  background: rgba(255,255,255,0.08);
+  padding: 3px 8px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+
+.cmd-results {
+  padding: 8px 4px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.cmd-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-ghost);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  padding: 6px 14px 4px;
+}
+.cmd-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-dim);
+  transition: background 0.1s, color 0.1s;
+}
+.cmd-result:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+.cmd-result.selected { background: rgba(88,166,255,0.1); color: var(--text); border-left: 2px solid var(--accent); }
+.cmd-result svg { width: 18px; height: 18px; color: var(--text-faint); flex-shrink: 0; }
+.cmd-result:hover svg { color: var(--accent); }
+.cmd-result-left { display: flex; align-items: center; gap: 10px; }
+.cmd-shortcut {
+  font-size: 10px;
+  color: var(--text-ghost);
+  font-family: var(--font-mono);
+}
+
+/* ── Dock ── */
+.dock {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 92%;
+  max-width: 1100px;
+  background: rgba(10,14,20,0.85);
+  backdrop-filter: blur(24px);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-xl);
+  padding: 10px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  z-index: 50;
+  box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+}
+
+.dock-section {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.dock-model {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.model-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius);
+  background: rgba(88,166,255,0.08);
+  border: 1px solid rgba(88,166,255,0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+.model-icon svg { width: 20px; height: 20px; }
+.model-info { display: flex; flex-direction: column; gap: 1px; }
+.model-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-family: var(--font-mono);
+}
+.model-name {
+  font-family: var(--font-headline);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.dock-divider {
+  width: 1px;
+  height: 28px;
+  background: rgba(255,255,255,0.08);
+}
+
+.dock-budget {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.budget-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.budget-label {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-family: var(--font-mono);
+}
+.budget-value {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  color: var(--accent);
+}
+.budget-track {
+  width: 120px;
+  height: 3px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.budget-fill {
+  height: 100%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+  border-radius: 2px;
+  transition: width 0.5s ease;
+}
+
+/* Dock toggles */
+.dock-toggles {
+  display: flex;
+  gap: 4px;
+  background: rgba(255,255,255,0.02);
+  padding: 4px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-subtle);
+}
+.dock-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-family: var(--font-headline);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.dock-toggle:hover { background: rgba(255,255,255,0.04); color: var(--text-dim); }
+.dock-toggle.active {
+  background: rgba(88,166,255,0.12);
+  color: var(--accent);
+}
+.dock-toggle svg { width: 16px; height: 16px; }
+
+.dock-icon-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-subtle);
+  background: rgba(255,255,255,0.03);
+  color: var(--text-faint);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.dock-icon-btn:hover { color: var(--accent); background: rgba(88,166,255,0.08); }
+.dock-icon-btn svg { width: 18px; height: 18px; }
+
+/* ── Drawer (shared) ── */
+.drawer-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.35);
+  z-index: 89;
+  display: none;
+}
+.drawer-overlay.open { display: block; }
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 520px;
+  height: 100vh;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border);
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.25s ease;
+  box-shadow: -8px 0 32px rgba(0,0,0,0.4);
+}
+.drawer.open { transform: translateX(0); }
+
+.drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.drawer-title {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.drawer-actions {
+  display: flex;
+  gap: 6px;
+}
+.drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 18px;
+  font-size: 13px;
+  line-height: 1.6;
+  min-height: 0;
+}
+
+/* ── CogDoc Viewer ── */
+.cogdoc-drawer .drawer-title { color: var(--green); }
+.cogdoc-raw {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+}
+
+/* ── Context Inspector ── */
+.ctx-zone {
+  margin-bottom: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.ctx-zone-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.ctx-zone-header:hover { background: rgba(255,255,255,0.02); }
+.ctx-zone-indicator {
+  width: 4px;
+  height: 18px;
+  border-radius: 2px;
+}
+.ctx-zone-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.ctx-zone-tokens {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.ctx-zone-items {
+  display: none;
+  padding: 0 12px 8px;
+}
+.ctx-zone.expanded .ctx-zone-items { display: block; }
+.ctx-zone-item {
+  padding: 6px 8px;
+  margin-top: 4px;
+  background: var(--bg);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.ctx-zone-item-title { color: var(--text); font-weight: 500; }
+.ctx-zone-item-meta { color: var(--text-dim); font-size: 10px; margin-top: 2px; }
+.ctx-zone-item-preview {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ctx-budget-bar {
+  display: flex;
+  height: 20px;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
+.ctx-budget-seg { height: 100%; transition: width 0.3s ease; }
+.ctx-budget-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+}
+.ctx-legend-item { display: flex; align-items: center; gap: 4px; }
+.ctx-legend-dot { width: 8px; height: 8px; border-radius: 2px; }
+.ctx-summary {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  margin-top: 12px;
+}
+.ctx-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  text-align: center;
+  padding: 40px 0;
+}
+
+/* ── CogDoc Browser ── */
+.doc-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 12px;
+}
+.doc-search svg { width: 16px; height: 16px; color: var(--text-dim); flex-shrink: 0; }
+.doc-search input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-sans);
+}
+.doc-search input::placeholder { color: var(--text-ghost); }
+
+.doc-list { display: flex; flex-direction: column; gap: 4px; }
+.doc-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: background 0.1s;
+  border: 1px solid transparent;
+}
+.doc-item:hover { background: rgba(255,255,255,0.03); border-color: var(--border); }
+.doc-item-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: rgba(103,223,112,0.08);
+  border: 1px solid rgba(103,223,112,0.15);
+  color: var(--green);
+}
+.doc-item-icon svg { width: 16px; height: 16px; }
+.doc-item-body { flex: 1; min-width: 0; }
+.doc-item-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.doc-item-uri {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.doc-item-meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-top: 3px;
+}
+.doc-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-ghost);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  padding: 8px 0 4px;
+  font-family: var(--font-mono);
+}
+
+/* ── Responsive ── */
+@media (max-width: 1024px) {
+  .dock-toggle span:not(svg) { display: none; }
+  .dock { padding: 8px 16px; gap: 12px; }
+  .drawer { width: 100%; }
+}
+</style>
+</head>
+<body>
+
+<div id="canvas-container">
+  <div id="canvas-viewport">
+    <div class="canvas-grid"></div>
+
+    <!-- Edge layer: inside viewport, before nodes = renders behind them -->
+    <svg id="edge-layer" xmlns="http://www.w3.org/2000/svg"></svg>
+
+    <!-- ── Chat Node ── -->
+    <div class="node node-chat" id="node-chat" data-node-type="chat" style="left:400px;top:200px;">
+      <div class="node-header handle">
+        <div class="node-header-left">
+          <span class="status-dot live" id="chat-status-dot"></span>
+          <span class="node-label">Live Mycelium Stream</span>
+        </div>
+        <div class="node-header-right">
+          <button class="icon-btn" onclick="expandChatNode()" title="Expand">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+          </button>
+          <button class="icon-btn drag-hint" title="Drag">
+            <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="chat-messages scrollbar-hidden" id="chat-messages"></div>
+      <div class="chat-input-area">
+        <div class="chat-input-wrap">
+          <textarea id="chat-input" placeholder="Inject thought stream..." rows="1"></textarea>
+          <button id="send-btn" onclick="sendMessage()" title="Send">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="node-resize" id="chat-resize"></div>
+    </div>
+
+    <!-- ── Terminal Node ── -->
+    <div class="node node-terminal" id="node-terminal" data-node-type="terminal" style="left:500px;top:700px;">
+      <div class="node-header handle">
+        <span style="color:var(--yellow);display:flex;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
+        </span>
+        <span class="node-label yellow" style="flex:1;margin-left:8px;">/v1/proprioceptive</span>
+        <button class="icon-btn" title="Close" onclick="hideNode('node-terminal')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="terminal-output scrollbar-hidden" id="terminal-output">
+        <p class="term-line dim">&gt; CogOS v3 daemon ready</p>
+        <p class="term-line dim">&gt; Waiting for first inference...</p>
+      </div>
+    </div>
+
+    <!-- Dynamic nodes (CogDocs, Insights) will be created by JS -->
+  </div>
+</div>
+
+<!-- Fixed overlays -->
+<div class="fovea-glow"></div>
+<div class="light-cone-mask" id="light-cone-mask"></div>
+
+<!-- Command Palette -->
+<div class="cmd-backdrop" id="cmd-backdrop" onclick="closeCommandPalette()"></div>
+<div class="command-palette" id="command-palette">
+  <div class="cmd-search">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="cmd-input" placeholder="Search knowledge graph or command..." autocomplete="off" />
+    <span class="cmd-hint">⌘K</span>
+  </div>
+  <div class="cmd-results" id="cmd-results">
+    <div class="cmd-section-label">Commands</div>
+    <div class="cmd-result" onclick="cmdAction('recenter')">
+      <div class="cmd-result-left">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="6" r="2"/><circle cx="20" cy="6" r="2"/><circle cx="4" cy="18" r="2"/><circle cx="20" cy="18" r="2"/><path d="M9.5 10.5 5.5 7.5M14.5 10.5l4-3M9.5 13.5l-4 3M14.5 13.5l4 3"/></svg>
+        <span>Recenter on active conversation</span>
+      </div>
+      <span class="cmd-shortcut">⌘R</span>
+    </div>
+    <div class="cmd-result" onclick="cmdAction('clear')">
+      <div class="cmd-result-left">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        <span>Clear conversation</span>
+      </div>
+    </div>
+    <div class="cmd-result" onclick="cmdAction('export')">
+      <div class="cmd-result-left">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+        <span>Export chat as markdown</span>
+      </div>
+    </div>
+    <div class="cmd-section-label" style="margin-top:8px;">Fovea Nodes</div>
+    <div id="cmd-fovea-results"></div>
+  </div>
+</div>
+
+<!-- Dock -->
+<div class="dock" id="dock">
+  <div class="dock-section">
+    <div class="dock-model">
+      <div class="model-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a5 5 0 015 5c0 1.1-.4 2.1-1 2.9.6.8 1 1.8 1 2.9A5 5 0 0112 18a5 5 0 01-5-5.2c0-1.1.4-2.1 1-2.9-.6-.8-1-1.8-1-2.9A5 5 0 0112 2z"/><path d="M12 2v16"/></svg>
+      </div>
+      <div class="model-info">
+        <span class="model-label">Active Inference</span>
+        <span class="model-name" id="dock-model-name">connecting...</span>
+      </div>
+    </div>
+    <div class="dock-divider"></div>
+    <div class="dock-budget">
+      <div class="budget-header">
+        <span class="budget-label">Token Budget</span>
+        <span class="budget-value" id="dock-budget-text">-- / --</span>
+      </div>
+      <div class="budget-track">
+        <div class="budget-fill" id="dock-budget-fill" style="width:0%"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="dock-toggles">
+    <button class="dock-toggle" id="toggle-light-cone" onclick="toggleOverlay('light-cone')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+      <span>Light Cone</span>
+    </button>
+    <button class="dock-toggle" id="toggle-heatmap" onclick="toggleOverlay('heatmap')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12a10 10 0 0110-10"/><path d="M2 12a10 10 0 0010 10"/><path d="M6 12a6 6 0 016-6"/><path d="M6 12a6 6 0 006 6"/><circle cx="12" cy="12" r="2"/></svg>
+      <span>Heatmap</span>
+    </button>
+    <button class="dock-toggle" id="toggle-prediction" onclick="toggleOverlay('prediction')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m7 16 4-8 4 5 5-9"/></svg>
+      <span>Prediction</span>
+    </button>
+  </div>
+
+  <div class="dock-section">
+    <button class="dock-icon-btn" title="Browse CogDocs (⌘D)" onclick="toggleCogdocBrowser()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/><path d="M8 7h8M8 11h6"/></svg>
+    </button>
+    <button class="dock-icon-btn" title="Recenter (⌘R)" onclick="recenterView()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M3 12h3M18 12h3M12 3v3M12 18v3"/></svg>
+    </button>
+    <button class="dock-icon-btn" title="Context Inspector (⌘I)" onclick="toggleContextDrawer()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 2 7l10 5 10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>
+    </button>
+    <button class="dock-icon-btn" title="Minimap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 6v16l7-4 8 4 7-4V2l-7 4-8-4z"/><path d="M8 2v16M16 6v16"/></svg>
+    </button>
+  </div>
+</div>
+
+<!-- ── CogDoc Viewer Drawer ── -->
+<div class="drawer-overlay" id="drawer-overlay" onclick="closeAllDrawers()"></div>
+<div class="drawer cogdoc-drawer" id="cogdoc-drawer">
+  <div class="drawer-header">
+    <span class="drawer-title" id="cogdoc-drawer-title">--</span>
+    <div class="drawer-actions">
+      <button class="icon-btn" onclick="copyCogdocURI()" title="Copy URI">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+      </button>
+      <button class="icon-btn" onclick="toggleCogdocRaw()" title="Toggle raw/rendered">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/></svg>
+      </button>
+      <button class="icon-btn" onclick="closeAllDrawers()" title="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="drawer-body" id="cogdoc-drawer-body">
+    <div class="ctx-empty">Select a CogDoc to view</div>
+  </div>
+</div>
+
+<!-- ── Context Inspector Drawer ── -->
+<div class="drawer" id="context-drawer">
+  <div class="drawer-header">
+    <span class="drawer-title">Context Inspector</span>
+    <div class="drawer-actions">
+      <button class="icon-btn" onclick="refreshContextDrawer()" title="Refresh">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0115-6.7L21 8M3 22v-6h6"/><path d="M21 12a9 9 0 01-15 6.7L3 16"/></svg>
+      </button>
+      <button class="icon-btn" onclick="closeAllDrawers()" title="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="drawer-body" id="context-drawer-body">
+    <div class="ctx-empty">Send a message to see context assembly</div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────
+// CogOS Mycelium — Canvas Engine
+// ─────────────────────────────────────────
+
+const API = window.location.origin;
+const $ = id => document.getElementById(id);
+
+// ── State ──
+let chatHistory = [];
+let renderTimer = null;
+let scale = 1;
+let panX = 0, panY = 0;
+let isPanning = false;
+let startX, startY;
+let panVelX = 0, panVelY = 0;
+let lastPanTime = 0;
+let activeOverlay = null;
+let nodePositions = {};  // persisted to localStorage
+let connections = [];     // [sourceId, targetId, active]
+let dynamicNodeCount = 0;
+
+const container = $('canvas-container');
+const viewport = $('canvas-viewport');
+
+// ── Escape helper ──
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Markdown Renderer ──
+function renderMarkdown(src) {
+  let s = src.replace(/\r\n/g, '\n');
+  s = s.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre><code class="lang-${esc(lang)}">${esc(code.replace(/\n$/, ''))}</code></pre>`);
+  const lines = s.split('\n');
+  const out = [];
+  let inList = false, listType = '';
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    if (line.includes('<pre>') || line.includes('</pre>') || line.includes('</code></pre>')) {
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      out.push(line); continue;
+    }
+    const hMatch = line.match(/^(#{1,6})\s+(.+)/);
+    if (hMatch) {
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      out.push(`<h${hMatch[1].length}>${inline(hMatch[2])}</h${hMatch[1].length}>`); continue;
+    }
+    if (/^[-*_]{3,}\s*$/.test(line)) {
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      out.push('<hr>'); continue;
+    }
+    if (line.startsWith('> ')) {
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      out.push(`<blockquote>${inline(line.slice(2))}</blockquote>`); continue;
+    }
+    const ulMatch = line.match(/^[\s]*[-*+]\s+(.+)/);
+    if (ulMatch) {
+      if (!inList || listType !== 'ul') { if (inList) out.push(`</${listType}>`); out.push('<ul>'); inList = true; listType = 'ul'; }
+      out.push(`<li>${inline(ulMatch[1])}</li>`); continue;
+    }
+    const olMatch = line.match(/^[\s]*\d+[.)]\s+(.+)/);
+    if (olMatch) {
+      if (!inList || listType !== 'ol') { if (inList) out.push(`</${listType}>`); out.push('<ol>'); inList = true; listType = 'ol'; }
+      out.push(`<li>${inline(olMatch[1])}</li>`); continue;
+    }
+    if (inList) { out.push(`</${listType}>`); inList = false; }
+    if (line.includes('|') && line.trim().startsWith('|')) {
+      const next = lines[i + 1] || '';
+      if (/^\|[\s:|-]+\|$/.test(next.trim())) {
+        const cells = line.split('|').filter(c => c.trim()).map(c => `<th>${inline(c.trim())}</th>`);
+        out.push(`<table><tr>${cells.join('')}</tr>`); i++; continue;
+      } else if (out.length > 0 && out[out.length - 1].includes('</tr>')) {
+        const cells = line.split('|').filter(c => c.trim()).map(c => `<td>${inline(c.trim())}</td>`);
+        out.push(`<tr>${cells.join('')}</tr>`);
+        const nextLine = lines[i + 1] || '';
+        if (!nextLine.trim().startsWith('|')) out.push('</table>');
+        continue;
+      }
+    }
+    if (line.trim() === '') { out.push(''); continue; }
+    out.push(`<p>${inline(line)}</p>`);
+  }
+  if (inList) out.push(`</${listType}>`);
+  return out.join('\n');
+}
+
+function inline(s) {
+  s = esc(s);
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+  s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  s = s.replace(/_([^_]+)_/g, '<em>$1</em>');
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  return s;
+}
+
+// ── Pan & Zoom ──
+container.addEventListener('wheel', (e) => {
+  // Don't hijack scroll inside node scrollable areas
+  const scrollable = e.target.closest('.chat-messages, .terminal-output, .cmd-results, .cogdoc-preview');
+  if (scrollable) {
+    const atTop = scrollable.scrollTop <= 0;
+    const atBottom = scrollable.scrollTop + scrollable.clientHeight >= scrollable.scrollHeight - 1;
+    const scrollingUp = e.deltaY < 0;
+    const scrollingDown = e.deltaY > 0;
+    // Only zoom if scrolled to the edge in that direction
+    if ((scrollingUp && !atTop) || (scrollingDown && !atBottom)) {
+      return; // let normal scroll happen
+    }
+  }
+  e.preventDefault();
+  const delta = e.deltaY > 0 ? 0.92 : 1.08;
+  const newScale = Math.max(0.15, Math.min(4, scale * delta));
+  const rect = container.getBoundingClientRect();
+  const mouseX = e.clientX - rect.left;
+  const mouseY = e.clientY - rect.top;
+  panX = mouseX - (mouseX - panX) * (newScale / scale);
+  panY = mouseY - (mouseY - panY) * (newScale / scale);
+  scale = newScale;
+  updateViewport();
+}, { passive: false });
+
+container.addEventListener('mousedown', (e) => {
+  if (e.target === container || e.target.closest('.canvas-grid')) {
+    isPanning = true;
+    startX = e.clientX - panX;
+    startY = e.clientY - panY;
+    panVelX = 0; panVelY = 0;
+    lastPanTime = Date.now();
+    container.classList.add('no-grab');
+  }
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!isPanning) return;
+  const now = Date.now();
+  const dt = Math.max(1, now - lastPanTime);
+  const newPanX = e.clientX - startX;
+  const newPanY = e.clientY - startY;
+  panVelX = (newPanX - panX) / dt * 16;
+  panVelY = (newPanY - panY) / dt * 16;
+  panX = newPanX;
+  panY = newPanY;
+  lastPanTime = now;
+  updateViewport();
+});
+
+window.addEventListener('mouseup', () => {
+  if (isPanning) {
+    isPanning = false;
+    container.classList.remove('no-grab');
+    // Momentum
+    if (Math.abs(panVelX) > 0.5 || Math.abs(panVelY) > 0.5) {
+      requestAnimationFrame(function decay() {
+        panVelX *= 0.92;
+        panVelY *= 0.92;
+        panX += panVelX;
+        panY += panVelY;
+        updateViewport();
+        if (Math.abs(panVelX) > 0.1 || Math.abs(panVelY) > 0.1) {
+          requestAnimationFrame(decay);
+        }
+      });
+    }
+  }
+});
+
+function updateViewport() {
+  viewport.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+  drawEdges();
+}
+
+// ── Node Dragging (scale-aware) ──
+function initNodeDrag(node) {
+  const handle = node.querySelector('.handle') || node.querySelector('.insight-header') || node;
+  let isDragging = false;
+  let nStartX, nStartY;
+
+  handle.addEventListener('mousedown', (e) => {
+    e.stopPropagation();
+    isDragging = true;
+    nStartX = e.clientX / scale - parseInt(node.style.left);
+    nStartY = e.clientY / scale - parseInt(node.style.top);
+    document.body.style.cursor = 'grabbing';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const x = e.clientX / scale - nStartX;
+    const y = e.clientY / scale - nStartY;
+    node.style.left = x + 'px';
+    node.style.top = y + 'px';
+    drawEdges();
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (isDragging) {
+      isDragging = false;
+      document.body.style.cursor = '';
+      saveNodePositions();
+    }
+  });
+}
+
+// Initialize dragging for static nodes
+document.querySelectorAll('.node').forEach(initNodeDrag);
+
+// ── Node Resize ──
+function initNodeResize(handle, node) {
+  let isResizing = false;
+  let rStartX, rStartY, rStartW, rStartH;
+
+  handle.addEventListener('mousedown', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    isResizing = true;
+    rStartX = e.clientX;
+    rStartY = e.clientY;
+    rStartW = node.offsetWidth;
+    rStartH = node.offsetHeight;
+    document.body.style.cursor = 'nwse-resize';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isResizing) return;
+    const dx = (e.clientX - rStartX) / scale;
+    const dy = (e.clientY - rStartY) / scale;
+    const minW = parseInt(getComputedStyle(node).minWidth) || 280;
+    const minH = parseInt(getComputedStyle(node).minHeight) || 200;
+    node.style.width = Math.max(minW, rStartW + dx) + 'px';
+    node.style.height = Math.max(minH, rStartH + dy) + 'px';
+    drawEdges();
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (isResizing) {
+      isResizing = false;
+      document.body.style.cursor = '';
+      saveNodePositions();
+    }
+  });
+}
+
+// Init resize for chat node
+const chatResize = $('chat-resize');
+if (chatResize) initNodeResize(chatResize, $('node-chat'));
+
+// ── Edge Drawing ──
+function drawEdges() {
+  const svg = $('edge-layer');
+  svg.innerHTML = '';
+  for (const [srcId, tgtId, active] of connections) {
+    const src = $(srcId);
+    const tgt = $(tgtId);
+    if (!src || !tgt) continue;
+    const x1 = parseInt(src.style.left) + src.offsetWidth / 2;
+    const y1 = parseInt(src.style.top) + src.offsetHeight / 2;
+    const x2 = parseInt(tgt.style.left) + tgt.offsetWidth / 2;
+    const y2 = parseInt(tgt.style.top) + tgt.offsetHeight / 2;
+    // Offset the SVG origin (-10000)
+    const ox = 10000, oy = 10000;
+    const sx1 = x1 + ox, sy1 = y1 + oy;
+    const sx2 = x2 + ox, sy2 = y2 + oy;
+    const cpx = sx1 + (sx2 - sx1) / 2;
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', `M ${sx1} ${sy1} C ${cpx} ${sy1}, ${cpx} ${sy2}, ${sx2} ${sy2}`);
+    path.classList.add('edge-path');
+    if (active) path.classList.add('active');
+    svg.appendChild(path);
+  }
+}
+
+// ── Chat ──
+const messagesEl = $('chat-messages');
+const inputEl = $('chat-input');
+const sendBtn = $('send-btn');
+
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+inputEl.addEventListener('input', () => {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+});
+
+function addMessage(role, content, isMarkdown) {
+  const msg = document.createElement('div');
+  msg.className = `msg ${role}`;
+  const roleTag = document.createElement('div');
+  roleTag.className = 'msg-role';
+  roleTag.textContent = role === 'user' ? 'OBSERVER' : 'COGOS';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  if (role === 'assistant' && isMarkdown && content) {
+    bubble.classList.add('md-content');
+    bubble.innerHTML = renderMarkdown(content);
+  } else {
+    bubble.textContent = content;
+  }
+  if (role === 'user') {
+    msg.appendChild(bubble);
+    msg.appendChild(roleTag);
+  } else {
+    msg.appendChild(bubble);
+    msg.appendChild(roleTag);
+  }
+  messagesEl.appendChild(msg);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return bubble;
+}
+
+function addChatStatus(text, type) {
+  const el = document.createElement('div');
+  el.className = 'chat-status';
+  if (type === 'pill') {
+    el.innerHTML = `<span class="status-pill">${esc(text)}</span>`;
+  } else {
+    el.textContent = text;
+  }
+  messagesEl.appendChild(el);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function sendMessage() {
+  const content = inputEl.value.trim();
+  if (!content) return;
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  addMessage('user', content, false);
+  chatHistory.push({ role: 'user', content });
+
+  const bodyPayload = {
+    model: 'local',
+    messages: chatHistory,
+    stream: true,
+  };
+
+  let fullResponse = '';
+  const bodyEl = addMessage('assistant', '', false);
+  bodyEl.classList.add('msg-streaming');
+
+  try {
+    const res = await fetch(API + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(bodyPayload),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`${res.status}: ${errText}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      for (const line of chunk.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') break;
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content || '';
+          fullResponse += delta;
+          if (!renderTimer) {
+            renderTimer = setTimeout(() => {
+              bodyEl.className = 'msg-bubble md-content msg-streaming';
+              bodyEl.innerHTML = renderMarkdown(fullResponse);
+              messagesEl.scrollTop = messagesEl.scrollHeight;
+              renderTimer = null;
+            }, 150);
+          }
+        } catch {}
+      }
+    }
+  } catch (err) {
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+    bodyEl.classList.remove('msg-streaming');
+    bodyEl.textContent = `[Error: ${err.message}]`;
+    bodyEl.style.color = 'var(--red)';
+    sendBtn.disabled = false;
+    inputEl.focus();
+    return;
+  }
+
+  // Final render
+  if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+  bodyEl.classList.remove('msg-streaming');
+  bodyEl.className = 'msg-bubble md-content';
+  bodyEl.innerHTML = renderMarkdown(fullResponse);
+  chatHistory.push({ role: 'assistant', content: fullResponse });
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  sendBtn.disabled = false;
+  inputEl.focus();
+
+  // Refresh context data after each turn
+  refreshBudget();
+  refreshProprioceptive();
+  refreshFovea();
+  // Auto-refresh context drawer if it's open
+  if ($('context-drawer').classList.contains('open')) refreshContextDrawer();
+}
+
+// ── API: Health ──
+async function refreshHealth() {
+  try {
+    const res = await fetch(API + '/health');
+    const data = await res.json();
+    const dot = $('chat-status-dot');
+    if (data.status === 'ok') {
+      dot.className = 'status-dot live';
+    } else {
+      dot.className = 'status-dot error';
+    }
+    // Update model name from health or config
+    if (data.router?.active_provider) {
+      $('dock-model-name').textContent = data.router.active_provider;
+    } else if (data.identity) {
+      $('dock-model-name').textContent = data.identity;
+    }
+  } catch {
+    $('chat-status-dot').className = 'status-dot error';
+    $('dock-model-name').textContent = 'offline';
+  }
+}
+
+// ── API: Token Budget ──
+async function refreshBudget() {
+  try {
+    const res = await fetch(API + '/v1/debug/context');
+    if (!res.ok) return;
+    const data = await res.json();
+    const budget = data.budget;
+    if (!budget) return;
+    const total = budget.total || 32768;
+    const used = budget.used || 0;
+    const pct = Math.min(100, (used / total) * 100);
+    $('dock-budget-text').textContent = `${(used/1000).toFixed(1)}k / ${(total/1000).toFixed(0)}k`;
+    $('dock-budget-fill').style.width = pct + '%';
+    // Change color when running low
+    if (pct > 80) {
+      $('dock-budget-fill').style.background = 'var(--red)';
+      $('dock-budget-fill').style.boxShadow = '0 0 6px var(--red)';
+    } else if (pct > 60) {
+      $('dock-budget-fill').style.background = 'var(--yellow)';
+      $('dock-budget-fill').style.boxShadow = '0 0 6px var(--yellow)';
+    } else {
+      $('dock-budget-fill').style.background = 'var(--accent)';
+      $('dock-budget-fill').style.boxShadow = '0 0 6px var(--accent)';
+    }
+  } catch {}
+}
+
+// ── API: Proprioceptive → Terminal ──
+async function refreshProprioceptive() {
+  try {
+    const res = await fetch(API + '/v1/proprioceptive');
+    if (!res.ok) return;
+    const data = await res.json();
+    const output = $('terminal-output');
+    output.innerHTML = '';
+    const entries = (data.entries || []).slice(-12);
+    for (const entry of entries) {
+      const line = document.createElement('p');
+      line.className = 'term-line';
+      const ts = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : '';
+      if (entry.type === 'error') line.classList.add('error');
+      else if (entry.type === 'warning') line.classList.add('warn');
+      else if (entry.type === 'prediction') line.classList.add('accent');
+      line.textContent = `${ts} ${entry.message || JSON.stringify(entry)}`;
+      output.appendChild(line);
+    }
+    output.scrollTop = output.scrollHeight;
+  } catch {}
+}
+
+// ── API: Fovea → CogDoc Nodes ──
+let foveaNodes = {};  // id → DOM node
+
+async function refreshFovea() {
+  try {
+    const res = await fetch(API + '/v1/constellation/fovea?limit=6');
+    if (!res.ok) return;
+    const data = await res.json();
+    const items = data.items || data.fovea || [];
+
+    // Update or create CogDoc nodes for fovea items
+    const seenIds = new Set();
+    let idx = 0;
+    for (const item of items) {
+      const id = item.uri || item.id || item.path;
+      if (!id) continue;
+      seenIds.add(id);
+      if (!foveaNodes[id]) {
+        createCogDocNode(id, item, idx);
+      }
+      idx++;
+    }
+
+    // Update command palette fovea results
+    const foveaResults = $('cmd-fovea-results');
+    foveaResults.innerHTML = '';
+    for (const item of items) {
+      const id = item.uri || item.id || item.path || '';
+      const div = document.createElement('div');
+      div.className = 'cmd-result';
+      div.onclick = () => { panToNode(foveaNodes[id]?.id); closeCommandPalette(); };
+      div.innerHTML = `<div class="cmd-result-left">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
+        <span>${esc(item.title || id)}</span>
+      </div><span class="cmd-shortcut">${item.score ? item.score.toFixed(2) : ''}</span>`;
+      foveaResults.appendChild(div);
+    }
+  } catch {}
+}
+
+function createCogDocNode(uri, item, idx) {
+  const nodeId = 'node-cogdoc-' + (dynamicNodeCount++);
+  const node = document.createElement('div');
+  node.className = 'node node-cogdoc';
+  node.id = nodeId;
+  node.dataset.nodeType = 'cogdoc';
+  node.dataset.uri = uri;
+
+  // Position to the right of chat node, staggered
+  const chatNode = $('node-chat');
+  const baseX = parseInt(chatNode.style.left) + 560;
+  const baseY = parseInt(chatNode.style.top) + idx * 180;
+  const saved = loadNodePosition(nodeId);
+  node.style.left = (saved?.x || baseX) + 'px';
+  node.style.top = (saved?.y || baseY) + 'px';
+
+  const title = item.title || uri.split('/').pop() || uri;
+  const preview = item.preview || item.content_preview || '';
+  const tokens = item.tokens || '';
+  const score = item.score ? item.score.toFixed(2) : '';
+
+  node.innerHTML = `
+    <div class="node-header handle">
+      <div class="node-header-left">
+        <span class="cogdoc-uri">${esc(uri.length > 40 ? '...' + uri.slice(-37) : uri)}</span>
+      </div>
+      <button class="icon-btn" onclick="hideNode('${nodeId}')" title="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="cogdoc-body">
+      <div class="cogdoc-title">${esc(title)}</div>
+      <div class="cogdoc-preview">
+        ${esc(preview).substring(0, 200)}
+        <div class="cogdoc-preview-fade"></div>
+      </div>
+    </div>
+    <div class="cogdoc-footer">
+      <span>${tokens ? '◈ ' + tokens + ' tok' : ''}${score ? ' · score: ' + score : ''}</span>
+      <span>${item.modified || ''}</span>
+    </div>
+  `;
+
+  viewport.appendChild(node);
+  initNodeDrag(node);
+  foveaNodes[uri] = node;
+
+  // Connect to chat
+  connections.push([nodeId, 'node-chat', idx === 0]);
+  drawEdges();
+}
+
+// ── Node Utilities ──
+function hideNode(id) {
+  const node = $(id);
+  if (node) node.style.display = 'none';
+  connections = connections.filter(([s, t]) => s !== id && t !== id);
+  drawEdges();
+}
+
+function expandChatNode() {
+  const chat = $('node-chat');
+  if (chat.style.height === '720px') {
+    chat.style.width = '480px';
+    chat.style.height = '540px';
+  } else {
+    chat.style.width = '620px';
+    chat.style.height = '720px';
+  }
+  drawEdges();
+}
+
+// ── Node Position Persistence ──
+function saveNodePositions() {
+  const positions = {};
+  document.querySelectorAll('.node').forEach(node => {
+    if (node.id) {
+      positions[node.id] = {
+        x: parseInt(node.style.left) || 0,
+        y: parseInt(node.style.top) || 0,
+      };
+    }
+  });
+  try { localStorage.setItem('cogos-canvas-positions', JSON.stringify(positions)); } catch {}
+}
+
+function loadNodePosition(id) {
+  try {
+    const positions = JSON.parse(localStorage.getItem('cogos-canvas-positions') || '{}');
+    return positions[id] || null;
+  } catch { return null; }
+}
+
+function restoreNodePositions() {
+  try {
+    const positions = JSON.parse(localStorage.getItem('cogos-canvas-positions') || '{}');
+    for (const [id, pos] of Object.entries(positions)) {
+      const node = $(id);
+      if (node && pos.x !== undefined) {
+        node.style.left = pos.x + 'px';
+        node.style.top = pos.y + 'px';
+      }
+    }
+  } catch {}
+}
+
+// ── Command Palette ──
+function openCommandPalette() {
+  $('command-palette').classList.add('open');
+  $('cmd-backdrop').classList.add('open');
+  $('cmd-input').value = '';
+  $('cmd-input').focus();
+}
+
+function closeCommandPalette() {
+  $('command-palette').classList.remove('open');
+  $('cmd-backdrop').classList.remove('open');
+}
+
+function cmdAction(action) {
+  closeCommandPalette();
+  switch (action) {
+    case 'recenter': recenterView(); break;
+    case 'clear': clearChat(); break;
+    case 'export': exportMarkdown(); break;
+  }
+}
+
+function clearChat() {
+  chatHistory = [];
+  messagesEl.innerHTML = '';
+}
+
+function exportMarkdown() {
+  let md = '# CogOS Mycelium Chat Export\n\n';
+  for (const m of chatHistory) {
+    md += `## ${m.role}\n\n${m.content}\n\n---\n\n`;
+  }
+  const blob = new Blob([md], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'cogos-chat.md';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function recenterView() {
+  const chat = $('node-chat');
+  const cx = parseInt(chat.style.left) + chat.offsetWidth / 2;
+  const cy = parseInt(chat.style.top) + chat.offsetHeight / 2;
+  const cw = container.offsetWidth;
+  const ch = container.offsetHeight;
+  scale = 1;
+  panX = cw / 2 - cx * scale;
+  panY = ch / 2 - cy * scale;
+  updateViewport();
+}
+
+function panToNode(nodeId) {
+  const node = $(nodeId);
+  if (!node) return;
+  const cx = parseInt(node.style.left) + node.offsetWidth / 2;
+  const cy = parseInt(node.style.top) + node.offsetHeight / 2;
+  const cw = container.offsetWidth;
+  const ch = container.offsetHeight;
+  panX = cw / 2 - cx * scale;
+  panY = ch / 2 - cy * scale;
+  updateViewport();
+}
+
+// ── Overlay Toggles ──
+function toggleOverlay(name) {
+  const btn = $('toggle-' + name);
+  if (activeOverlay === name) {
+    // Turn off
+    activeOverlay = null;
+    btn.classList.remove('active');
+    document.body.classList.remove('light-cone-active');
+  } else {
+    // Turn off previous
+    if (activeOverlay) {
+      $('toggle-' + activeOverlay)?.classList.remove('active');
+      document.body.classList.remove('light-cone-active');
+    }
+    activeOverlay = name;
+    btn.classList.add('active');
+    if (name === 'light-cone') {
+      document.body.classList.add('light-cone-active');
+    }
+  }
+}
+
+// ── CogDoc Viewer Drawer ──
+let currentCogdocURI = '';
+let cogdocRawMode = false;
+let cogdocContent = '';
+
+function openCogdocDrawer(uri) {
+  currentCogdocURI = uri;
+  cogdocRawMode = false;
+  $('cogdoc-drawer-title').textContent = uri;
+  $('cogdoc-drawer-body').innerHTML = '<div class="ctx-empty">Loading...</div>';
+  $('cogdoc-drawer').classList.add('open');
+  $('drawer-overlay').classList.add('open');
+  $('context-drawer').classList.remove('open');
+
+  fetch(API + '/v1/cogdoc/read?uri=' + encodeURIComponent(uri))
+    .then(r => r.json())
+    .then(data => {
+      if (!data.exists || !data.content) {
+        $('cogdoc-drawer-body').innerHTML = '<div class="ctx-empty">File not found: ' + esc(uri) + '</div>';
+        return;
+      }
+      cogdocContent = data.content;
+      renderCogdocContent();
+    })
+    .catch(err => {
+      $('cogdoc-drawer-body').innerHTML = '<div class="ctx-empty">Error: ' + esc(err.message) + '</div>';
+    });
+}
+
+function renderCogdocContent() {
+  const body = $('cogdoc-drawer-body');
+  if (cogdocRawMode) {
+    body.innerHTML = '<pre class="cogdoc-raw">' + esc(cogdocContent) + '</pre>';
+  } else {
+    body.innerHTML = '<div class="md-content">' + renderMarkdown(cogdocContent) + '</div>';
+  }
+}
+
+function toggleCogdocRaw() {
+  cogdocRawMode = !cogdocRawMode;
+  if (cogdocContent) renderCogdocContent();
+}
+
+function copyCogdocURI() {
+  if (currentCogdocURI) navigator.clipboard.writeText(currentCogdocURI);
+}
+
+// Wire double-click on CogDoc nodes
+document.addEventListener('dblclick', (e) => {
+  const node = e.target.closest('.node-cogdoc');
+  if (node && node.dataset.uri) {
+    openCogdocDrawer(node.dataset.uri);
+  }
+});
+
+// ── Context Inspector Drawer ──
+const zoneColorMap = {
+  nucleus: '#58a6ff',
+  client_system: '#d29922',
+  cogdocs: '#67df70',
+  conversation: '#bc8cff',
+  current_message: '#f0883e',
+};
+
+function toggleContextDrawer() {
+  const drawer = $('context-drawer');
+  const overlay = $('drawer-overlay');
+  if (drawer.classList.contains('open')) {
+    closeAllDrawers();
+  } else {
+    $('cogdoc-drawer').classList.remove('open');
+    drawer.classList.add('open');
+    overlay.classList.add('open');
+    refreshContextDrawer();
+  }
+}
+
+async function refreshContextDrawer() {
+  const body = $('context-drawer-body');
+  try {
+    const res = await fetch(API + '/v1/debug/context');
+    if (!res.ok) {
+      body.innerHTML = '<div class="ctx-empty">No context data yet — send a message first</div>';
+      return;
+    }
+    const data = await res.json();
+    renderContextInspector(data);
+  } catch (err) {
+    body.innerHTML = '<div class="ctx-empty">Error: ' + esc(err.message) + '</div>';
+  }
+}
+
+function renderContextInspector(data) {
+  const body = $('context-drawer-body');
+  const zones = data.zones || [];
+  const budget = data.budget || {};
+  const total = budget.total || 32768;
+  let html = '';
+
+  // Budget bar
+  html += '<div class="ctx-budget-bar">';
+  for (const zone of zones) {
+    const pct = (zone.tokens / total) * 100;
+    if (pct < 0.2) continue;
+    const color = zoneColorMap[zone.zone] || '#8b949e';
+    html += `<div class="ctx-budget-seg" style="width:${pct}%;background:${color}" title="${esc(zone.zone)}: ${zone.tokens} tokens"></div>`;
+  }
+  if (budget.output_reserve) {
+    const pct = (budget.output_reserve / total) * 100;
+    html += `<div class="ctx-budget-seg" style="width:${pct}%;background:var(--bg);opacity:0.5" title="output reserve: ${budget.output_reserve}"></div>`;
+  }
+  html += '</div>';
+
+  // Legend
+  html += '<div class="ctx-budget-legend">';
+  for (const [name, color] of Object.entries(zoneColorMap)) {
+    html += `<span class="ctx-legend-item"><span class="ctx-legend-dot" style="background:${color}"></span> ${name.replace(/_/g, ' ')}</span>`;
+  }
+  html += '</div>';
+
+  // Zone cards
+  for (const zone of zones) {
+    const color = zoneColorMap[zone.zone] || '#8b949e';
+    html += `<div class="ctx-zone" onclick="this.classList.toggle('expanded')">`;
+    html += `<div class="ctx-zone-header">`;
+    html += `<div class="ctx-zone-indicator" style="background:${color}"></div>`;
+    html += `<span class="ctx-zone-name">${esc(zone.zone.replace(/_/g, ' '))}</span>`;
+    html += `<span class="ctx-zone-tokens">${zone.tokens} tok</span>`;
+    html += `</div>`;
+
+    if (zone.items && zone.items.length > 0) {
+      html += '<div class="ctx-zone-items">';
+      for (const item of zone.items) {
+        const title = item.title || item.role || item.id || '';
+        const meta = [];
+        if (item.tokens) meta.push(item.tokens + ' tok');
+        if (item.salience) meta.push('sal: ' + item.salience.toFixed(2));
+        if (item.recency) meta.push('rec: ' + item.recency.toFixed(2));
+        if (item.relevance) meta.push('rel: ' + item.relevance.toFixed(2));
+        if (item.reason) meta.push(item.reason);
+        const isURI = item.id && item.id.startsWith('cog://');
+        html += '<div class="ctx-zone-item">';
+        if (isURI) {
+          html += `<div class="ctx-zone-item-title"><a href="#" onclick="event.stopPropagation();openCogdocDrawer('${esc(item.id).replace(/'/g, "\\'")}');return false" style="color:var(--accent);text-decoration:none">${esc(title)}</a></div>`;
+        } else {
+          html += `<div class="ctx-zone-item-title">${esc(title)}</div>`;
+        }
+        if (meta.length) html += `<div class="ctx-zone-item-meta">${esc(meta.join(' · '))}</div>`;
+        if (item.preview) html += `<div class="ctx-zone-item-preview">${esc(item.preview)}</div>`;
+        html += '</div>';
+      }
+      html += '</div>';
+    } else if (zone.content_preview) {
+      html += '<div class="ctx-zone-items">';
+      html += `<div class="ctx-zone-item"><div class="ctx-zone-item-preview">${esc(zone.content_preview)}</div></div>`;
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Summary
+  if (budget.used !== undefined) {
+    html += `<div class="ctx-summary">${budget.used} / ${total - (budget.output_reserve || 0)} tokens used`;
+    if (budget.output_reserve) html += ` (${budget.output_reserve} reserved)`;
+    if (budget.remaining !== undefined) html += ` · ${budget.remaining} remaining`;
+    html += '</div>';
+  }
+
+  body.innerHTML = html;
+}
+
+function closeAllDrawers() {
+  $('cogdoc-drawer').classList.remove('open');
+  $('context-drawer').classList.remove('open');
+  $('drawer-overlay').classList.remove('open');
+}
+
+// ── CogDoc Browser ──
+let allFoveaDocs = [];
+
+function toggleCogdocBrowser() {
+  const drawer = $('cogdoc-drawer');
+  const overlay = $('drawer-overlay');
+  if (drawer.classList.contains('open') && $('cogdoc-drawer-title').textContent === 'Browse CogDocs') {
+    closeAllDrawers();
+    return;
+  }
+  $('context-drawer').classList.remove('open');
+  drawer.classList.add('open');
+  overlay.classList.add('open');
+  $('cogdoc-drawer-title').textContent = 'Browse CogDocs';
+  $('cogdoc-drawer-body').innerHTML = '<div class="ctx-empty">Loading...</div>';
+  loadCogdocBrowser();
+}
+
+async function loadCogdocBrowser() {
+  const body = $('cogdoc-drawer-body');
+  try {
+    // Fetch fovea (top docs by attention)
+    const foveaRes = await fetch(API + '/v1/constellation/fovea?limit=30');
+    const foveaData = foveaRes.ok ? await foveaRes.json() : {};
+    allFoveaDocs = foveaData.items || foveaData.fovea || [];
+
+    renderDocBrowser(allFoveaDocs);
+  } catch (err) {
+    body.innerHTML = '<div class="ctx-empty">Error loading: ' + esc(err.message) + '</div>';
+  }
+}
+
+function renderDocBrowser(docs, filter) {
+  const body = $('cogdoc-drawer-body');
+  let filtered = docs;
+  if (filter) {
+    const q = filter.toLowerCase();
+    filtered = docs.filter(d => {
+      const text = (d.uri || d.id || '') + ' ' + (d.title || '') + ' ' + (d.preview || '');
+      return text.toLowerCase().includes(q);
+    });
+  }
+
+  let html = '';
+
+  // Search box
+  html += `<div class="doc-search">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="doc-filter" placeholder="Filter CogDocs..." value="${esc(filter || '')}" oninput="renderDocBrowser(allFoveaDocs, this.value)" />
+  </div>`;
+
+  if (filtered.length === 0) {
+    html += '<div class="ctx-empty">No CogDocs found' + (filter ? ' matching "' + esc(filter) + '"' : '') + '</div>';
+  } else {
+    html += `<div class="doc-section-label">Attentional Field (${filtered.length} docs)</div>`;
+    html += '<div class="doc-list">';
+    for (const doc of filtered) {
+      const uri = doc.uri || doc.id || doc.path || '';
+      const title = doc.title || uri.split('/').pop() || uri;
+      const score = doc.score ? doc.score.toFixed(2) : '';
+      const tokens = doc.tokens || '';
+      const meta = [tokens ? tokens + ' tok' : '', score ? 'score: ' + score : ''].filter(Boolean).join(' · ');
+
+      html += `<div class="doc-item" onclick="openCogdocDrawer('${esc(uri).replace(/'/g, "\\'")}')">
+        <div class="doc-item-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>
+        </div>
+        <div class="doc-item-body">
+          <div class="doc-item-title">${esc(title)}</div>
+          <div class="doc-item-uri">${esc(uri)}</div>
+          ${meta ? '<div class="doc-item-meta">' + esc(meta) + '</div>' : ''}
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+
+  body.innerHTML = html;
+  // Re-focus filter input and restore cursor position
+  const filterInput = $('doc-filter');
+  if (filterInput && filter !== undefined) {
+    filterInput.focus();
+    filterInput.setSelectionRange(filterInput.value.length, filterInput.value.length);
+  }
+}
+
+// ── Keyboard Shortcuts ──
+window.addEventListener('keydown', (e) => {
+  // Cmd+K or / → command palette
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    if ($('command-palette').classList.contains('open')) {
+      closeCommandPalette();
+    } else {
+      openCommandPalette();
+    }
+    return;
+  }
+  if (e.key === '/' && document.activeElement.tagName !== 'TEXTAREA' && document.activeElement.tagName !== 'INPUT') {
+    e.preventDefault();
+    openCommandPalette();
+    return;
+  }
+  if (e.key === 'Escape') {
+    closeCommandPalette();
+    closeAllDrawers();
+    return;
+  }
+  // Cmd+R → recenter
+  if ((e.metaKey || e.ctrlKey) && e.key === 'r' && !e.shiftKey) {
+    e.preventDefault();
+    recenterView();
+    return;
+  }
+  // Cmd+L → light cone
+  if ((e.metaKey || e.ctrlKey) && e.key === 'l') {
+    e.preventDefault();
+    toggleOverlay('light-cone');
+    return;
+  }
+  // Cmd+I → context inspector
+  if ((e.metaKey || e.ctrlKey) && e.key === 'i') {
+    e.preventDefault();
+    toggleContextDrawer();
+    return;
+  }
+  // Cmd+D → browse CogDocs
+  if ((e.metaKey || e.ctrlKey) && e.key === 'd') {
+    e.preventDefault();
+    toggleCogdocBrowser();
+    return;
+  }
+});
+
+// ── Initialization ──
+window.onload = () => {
+  // Restore saved positions
+  restoreNodePositions();
+
+  // Center view on chat node
+  recenterView();
+
+  // Add initial connection (chat → terminal)
+  connections.push(['node-chat', 'node-terminal', false]);
+  drawEdges();
+
+  // Initial data fetch
+  refreshHealth();
+  refreshFovea();
+  refreshBudget();
+
+  // Periodic refresh
+  setInterval(refreshHealth, 15000);
+  setInterval(refreshFovea, 30000);
+  setInterval(refreshProprioceptive, 20000);
+};
+
+window.addEventListener('resize', () => { updateViewport(); });
+</script>
+</body>
+</html>

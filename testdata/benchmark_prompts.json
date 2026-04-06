@@ -1,0 +1,27 @@
+[
+  {
+    "prompt": "Explain eigenforms in von Foerster's framework",
+    "expected_docs": ["claude-eigenform-continuity", "cft-thesis"],
+    "expected_keywords": ["eigenform", "fixed point", "self-reference"]
+  },
+  {
+    "prompt": "What is the alpha derivation and how does it reach 137?",
+    "expected_docs": ["eigenform-wzw-preprint", "framework-status"],
+    "expected_keywords": ["137", "partition function", "fredholm", "alpha"]
+  },
+  {
+    "prompt": "How does the coherence checker work and what does it validate?",
+    "expected_docs": ["framework-status"],
+    "expected_keywords": ["coherence", "validation", "drift"]
+  },
+  {
+    "prompt": "Describe the lepton mass derivation and zero-parameter prediction",
+    "expected_docs": ["framework-status", "eigenform-wzw-preprint"],
+    "expected_keywords": ["lepton", "mass", "eigenfrequency", "zero-parameter"]
+  },
+  {
+    "prompt": "How does foveated attention work in the CogOS architecture?",
+    "expected_docs": ["cft-thesis", "claude-eigenform-continuity"],
+    "expected_keywords": ["fovea", "salience", "attentional", "context"]
+  }
+]

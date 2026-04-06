@@ -1,0 +1,337 @@
+// serve_foveated.go — POST /v1/context/foveated
+//
+// Bridge endpoint matching the v2 foveated context API so that the Claude Code
+// hook (foveated-context.py) can point at the v3 kernel.
+//
+// Input:  {prompt, iris: {size, used}, profile, session_id}
+// Output: {context, tokens, anchor, goal, iris_pressure}
+//
+// The "context" field is a rendered string of CogBlock HTML comment blocks that
+// get injected into Claude's context window via the hook's additionalContext.
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+// foveatedRequest is the wire format for POST /v1/context/foveated.
+type foveatedRequest struct {
+	Prompt    string     `json:"prompt"`
+	Iris      irisSignal `json:"iris"`
+	Profile   string     `json:"profile"`
+	SessionID string     `json:"session_id"`
+}
+
+type irisSignal struct {
+	Size int `json:"size"` // total context window tokens
+	Used int `json:"used"` // estimated tokens consumed
+}
+
+// foveatedResponse is the wire format returned to the hook.
+type foveatedResponse struct {
+	Context         string         `json:"context"`
+	Tokens          int            `json:"tokens"`
+	Anchor          string         `json:"anchor"`
+	Goal            string         `json:"goal"`
+	IrisPressure    float64        `json:"iris_pressure"`
+	CoherenceScore  float64        `json:"coherence_score"`
+	TierBreakdown   map[string]int `json:"tier_breakdown"`
+	EffectiveBudget int            `json:"effective_budget"`
+	Blocks          []foveatedBlock `json:"blocks"`
+}
+
+type foveatedBlock struct {
+	Tier      string                `json:"tier"`
+	Name      string                `json:"name"`
+	Hash      string                `json:"hash"`
+	Tokens    int                   `json:"tokens"`
+	Stability int                   `json:"stability"`
+	Preview   string                `json:"preview,omitempty"`
+	Sources   []foveatedBlockSource `json:"sources,omitempty"`
+}
+
+type foveatedBlockSource struct {
+	URI      string  `json:"uri"`
+	Title    string  `json:"title,omitempty"`
+	Path     string  `json:"path,omitempty"`
+	Salience float64 `json:"salience,omitempty"`
+	Reason   string  `json:"reason,omitempty"`
+	Summary  string  `json:"summary,omitempty"`
+}
+
+// handleFoveatedContext assembles context blocks for Claude Code injection.
+//
+//	POST /v1/context/foveated
+func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
+	var req foveatedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "parse body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Extract anchor (topic) and goal from prompt.
+	anchor := extractAnchor(req.Prompt)
+	goal := extractGoal(req.Prompt)
+	keywords := extractKeywords(req.Prompt)
+
+	// Compute iris pressure.
+	pressure := 0.0
+	if req.Iris.Size > 0 {
+		pressure = float64(req.Iris.Used) / float64(req.Iris.Size)
+	}
+
+	// === Tier 4: Knowledge (Constellation) ===
+	// Try TRM scoring first (best results), fall back to keyword+salience.
+	var knowledgeDocs []FovealDoc
+	usedTRM := false
+
+	if s.process.TRM() != nil && s.process.EmbeddingIndex() != nil && req.Prompt != "" {
+		// Use a 5s timeout for TRM scoring — the hook has 10s total,
+		// and we need time for rendering + response writing.
+		trmCtx, trmCancel := context.WithTimeout(r.Context(), 5*time.Second)
+		trmResults := trmScoreDocs(trmCtx, s.process, req.Prompt, req.SessionID, 100)
+		trmCancel()
+		if len(trmResults) > 0 {
+			usedTRM = true
+			for _, tr := range trmResults {
+				knowledgeDocs = append(knowledgeDocs, FovealDoc{
+					URI:      "cog://chunks/" + tr.IndexResult.ChunkMeta.ChunkID,
+					Path:     tr.IndexResult.ChunkMeta.Path,
+					Title:    tr.IndexResult.ChunkMeta.Title,
+					Salience: float64(tr.TRMScore),
+					Reason:   "trm",
+				})
+			}
+		}
+	}
+
+	// Fall back to keyword+salience when TRM unavailable.
+	if !usedTRM {
+		cogIdx := s.process.Index()
+		if cogIdx != nil && len(cogIdx.ByURI) > 0 {
+			for _, doc := range cogIdx.ByURI {
+				switch strings.ToLower(doc.Status) {
+				case "superseded", "deprecated", "retired":
+					continue
+				}
+				if strings.Contains(filepath.ToSlash(doc.Path), "/archive/") {
+					continue
+				}
+
+				relevance := queryRelevance(doc, keywords)
+				salience := s.process.Field().Score(doc.Path)
+				if relevance <= 0 && salience <= 0 {
+					continue
+				}
+
+				reason := "high-salience"
+				switch {
+				case relevance > 0 && salience > 0:
+					reason = "both"
+				case relevance > 0:
+					reason = "query-match"
+				}
+
+				knowledgeDocs = append(knowledgeDocs, FovealDoc{
+					URI:      doc.URI,
+					Path:     doc.Path,
+					Title:    doc.Title,
+					Salience: relevance*2.0 + salience,
+					Reason:   reason,
+				})
+			}
+		}
+
+		// Sort by salience descending.
+		sort.Slice(knowledgeDocs, func(i, j int) bool {
+			return knowledgeDocs[i].Salience > knowledgeDocs[j].Salience
+		})
+	}
+
+	maxDocs := 10
+	if len(knowledgeDocs) > maxDocs {
+		knowledgeDocs = knowledgeDocs[:maxDocs]
+	}
+
+	// Build a manifest for selected docs (budget: ~4000 tokens for tier4).
+	tier4Budget := 4000
+	renderedDocs, _ := evictForBudgetMode(knowledgeDocs, nil, tier4Budget, s.cfg.WorkspaceRoot, true)
+
+	// === Render context blocks ===
+	var sb strings.Builder
+	blocks := make([]foveatedBlock, 0, 3)
+
+	// Tier 4: Knowledge
+	renderKnowledgeBlock(&sb, &blocks, renderedDocs)
+
+	// Tier 2: Temporal context (placeholder — time-aware context)
+	renderBlock(&sb, &blocks, "tier2", "temporal-context", "# Temporal Context\n", 40, nil)
+
+	// Tier 2: Current focus
+	focusContent := fmt.Sprintf("Topic: %s\n", anchor)
+	renderBlock(&sb, &blocks, "tier2", "current-focus", focusContent, 40, nil)
+
+	// Tier 2: User intent
+	goalContent := fmt.Sprintf("Goal: %s\n", goal)
+	renderBlock(&sb, &blocks, "tier2", "user-intent", goalContent, 40, nil)
+
+	contextStr := sb.String()
+	tokens := estTokens(contextStr)
+
+	slog.Info("foveated: assembled",
+		"anchor", anchor,
+		"goal", goal,
+		"docs", len(renderedDocs),
+		"tokens", tokens,
+		"pressure", fmt.Sprintf("%.1f%%", pressure*100),
+	)
+
+	// Compute effective budget from iris signal.
+	effectiveBudget := tier4Budget
+	if req.Iris.Size > 0 && req.Iris.Used > 0 {
+		available := req.Iris.Size - req.Iris.Used
+		if available > 0 && available < effectiveBudget {
+			effectiveBudget = available
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(foveatedResponse{
+		Context:         contextStr,
+		Tokens:          tokens,
+		Anchor:          anchor,
+		Goal:            goal,
+		IrisPressure:    pressure,
+		CoherenceScore:  1.0, // TODO: compute from tier quality scores
+		TierBreakdown:   map[string]int{"tier2": 80, "tier4": tokens - 80},
+		EffectiveBudget: effectiveBudget,
+		Blocks:          blocks,
+	})
+}
+
+// renderBlock writes a single CogBlock HTML comment block.
+func renderBlock(sb *strings.Builder, blocks *[]foveatedBlock, tier, name, content string, stability int, sources []foveatedBlockSource) {
+	h := sha256.Sum256([]byte(content))
+	hash := fmt.Sprintf("%x", h[:4])
+	tokens := estTokens(content)
+	fmt.Fprintf(sb, "<!-- block:%s:%s hash:%s tokens:%d stability:%d -->\n",
+		tier, name, hash, tokens, stability)
+	sb.WriteString(content)
+	sb.WriteString("\n---\n\n")
+	if blocks != nil {
+		*blocks = append(*blocks, foveatedBlock{
+			Tier:      tier,
+			Name:      name,
+			Hash:      hash,
+			Tokens:    tokens,
+			Stability: stability,
+			Preview:   truncate(content, 280),
+			Sources:   sources,
+		})
+	}
+}
+
+// renderKnowledgeBlock writes the tier4 knowledge block with constellation results.
+func renderKnowledgeBlock(sb *strings.Builder, blocks *[]foveatedBlock, docs []FovealDoc) {
+	var content strings.Builder
+	sources := make([]foveatedBlockSource, 0, len(docs))
+	for _, doc := range docs {
+		sources = append(sources, foveatedBlockSource{
+			URI:      doc.URI,
+			Title:    doc.Title,
+			Path:     doc.Path,
+			Salience: doc.Salience,
+			Reason:   doc.Reason,
+			Summary:  truncate(strings.TrimSpace(doc.Summary), 180),
+		})
+	}
+	if docsUseManifest(docs) {
+		content.WriteString(renderWorkspaceManifest(docs))
+		renderBlock(sb, blocks, "tier4", "knowledge", content.String(), 50, sources)
+		return
+	}
+
+	content.WriteString("# Relevant Knowledge (Constellation)\n\n")
+	content.WriteString("The following documents from the workspace knowledge graph are relevant to your query:\n\n")
+
+	if len(docs) > 0 {
+		for _, doc := range docs {
+			title := doc.Title
+			if title == "" {
+				title = filepath.Base(doc.Path)
+			}
+			fmt.Fprintf(&content, "### %s\n", title)
+			fmt.Fprintf(&content, "_Source: %s | Salience: %.2f | Reason: %s_\n\n", doc.URI, doc.Salience, doc.Reason)
+			if doc.Content != "" {
+				content.WriteString(doc.Content)
+				content.WriteString("\n\n")
+			}
+		}
+	}
+
+	renderBlock(sb, blocks, "tier4", "knowledge", content.String(), 50, sources)
+}
+
+// extractAnchor derives the current topic from the user's prompt.
+// Returns the most salient keyword or short phrase.
+func extractAnchor(prompt string) string {
+	keywords := extractKeywords(prompt)
+	if len(keywords) == 0 {
+		return "(none)"
+	}
+	// Take up to first 3 keywords as the anchor.
+	n := min(3, len(keywords))
+	return strings.Join(keywords[:n], " ")
+}
+
+// extractGoal derives the user's intent from their prompt.
+// Uses simple heuristics to classify as question, action, or exploration.
+func extractGoal(prompt string) string {
+	lower := strings.ToLower(strings.TrimSpace(prompt))
+
+	// Question patterns.
+	questionStarts := []string{"what", "how", "why", "where", "when", "who", "which", "can", "could", "would", "is", "are", "does", "do"}
+	for _, q := range questionStarts {
+		if strings.HasPrefix(lower, q+" ") || strings.HasPrefix(lower, q+"'") {
+			return "understand: " + truncateGoal(prompt)
+		}
+	}
+
+	// Action patterns.
+	actionStarts := []string{"build", "create", "add", "implement", "fix", "write", "make", "set up", "wire", "connect", "run", "start", "deploy", "update", "remove", "delete", "refactor", "test"}
+	for _, a := range actionStarts {
+		if strings.HasPrefix(lower, a+" ") || strings.HasPrefix(lower, a+".") {
+			return truncateGoal(prompt)
+		}
+	}
+
+	// Imperative patterns (let's, lets).
+	if strings.HasPrefix(lower, "let") {
+		return truncateGoal(prompt)
+	}
+
+	// Default: exploration.
+	return "(exploring/discussing)"
+}
+
+// truncateGoal caps a goal string at ~80 chars.
+func truncateGoal(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 80 {
+		// Try to break at a word boundary.
+		if idx := strings.LastIndex(s[:80], " "); idx > 40 {
+			return s[:idx]
+		}
+		return s[:80]
+	}
+	return s
+}
