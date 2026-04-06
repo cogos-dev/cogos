@@ -1,63 +1,90 @@
 # CogOS
 
-**Your AI agents forget everything between sessions. CogOS doesn't.**
+**Cognitive infrastructure for AI agents.** Memory, context, identity, and trust — as a daemon.
 
-CogOS is a daemon that runs alongside your AI coding agents — Claude Code, Cursor, Gemini CLI, whatever you use — and gives them persistent memory, intelligent context assembly, and multi-provider inference routing. It's not a framework. It's not a library. It's a kernel that runs continuously and maintains cognitive state while agents come and go.
+CogOS is a background kernel that gives AI agents the things they can't give themselves: persistent memory that survives across sessions, context assembly that knows what matters right now, multi-provider inference routing that keeps data local, and a tamper-evident ledger that records every decision. It runs on your hardware, it works with any agent, and everything it knows stays yours.
 
 ```sh
-# Install and initialize a workspace
 make build
 ./cogos init --workspace ~/my-project
 ./cogos serve --workspace ~/my-project
-
-# That's it. Your agents now have memory.
-curl http://localhost:5200/health
 ```
 
-## What it actually does
+## The problem
 
-**Without CogOS:** Each agent session starts from zero. You re-explain context. The agent re-reads files it already understood yesterday. It can't remember what you decided last week.
+AI agents are stateless. Every session starts from zero. You re-explain context. The agent re-reads files it already understood yesterday. If you use Claude Code in the morning and Cursor in the afternoon, neither knows what the other did. There's no shared memory, no continuity, no identity.
 
-**With CogOS:** The daemon maintains a continuous attentional field over your workspace. It knows which files matter right now (git-derived salience scoring), what the agent said last time (persistent memory), and which model should handle this request (local-first routing with cloud fallback). When a new session starts, the context engine assembles exactly the right context — scored, ranked, and budget-fitted — without the agent having to ask.
+CogOS sits underneath all of them and provides what they can't provide for themselves.
+
+## What happens when you install it
+
+**Day 1:** Your agent remembers things you didn't tell it to remember. Context it surfaces feels right — it knows which files matter because it watches your git history, not just your current message.
+
+**Day 3:** Conversations get shorter. You're spending fewer tokens because the system understands what you mean, not just what you say. The compression comes from shared context that accumulates without effort.
+
+**Week 1:** You stop noticing it. That's the point. The agent just knows things. The workspace has continuity. You open a new session and it already has the thread.
 
 ## Architecture
+
+CogOS is a continuous-process daemon, not a request handler. It has its own cognitive loop that runs regardless of whether anyone is talking to it:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                     Agent Harnesses                      │
 │         Claude Code · Cursor · Gemini CLI · etc.         │
 └────────────────────────┬────────────────────────────────┘
-                         │ OpenAI-compatible API
-                         │ Anthropic Messages API
-                         │ MCP (Streamable HTTP)
+                         │ OpenAI / Anthropic / MCP
 ┌────────────────────────▼────────────────────────────────┐
-│                      CogOS Daemon                        │
+│                      CogOS Kernel                        │
 │                                                          │
 │  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │ Nucleus  │  │   Process    │  │  Context Assembly  │  │
-│  │          │  │              │  │                    │  │
-│  │ Identity │  │  Active      │  │  Zone 0: Nucleus   │  │
-│  │ context  │  │  Receptive   │  │  Zone 1: Knowledge │  │
-│  │ (always  │  │  Consolidate │  │  Zone 2: History   │  │
-│  │  loaded) │  │  Dormant     │  │  Zone 3: Current   │  │
+│  │ Nucleus  │  │   Process    │  │  Context Engine    │  │
+│  │ identity │  │  4-state loop│  │  foveated assembly │  │
 │  └──────────┘  └──────────────┘  └───────────────────┘  │
-│                                                          │
 │  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │  Ledger  │  │   Router     │  │    Salience        │  │
-│  │  (hash-  │  │  (local-first│  │  (git-derived      │  │
-│  │  chained)│  │   routing)   │  │   attention)       │  │
+│  │  Ledger  │  │   Router     │  │  Salience          │  │
+│  │  hash-   │  │  local-first │  │  git-derived       │  │
+│  │  chained │  │  routing     │  │  attention          │  │
 │  └──────────┘  └──────────────┘  └───────────────────┘  │
-│                                                          │
 │  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │Coherence │  │  Blob Store  │  │   MCP Server       │  │
+│  │Coherence │  │  Blob Store  │  │  MCP Server        │  │
 │  └──────────┘  └──────────────┘  └───────────────────┘  │
-│                                                          │
 │  ┌──────────────────────────────────────────────────┐    │
-│  │              Inference Providers                   │    │
-│  │    Anthropic · Ollama · Claude Code · Codex       │    │
+│  │    Providers: Anthropic · Ollama · Claude Code    │    │
 │  └──────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────┘
 ```
+
+The daemon has four states — **Active** (processing a request), **Receptive** (idle, maintaining the attentional field), **Consolidating** (internal maintenance), and **Dormant** (heartbeat only). It's always aware of what changed, even between sessions.
+
+## Core ideas
+
+### Your workspace is the cognitive object, not the model
+
+Most agent frameworks treat the model as the brain and bolt memory on the side. CogOS inverts this: the workspace is the persistent cognitive substrate. Models are organs — swappable, upgradeable, transient. Identity and memory live in the workspace and survive any model change.
+
+### Context should be assembled, not stuffed
+
+Instead of dumping everything into the context window, the engine scores every available piece of context and arranges it into stability zones optimized for KV cache reuse:
+
+| Zone | Contents | Stability |
+|------|----------|-----------|
+| 0 — Nucleus | Identity | Always present, never evicted |
+| 1 — Knowledge | Workspace docs, indexed memory | Shifts slowly, high cache hit rate |
+| 2 — History | Conversation turns | Scored by relevance, evictable |
+| 3 — Current | The current message | Always present |
+
+### Local first, cloud as fallback
+
+The router scores providers on a sovereignty gradient. Local models (Ollama) are preferred. Cloud APIs are fallbacks, not defaults. Your data stays on your hardware unless you explicitly say otherwise.
+
+### Every decision is recorded
+
+The ledger is append-only, hash-chained (SHA-256, RFC 8785), and complete. Every routing decision, every context assembly, every state transition. Tamper-evident and causally ordered. Not for compliance theater — for understanding why the system did what it did.
+
+### It works with what you already have
+
+CogOS doesn't replace your tools. It sits behind them. Any OpenAI-compatible client, any Anthropic Messages client, any MCP-capable agent can connect. Claude Code, Cursor, Gemini CLI, custom agents — they all talk to the same kernel, share the same memory, benefit from the same context.
 
 ## Quick start
 
@@ -67,7 +94,7 @@ git clone https://github.com/cogos-dev/cogos.git
 cd cogos
 make build
 
-# Initialize a workspace (creates .cog/ with config, memory dirs, identity)
+# Initialize a workspace
 ./cogos init --workspace ~/my-project
 
 # Start the daemon
@@ -77,156 +104,71 @@ make build
 curl -s http://localhost:5200/health | jq .
 ```
 
+### Developer setup
+
+```sh
+./scripts/setup-dev.sh    # Build, install to ~/.cogos/bin, configure PATH
+```
+
 ### Docker
 
 ```sh
 make e2e          # Build + run full cold-start test in a container
 make image        # Build production image
-make run          # Run in Docker with workspace mount
+make run          # Run with workspace volume mount
 ```
-
-## How it's different
-
-CogOS is not LangChain, CrewAI, or another agent framework. Here's why:
-
-| | Agent frameworks | CogOS |
-|---|---|---|
-| **Lifecycle** | Runs when called, dies when done | Continuous daemon with internal tickers |
-| **Memory** | Bolted on (vector DB, external store) | Native hierarchical memory with consolidation |
-| **Context** | Naive stuffing or basic RAG | Foveated assembly with stability zones and KV cache optimization |
-| **Models** | One provider, hardcoded | Multi-provider routing with sovereignty gradient |
-| **Trust** | None | Hash-chained ledger (SHA-256, RFC 8785) for every decision |
-| **Integration** | Replace your agent | Sits *behind* any agent (Claude Code, Cursor, etc.) |
-
-### The continuous process
-
-Most agent systems are request-triggered — nothing happens until you send a message. CogOS has a four-state process loop that runs regardless:
-
-- **Active** — processing an external request
-- **Receptive** — idle, listening, maintaining the attentional field
-- **Consolidating** — running internal maintenance (memory consolidation, coherence checks, salience updates)
-- **Dormant** — minimal activity, heartbeat only
-
-This means the daemon is always aware of what changed in your workspace, even between sessions.
-
-### Foveated context assembly
-
-Instead of dumping everything into the context window, CogOS scores every available piece of context and arranges it into stability zones:
-
-- **Zone 0 (Nucleus):** Identity — always present, never evicted
-- **Zone 1 (Knowledge):** CogDocs and workspace knowledge — shifts slowly, high cache hit rate
-- **Zone 2 (History):** Conversation history — scored by relevance + recency, evictable
-- **Zone 3 (Current):** The current message — always present
-
-Zones are ordered for KV cache reuse. Stable content stays in the same position across requests, so the model's cache isn't invalidated unnecessarily.
-
-### Local-first inference routing
-
-The router scores providers on a sovereignty gradient: local models are preferred over cloud. If Ollama is running, it gets the request. Cloud APIs are fallbacks, not defaults.
-
-```yaml
-# providers.yaml
-providers:
-  ollama:
-    type: ollama
-    enabled: true
-    endpoint: "http://localhost:11434"
-    model: "llama3.2"
-
-  anthropic:
-    type: anthropic
-    enabled: false  # enable when needed
-    api_key_env: ANTHROPIC_API_KEY
-    model: "claude-sonnet-4-20250514"
-
-routing:
-  prefer_local: true
-  fallback_chain: [ollama, anthropic]
-```
-
-Custom providers can be added by implementing the [Provider interface](docs/writing-a-provider.md) — six methods, same pattern as Terraform providers.
 
 ## API
-
-Any OpenAI-compatible client works. The context engine intercepts the messages array and assembles what the model actually sees.
 
 | Endpoint | What it does |
 |----------|-------------|
 | `POST /v1/chat/completions` | OpenAI-compatible chat (streaming + non-streaming) |
 | `POST /v1/messages` | Anthropic Messages-compatible chat |
-| `POST /v1/context/foveated` | Foveated context assembly for harness hooks |
-| `GET /v1/context` | Current attentional field state |
-| `GET /health` | Liveness probe with identity, state, and trust info |
-| `POST /mcp` | MCP Streamable HTTP endpoint (Go SDK) |
+| `POST /v1/context/foveated` | Foveated context assembly |
+| `GET /v1/context` | Current attentional field |
+| `GET /health` | Liveness probe with identity, state, trust |
+| `POST /mcp` | MCP Streamable HTTP endpoint |
+
+## Providers
+
+Ships with Anthropic, Ollama, Claude Code, and Codex. New providers implement [six methods](docs/writing-a-provider.md) — same extensibility pattern as Terraform providers.
 
 ## Project layout
 
 ```
-cmd/cogos/                 Entry point
-internal/engine/           Kernel implementation (90 source files, 33 test files)
-  process.go               Four-state cognitive loop
-  nucleus.go               Always-loaded identity context
-  context_assembly.go      Foveated context engine with stability zones
-  serve.go                 HTTP API (OpenAI + Anthropic compatible)
-  ledger.go                Hash-chained event log (SHA-256, RFC 8785)
-  router.go                Multi-provider inference routing
-  provider.go              Provider interface definition
-  provider_anthropic.go    Anthropic Claude API
-  provider_ollama.go       Ollama local inference
-  provider_claudecode.go   Claude Code agentic subprocess spawning
-  mcp_server.go            MCP Streamable HTTP server (official Go SDK)
-  salience.go              Git-derived attention scoring
-  coherence.go             4-layer validation stack
-  blobstore.go             Content-addressed storage
-  init.go                  Workspace scaffolding (cogos init)
-  defaults/                Embedded default configs and identity
-docs/
-  writing-a-provider.md    Guide for writing custom providers
-  MCP-SPEC.md              MCP server specification
-  PROVIDER-SPEC.md         Provider contract specification
-scripts/
-  e2e-test.sh              End-to-end cold-start test (15 checks)
-Dockerfile                 Production multi-stage build
-Dockerfile.e2e             Containerized e2e test
+cmd/cogos/              Entry point
+internal/engine/        Kernel (90 source files, 33 test files)
+docs/                   Specs and guides
+scripts/                Setup, CLI, and e2e tests
 ```
 
 ## Testing
 
 ```sh
 make test         # Unit tests
-make e2e-local    # Full cold-start lifecycle test (local)
-make e2e          # Same test, containerized
+make e2e-local    # Full cold-start lifecycle test
+make e2e          # Containerized e2e
 ```
 
 ## Status
 
-This is the v3 kernel — a ground-up rewrite after a year of iteration. The architecture has been validated through daily use across multiple agent harnesses.
+v3 kernel — ground-up rewrite after a year of daily use across multiple agent harnesses.
 
-What's working:
-- Continuous process with four operational states
-- Foveated context assembly with stability zones
-- Hash-chained event ledger
-- Multi-provider inference routing (Anthropic, Ollama, Claude Code, Codex)
-- MCP server (Streamable HTTP)
-- Content-addressed blob store
-- Git-derived salience scoring
-- OpenAI and Anthropic API compatibility
-- Workspace scaffolding (`cogos init`)
-- End-to-end containerized testing
-- Embedded web dashboard
-- OpenTelemetry instrumentation
+Working: continuous process, foveated context, hash-chained ledger, multi-provider routing, MCP server, blob store, salience scoring, OpenAI/Anthropic compatibility, workspace scaffolding, e2e testing, web dashboard, OpenTelemetry.
 
-What's next:
-- Persistent memory consolidation loop
-- Multi-agent process management
-- Sentinel (routing feedback) training pipeline
-- `cog` CLI as the user-facing shell
+Next: memory consolidation loop, multi-agent process management, identity and trust module, `cog` CLI.
+
+## Deeper
+
+- [System Specification](docs/vision/distributed-presence-and-trust.md) — multi-device presence, learned boundaries, trust membrane
+- [Writing a Provider](docs/writing-a-provider.md) — extensibility guide
+- [MCP Specification](docs/MCP-SPEC.md) — MCP server contract
+- [Provider Specification](docs/PROVIDER-SPEC.md) — provider interface contract
 
 ## Requirements
 
 - Go 1.24+
 - macOS or Linux
-- Docker (optional, for containerized testing and deployment)
 
 ## License
 
