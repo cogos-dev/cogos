@@ -13,7 +13,7 @@
 BINARY     := cogos
 IMAGE      := cogos-dev/cogos
 TAG        := dev
-PORT       := 5200
+PORT       := 6931
 WORKSPACE  ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo $$HOME/cog-workspace)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 VERSION    ?= dev

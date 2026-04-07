@@ -171,7 +171,7 @@ Same three operations at every level: fork, merge, die.
 
 ```
     ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-    ┃  Node (laptop, port 5200)                      ┃
+    ┃  Node (laptop, port 6931)                      ┃
     ┃                                                ┃
     ┃  ╭━━━━━━━━━━╮  ← Nucleus (shared)             ┃
     ┃  ┃ Identity ┃                                  ┃
@@ -190,7 +190,7 @@ Same three operations at every level: fork, merge, die.
 
 ```
     ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-    ┃  Node (laptop, port 5200)                                   ┃
+    ┃  Node (laptop, port 6931)                                   ┃
     ┃                                                             ┃
     ┃  ╭━━━━━━━━━━━━━━╮                                           ┃
     ┃  ┃   Kernel      ┃   (shared nucleus, shared membrane)      ┃

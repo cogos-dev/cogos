@@ -9,7 +9,7 @@
 
 ## Overview
 
-CogOS v3 exposes its cognitive infrastructure through a native MCP (Model Context Protocol) server written in Go, embedded directly in the `cogos-v3` daemon on port 5200. This replaces the v2 Python-based cogos-api (45 tools across 5 profiles) with a focused, stage-1 tool set that maps directly to v3's first-principles architecture.
+CogOS v3 exposes its cognitive infrastructure through a native MCP (Model Context Protocol) server written in Go, embedded directly in the `cogos-v3` daemon on port 6931. This replaces the v2 Python-based cogos-api (45 tools across 5 profiles) with a focused, stage-1 tool set that maps directly to v3's first-principles architecture.
 
 ### Design Principles
 
@@ -23,7 +23,7 @@ CogOS v3 exposes its cognitive infrastructure through a native MCP (Model Contex
 | Aspect | v2 (cogos-api) | v3 (this spec) |
 |--------|----------------|----------------|
 | Language | Python (FastMCP) | Go (official SDK) |
-| Transport | stdio / streamable-http | SSE on port 5200 |
+| Transport | stdio / streamable-http | SSE on port 6931 |
 | Tool count | 45 across 5 profiles | 11 (stage-1), expandable |
 | Architecture | Wraps basic-memory + external tools | Native to kernel internals |
 | Process model | Starts on demand | Always-running daemon |
@@ -35,7 +35,7 @@ CogOS v3 exposes its cognitive infrastructure through a native MCP (Model Contex
 
 ### SSE Transport (Primary)
 
-The MCP server runs as an HTTP handler on the existing cogos-v3 HTTP server at `http://localhost:5200/mcp`.
+The MCP server runs as an HTTP handler on the existing cogos-v3 HTTP server at `http://localhost:6931/mcp`.
 
 This uses the MCP SSE transport, which is the standard transport that Claude Code, Claude Desktop, Cursor, and other MCP clients expect for remote/networked servers.
 
@@ -66,7 +66,7 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
 {
   "mcpServers": {
     "cogos-v3": {
-      "url": "http://localhost:5200/mcp"
+      "url": "http://localhost:6931/mcp"
     }
   }
 }
@@ -93,7 +93,7 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `COG_WORKSPACE` | `~/.cog` or auto-detect | Path to the `.cog/` workspace root |
-| `COG_MCP_PORT` | `5200` | Port for the HTTP/SSE server |
+| `COG_MCP_PORT` | `6931` | Port for the HTTP/SSE server |
 | `COG_MCP_PATH` | `/mcp` | URL path for the MCP endpoint |
 | `COG_LOG_LEVEL` | `info` | Logging verbosity |
 
@@ -971,7 +971,7 @@ Rationale:
 
 ### Wiring into serve.go
 
-The MCP server should be mounted as an HTTP handler on the existing cogos-v3 HTTP server. The daemon's `serve.go` already manages the HTTP listener on port 5200.
+The MCP server should be mounted as an HTTP handler on the existing cogos-v3 HTTP server. The daemon's `serve.go` already manages the HTTP listener on port 6931.
 
 ```go
 package main

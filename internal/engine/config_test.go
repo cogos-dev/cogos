@@ -15,8 +15,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 
-	if cfg.Port != 5200 {
-		t.Errorf("Port = %d; want 5200", cfg.Port)
+	if cfg.Port != 6931 {
+		t.Errorf("Port = %d; want 6931", cfg.Port)
 	}
 	if cfg.ConsolidationInterval != 900 {
 		t.Errorf("ConsolidationInterval = %d; want 900", cfg.ConsolidationInterval)
@@ -99,8 +99,8 @@ func TestLoadConfigExplicitPathUsedAsIs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig with explicit temp dir: %v", err)
 	}
-	if cfg.Port != 5200 {
-		t.Errorf("Port = %d; want default 5200", cfg.Port)
+	if cfg.Port != 6931 {
+		t.Errorf("Port = %d; want default 6931", cfg.Port)
 	}
 }
 
@@ -112,19 +112,19 @@ func TestLoadConfigMissingKernelYAMLIsOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig without kernel.yaml: %v", err)
 	}
-	if cfg.Port != 5200 {
-		t.Errorf("Port = %d; want default 5200", cfg.Port)
+	if cfg.Port != 6931 {
+		t.Errorf("Port = %d; want default 6931", cfg.Port)
 	}
 }
 
 func TestLoadConfigV3SectionOverridesTopLevel(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
-	// Top-level port is 5100 (v2); v3: section overrides to 5200.
+	// Top-level port is 5100 (v2); v3: section overrides to 6931.
 	kernelYAML := `port: 5100
 consolidation_interval: 120
 v3:
-  port: 5200
+  port: 6931
   consolidation_interval: 600
 `
 	writeTestFile(t, filepath.Join(root, ".cog", "config", "kernel.yaml"), kernelYAML)
@@ -135,8 +135,8 @@ v3:
 	}
 
 	// v3: section wins over top-level.
-	if cfg.Port != 5200 {
-		t.Errorf("Port = %d; want 5200 (v3 section)", cfg.Port)
+	if cfg.Port != 6931 {
+		t.Errorf("Port = %d; want 6931 (v3 section)", cfg.Port)
 	}
 	if cfg.ConsolidationInterval != 600 {
 		t.Errorf("ConsolidationInterval = %d; want 600 (v3 section)", cfg.ConsolidationInterval)

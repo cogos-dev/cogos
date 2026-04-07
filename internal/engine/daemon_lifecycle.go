@@ -95,7 +95,7 @@ func daemonStatePath(workspaceRoot string) string {
 
 func endpointForPort(port int) string {
 	if port == 0 {
-		port = 5200
+		port = 6931
 	}
 	return fmt.Sprintf("http://localhost:%d", port)
 }
@@ -117,7 +117,7 @@ func loadDaemonState(workspaceRoot string) (*DaemonState, error) {
 		state.Workspace = workspaceRoot
 	}
 	if state.Endpoint == "" {
-		state.Endpoint = endpointForPort(5200)
+		state.Endpoint = endpointForPort(6931)
 	}
 	return &state, nil
 }

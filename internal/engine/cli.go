@@ -6,7 +6,7 @@
 //
 // Flags:
 //
-//	--port        API port (default 5200; v2 is 5100)
+//	--port        API port (default 6931; v2 is 5100)
 //	--workspace   path to workspace root (auto-detected from cwd if omitted)
 //	--config      (reserved for future use)
 package engine
@@ -34,7 +34,7 @@ var (
 )
 
 func Main() {
-	port := flag.Int("port", 0, "HTTP API port (default 5200)")
+	port := flag.Int("port", 0, "HTTP API port (default 6931)")
 	workspace := flag.String("workspace", "", "Workspace root path (auto-detected if empty)")
 	flag.Parse()
 
@@ -120,7 +120,7 @@ func setupLogger() {
 func runServeCmd(args []string, defaultWorkspace string, defaultPort int) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	workspace := fs.String("workspace", defaultWorkspace, "Workspace root path (auto-detected if empty)")
-	port := fs.Int("port", defaultPort, "HTTP API port (default 5200)")
+	port := fs.Int("port", defaultPort, "HTTP API port (default 6931)")
 	_ = fs.Parse(args)
 	runServe(*workspace, *port)
 }

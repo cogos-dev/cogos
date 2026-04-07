@@ -136,7 +136,7 @@ make build
 ./cogos serve --workspace ~/my-project
 
 # Verify
-curl -s http://localhost:5200/health | jq .
+curl -s http://localhost:6931/health | jq .
 ```
 
 ### Developer setup

@@ -141,6 +141,8 @@ The kernel runs as a continuous daemon with four states:
 | **Consolidating** | Internal maintenance (memory, coherence, salience) |
 | **Dormant** | Minimal activity, heartbeat only |
 
+The process loop isn't optional — it's constitutive. Like a microwave turntable that rotates food to prevent cold spots, the process loop cycles through the cognitive field to ensure no part of the workspace sits at a permanent dead zone. Without the loop, parts of the substrate would receive no attention and go stale. The rotation ensures every part of the workspace periodically receives active processing.
+
 The process states map to adaptive sample rates — the system spends attention where it expects to find information.
 
 ### Node vs workspace

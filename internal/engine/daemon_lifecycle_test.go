@@ -53,7 +53,7 @@ func TestSaveLoadDaemonState(t *testing.T) {
 	pid := 4242
 	want := &DaemonState{
 		Mode:      daemonModeBareMetal,
-		Endpoint:  "http://localhost:5200",
+		Endpoint:  "http://localhost:6931",
 		Workspace: root,
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
 		PID:       &pid,
@@ -80,7 +80,7 @@ func TestPlanStartFresh(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
-	cfg.Port = 5200
+	cfg.Port = 6931
 
 	plan, err := planStart(cfg, &fakeRuntime{statusByID: map[string]ContainerStatus{}},
 		func(string, time.Duration) (*DaemonHealth, error) { return nil, errors.New("down") },
@@ -97,7 +97,7 @@ func TestPlanStartReuseSameWorkspace(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
-	cfg.Port = 5200
+	cfg.Port = 6931
 	state := &DaemonState{
 		Mode:      daemonModeContainer,
 		Endpoint:  endpointForPort(cfg.Port),
@@ -127,7 +127,7 @@ func TestPlanStartConflictDifferentWorkspace(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
-	cfg.Port = 5200
+	cfg.Port = 6931
 
 	plan, err := planStart(cfg, &fakeRuntime{},
 		func(string, time.Duration) (*DaemonHealth, error) {
@@ -146,7 +146,7 @@ func TestPlanStartAdoptsExistingContainerWithoutStateFile(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
-	cfg.Port = 5200
+	cfg.Port = 6931
 	name := containerNameForWorkspace(root)
 
 	plan, err := planStart(cfg, &fakeRuntime{statusByID: map[string]ContainerStatus{
@@ -169,7 +169,7 @@ func TestPlanStartReclaimsStaleState(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
-	cfg.Port = 5200
+	cfg.Port = 6931
 	name := containerNameForWorkspace(root)
 	state := &DaemonState{
 		Mode:      daemonModeContainer,

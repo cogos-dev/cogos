@@ -25,7 +25,7 @@ type Config struct {
 	// CogDir is WorkspaceRoot/.cog
 	CogDir string
 
-	// Port the HTTP API listens on. Default: 5200 (v2 is 5100).
+	// Port the HTTP API listens on. Default: 6931 (ln(2) × 10⁴).
 	Port int
 
 	// ConsolidationInterval is how often the consolidation loop fires (seconds).
@@ -100,7 +100,7 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 	cfg := &Config{
 		WorkspaceRoot:         workspaceRoot,
 		CogDir:                filepath.Join(workspaceRoot, ".cog"),
-		Port:                  5200,
+		Port:                  6931,
 		ConsolidationInterval: 900,
 		HeartbeatInterval:     60,
 		SalienceDaysWindow:    90,

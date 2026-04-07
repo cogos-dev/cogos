@@ -62,7 +62,7 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 	s.logCompatDeprecated(r)
 	port := s.cfg.Port
 	if port == 0 {
-		port = 5200
+		port = 6931
 	}
 
 	card := map[string]any{

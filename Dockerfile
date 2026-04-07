@@ -5,8 +5,8 @@
 #
 # Run:
 #   docker run -v /path/to/workspace:/workspace \
-#              -p 5200:5200 cogos-dev/cogos:dev \
-#              serve --workspace /workspace --port 5200
+#              -p 6931:6931 cogos-dev/cogos:dev \
+#              serve --workspace /workspace --port 6931
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM golang:1.24-alpine AS builder
@@ -43,10 +43,10 @@ RUN mkdir -p .cog/mem .cog/config .cog/ledger \
 
 USER cogos
 
-EXPOSE 5200
+EXPOSE 6931
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:5200/health || exit 1
+    CMD curl -f http://localhost:6931/health || exit 1
 
 ENTRYPOINT ["cogos"]
-CMD ["serve", "--port", "5200"]
+CMD ["serve", "--port", "6931"]

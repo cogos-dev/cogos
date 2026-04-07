@@ -9,9 +9,9 @@
 //
 // Usage:
 //
-//	cogos-v3 chat              # connect to daemon on default port 5200
-//	cogos-v3 chat --port 5200  # explicit port
-//	cogos-v3 --port 5200 chat  # flags must precede subcommand name
+//	cogos-v3 chat              # connect to daemon on default port 6931
+//	cogos-v3 chat --port 6931  # explicit port
+//	cogos-v3 --port 6931 chat  # flags must precede subcommand name
 //	cogos-v3 chat --direct     # bypass daemon, talk directly to Ollama
 package engine
 
@@ -39,7 +39,7 @@ func runChat(args []string, defaultWorkspace string, defaultPort int) {
 	_ = fs.Parse(args)
 
 	if *port == 0 {
-		*port = 5200
+		*port = 6931
 	}
 
 	if *direct {

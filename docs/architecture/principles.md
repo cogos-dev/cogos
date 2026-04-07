@@ -62,7 +62,11 @@ Surprise in both directions is information:
 | 2 — History | Medium | Re-ranked per request. |
 | 3 — Current | Very high | Changes every request. Not surprising. |
 
+**Physical intuition:** The stability ordering of the foveated zones follows the same pattern as standing waves in a bounded container — the center is always the calmest point (the node), the boundary is always the most active (the antinode). This isn't a design choice. It's a consequence of wave physics in any bounded oscillating system. The nucleus *must* be the most stable zone because it sits at the node where incoming and outgoing signals cancel.
+
 **Design principle:** Frequency and delta should be inversely correlated. Hot paths should be boring. Interesting stuff can happen on cold paths.
+
+**Physical intuition:** This is the same pattern as pushing someone on a swing — you only push at the moment the returning arc reaches you. Pushing continuously wastes energy. Pushing at resonance amplifies the motion with minimal effort. The system self-tunes its sample rate to the frequency where it learns the most per unit of energy spent.
 
 ## 4. Boundary Crossing Energy Signatures
 

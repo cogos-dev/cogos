@@ -238,7 +238,7 @@ func runExperimentCmd(args []string, workspaceRoot string, defaultPort int) {
 	_ = fs.Parse(args)
 
 	if *port == 0 {
-		*port = 5200
+		*port = 6931
 	}
 
 	subArgs := fs.Args()
