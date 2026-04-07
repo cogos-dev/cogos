@@ -71,6 +71,7 @@ type Process struct {
 	nucleus *Nucleus
 	field   *AttentionalField
 	gate    *Gate
+	bridge  ConstellationBridge
 	cfg     *Config
 
 	// sessionID is the persistent process session identifier.
@@ -105,9 +106,10 @@ type Process struct {
 	// lightCones manages per-conversation SSM hidden states.
 	lightCones *LightConeManager
 
-	// lastConsolidation records when the previous consolidation ran, so the
-	// observer can filter the attention log to the current tick window.
+	// lastConsolidation records the last dormant memory consolidation pass.
 	lastConsolidation time.Time
+
+	lastMaintenanceTick time.Time
 
 	// lastCoherenceReport caches the most recent coherence result so the
 	// heartbeat can reuse it instead of recomputing.
@@ -128,6 +130,7 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		nucleus:   nucleus,
 		field:     field,
 		gate:      gate,
+		bridge:    NilBridge{},
 		cfg:       cfg,
 		sessionID: uuid.New().String(),
 		startedAt: now,
@@ -136,9 +139,10 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 			LocalScore:           1.0,
 			CoherenceFingerprint: "sha256:" + sha256Hex("coherence:unknown"),
 		},
-		externalCh:        make(chan *GateEvent, 64),
-		observer:          NewTrajectoryModel(),
-		lastConsolidation: now,
+		externalCh:          make(chan *GateEvent, 64),
+		observer:            NewTrajectoryModel(),
+		lastConsolidation:   now,
+		lastMaintenanceTick: now,
 	}
 }
 
@@ -319,10 +323,10 @@ func (p *Process) handleExternal(evt *GateEvent) {
 func (p *Process) runConsolidation() {
 	p.transition(StateConsolidating)
 
-	// Record the current tick window before updating lastConsolidation.
+	// Record the current tick window before updating the maintenance watermark.
 	now := time.Now()
-	tickStart := p.lastConsolidation
-	p.lastConsolidation = now
+	tickStart := p.lastMaintenanceTick
+	p.lastMaintenanceTick = now
 
 	slog.Debug("process: consolidating", "window_since", tickStart.Format(time.RFC3339))
 
@@ -448,13 +452,34 @@ func (p *Process) emitHeartbeat() {
 	p.mu.Unlock()
 
 	p.transition(StateDormant)
+	state := p.State().String()
+	fieldSize := p.field.Len()
+	fingerprint := p.Fingerprint()
+	receipt, err := p.constellationBridge().EmitHeartbeat(KernelHeartbeatPayload{
+		ProcessState:         state,
+		FieldSize:            fieldSize,
+		CoherenceFingerprint: coherenceHash,
+		NucleusFingerprint:   p.nucleusDigest(),
+		LedgerHead:           p.currentLedgerHead(),
+		Timestamp:            now,
+	})
+	if err != nil {
+		slog.Warn("process: constellation heartbeat failed", "err", err)
+		receipt = HeartbeatReceipt{}
+	}
+
 	heartbeat := map[string]interface{}{
-		"state":          p.State().String(),
-		"field_size":     p.field.Len(),
-		"node_id":        p.NodeID,
-		"fingerprint":    p.Fingerprint(),
-		"timestamp":      now.Format(time.RFC3339),
-		"coherence_hash": coherenceHash,
+		"state":                      state,
+		"field_size":                 fieldSize,
+		"node_id":                    p.NodeID,
+		"fingerprint":                fingerprint,
+		"timestamp":                  now.Format(time.RFC3339),
+		"coherence_hash":             coherenceHash,
+		"constellation_receipt_hash": receipt.Hash,
+		"constellation_peers_sent":   receipt.PeersSent,
+	}
+	if !receipt.Timestamp.IsZero() {
+		heartbeat["constellation_receipt_at"] = receipt.Timestamp.Format(time.RFC3339)
 	}
 	p.emitEvent("heartbeat", heartbeat)
 
@@ -486,12 +511,33 @@ func (p *Process) emitHeartbeat() {
 	if p.nucleus != nil {
 		block.TargetIdentity = p.nucleus.Name
 	}
+	if receipt.Hash != "" {
+		block.Artifacts = append(block.Artifacts, BlockArtifact{
+			Kind: "constellation_receipt",
+			Ref:  receipt.Hash,
+		})
+	}
 	ref := p.RecordBlock(block)
 
 	p.mu.Lock()
 	p.TrustState.LastHeartbeatHash = ref
 	p.TrustState.LastHeartbeatAt = now
 	p.mu.Unlock()
+
+	interval := time.Duration(p.cfg.ConsolidationInterval) * time.Second
+	if interval <= 0 || now.Sub(p.lastConsolidation) < interval {
+		return
+	}
+
+	action := ConsolidationAction{WorkspaceRoot: p.cfg.WorkspaceRoot}
+	count, err := action.Run()
+	if err != nil {
+		slog.Warn("process: memory consolidation failed", "err", err)
+		return
+	}
+
+	p.lastConsolidation = now
+	slog.Info("process: memory consolidated", "sessions", count)
 }
 
 // transition moves the process to a new state (with logging).
