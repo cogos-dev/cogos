@@ -157,6 +157,75 @@ func TestSyncWatcherGracefulShutdown(t *testing.T) {
 	assertSyncWatcherStopped(t, errCh)
 }
 
+func TestSyncWatcherIgnoresNonJSONFilesInInbox(t *testing.T) {
+	t.Parallel()
+
+	workspaceRoot := t.TempDir()
+	inboxPath := mustMakeSyncInbox(t, workspaceRoot)
+	blobStore := newTestBlobStore(t, workspaceRoot)
+	watcher := NewSyncWatcher(blobStore, 10*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan SyncEvent, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- watcher.Watch(ctx, inboxPath, out)
+	}()
+
+	if err := os.WriteFile(filepath.Join(inboxPath, "README.txt"), []byte("ignore me"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case event := <-out:
+		t.Fatalf("unexpected event for non-json file: %+v", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	writeSyncEnvelopeFile(t, filepath.Join(inboxPath, "envelope.json"), SyncEnvelope{
+		Version:      1,
+		OriginNodeID: "node-a",
+		TargetNodeID: "node-b",
+		BlobHash:     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		Kind:         "event",
+		Signature:    "signature",
+	})
+
+	event := waitForSyncEvent(t, out)
+	if !event.Valid {
+		t.Fatalf("Valid = false, want true (error: %s)", event.ValidationError)
+	}
+
+	cancel()
+	assertSyncWatcherStopped(t, errCh)
+}
+
+func TestSyncWatcherHandlesEmptyDirectoryGracefully(t *testing.T) {
+	t.Parallel()
+
+	workspaceRoot := t.TempDir()
+	inboxPath := mustMakeSyncInbox(t, workspaceRoot)
+
+	state := syncWatcherState{
+		path: inboxPath,
+		seen: make(map[string]struct{}),
+	}
+
+	called := false
+	if err := state.poll(func(string) error {
+		called = true
+		return nil
+	}); err != nil {
+		t.Fatalf("poll returned error: %v", err)
+	}
+	if called {
+		t.Fatal("poll callback called for empty directory")
+	}
+}
+
 func newTestBlobStore(t *testing.T, workspaceRoot string) *BlobStore {
 	t.Helper()
 

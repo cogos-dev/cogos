@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -50,6 +51,22 @@ func TestValidateToolCallMissingRequiredParam(t *testing.T) {
 	}
 	if result.Reason != `missing required parameter "query"` {
 		t.Fatalf("Reason = %q; want missing required parameter rejection", result.Reason)
+	}
+}
+
+func TestValidateToolCallWrongParamType(t *testing.T) {
+	t.Parallel()
+
+	result := ValidateToolCall(ToolCall{
+		Name:      "lookup",
+		Arguments: `{"query":123}`,
+	}, []ToolDefinition{testToolDefinition()})
+
+	if result.Valid {
+		t.Fatal("Valid = true; want false")
+	}
+	if result.Reason != `parameter "query" must be string` {
+		t.Fatalf("Reason = %q; want wrong parameter type rejection", result.Reason)
 	}
 }
 
@@ -142,6 +159,8 @@ func TestRunToolLoopRejectsInvalidToolCall(t *testing.T) {
 }
 
 func TestRunToolLoopSkipsValidationForTrustedProviders(t *testing.T) {
+	t.Parallel()
+
 	executed := 0
 	registry := &KernelToolRegistry{
 		cfg: &Config{
@@ -207,6 +226,58 @@ func TestRunToolLoopSkipsValidationForTrustedProviders(t *testing.T) {
 	}
 	if resp.Content != "tool completed" {
 		t.Fatalf("final content = %q; want tool completed", resp.Content)
+	}
+}
+
+func TestRunToolLoopTracksToolCallRejections(t *testing.T) {
+	providerName := "rejection-counter-provider"
+	toolCallRejectionsByProvider.Delete(providerName)
+	t.Cleanup(func() {
+		toolCallRejectionsByProvider.Delete(providerName)
+	})
+
+	registry := &KernelToolRegistry{
+		cfg: &Config{ToolCallValidationEnabled: true},
+	}
+	provider := &scriptedToolLoopProvider{
+		name: providerName,
+		caps: ProviderCapabilities{
+			Capabilities: []Capability{CapToolCallValidation},
+			IsLocal:      true,
+		},
+		responses: []*CompletionResponse{{
+			Content:    "retry succeeded",
+			StopReason: "end_turn",
+			ProviderMeta: ProviderMeta{
+				Provider: providerName,
+				Model:    "test",
+			},
+		}},
+	}
+
+	initial := &CompletionResponse{
+		ToolCalls: []ToolCall{{
+			ID:        "call-1",
+			Name:      "lookup",
+			Arguments: `{"query":"kernel"}`,
+		}},
+		StopReason: "tool_use",
+		ProviderMeta: ProviderMeta{
+			Provider: providerName,
+			Model:    "test",
+		},
+	}
+
+	if _, _, err := RunToolLoop(context.Background(), provider, &CompletionRequest{}, initial, registry); err != nil {
+		t.Fatalf("RunToolLoop: %v", err)
+	}
+
+	counter, ok := toolCallRejectionsByProvider.Load(providerName)
+	if !ok {
+		t.Fatalf("missing rejection counter for provider %q", providerName)
+	}
+	if got := counter.(*atomic.Int64).Load(); got != 1 {
+		t.Fatalf("rejection count = %d; want 1", got)
 	}
 }
 

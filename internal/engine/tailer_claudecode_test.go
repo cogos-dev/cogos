@@ -53,6 +53,38 @@ func TestClaudeCodeTailerNormalizesJSONL(t *testing.T) {
 	}
 }
 
+func TestNormalizeClaudeCodeLineToolUseKind(t *testing.T) {
+	t.Parallel()
+
+	block, err := normalizeClaudeCodeLine([]byte(`{"role":"assistant","content":"calling","tool_use":{"name":"shell"},"timestamp":"2026-01-02T03:04:06Z"}`))
+	if err != nil {
+		t.Fatalf("normalizeClaudeCodeLine: %v", err)
+	}
+	if block.Kind != BlockToolCall {
+		t.Fatalf("Kind = %q; want %q", block.Kind, BlockToolCall)
+	}
+}
+
+func TestNormalizeClaudeCodeLineToolResultKind(t *testing.T) {
+	t.Parallel()
+
+	block, err := normalizeClaudeCodeLine([]byte(`{"role":"tool","content":"ok","tool_result":{"status":"ok"},"timestamp":"2026-01-02T03:04:07Z"}`))
+	if err != nil {
+		t.Fatalf("normalizeClaudeCodeLine: %v", err)
+	}
+	if block.Kind != BlockToolResult {
+		t.Fatalf("Kind = %q; want %q", block.Kind, BlockToolResult)
+	}
+}
+
+func TestNormalizeClaudeCodeLineMalformedJSONReturnsError(t *testing.T) {
+	t.Parallel()
+
+	if _, err := normalizeClaudeCodeLine([]byte(`{"role":"assistant","content":"oops"`)); err == nil {
+		t.Fatal("normalizeClaudeCodeLine error = nil; want parse error")
+	}
+}
+
 func assertClaudeCodeBlock(t *testing.T, block CogBlock, kind CogBlockKind, role, content string) {
 	t.Helper()
 

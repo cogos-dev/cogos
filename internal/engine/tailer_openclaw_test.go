@@ -89,3 +89,81 @@ func TestOpenClawTailerTailsJSONLFile(t *testing.T) {
 		t.Fatal("tailer did not stop after cancellation")
 	}
 }
+
+func TestOpenClawTailerDirectoryModeDiscoversNewJSONLFiles(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	tailer := &OpenClawTailer{
+		Watcher:      NewFileWatcher(10 * time.Millisecond),
+		ScanInterval: 10 * time.Millisecond,
+	}
+
+	out := make(chan CogBlock, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- tailer.Tail(ctx, root, out)
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	logPath := filepath.Join(root, "new-session.jsonl")
+	line := `{"id":"evt-1","type":"message","role":"user","content":"hello","timestamp":"2026-01-02T03:04:05Z","session_id":"sess-1"}` + "\n"
+	if err := os.WriteFile(logPath, []byte(line), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	block := waitForBlock(t, out)
+	if block.Kind != BlockMessage {
+		t.Fatalf("Kind = %q; want %q", block.Kind, BlockMessage)
+	}
+	if block.SessionID != "sess-1" {
+		t.Fatalf("SessionID = %q; want %q", block.SessionID, "sess-1")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Tail returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tailer did not stop after cancellation")
+	}
+}
+
+func TestOpenClawTailerSkipsMalformedJSONLines(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	logPath := filepath.Join(root, "session.jsonl")
+	fixture := "" +
+		`{"id":"evt-bad","type":"message","role":"user","content":"unterminated"` + "\n" +
+		`{"id":"evt-good","type":"message","role":"user","content":"hello","timestamp":"2026-01-02T03:04:05Z","session_id":"sess-2"}` + "\n"
+	if err := os.WriteFile(logPath, []byte(fixture), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	tailer := &OpenClawTailer{Watcher: NewFileWatcher(10 * time.Millisecond)}
+	out := make(chan CogBlock, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- tailer.Tail(ctx, logPath, out)
+	}()
+
+	block := waitForBlock(t, out)
+	if block.ID != "evt-good" {
+		t.Fatalf("ID = %q; want evt-good", block.ID)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Tail returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tailer did not stop after cancellation")
+	}
+}

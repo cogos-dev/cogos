@@ -32,7 +32,14 @@ func TestNilBridgeEmitHeartbeatReturnsZeroReceipt(t *testing.T) {
 	t.Parallel()
 
 	bridge := NilBridge{}
-	receipt, err := bridge.EmitHeartbeat(KernelHeartbeatPayload{})
+	payload := KernelHeartbeatPayload{
+		ProcessState:         "dormant",
+		FieldSize:            42,
+		CoherenceFingerprint: "sha256:coherence",
+		NucleusFingerprint:   "sha256:nucleus",
+		LedgerHead:           "sha256:ledger",
+	}
+	receipt, err := bridge.EmitHeartbeat(payload)
 	if err != nil {
 		t.Fatalf("EmitHeartbeat returned error: %v", err)
 	}
