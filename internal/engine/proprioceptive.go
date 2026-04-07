@@ -20,6 +20,12 @@ import (
 // ProprioceptiveEntry is a single prediction-vs-reality log entry.
 type ProprioceptiveEntry struct {
 	Timestamp   string           `json:"timestamp"`
+	Event       string           `json:"event,omitempty"`
+	Provider    string           `json:"provider,omitempty"`
+	ToolName    string           `json:"tool_name,omitempty"`
+	ToolCallID  string           `json:"tool_call_id,omitempty"`
+	ToolArgs    string           `json:"tool_args,omitempty"`
+	Reason      string           `json:"reason,omitempty"`
 	Query       string           `json:"query"`
 	Predicted   []PredictedChunk `json:"predicted"`
 	Actual      []string         `json:"actual"`

@@ -17,6 +17,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -26,8 +29,10 @@ const maxToolLoopIterations = 10
 // KernelToolRegistry holds the kernel's tool definitions and executors.
 // Populated at startup from the MCP server's tool set.
 type KernelToolRegistry struct {
+	cfg         *Config
 	definitions []ToolDefinition
 	executors   map[string]toolExecutor
+	proprio     *ProprioceptiveLogger
 }
 
 // toolExecutor is a function that takes JSON arguments and returns a JSON result.
@@ -36,7 +41,11 @@ type toolExecutor func(ctx context.Context, arguments string) (string, error)
 // NewKernelToolRegistry builds the tool registry from the MCP server.
 func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 	reg := &KernelToolRegistry{
+		cfg:       mcpSrv.cfg,
 		executors: make(map[string]toolExecutor),
+	}
+	if mcpSrv.cfg != nil && mcpSrv.cfg.WorkspaceRoot != "" {
+		reg.proprio = NewProprioceptiveLogger(filepath.Join(mcpSrv.cfg.WorkspaceRoot, ".cog", "run", "proprioceptive.jsonl"))
 	}
 
 	// Register each tool with its schema and executor.
@@ -216,6 +225,85 @@ func (r *KernelToolRegistry) Definitions() []ToolDefinition {
 	return r.definitions
 }
 
+func toolCallValidationEnabled(provider Provider, cfg *Config) bool {
+	caps := provider.Capabilities()
+	if caps.HasCapability(CapToolUse) {
+		return false
+	}
+	if !caps.HasCapability(CapToolCallValidation) {
+		return false
+	}
+	if cfg == nil {
+		return true
+	}
+	return cfg.ToolCallValidationEnabled
+}
+
+func (r *KernelToolRegistry) logRejectedToolCall(providerName string, tc ToolCall, validation ToolCallValidationResult) {
+	if r == nil {
+		return
+	}
+	if r.proprio == nil && r.cfg != nil && r.cfg.WorkspaceRoot != "" {
+		r.proprio = NewProprioceptiveLogger(filepath.Join(r.cfg.WorkspaceRoot, ".cog", "run", "proprioceptive.jsonl"))
+	}
+	if r.proprio == nil {
+		return
+	}
+	r.proprio.Log(ProprioceptiveEntry{
+		Event:       "tool_call_rejected",
+		Provider:    providerName,
+		ToolName:    tc.Name,
+		ToolCallID:  tc.ID,
+		ToolArgs:    truncateString(tc.Arguments, 500),
+		Reason:      validation.Reason,
+		Query:       fmt.Sprintf("tool_call:%s", tc.Name),
+		ResponseLen: len(tc.Arguments),
+	})
+}
+
+// ToolCallValidationResult describes whether a model-emitted tool call is safe to run.
+type ToolCallValidationResult struct {
+	Valid    bool
+	Reason   string
+	ToolName string
+}
+
+// ValidateToolCall verifies that the model requested a known tool with arguments
+// that match the registered input schema.
+func ValidateToolCall(tc ToolCall, toolDefs []ToolDefinition) ToolCallValidationResult {
+	result := ToolCallValidationResult{
+		ToolName: tc.Name,
+	}
+
+	def, ok := lookupToolDefinition(toolDefs, tc.Name)
+	if !ok {
+		result.Reason = fmt.Sprintf("unknown tool %q", tc.Name)
+		return result
+	}
+
+	args := map[string]interface{}{}
+	raw := strings.TrimSpace(tc.Arguments)
+	if raw != "" && raw != "{}" {
+		if err := json.Unmarshal([]byte(raw), &args); err != nil {
+			result.Reason = fmt.Sprintf("invalid JSON arguments: %v", err)
+			return result
+		}
+	}
+
+	if hasEmbeddedResult(args) {
+		result.Reason = "embedded result field is not allowed in tool arguments"
+		return result
+	}
+
+	if reason := validateObjectAgainstSchema(args, def.InputSchema, ""); reason != "" {
+		result.Reason = reason
+		return result
+	}
+
+	result.Valid = true
+	return result
+}
+
 // RunToolLoop executes the kernel tool loop.
 // Given a CompletionResponse with tool_calls, it:
 // 1. Separates kernel tools from client tools
@@ -241,10 +329,73 @@ func RunToolLoop(
 			return resp, clientToolCalls, nil
 		}
 
+		// Add the assistant message with tool calls to the conversation.
+		assistantMsg := ProviderMessage{
+			Role:      "assistant",
+			ToolCalls: resp.ToolCalls,
+		}
+		if resp.Content != "" {
+			assistantMsg.Content = resp.Content
+		}
+		req.Messages = append(req.Messages, assistantMsg)
+
+		var cfg *Config
+		if registry != nil {
+			cfg = registry.cfg
+		}
+		if toolCallValidationEnabled(provider, cfg) {
+			toolDefs := make([]ToolDefinition, 0, len(req.Tools))
+			toolDefs = append(toolDefs, req.Tools...)
+			if registry != nil {
+				toolDefs = append(toolDefs, registry.Definitions()...)
+			}
+
+			var rejected []ToolCallValidationResult
+			for _, tc := range resp.ToolCalls {
+				validation := ValidateToolCall(tc, toolDefs)
+				if validation.Valid {
+					continue
+				}
+
+				rejected = append(rejected, validation)
+				recordToolCallRejection(provider.Name())
+				if registry != nil {
+					registry.logRejectedToolCall(provider.Name(), tc, validation)
+				}
+				slog.Warn("tool_loop: rejected tool call",
+					"provider", provider.Name(),
+					"tool", tc.Name,
+					"reason", validation.Reason,
+					"iteration", i+1,
+				)
+			}
+
+			if len(rejected) > 0 {
+				req.Messages = append(req.Messages, ProviderMessage{
+					Role:    "system",
+					Content: fmt.Sprintf("Tool call rejected: %s. Please try again with valid parameters.", rejected[0].Reason),
+				})
+
+				var err error
+				resp, err = provider.Complete(ctx, req)
+				if err != nil {
+					return nil, clientToolCalls, fmt.Errorf("tool_loop re-call after rejection: %w", err)
+				}
+
+				slog.Info("tool_loop: provider re-called after tool rejection",
+					"iteration", i+1,
+					"rejected", len(rejected),
+					"tool_calls", len(resp.ToolCalls),
+					"has_content", resp.Content != "",
+				)
+				continue
+			}
+		}
+
 		// Separate kernel vs client tool calls.
 		var kernelCalls []ToolCall
 		for _, tc := range resp.ToolCalls {
-			if registry.IsKernelTool(tc.Name) {
+			if registry != nil && registry.IsKernelTool(tc.Name) {
 				kernelCalls = append(kernelCalls, tc)
 			} else {
 				clientToolCalls = append(clientToolCalls, tc)
@@ -255,16 +406,6 @@ func RunToolLoop(
 		if len(kernelCalls) == 0 {
 			return resp, clientToolCalls, nil
 		}
-
-		// Add the assistant message with tool calls to the conversation.
-		assistantMsg := ProviderMessage{
-			Role:      "assistant",
-			ToolCalls: resp.ToolCalls,
-		}
-		if resp.Content != "" {
-			assistantMsg.Content = resp.Content
-		}
-		req.Messages = append(req.Messages, assistantMsg)
 
 		// Execute kernel tools and add results.
 		for _, tc := range kernelCalls {
@@ -411,5 +552,159 @@ func makeExecutor[In any](mcpSrv *MCPServer, handler func(context.Context, *mcp.
 			}
 		}
 		return "{}", nil
+	}
+}
+
+func lookupToolDefinition(toolDefs []ToolDefinition, name string) (ToolDefinition, bool) {
+	for i := len(toolDefs) - 1; i >= 0; i-- {
+		if toolDefs[i].Name == name {
+			return toolDefs[i], true
+		}
+	}
+	return ToolDefinition{}, false
+}
+
+func hasEmbeddedResult(args map[string]interface{}) bool {
+	for name := range args {
+		if strings.EqualFold(name, "result") {
+			return true
+		}
+	}
+	return false
+}
+
+func validateObjectAgainstSchema(args map[string]interface{}, schema map[string]interface{}, path string) string {
+	if len(schema) == 0 {
+		return ""
+	}
+
+	for _, required := range schemaStringSlice(schema["required"]) {
+		if _, ok := args[required]; !ok {
+			if path == "" {
+				return fmt.Sprintf("missing required parameter %q", required)
+			}
+			return fmt.Sprintf("missing required parameter %q in %s", required, path)
+		}
+	}
+
+	props, _ := schema["properties"].(map[string]interface{})
+	for name, value := range args {
+		propSchema, ok := props[name].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fieldPath := name
+		if path != "" {
+			fieldPath = path + "." + name
+		}
+		if reason := validateValueAgainstSchema(value, propSchema, fieldPath); reason != "" {
+			return reason
+		}
+	}
+
+	return ""
+}
+
+func validateValueAgainstSchema(value interface{}, schema map[string]interface{}, path string) string {
+	if len(schema) == 0 {
+		return ""
+	}
+
+	typeName := schemaType(schema)
+	if typeName == "" {
+		if props, ok := schema["properties"].(map[string]interface{}); ok && len(props) > 0 {
+			typeName = "object"
+		}
+	}
+
+	switch typeName {
+	case "":
+		return ""
+	case "string":
+		if _, ok := value.(string); !ok {
+			return fmt.Sprintf("parameter %q must be string", path)
+		}
+	case "integer", "int":
+		if !isJSONInteger(value) {
+			return fmt.Sprintf("parameter %q must be integer", path)
+		}
+	case "number":
+		if !isJSONNumber(value) {
+			return fmt.Sprintf("parameter %q must be number", path)
+		}
+	case "boolean", "bool":
+		if _, ok := value.(bool); !ok {
+			return fmt.Sprintf("parameter %q must be boolean", path)
+		}
+	case "array":
+		items, ok := value.([]interface{})
+		if !ok {
+			return fmt.Sprintf("parameter %q must be array", path)
+		}
+		itemSchema, _ := schema["items"].(map[string]interface{})
+		for i, item := range items {
+			if reason := validateValueAgainstSchema(item, itemSchema, fmt.Sprintf("%s[%d]", path, i)); reason != "" {
+				return reason
+			}
+		}
+	case "object":
+		obj, ok := value.(map[string]interface{})
+		if !ok {
+			return fmt.Sprintf("parameter %q must be object", path)
+		}
+		return validateObjectAgainstSchema(obj, schema, path)
+	}
+
+	return ""
+}
+
+func schemaType(schema map[string]interface{}) string {
+	if raw, ok := schema["type"].(string); ok {
+		return raw
+	}
+	return ""
+}
+
+func schemaStringSlice(raw interface{}) []string {
+	switch v := raw.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func isJSONNumber(value interface{}) bool {
+	switch n := value.(type) {
+	case float64:
+		return true
+	case json.Number:
+		_, err := n.Float64()
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func isJSONInteger(value interface{}) bool {
+	switch n := value.(type) {
+	case float64:
+		return n == float64(int64(n))
+	case json.Number:
+		if _, err := n.Int64(); err == nil {
+			return true
+		}
+		f, err := strconv.ParseFloat(n.String(), 64)
+		return err == nil && f == float64(int64(f))
+	default:
+		return false
 	}
 }

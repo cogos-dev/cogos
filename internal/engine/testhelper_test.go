@@ -58,12 +58,13 @@ func makeWorkspace(t *testing.T) string {
 func makeConfig(t *testing.T, root string) *Config {
 	t.Helper()
 	return &Config{
-		WorkspaceRoot:         root,
-		CogDir:                filepath.Join(root, ".cog"),
-		Port:                  0,
-		ConsolidationInterval: 99999,
-		HeartbeatInterval:     99999,
-		SalienceDaysWindow:    90,
+		WorkspaceRoot:             root,
+		CogDir:                    filepath.Join(root, ".cog"),
+		Port:                      0,
+		ConsolidationInterval:     99999,
+		HeartbeatInterval:         99999,
+		SalienceDaysWindow:        90,
+		ToolCallValidationEnabled: true,
 	}
 }
 
