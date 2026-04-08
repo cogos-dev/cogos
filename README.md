@@ -91,6 +91,7 @@ CogOS is not a monolith. It's a cell. Each subsystem is its own repo, its own re
 | [research](https://github.com/cogos-dev/research) | **KNOWS** | Theory — EA/EFM thesis, LoRO framework, cognitive architecture papers |
 | [charts](https://github.com/cogos-dev/charts) | **DEPLOYS** | Helm charts + Docker Compose for single-node through multi-node topologies |
 | [desktop](https://github.com/cogos-dev/desktop) | **USE** | Native macOS app — kernel management, terminal, dashboard |
+| [openclaw-plugin](https://github.com/cogos-dev/openclaw-plugin) | **CONNECTS** | OpenClaw integration — iris-driven foveated context injection |
 
 Each organelle is independently deployable. They coordinate through the substrate, not through imports. The workspace discovers available organelles at runtime through capability scanning — like a cell discovering what enzymes are available in the cytoplasm.
 
@@ -100,7 +101,7 @@ Each organelle is independently deployable. They coordinate through the substrat
 
 Every other approach says "make the model smarter." CogOS says: make the environment more structured so that any intelligence — human or machine — can operate more effectively within it. The substrate provides two things models do poorly:
 
-**Externalized Attention** — deciding what information is relevant *before* the model sees it. The foveated context engine, TRM (a [Tiny Recursive Model](https://arxiv.org/abs/2510.04871) implemented as a Mamba SSM for temporal context scoring), salience scoring, and zone ordering ensure the model never attends to irrelevant information.
+**Externalized Attention** — deciding what information is relevant *before* the model sees it. The foveated context engine, TRM (a [Tiny Recursive Model](https://arxiv.org/abs/2510.04871) implemented as a Mamba SSM (Selective State Space Model) for temporal context scoring), salience scoring, and zone ordering ensure the model never attends to irrelevant information.
 
 **Executive Function Modulation** — deciding how the model should behave *before* it generates. The process state machine, sovereignty gradient, tool-call validation gate, and consolidation policy shape behavior through conditioning signals, not English prompts.
 
