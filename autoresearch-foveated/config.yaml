@@ -1,0 +1,34 @@
+# Foveated Context Engine — Experiment Configuration
+# This is the ONLY file modified by the experiment loop.
+
+# Zone budget allocation (fraction of total budget per zone)
+zone_budgets:
+  nucleus: 0.15
+  knowledge: 0.40
+  history: 0.30
+  current: 0.15
+
+# Salience scoring weights
+salience:
+  recency_weight: 0.4
+  frequency_weight: 0.3
+  churn_weight: 0.3
+  decay_half_life: 3600
+
+# TRM integration
+trm:
+  enabled: true
+  score_weight: 0.6
+  min_score_threshold: 0.1
+
+# Iris pressure response
+iris:
+  pressure_curve: "linear"
+  max_budget_fraction: 0.8
+  min_budget_tokens: 500
+
+# Anchor extraction
+anchor:
+  method: "keyword"
+  max_keywords: 5
+  boost_factor: 2.0

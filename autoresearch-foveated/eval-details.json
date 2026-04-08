@@ -1,0 +1,1252 @@
+[
+  {
+    "question_id": "ws-01",
+    "condition": "A",
+    "score": 0.25,
+    "elapsed": 5.3,
+    "response_preview": "Based on the architectural design of the **CogOS** kernel (a specialized microkernel architecture often used in academic or research-oriented operating system studies), the four process states are:\n\n1",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "process.go",
+      "config.go"
+    ]
+  },
+  {
+    "question_id": "ws-01",
+    "condition": "B",
+    "score": 0.25,
+    "elapsed": 10.6,
+    "response_preview": "Based on the architecture of the **CogOS** kernel (a specialized microkernel design often used in academic or research contexts for studying operating system principles), the four process states are:\n",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "process.go",
+      "config.go"
+    ]
+  },
+  {
+    "question_id": "ws-01",
+    "condition": "C",
+    "score": 0.25,
+    "elapsed": 5.0,
+    "response_preview": "In the CogOS kernel, processes transition through four primary states during their lifecycle. These states are managed by the scheduler to optimize CPU utilization and handle I/O operations efficientl",
+    "meta": {
+      "tokens": 138,
+      "anchor": "four process states",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "56b013e2",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: four process states\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "bd926ed9",
+          "tokens": 18,
+          "stability": 40,
+          "preview": "Goal: understand: What are the four process states in the CogOS kernel?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 58
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "process.go",
+      "config.go"
+    ]
+  },
+  {
+    "question_id": "ws-02",
+    "condition": "A",
+    "score": 0.0,
+    "elapsed": 3.2,
+    "response_preview": "There is no widely recognized operating system or kernel in the public domain or mainstream computing industry known as **\"CogOS.\"**\n\nBecause of this, there is no standard or \"default\" port associated",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "config.go",
+      "cli.go"
+    ]
+  },
+  {
+    "question_id": "ws-02",
+    "condition": "B",
+    "score": 0.0,
+    "elapsed": 10.6,
+    "response_preview": "There is no widely recognized operating system or kernel in the public domain or mainstream computing industry known as **\"CogOS.\"**\n\nBecause of this, there is no standard or \"default\" port associated",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "config.go",
+      "cli.go"
+    ]
+  },
+  {
+    "question_id": "ws-02",
+    "condition": "C",
+    "score": 0.0,
+    "elapsed": 2.7,
+    "response_preview": "Based on the available information, there is no specific documentation provided in the current context regarding a \"default port\" for the CogOS kernel.\n\nIn general networking and kernel development, \"",
+    "meta": {
+      "tokens": 136,
+      "anchor": "default port cogos",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "3506f160",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: default port cogos\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "b527e897",
+          "tokens": 17,
+          "stability": 40,
+          "preview": "Goal: understand: What is the default port for the CogOS kernel?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 56
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "config.go",
+      "cli.go"
+    ]
+  },
+  {
+    "question_id": "ws-03",
+    "condition": "A",
+    "score": 0.0,
+    "elapsed": 5.3,
+    "response_preview": "To provide an accurate answer, I need to know which specific **TRM (Technical Reference Manual)** you are referring to.\n\nThe term \"D_STATE\" is a common variable name used in various hardware architect",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "trm_context.go",
+      "program.md"
+    ]
+  },
+  {
+    "question_id": "ws-03",
+    "condition": "B",
+    "score": 0.0,
+    "elapsed": 10.6,
+    "response_preview": "To provide an accurate answer, I need to know which specific **TRM (Technical Reference Manual)** you are referring to.\n\nThe term `D_STATE` (or `d_state`) is a common variable name used in various emb",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "trm_context.go",
+      "program.md"
+    ]
+  },
+  {
+    "question_id": "ws-03",
+    "condition": "C",
+    "score": 0.0,
+    "elapsed": 5.9,
+    "response_preview": "To provide an accurate answer, I need to know which specific **TRM (Technical Reference Manual)** or system you are referring to.\n\nThe term `D_STATE` (often standing for \"Data State,\" \"Device State,\" ",
+    "meta": {
+      "tokens": 132,
+      "anchor": "trm d_state value",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "a169a93a",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: trm d_state value\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "547085c3",
+          "tokens": 13,
+          "stability": 40,
+          "preview": "Goal: understand: What is the TRM's D_STATE value?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 52
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "trm_context.go",
+      "program.md"
+    ]
+  },
+  {
+    "question_id": "ws-04",
+    "condition": "A",
+    "score": 0.0,
+    "elapsed": 5.3,
+    "response_preview": "The **Foveated Context Engine** (often discussed in the context of advanced eye-tracking and foveated rendering technologies used in VR/AR) typically divides the visual field into four distinct zones ",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "context_assembly.go",
+      "serve_foveated.go"
+    ]
+  },
+  {
+    "question_id": "ws-04",
+    "condition": "B",
+    "score": 0.0,
+    "elapsed": 10.6,
+    "response_preview": "The **Foveated Context Engine** (often discussed in the context of advanced eye-tracking and foveated rendering technologies used in VR/AR) typically divides the visual field into four distinct zones ",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "context_assembly.go",
+      "serve_foveated.go"
+    ]
+  },
+  {
+    "question_id": "ws-04",
+    "condition": "C",
+    "score": 0.25,
+    "elapsed": 5.9,
+    "response_preview": "The foveated context engine (CogOS foveated) utilizes a hierarchical structure of four distinct zones to manage information density and processing priority. These zones are organized based on their pr",
+    "meta": {
+      "tokens": 138,
+      "anchor": "four zones foveated",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "deabcb19",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: four zones foveated\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "0fe3adff",
+          "tokens": 18,
+          "stability": 40,
+          "preview": "Goal: understand: What four zones does the foveated context engine use?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 58
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "context_assembly.go",
+      "serve_foveated.go"
+    ]
+  },
+  {
+    "question_id": "ws-05",
+    "condition": "A",
+    "score": 0.5,
+    "elapsed": 4.8,
+    "response_preview": "Based on the technical documentation for the **CogOS** (the operating system/ledger framework used by the Cog ecosystem), the ledger utilizes the **SHA-256** (Secure Hash Algorithm 256-bit) hashing al",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "ledger.go"
+    ]
+  },
+  {
+    "question_id": "ws-05",
+    "condition": "B",
+    "score": 0.5,
+    "elapsed": 9.9,
+    "response_preview": "Based on the technical documentation for the **CogOS** (the operating system/ledger framework used by the Cog ecosystem), the ledger utilizes the **SHA-256** (Secure Hash Algorithm 256-bit) hashing al",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "ledger.go"
+    ]
+  },
+  {
+    "question_id": "ws-05",
+    "condition": "C",
+    "score": 0.5,
+    "elapsed": 3.4,
+    "response_preview": "Based on the current technical specifications for the CogOS architecture, the CogOS ledger utilizes the **SHA-256** (Secure Hash Algorithm 256-bit) algorithm.\n\nThis choice is standard for high-integri",
+    "meta": {
+      "tokens": 137,
+      "anchor": "hash algorithm cogos",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "e1c6c02c",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: hash algorithm cogos\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "bb3d47b1",
+          "tokens": 17,
+          "stability": 40,
+          "preview": "Goal: understand: What hash algorithm does the CogOS ledger use?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 57
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "ledger.go"
+    ]
+  },
+  {
+    "question_id": "ws-06",
+    "condition": "A",
+    "score": 0.0,
+    "elapsed": 5.3,
+    "response_preview": "Based on the current documentation and technical specifications for **CogOS** (the operating system designed for the Cog ecosystem), there is **no single \"default\" local model** hardcoded into the OS ",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "config.go"
+    ]
+  },
+  {
+    "question_id": "ws-06",
+    "condition": "B",
+    "score": 0.0,
+    "elapsed": 10.6,
+    "response_preview": "Based on the current technical documentation and available information regarding **CogOS** (the operating system designed for the Cog ecosystem), there is **no single \"default\" local model** hardcoded",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "config.go"
+    ]
+  },
+  {
+    "question_id": "ws-06",
+    "condition": "C",
+    "score": 0.0,
+    "elapsed": 1.8,
+    "response_preview": "Based on the current context provided, the default local model in CogOS is simply referred to as the **default local model**. \n\nNo specific architecture name (such as Llama, Mistral, or a proprietary ",
+    "meta": {
+      "tokens": 135,
+      "anchor": "default local model",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "2e166576",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: default local model\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "3c4d4db9",
+          "tokens": 15,
+          "stability": 40,
+          "preview": "Goal: understand: What is the default local model in CogOS?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 55
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "config.go"
+    ]
+  },
+  {
+    "question_id": "ws-07",
+    "condition": "A",
+    "score": 1.0,
+    "elapsed": 5.3,
+    "response_preview": "To answer this accurately, it is important to clarify that \"TRM\" usually refers to the **Transformer** architecture. Because the Transformer is a foundational architecture rather than a single specifi",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "results.tsv",
+      "program.md"
+    ]
+  },
+  {
+    "question_id": "ws-07",
+    "condition": "B",
+    "score": 0.0,
+    "elapsed": 10.6,
+    "response_preview": "To answer this accurately, it is important to clarify that \"TRM\" (Transformer Model) is a generic architecture class rather than a single specific model. Because the Transformer architecture is used i",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "results.tsv",
+      "program.md"
+    ]
+  },
+  {
+    "question_id": "ws-07",
+    "condition": "C",
+    "score": 1.0,
+    "elapsed": 5.6,
+    "response_preview": "Based on the standard architecture of the Transformer (TRM) models, the number of attention heads depends on the specific model size being referenced (e.g., Base, Large, or XL).\n\nHowever, if you are r",
+    "meta": {
+      "tokens": 139,
+      "anchor": "many attention heads",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "c480eb88",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: many attention heads\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "cf7a2325",
+          "tokens": 19,
+          "stability": 40,
+          "preview": "Goal: understand: How many attention heads does the TRM's best config use?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 59
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "results.tsv",
+      "program.md"
+    ]
+  },
+  {
+    "question_id": "ws-08",
+    "condition": "A",
+    "score": 0.0,
+    "elapsed": 5.3,
+    "response_preview": "The term **\"sovereignty gradient\"** is most commonly used in the fields of **political science, international relations, and legal theory**. It refers to the measurement of how much independent author",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "router.go"
+    ]
+  },
+  {
+    "question_id": "ws-08",
+    "condition": "B",
+    "score": 0.25,
+    "elapsed": 10.6,
+    "response_preview": "The term **\"sovereignty gradient\"** is most commonly used in the fields of **political science, international relations, and legal theory**. It refers to the measurement of the degree of autonomy, aut",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "router.go"
+    ]
+  },
+  {
+    "question_id": "ws-08",
+    "condition": "C",
+    "score": 0.0,
+    "elapsed": 5.9,
+    "response_preview": "In the context of political science, legal theory, and geopolitical analysis, a **sovereignty gradient** determines the **distribution and intensity of authority** across a given space or between diff",
+    "meta": {
+      "tokens": 139,
+      "anchor": "sovereignty gradient determine",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "c33db995",
+          "tokens": 10,
+          "stability": 40,
+          "preview": "Topic: sovereignty gradient determine\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "42e80256",
+          "tokens": 16,
+          "stability": 40,
+          "preview": "Goal: understand: What does the sovereignty gradient determine?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 59
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "router.go"
+    ]
+  },
+  {
+    "question_id": "ws-09",
+    "condition": "A",
+    "score": 0.3333333333333333,
+    "elapsed": 5.3,
+    "response_preview": "Because \"ConstellationBridge\" is not a single, universally standardized piece of software (like \"Windows\" or \"Python\"), its meaning depends entirely on the specific technical context in which you enco",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "constellation_bridge.go"
+    ]
+  },
+  {
+    "question_id": "ws-09",
+    "condition": "B",
+    "score": 0.3333333333333333,
+    "elapsed": 10.6,
+    "response_preview": "Because \"ConstellationBridge\" is not a single, universally standardized term in computing, its meaning depends entirely on the specific technical context in which you encountered it.\n\nHere are the thr",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "constellation_bridge.go"
+    ]
+  },
+  {
+    "question_id": "ws-09",
+    "condition": "C",
+    "score": 0.3333333333333333,
+    "elapsed": 5.6,
+    "response_preview": "Based on the context provided, **ConstellationBridge** is a specialized component or interface used within the **CogOS** ecosystem to facilitate communication or data transfer between different layers",
+    "meta": {
+      "tokens": 136,
+      "anchor": "constellationbridge used",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "04898409",
+          "tokens": 8,
+          "stability": 40,
+          "preview": "Topic: constellationbridge used\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "3e408651",
+          "tokens": 15,
+          "stability": 40,
+          "preview": "Goal: understand: What is the ConstellationBridge used for?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 56
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "constellation_bridge.go"
+    ]
+  },
+  {
+    "question_id": "ws-10",
+    "condition": "A",
+    "score": 0.6666666666666666,
+    "elapsed": 4.4,
+    "response_preview": "Based on the technical architecture of **LoRO** (Low-Rank Re-parameterization), the method unifies the following three mechanisms:\n\n1.  **LoRA (Low-Rank Adaptation):** The core mechanism of using low-",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "ple-lora-trm-convergence.cog.md",
+      "framework.md"
+    ]
+  },
+  {
+    "question_id": "ws-10",
+    "condition": "B",
+    "score": 0.3333333333333333,
+    "elapsed": 9.8,
+    "response_preview": "Based on the technical architecture of **LoRO** (Low-Rank Re-parameterization), the method unifies the following three mechanisms:\n\n1.  **LoRA (Low-Rank Adaptation):** The core mechanism of using low-",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "ple-lora-trm-convergence.cog.md",
+      "framework.md"
+    ]
+  },
+  {
+    "question_id": "ws-10",
+    "condition": "C",
+    "score": 0.3333333333333333,
+    "elapsed": 3.0,
+    "response_preview": "LoRO (Low-Rank Reconstruction Optimization) unifies the following three mechanisms:\n\n1.  **Low-Rank Adaptation (LoRA):** The use of low-rank matrices to parameterize updates.\n2.  **Reconstruction-base",
+    "meta": {
+      "tokens": 135,
+      "anchor": "three mechanisms loro",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "1f4b6868",
+          "tokens": 8,
+          "stability": 40,
+          "preview": "Topic: three mechanisms loro\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "90484e06",
+          "tokens": 15,
+          "stability": 40,
+          "preview": "Goal: understand: What three mechanisms does LoRO unify?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 55
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "ple-lora-trm-convergence.cog.md",
+      "framework.md"
+    ]
+  },
+  {
+    "question_id": "ws-11",
+    "condition": "A",
+    "score": 0.0,
+    "elapsed": 5.3,
+    "response_preview": "The **CogOS TRM** (Task-based Resource Management) was primarily inspired by the paper **\"The Design of a Task-Based Operating System\"** (often associated with the development of the **CogOS** archite",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "trm-paper-details.md",
+      "thesis.md"
+    ]
+  },
+  {
+    "question_id": "ws-11",
+    "condition": "B",
+    "score": 0.0,
+    "elapsed": 13.6,
+    "response_preview": "Based on the provided documents, there is no explicit mention of a paper that inspired the \"CogOS TRM.\"\n\nThe available records contain information regarding:\n*   **\"Self-Referential Closure: The Topol",
+    "meta": {
+      "rag_context_chars": 8335
+    },
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "trm-paper-details.md",
+      "thesis.md"
+    ]
+  },
+  {
+    "question_id": "ws-11",
+    "condition": "C",
+    "score": 0.0,
+    "elapsed": 2.5,
+    "response_preview": "The CogOS **Task-Resource Model (TRM)** was inspired by the paper **\"A Theory of Cognitive Control\"** by **Shenhav, Botvinick, and Cohen (2013)**.\n\nThe TRM adapts the core principles of this theory\u2014sp",
+    "meta": {
+      "tokens": 134,
+      "anchor": "paper inspired cogos",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "3046fda7",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: paper inspired cogos\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "a2b15c32",
+          "tokens": 14,
+          "stability": 40,
+          "preview": "Goal: understand: What paper inspired the CogOS TRM?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 54
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "trm-paper-details.md",
+      "thesis.md"
+    ]
+  },
+  {
+    "question_id": "ws-12",
+    "condition": "A",
+    "score": 0.5,
+    "elapsed": 5.3,
+    "response_preview": "Foveated rendering is driven by two primary signals: **eye position (gaze direction)** and **eye movement (saccades/fixations).**\n\nTo achieve high-performance foveated rendering, a system must process",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "serve_foveated.go",
+      "context_assembly.go"
+    ]
+  },
+  {
+    "question_id": "ws-12",
+    "condition": "B",
+    "score": 0.75,
+    "elapsed": 10.6,
+    "response_preview": "Foveated rendering is driven by two primary signals: **eye position (gaze direction)** and **foveal eccentricity (visual acuity/resolution requirements).**\n\nIn a more technical sense, these can be bro",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "serve_foveated.go",
+      "context_assembly.go"
+    ]
+  },
+  {
+    "question_id": "ws-12",
+    "condition": "C",
+    "score": 0.5,
+    "elapsed": 5.1,
+    "response_preview": "Foveated rendering is driven by two primary signals that work together to determine where high-resolution detail is needed and where it can be reduced:\n\n1.  **Eye Tracking (Gaze Position):** This sign",
+    "meta": {
+      "tokens": 135,
+      "anchor": "two signals drive",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "39083652",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: two signals drive\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "2d7c5fe2",
+          "tokens": 16,
+          "stability": 40,
+          "preview": "Goal: understand: What two signals drive foveated rendering?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 55
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "serve_foveated.go",
+      "context_assembly.go"
+    ]
+  },
+  {
+    "question_id": "ws-13",
+    "condition": "A",
+    "score": 0.0,
+    "elapsed": 1.4,
+    "response_preview": "The EA/EFM (Effective Altruism/Effective Fundraising Management) thesis posits that by applying rigorous scientific methods, data-driven decision-making, and cost-benefit analysis to philanthropy, don",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "externalized-executive-function-thesis.cog.md",
+      "thesis.md"
+    ]
+  },
+  {
+    "question_id": "ws-13",
+    "condition": "B",
+    "score": 0.0,
+    "elapsed": 6.7,
+    "response_preview": "The EA/EFM (Effective Altruism/Effective Fundraising Management) thesis posits that by applying rigorous scientific methods, data-driven decision-making, and cost-benefit analysis to philanthropy, don",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "externalized-executive-function-thesis.cog.md",
+      "thesis.md"
+    ]
+  },
+  {
+    "question_id": "ws-13",
+    "condition": "C",
+    "score": 0.0,
+    "elapsed": 1.9,
+    "response_preview": "The EA/EFM (Effective Altruism / Effective Flourishing Model) thesis posits that by applying rigorous, evidence-based reasoning to identify the most impactful interventions, individuals can maximize t",
+    "meta": {
+      "tokens": 134,
+      "anchor": "efm thesis one",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "019ae637",
+          "tokens": 6,
+          "stability": 40,
+          "preview": "Topic: efm thesis one\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "a0f9ef46",
+          "tokens": 16,
+          "stability": 40,
+          "preview": "Goal: understand: What is the EA/EFM thesis in one sentence?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 54
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "externalized-executive-function-thesis.cog.md",
+      "thesis.md"
+    ]
+  },
+  {
+    "question_id": "ws-14",
+    "condition": "A",
+    "score": 0.25,
+    "elapsed": 5.3,
+    "response_preview": "The term **\"Tool-Call Hallucination Gate\"** refers to a specific architectural pattern used in LLM agent design to prevent a model from attempting to use a tool with incorrect, non-existent, or malfor",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "tool_loop.go"
+    ]
+  },
+  {
+    "question_id": "ws-14",
+    "condition": "B",
+    "score": 0.25,
+    "elapsed": 10.6,
+    "response_preview": "The term **\"Tool-Call Hallucination Gate\"** refers to a specific architectural pattern used in LLM agent design to prevent a model from attempting to use a tool with incorrect, non-existent, or malfor",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "tool_loop.go"
+    ]
+  },
+  {
+    "question_id": "ws-14",
+    "condition": "C",
+    "score": 0.25,
+    "elapsed": 5.9,
+    "response_preview": "The **tool-call hallucination gate** is a defensive architectural layer designed to prevent an LLM from attempting to execute \"hallucinated\" tool calls\u2014instances where the model generates a function n",
+    "meta": {
+      "tokens": 139,
+      "anchor": "tool-call hallucination gate",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "7789358d",
+          "tokens": 9,
+          "stability": 40,
+          "preview": "Topic: tool-call hallucination gate\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "dc8db07b",
+          "tokens": 17,
+          "stability": 40,
+          "preview": "Goal: understand: How does the tool-call hallucination gate work?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 59
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "tool_loop.go"
+    ]
+  },
+  {
+    "question_id": "ws-15",
+    "condition": "A",
+    "score": 0.5,
+    "elapsed": 5.3,
+    "response_preview": "In the context of **MOD3** (which typically refers to the **Modular 3** architecture used in certain embedded systems, FPGA-based SoC designs, or specific industrial automation frameworks), the **Moda",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "bus.py",
+      "modality.py",
+      "ARCHITECTURE.md"
+    ]
+  },
+  {
+    "question_id": "ws-15",
+    "condition": "B",
+    "score": 0.5,
+    "elapsed": 10.6,
+    "response_preview": "In the context of **MOD3** (which typically refers to the **Modular 3** architecture used in certain embedded systems, automotive ECUs, or specific industrial control frameworks), the **Modality Bus**",
+    "meta": {},
+    "context_ndcg": null,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "bus.py",
+      "modality.py",
+      "ARCHITECTURE.md"
+    ]
+  },
+  {
+    "question_id": "ws-15",
+    "condition": "C",
+    "score": 0.5,
+    "elapsed": 5.9,
+    "response_preview": "In the context of **mod3** (specifically within the architecture of the **CogOS** or related neuromorphic/cognitive computing frameworks), the **modality bus** is a specialized communication backbone ",
+    "meta": {
+      "tokens": 133,
+      "anchor": "modality bus mod3",
+      "blocks": [
+        {
+          "tier": "tier4",
+          "name": "knowledge",
+          "hash": "fd681f01",
+          "tokens": 32,
+          "stability": 50,
+          "preview": "# Relevant Knowledge (Constellation)\n\nThe following documents from the workspace knowledge graph are relevant to your query:\n\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "temporal-context",
+          "hash": "000603ab",
+          "tokens": 5,
+          "stability": 40,
+          "preview": "# Temporal Context\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "current-focus",
+          "hash": "f130d48d",
+          "tokens": 7,
+          "stability": 40,
+          "preview": "Topic: modality bus mod3\n"
+        },
+        {
+          "tier": "tier2",
+          "name": "user-intent",
+          "hash": "80a63386",
+          "tokens": 13,
+          "stability": 40,
+          "preview": "Goal: understand: What is the modality bus in mod3?\n"
+        }
+      ],
+      "tier_breakdown": {
+        "tier2": 80,
+        "tier4": 53
+      },
+      "iris_pressure": 0.0390625
+    },
+    "context_ndcg": 0.0,
+    "assembled_sources": [],
+    "ideal_sources": [
+      "bus.py",
+      "modality.py",
+      "ARCHITECTURE.md"
+    ]
+  }
+]
