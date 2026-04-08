@@ -100,7 +100,7 @@ Each organelle is independently deployable. They coordinate through the substrat
 
 Every other approach says "make the model smarter." CogOS says: make the environment more structured so that any intelligence — human or machine — can operate more effectively within it. The substrate provides two things models do poorly:
 
-**Externalized Attention** — deciding what information is relevant *before* the model sees it. The foveated context engine, TRM, salience scoring, and zone ordering ensure the model never attends to irrelevant information.
+**Externalized Attention** — deciding what information is relevant *before* the model sees it. The foveated context engine, TRM (Tiny Recursive Model — a Mamba-based scoring network), salience scoring, and zone ordering ensure the model never attends to irrelevant information.
 
 **Executive Function Modulation** — deciding how the model should behave *before* it generates. The process state machine, sovereignty gradient, tool-call validation gate, and consolidation policy shape behavior through conditioning signals, not English prompts.
 
