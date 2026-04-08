@@ -86,9 +86,11 @@ CogOS is not a monolith. It's a cell. Each subsystem is its own repo, its own re
 |------|------|-------------|
 | [cogos](https://github.com/cogos-dev/cogos) | **IS** | The cell — nucleus, substrate, membrane as a continuous process daemon |
 | [constellation](https://github.com/cogos-dev/constellation) | **TRUSTS** | Distributed identity where trust is earned through temporal coherence |
-| [mod3](https://github.com/cogos-dev/mod3) | **ACTS** | Modality bus — translates between thinking and acting across any modality |
+| [mod3](https://github.com/cogos-dev/mod3) | **ACTS** | Modality bus — translates between thinking and acting, voice-first |
+| [skills](https://github.com/cogos-dev/skills) | **CAN DO** | Plugin marketplace — 17 Agent Skills across workflow, research, voice, and dev tools |
+| [research](https://github.com/cogos-dev/research) | **KNOWS** | Theory — EA/EFM thesis, LoRO framework, cognitive architecture papers |
 | [charts](https://github.com/cogos-dev/charts) | **DEPLOYS** | Helm charts + Docker Compose for single-node through multi-node topologies |
-| [desktop](https://github.com/cogos-dev/desktop) | **PRESENTS** | Native macOS app — kernel management, terminal, dashboard |
+| [desktop](https://github.com/cogos-dev/desktop) | **USE** | Native macOS app — kernel management, terminal, dashboard |
 
 Each organelle is independently deployable. They coordinate through the substrate, not through imports. The workspace discovers available organelles at runtime through capability scanning — like a cell discovering what enzymes are available in the cytoplasm.
 
@@ -184,7 +186,7 @@ Ships with Anthropic, Ollama, Claude Code, and Codex. New providers implement [s
 
 ```
 cmd/cogos/              Entry point
-internal/engine/        Kernel (90 source files, 33 test files)
+internal/engine/        Kernel (64 source files, 40 test files)
 docs/                   Specs, guides, and architecture diagrams
 scripts/                Setup, CLI, and e2e tests
 ```
@@ -203,7 +205,7 @@ v3 kernel — ground-up rewrite after a year of daily use across multiple agent 
 
 Working: continuous process, foveated context with Mamba TRM, hash-chained ledger, multi-provider routing (Gemma 4 E4B default), MCP server, blob store, salience scoring, tool-call hallucination gate, digestion pipeline (Claude Code + OpenClaw adapters), memory consolidation, constellation bridge interface, OpenAI/Anthropic compatibility, workspace scaffolding, e2e testing, web dashboard, OpenTelemetry.
 
-Next: wire digestion tailers into process loop, constellation library integration, multi-agent process management, `cog` CLI, README updates across ecosystem.
+Next: wire digestion tailers into process loop, constellation library integration, multi-agent process management, `cog` CLI.
 
 ## Deeper
 
