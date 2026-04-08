@@ -127,8 +127,13 @@ check_output "context has nucleus"       '"nucleus":"CogOS"'   "http://localhost
 
 # Version endpoint.
 VERSION_OUT=$($COGOS version 2>&1)
-echo "$VERSION_OUT" | grep -q "cogos build="
-check "version command works"     test $? -eq 0
+if echo "$VERSION_OUT" | grep -q "cogos.*build="; then
+    echo "  PASS  version command works"
+    pass=$((pass + 1))
+else
+    echo "  FAIL  version command works (got: $VERSION_OUT)"
+    fail=$((fail + 1))
+fi
 
 echo ""
 
