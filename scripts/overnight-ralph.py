@@ -374,45 +374,51 @@ def main():
             random.shuffle(shuffled_questions)
 
             for qi, q in enumerate(shuffled_questions):
-                # Thermal check before each question
-                while not check_thermal():
-                    pass
+                # Run ALL conditions on each question (paired comparison)
+                for cond_id in ["A", "B", "C"]:
+                    # Thermal check before each call
+                    while not check_thermal():
+                        pass
 
-                # Pick condition — rotate through A, B, C
-                cond_id = ["A", "B", "C"][(cycle * len(shuffled_questions) + qi) % 3]
-                cond_name, cond_fn = CONDITIONS[cond_id]
+                    cond_name, cond_fn = CONDITIONS[cond_id]
 
-                log(f"C{cycle} Q{qi+1}/{len(shuffled_questions)}: {q['id']} cond={cond_id}({cond_name})")
+                    log(f"C{cycle} Q{qi+1}/{len(shuffled_questions)}: {q['id']} cond={cond_id}({cond_name})")
 
-                t0 = time.time()
-                response = cond_fn(MODEL, q["q"])
-                elapsed = round(time.time() - t0, 1)
-                sc = score(response, q["expect"])
+                    t0 = time.time()
+                    try:
+                        response = cond_fn(MODEL, q["q"])
+                    except Exception as e:
+                        response = f"ERROR: {e}"
+                    elapsed = round(time.time() - t0, 1)
+                    sc = score(response, q["expect"])
 
-                entry = {
-                    "type": "observation",
-                    "cycle": cycle,
-                    "question_id": q["id"],
-                    "condition": cond_id,
-                    "condition_name": cond_name,
-                    "score": round(sc, 3),
-                    "elapsed_sec": elapsed,
-                    "model": MODEL,
-                    "response_preview": response[:150],
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
-                append_chain(entry)
+                    entry = {
+                        "type": "observation",
+                        "cycle": cycle,
+                        "question_id": q["id"],
+                        "condition": cond_id,
+                        "condition_name": cond_name,
+                        "score": round(sc, 3),
+                        "elapsed_sec": elapsed,
+                        "model": MODEL,
+                        "response_preview": response[:150],
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    append_chain(entry)
 
-                marker = "✓" if sc >= 0.5 else "✗"
-                log(f"  → score={sc:.2f} {marker} ({elapsed}s)")
+                    marker = "✓" if sc >= 0.5 else "✗"
+                    log(f"  → score={sc:.2f} {marker} ({elapsed}s)")
 
-                # Pause between questions
-                time.sleep(INTER_QUESTION_PAUSE)
+                    # Brief pause between conditions
+                    time.sleep(INTER_QUESTION_PAUSE)
 
-                # Check if supervisor barge-in is due
+                # Check if supervisor barge-in is due (between questions)
                 if time.time() - last_barge_in >= BARGE_IN_INTERVAL:
-                    chain = read_chain()
-                    supervisor_barge_in(chain, cycle)
+                    try:
+                        chain = read_chain()
+                        supervisor_barge_in(chain, cycle)
+                    except Exception as e:
+                        log(f"Supervisor barge-in failed: {e}")
                     last_barge_in = time.time()
 
             log(f"Cycle {cycle} complete. Total observations: {len(read_chain())}")
