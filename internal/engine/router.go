@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -285,6 +286,9 @@ func BuildRouter(cfg *Config, opts ...BuildRouterOption) (Router, error) {
 		slog.Info("router: registered", "name", name, "model", pc.Model)
 	}
 
+	// Auto-discover OpenAI-compatible servers on well-known ports.
+	autoDiscoverOpenAICompat(router, pcfg)
+
 	return router, nil
 }
 
@@ -345,6 +349,8 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		return NewOllamaProvider(name, pc), nil
 	case "anthropic":
 		return NewAnthropicProvider(name, pc), nil
+	case "openai-compat", "openai", "lmstudio", "vllm", "llamacpp":
+		return NewOpenAICompatProvider(name, pc), nil
 	case "claude-code":
 		if procMgr == nil {
 			procMgr = NewProcessManager(ProcessManagerConfig{})
@@ -380,5 +386,54 @@ func defaultProvidersConfig(localModel string) ProvidersConfig {
 			LocalThreshold: 0.8,
 			FallbackChain:  []string{"ollama"},
 		},
+	}
+}
+
+// ── Auto-discovery ───────────────────────────────────────────────────────────
+
+// openaiCompatProbeEndpoint defines a well-known local endpoint to auto-discover.
+type openaiCompatProbeEndpoint struct {
+	name     string
+	endpoint string
+}
+
+// openaiCompatWellKnownEndpoints lists endpoints to probe on startup.
+// Ollama (localhost:11434) is handled separately; these are OpenAI-compatible servers.
+var openaiCompatWellKnownEndpoints = []openaiCompatProbeEndpoint{
+	{name: "lmstudio", endpoint: "http://localhost:1234"},
+}
+
+// autoDiscoverOpenAICompat probes well-known local ports for OpenAI-compatible
+// servers and registers any that respond. Skips endpoints already configured
+// in providers.yaml to avoid duplicates.
+func autoDiscoverOpenAICompat(router *SimpleRouter, pcfg ProvidersConfig) {
+	// Build a set of already-configured endpoints to avoid duplicates.
+	configuredEndpoints := map[string]bool{}
+	configuredNames := map[string]bool{}
+	for name, pc := range pcfg.Providers {
+		if pc.Endpoint != "" {
+			configuredEndpoints[strings.TrimRight(pc.Endpoint, "/")] = true
+		}
+		configuredNames[name] = true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	for _, probe := range openaiCompatWellKnownEndpoints {
+		endpoint := strings.TrimRight(probe.endpoint, "/")
+		if configuredEndpoints[endpoint] || configuredNames[probe.name] {
+			continue
+		}
+
+		p := NewOpenAICompatProvider(probe.name, ProviderConfig{
+			Type:     "openai-compat",
+			Endpoint: endpoint,
+			Timeout:  5,
+		})
+		if p.Available(ctx) {
+			router.RegisterProvider(p)
+			slog.Info("router: auto-discovered", "name", probe.name, "endpoint", endpoint)
+		}
 	}
 }
