@@ -1,7 +1,7 @@
-# Binaries
-cogos
-cogos-v3
-cog-v3
+# Binaries (root-level only, don't ignore cmd/cogos/)
+/cogos
+/cogos-v3
+/cog-v3
 *.exe
 *.dylib
 *.so
