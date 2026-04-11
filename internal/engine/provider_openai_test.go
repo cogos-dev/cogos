@@ -313,11 +313,10 @@ func TestOpenAIAvailableModelAbsent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Server has models, just not the one we want — but Available still returns
-	// true because the server is reachable and has models.
+	// Server has models, but not the configured one — should be unavailable.
 	p := newTestOpenAIProvider(t, srv.URL, "nonexistent-model")
-	if !p.Available(context.Background()) {
-		t.Error("Available() = false; want true (server has models even if exact match missing)")
+	if p.Available(context.Background()) {
+		t.Error("Available() = true; want false when configured model is not loaded")
 	}
 }
 

@@ -83,9 +83,8 @@ func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
 				return true
 			}
 		}
-		// Model not found, but server is up — still available if no specific
-		// model was required (the server may pick a default).
-		return len(models) > 0
+		// Model not found — the configured model isn't loaded on this server.
+		return false
 	}
 	return len(models) > 0
 }
