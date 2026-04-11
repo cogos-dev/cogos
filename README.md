@@ -13,7 +13,7 @@ make build && ./cogos serve --workspace ~/my-project
 
 - **Foveated context assembly** -- A live hook (`UserPromptSubmit`) fires on every Claude Code prompt, scores all available documents by relevance, and injects a focused context window. No manual `@`-file selection; the system decides what matters.
 
-- **Learned retrieval via TRM** -- A 2.3M-parameter Mamba SSM (Tiny Recursive Model) trained from 0.424 to 0.900 NDCG over 180+ experiment runs. Scores documents by temporal salience, edit recency, and semantic relevance. Runs inference locally in ~6KB of state.
+- **Learned retrieval via TRM** -- A 2.3M-parameter Mamba SSM (Tiny Recursive Model) trained to 0.878 mean NDCG@10 (0.900 peak) through 500+ tracked experiments. Scores documents by temporal salience, edit recency, and semantic relevance. Runs inference locally in ~6KB of state. See [docs/EVALUATION.md](docs/EVALUATION.md) for full methodology.
 
 - **Persistent memory** -- Hierarchical memory system with salience scoring and temporal attention. Your workspace remembers across sessions, models, and tools. Switch from Claude Code to Cursor and back -- same memory, same context.
 
@@ -152,7 +152,7 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 ### Working
 
 - Continuous process daemon with four-state FSM
-- Foveated context assembly with Mamba TRM (0.900 NDCG)
+- Foveated context assembly with Mamba TRM (0.878 mean NDCG@10)
 - Hash-chained append-only ledger
 - Multi-provider routing (Ollama, Anthropic, Claude Code, Codex)
 - MCP server (Streamable HTTP)

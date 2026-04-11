@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
 
 ### Added
 - OpenAI-compatible provider for LM Studio, vLLM, llama.cpp (1,613 LOC, 18 tests)
@@ -17,7 +17,7 @@
 ### Fixed
 - `Available()` in OpenAI-compat provider now returns false when the configured model is not in the server's model list
 
-## 2026-04-03 — Performance: eliminate CPU burn in continuous process
+## [0.0.1] - 2026-04-03 — Performance: eliminate CPU burn in continuous process
 
 The v3 daemon was consuming 200% CPU perpetually due to compounding
 inefficiencies in the consolidation loop. This release fixes all of them
