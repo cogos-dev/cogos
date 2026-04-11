@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- OpenAI-compatible provider for LM Studio, vLLM, llama.cpp (1,613 LOC, 18 tests)
+- Auto-discovery of inference providers on localhost
+- Professional README with progressive disclosure
+- CONTRIBUTING.md
+- Autoresearch pipeline (extract-signals, nightly-consolidation, survey-traces)
+- Experiment harness for cross-node benchmarking
+- Context assembly path fix for TRM-scored documents
+
+### Changed
+- README rewritten for clarity and approachability
+
+### Fixed
+- `Available()` in OpenAI-compat provider now returns false when the configured model is not in the server's model list
+
 ## 2026-04-03 — Performance: eliminate CPU burn in continuous process
 
 The v3 daemon was consuming 200% CPU perpetually due to compounding
