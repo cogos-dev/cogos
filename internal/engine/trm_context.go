@@ -132,6 +132,7 @@ func trmScoreDocs(ctx context.Context, p *Process, query string, convID string, 
 	trm := p.TRM()
 	idx := p.EmbeddingIndex()
 	if trm == nil || idx == nil {
+		slog.Debug("trm: score skipped — model or index nil", "trm_nil", trm == nil, "idx_nil", idx == nil)
 		return nil
 	}
 
@@ -141,6 +142,7 @@ func trmScoreDocs(ctx context.Context, p *Process, query string, convID string, 
 		slog.Warn("trm: query embedding failed, falling back to keyword scoring", "err", err)
 		return nil
 	}
+	slog.Info("trm: query embedded", "dim", len(queryEmb), "query_prefix", truncateQuery(query, 60))
 
 	// 2. Pre-filter with cosine similarity.
 	if topK <= 0 {
@@ -148,7 +150,20 @@ func trmScoreDocs(ctx context.Context, p *Process, query string, convID string, 
 	}
 	indices, candidateEmbs := idx.CosineTopKIndices(queryEmb, topK)
 	if len(indices) == 0 {
+		slog.Warn("trm: cosine pre-filter returned 0 candidates", "index_size", idx.Size(), "topK", topK)
 		return nil
+	}
+
+	// Log top cosine candidates for debugging.
+	if len(indices) > 0 {
+		topIdx := indices[0]
+		topScore := cosineSim(queryEmb, idx.Embeddings[topIdx])
+		slog.Info("trm: cosine pre-filter",
+			"candidates", len(indices),
+			"top_score", fmt.Sprintf("%.4f", topScore),
+			"top_chunk", idx.Chunks[topIdx].ChunkID,
+			"top_path", idx.Chunks[topIdx].Path,
+		)
 	}
 
 	// 3. Step through the TRM with the light cone.
@@ -158,6 +173,24 @@ func trmScoreDocs(ctx context.Context, p *Process, query string, convID string, 
 
 	// 4. Score candidates.
 	scores := trm.ScoreCandidates(contextVec, candidateEmbs)
+
+	// Log raw TRM score range.
+	if len(scores) > 0 {
+		minScore, maxScore := scores[0], scores[0]
+		for _, s := range scores[1:] {
+			if s < minScore {
+				minScore = s
+			}
+			if s > maxScore {
+				maxScore = s
+			}
+		}
+		slog.Info("trm: raw scores",
+			"count", len(scores),
+			"min", fmt.Sprintf("%.4f", minScore),
+			"max", fmt.Sprintf("%.4f", maxScore),
+		)
+	}
 
 	// Build result set.
 	results := make([]trmScoredDoc, len(indices))
@@ -175,12 +208,22 @@ func trmScoreDocs(ctx context.Context, p *Process, query string, convID string, 
 	// Residual scoring: blend TRM score with cosine baseline.
 	// This ensures new content (high cosine) can surface even when
 	// the TRM hasn't been trained on access patterns for it yet.
-	// As the TRM trains on more data, its signal dominates.
-	const trmWeight = 0.6
-	const cosineWeight = 0.4
+	//
+	// Raw TRM scores are unbounded (often deeply negative for unseen docs).
+	// We sigmoid-normalize them to [0,1] before blending so that large
+	// negative TRM scores don't destroy the cosine signal.
+	//
+	// Weight rationale: cosine similarity is the primary semantic signal.
+	// TRM adds a learned access-pattern prior that boosts docs the user
+	// has engaged with before. With a small model (2 layers, d_state=4)
+	// and limited training data, cosine must dominate to preserve
+	// semantic relevance. TRM acts as a tiebreaker and recency boost.
+	const cosineWeight = 0.7
+	const trmWeight = 0.3
 
 	for i := range results {
-		results[i].TRMScore = trmWeight*results[i].TRMScore + cosineWeight*results[i].IndexResult.Score
+		trmNorm := sigmoid(results[i].TRMScore)
+		results[i].TRMScore = cosineWeight*results[i].IndexResult.Score + trmWeight*trmNorm
 	}
 
 	// Sort by blended score descending.
@@ -188,7 +231,24 @@ func trmScoreDocs(ctx context.Context, p *Process, query string, convID string, 
 		return results[i].TRMScore > results[j].TRMScore
 	})
 
+	// Log blended score range after sorting.
+	if len(results) > 0 {
+		slog.Info("trm: blended scores",
+			"top_score", fmt.Sprintf("%.4f", results[0].TRMScore),
+			"bottom_score", fmt.Sprintf("%.4f", results[len(results)-1].TRMScore),
+			"top_path", results[0].IndexResult.ChunkMeta.Path,
+		)
+	}
+
 	return results
+}
+
+// truncateQuery truncates a query string for logging.
+func truncateQuery(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // loadTRMAtStartup attempts to load TRM weights and embedding index.

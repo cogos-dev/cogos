@@ -481,6 +481,9 @@ func evictForBudgetModeWithEstimator(docs []FovealDoc, conv []ScoredMessage, bud
 
 	// Phase 1: Fill with top CogDocs (they provide grounding).
 	var keptDocs []FovealDoc
+	skippedManifest := 0
+	skippedBudget := 0
+	skippedRead := 0
 	for _, doc := range docs {
 		if remaining <= 0 {
 			break
@@ -488,9 +491,21 @@ func evictForBudgetModeWithEstimator(docs []FovealDoc, conv []ScoredMessage, bud
 		if manifestMode {
 			manifestDoc, err := buildManifestDocWithEstimator(doc, workspaceRoot, estimateTokens)
 			if err != nil || manifestDoc.Summary == "" {
+				skippedManifest++
+				slog.Debug("evict: manifest build failed",
+					"path", doc.Path,
+					"err", err,
+					"summary_empty", manifestDoc.Summary == "",
+				)
 				continue
 			}
 			if manifestDoc.Tokens > remaining {
+				skippedBudget++
+				slog.Debug("evict: doc exceeds remaining budget",
+					"path", doc.Path,
+					"tokens", manifestDoc.Tokens,
+					"remaining", remaining,
+				)
 				continue
 			}
 			doc = manifestDoc
@@ -501,6 +516,12 @@ func evictForBudgetModeWithEstimator(docs []FovealDoc, conv []ScoredMessage, bud
 			}
 			content, err := readDocContent(readPath, remaining)
 			if err != nil || content == "" {
+				skippedRead++
+				slog.Debug("evict: content read failed",
+					"path", readPath,
+					"err", err,
+					"content_empty", content == "",
+				)
 				continue
 			}
 			tokens := estimateTokens(content)
@@ -514,6 +535,15 @@ func evictForBudgetModeWithEstimator(docs []FovealDoc, conv []ScoredMessage, bud
 		}
 		keptDocs = append(keptDocs, doc)
 		remaining -= doc.Tokens
+	}
+	if skippedManifest > 0 || skippedBudget > 0 || skippedRead > 0 {
+		slog.Info("evict: docs skipped",
+			"manifest_err", skippedManifest,
+			"budget_exceeded", skippedBudget,
+			"read_err", skippedRead,
+			"kept", len(keptDocs),
+			"total_input", len(docs),
+		)
 	}
 
 	// Phase 2: Fill remaining with conversation history (newest first).

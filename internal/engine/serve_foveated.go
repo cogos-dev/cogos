@@ -26,6 +26,7 @@ import (
 // foveatedRequest is the wire format for POST /v1/context/foveated.
 type foveatedRequest struct {
 	Prompt    string     `json:"prompt"`
+	Query     string     `json:"query"` // alias for prompt — accepted for API compatibility
 	Iris      irisSignal `json:"iris"`
 	Profile   string     `json:"profile"`
 	SessionID string     `json:"session_id"`
@@ -78,6 +79,11 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Accept "query" as an alias for "prompt" for API compatibility.
+	if req.Prompt == "" && req.Query != "" {
+		req.Prompt = req.Query
+	}
+
 	// Extract anchor (topic) and goal from prompt.
 	anchor := extractAnchor(req.Prompt)
 	goal := extractGoal(req.Prompt)
@@ -94,15 +100,35 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 	var knowledgeDocs []FovealDoc
 	usedTRM := false
 
-	if s.process.TRM() != nil && s.process.EmbeddingIndex() != nil && req.Prompt != "" {
+	hasTRM := s.process.TRM() != nil
+	hasIdx := s.process.EmbeddingIndex() != nil
+	hasPrompt := req.Prompt != ""
+	slog.Info("foveated: TRM gate check",
+		"has_trm", hasTRM,
+		"has_idx", hasIdx,
+		"has_prompt", hasPrompt,
+		"prompt_len", len(req.Prompt),
+		"prompt_prefix", truncate(req.Prompt, 80),
+	)
+
+	if hasTRM && hasIdx && hasPrompt {
 		// Use a 5s timeout for TRM scoring — the hook has 10s total,
 		// and we need time for rendering + response writing.
 		trmCtx, trmCancel := context.WithTimeout(r.Context(), 5*time.Second)
 		trmResults := trmScoreDocs(trmCtx, s.process, req.Prompt, req.SessionID, 100)
 		trmCancel()
+		slog.Info("foveated: TRM scoring complete", "results", len(trmResults))
 		if len(trmResults) > 0 {
 			usedTRM = true
+			// Deduplicate by path: keep only the highest-scoring chunk per file.
+			// TRM results are pre-sorted by score descending, so the first
+			// occurrence of each path is the best chunk from that file.
+			seenPaths := make(map[string]bool)
 			for _, tr := range trmResults {
+				if seenPaths[tr.IndexResult.ChunkMeta.Path] {
+					continue
+				}
+				seenPaths[tr.IndexResult.ChunkMeta.Path] = true
 				knowledgeDocs = append(knowledgeDocs, FovealDoc{
 					URI:      "cog://chunks/" + tr.IndexResult.ChunkMeta.ChunkID,
 					Path:     tr.IndexResult.ChunkMeta.Path,
@@ -111,6 +137,10 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 					Reason:   "trm",
 				})
 			}
+			slog.Info("foveated: TRM docs built",
+				"unique_paths", len(knowledgeDocs),
+				"total_chunks", len(trmResults),
+			)
 		}
 	}
 
