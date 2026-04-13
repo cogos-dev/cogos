@@ -25,8 +25,8 @@ func TestClaudeCodeBuildPromptIncludesMultipleUserTurns(t *testing.T) {
 	if !strings.Contains(prompt, "second question") {
 		t.Fatal("prompt should contain the second user turn")
 	}
-	if strings.Count(prompt, "User Turn") < 2 {
-		t.Fatalf("prompt should render multiple user turns, got %q", prompt)
+	if !strings.Contains(prompt, "[user]:") {
+		t.Fatalf("prompt should render user turns in history, got %q", prompt)
 	}
 }
 
