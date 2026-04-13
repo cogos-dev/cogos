@@ -159,7 +159,7 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := make([]entry, len(fovea))
 	for i, fs := range fovea {
-		entries[i] = entry{Path: fs.Path, Score: fs.Score}
+		entries[i] = entry(fs)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

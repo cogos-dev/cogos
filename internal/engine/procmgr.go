@@ -135,7 +135,6 @@ type ProcessManager struct {
 
 	// Graceful shutdown signal.
 	shutdownCh chan struct{}
-	shutdownWg sync.WaitGroup
 }
 
 // ProcessManagerConfig configures the process manager.

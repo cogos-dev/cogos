@@ -1,0 +1,30 @@
+version: "2"
+
+linters:
+  default: standard
+  exclusions:
+    rules:
+      # Ignore unchecked Close() in defer — standard Go pattern for read-only files.
+      - linters: [errcheck]
+        source: "defer .+\\.Close\\(\\)"
+      # Ignore unchecked fmt.Fprint/Fprintf/Fprintln — CLI output to stdout/stderr.
+      - linters: [errcheck]
+        source: "fmt\\.Fprint"
+      # Ignore unchecked fmt.Sscanf — best-effort parsing.
+      - linters: [errcheck]
+        source: "fmt\\.Sscanf"
+      # Ignore unchecked os.Unsetenv in tests.
+      - linters: [errcheck]
+        source: "os\\.Unsetenv"
+      # Ignore unchecked Process.Kill — best-effort cleanup.
+      - linters: [errcheck]
+        source: "\\.Kill\\(\\)"
+      # Ignore unchecked w.Write in HTTP handlers — error surfaces via ResponseWriter.
+      - linters: [errcheck]
+        source: "w\\.Write\\("
+      # Ignore unchecked conn.Close — best-effort cleanup.
+      - linters: [errcheck]
+        source: "conn\\.Close\\(\\)"
+      # Ignore unchecked resp.Body.Close — standard HTTP cleanup.
+      - linters: [errcheck]
+        source: "resp\\.Body\\.Close\\(\\)"

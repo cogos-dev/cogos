@@ -25,8 +25,10 @@ func TestClaudeCodeBuildPromptIncludesMultipleUserTurns(t *testing.T) {
 	if !strings.Contains(prompt, "second question") {
 		t.Fatal("prompt should contain the second user turn")
 	}
+	// buildPrompt folds prior turns into <conversation_history> with [user]: prefix,
+	// and keeps the last user message as the main prompt body.
 	if !strings.Contains(prompt, "[user]:") {
-		t.Fatalf("prompt should render user turns in history, got %q", prompt)
+		t.Fatalf("prompt should include prior user turns in conversation_history, got %q", prompt)
 	}
 }
 

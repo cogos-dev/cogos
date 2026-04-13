@@ -197,7 +197,7 @@ func (r *SimpleRouter) Stats() RouterStats {
 	return stats
 }
 
-func recordToolCallRejection(providerName string) {
+func recordToolCallRejection(providerName string) { //nolint:unused // called from tool_loop.go (mcpserver build tag)
 	if providerName == "" {
 		return
 	}

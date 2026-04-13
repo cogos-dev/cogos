@@ -1,9 +1,7 @@
-# Binaries
-cog
-cogos
-cogos-v3
-cog-v3
-cog-*
+# Binaries (root-level only, don't ignore cmd/cogos/)
+/cogos
+/cogos-v3
+/cog-v3
 *.exe
 *.dylib
 *.so
@@ -25,6 +23,14 @@ coverage.html
 # OS
 .DS_Store
 Thumbs.db
+
+# Model weights (trained on personal data — never release)
+*.pt
+*.onnx
+*.safetensors
+*.gguf
+*.bin
+!go.sum
 
 # Eval artifacts (may contain PII)
 autoresearch-foveated/eval-details.json

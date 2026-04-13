@@ -181,9 +181,7 @@ func runServe(workspace string, port int) {
 
 	// Build the HTTP server.
 	server := NewServer(cfg, nucleus, process)
-	if router != nil {
-		server.SetRouter(router)
-	}
+	server.SetRouter(router)
 
 	// Initialize telemetry (traces + metrics). No-op if no collector is available.
 	ctx0 := context.Background()

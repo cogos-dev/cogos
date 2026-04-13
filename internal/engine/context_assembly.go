@@ -195,10 +195,6 @@ func WithManifestMode(enabled bool) AssembleOption {
 	return func(o *assembleOpts) { o.manifestMode = enabled }
 }
 
-func (p *Process) assembleContextInner(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int) (*ContextPackage, error) {
-	return p.assembleContextInnerWithOpts(ctx, convID, query, messages, budget, false, irisSignal{})
-}
-
 func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool, iris irisSignal) (*ContextPackage, error) {
 	if budget <= 0 {
 		budget = 32768
@@ -720,10 +716,6 @@ func renderWorkspaceManifest(docs []FovealDoc) string {
 	}
 
 	return strings.TrimRight(sb.String(), "\n")
-}
-
-func buildManifestDoc(doc FovealDoc, workspaceRoot string) (FovealDoc, error) {
-	return buildManifestDocWithEstimator(doc, workspaceRoot, estTokens)
 }
 
 func buildManifestDocWithEstimator(doc FovealDoc, workspaceRoot string, estimateTokens func(string) int) (FovealDoc, error) {

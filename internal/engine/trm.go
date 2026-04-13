@@ -199,13 +199,6 @@ func vecAdd(a, b []float32) {
 	}
 }
 
-// vecScale computes a * s element-wise, storing result in a.
-func vecScale(a []float32, s float32) {
-	for i := range a {
-		a[i] *= s
-	}
-}
-
 // softmax computes stable softmax over a vector.
 func softmaxVec(x []float32) []float32 {
 	n := len(x)

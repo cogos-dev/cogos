@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -284,15 +283,6 @@ func (bs *BlobStore) appendManifest(entry BlobEntry) {
 func hashBytes(content []byte) string {
 	h := sha256.Sum256(content)
 	return hex.EncodeToString(h[:])
-}
-
-// hashReader computes SHA-256 of an io.Reader.
-func hashReader(r io.Reader) (string, error) {
-	h := sha256.New()
-	if _, err := io.Copy(h, r); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // humanSize formats bytes as a human-readable string.

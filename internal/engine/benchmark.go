@@ -167,20 +167,20 @@ func matchScore(injected, expected []string) (recall, precision float64) {
 // PrintSummary writes a tabular result summary to stdout.
 func PrintSummary(results []BenchmarkResult) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "#\tRecall\tPrec\tTokens\tAsmMs\tInfMs\tPrompt")
-	fmt.Fprintln(w, "-\t------\t----\t------\t-----\t-----\t------")
+	_, _ = fmt.Fprintln(w, "#\tRecall\tPrec\tTokens\tAsmMs\tInfMs\tPrompt")
+	_, _ = fmt.Fprintln(w, "-\t------\t----\t------\t-----\t-----\t------")
 	for i, r := range results {
 		prompt := r.Prompt
 		if len(prompt) > 52 {
 			prompt = prompt[:49] + "..."
 		}
-		fmt.Fprintf(w, "%d\t%.2f\t%.2f\t%d\t%d\t%d\t%s\n",
+		_, _ = fmt.Fprintf(w, "%d\t%.2f\t%.2f\t%d\t%d\t%d\t%s\n",
 			i+1, r.Recall, r.Precision,
 			r.TotalTokens, r.AssemblyMs, r.ResponseMs,
 			prompt,
 		)
 	}
-	w.Flush()
+	_ = w.Flush()
 
 	if len(results) == 0 {
 		return

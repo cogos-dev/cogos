@@ -144,7 +144,7 @@ func runServerChat(workspace string, port int, model string) {
 		fmt.Fprintf(os.Stderr, "error: daemon not reachable at %s — start it with: cogos-v3 serve or cogos-v3 start\n", baseURL)
 		os.Exit(1)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "warning: daemon health check returned %d\n", resp.StatusCode)
 	}

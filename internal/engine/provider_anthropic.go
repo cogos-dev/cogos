@@ -112,7 +112,7 @@ func (p *AnthropicProvider) Ping(ctx context.Context) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("anthropic: ping: %w", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
 		return 0, fmt.Errorf("anthropic: ping: invalid API key (401)")
 	}
@@ -311,11 +311,7 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 	if len(req.Tools) > 0 {
 		ar.Tools = make([]anthropicTool, len(req.Tools))
 		for i, t := range req.Tools {
-			ar.Tools[i] = anthropicTool{
-				Name:        t.Name,
-				Description: t.Description,
-				InputSchema: t.InputSchema,
-			}
+			ar.Tools[i] = anthropicTool(t)
 		}
 	}
 
@@ -537,7 +533,7 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req *CompletionRequest) 
 	}
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("anthropic: stream status %d: %s", resp.StatusCode, string(data))
 	}
 

@@ -213,6 +213,25 @@ func TestIntegrationConcurrentRequests(t *testing.T) {
 	}
 }
 
+// waitForState polls process.State() until it equals want or the deadline expires.
+// Uses a channel-based ticker (no raw sleep) to avoid flakiness.
+func waitForState(t *testing.T, p *Process, want ProcessState, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("process state: got %s after %s; want %s", p.State(), timeout, want)
+		case <-tick.C:
+			if p.State() == want {
+				return
+			}
+		}
+	}
+}
+
 // mustGET performs an HTTP GET and fatals on error.
 func mustGET(t *testing.T, url string) *http.Response {
 	t.Helper()

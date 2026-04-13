@@ -61,8 +61,8 @@ func TestBlobStoreList(t *testing.T) {
 	bs := NewBlobStore(tmp)
 	_ = bs.Init()
 
-	bs.Store([]byte("blob one"), "text/plain")
-	bs.Store([]byte("blob two"), "text/plain")
+	_, _ = bs.Store([]byte("blob one"), "text/plain")
+	_, _ = bs.Store([]byte("blob two"), "text/plain")
 
 	entries, err := bs.List()
 	if err != nil {
