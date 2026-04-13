@@ -3,18 +3,35 @@ package main
 // serve_context.go — TAA context visibility, per-session observability, and foveated context rendering
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// foveatedMetrics tracks score distributions over time for foveated context requests.
+type foveatedMetrics struct {
+	mu              sync.Mutex
+	requestCount    int64
+	totalDocs       int64
+	totalCoherence  float64
+	avgCoherence    float64
+	totalBudget     int64
+	totalPressure   float64
+	lastRequestTime time.Time
+}
+
+const syntheticCanaryHeader = "X-Cog-Synthetic-Canary"
 
 // handleTAA returns the TAA context state for debugging/visibility
 // This allows clients like cogcode to see what context was constructed
@@ -183,6 +200,7 @@ func (s *serveServer) handleSessionContext(w http.ResponseWriter, r *http.Reques
 // Response: { context, tokens, anchor, goal, coherence_score, tier_breakdown, effective_budget, iris_pressure }
 func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	isSyntheticCanary := strings.EqualFold(r.Header.Get(syntheticCanaryHeader), "true")
 
 	// Parse request
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<18) // 256KB limit
@@ -265,9 +283,11 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Store as last TAA state for /v1/taa visibility
-	s.taaStateMutex.Lock()
-	s.lastTAAState = ctx
-	s.taaStateMutex.Unlock()
+	if !isSyntheticCanary {
+		s.taaStateMutex.Lock()
+		s.lastTAAState = ctx
+		s.taaStateMutex.Unlock()
+	}
 
 	// Build response — stability-ordered blocks
 	contextStr, blocks := ctx.BuildOrderedContextString()
@@ -317,23 +337,44 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 	}
 	sessionContextStoreMu.RUnlock()
 
-	recordSessionContext(&SessionContextState{
-		SessionID:      sessionID,
-		Profile:        profileName,
-		TurnNumber:     turnNumber,
-		IrisSize:       req.Iris.Size,
-		IrisUsed:       req.Iris.Used,
-		IrisPressure:   irisPressure,
-		TotalTokens:    ctx.TotalTokens,
-		Blocks:         blocks,
-		BlockCount:     len(blocks),
-		CacheHits:      cacheHits,
-		LastRequestAt:  time.Now(),
-		CoherenceScore: ctx.CoherenceScore,
-	})
+	if !isSyntheticCanary {
+		recordSessionContext(&SessionContextState{
+			SessionID:      sessionID,
+			Profile:        profileName,
+			TurnNumber:     turnNumber,
+			IrisSize:       req.Iris.Size,
+			IrisUsed:       req.Iris.Used,
+			IrisPressure:   irisPressure,
+			TotalTokens:    ctx.TotalTokens,
+			Blocks:         blocks,
+			BlockCount:     len(blocks),
+			CacheHits:      cacheHits,
+			LastRequestAt:  time.Now(),
+			CoherenceScore: ctx.CoherenceScore,
+		})
+	}
 
 	log.Printf("[foveated] Response: tokens=%d blocks=%d anchor=%q goal=%q coherence=%.2f pressure=%.1f%%",
 		ctx.TotalTokens, len(blocks), ctx.Anchor, ctx.Goal, ctx.CoherenceScore, irisPressure*100)
+
+	// Per-request score distribution logging (B4)
+	log.Printf("[foveated] Scores: docs=%d coherence=%.3f budget=%d pressure=%.1f%% session=%s",
+		len(blocks), ctx.CoherenceScore, effectiveBudget, irisPressure*100, sessionID)
+
+	// Update rolling metrics
+	if !isSyntheticCanary && s.fceMetrics != nil {
+		s.fceMetrics.mu.Lock()
+		s.fceMetrics.requestCount++
+		s.fceMetrics.totalDocs += int64(len(blocks))
+		s.fceMetrics.totalCoherence += ctx.CoherenceScore
+		if s.fceMetrics.requestCount > 0 {
+			s.fceMetrics.avgCoherence = s.fceMetrics.totalCoherence / float64(s.fceMetrics.requestCount)
+		}
+		s.fceMetrics.totalBudget += int64(effectiveBudget)
+		s.fceMetrics.totalPressure += irisPressure
+		s.fceMetrics.lastRequestTime = time.Now()
+		s.fceMetrics.mu.Unlock()
+	}
 
 	json.NewEncoder(w).Encode(map[string]any{
 		"context":          contextStr,
@@ -348,29 +389,260 @@ func (s *serveServer) handleFoveatedContext(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+// handleHealthCanary runs a synthetic smoke-test foveated context request.
+// GET /v1/health/canary
+func (s *serveServer) handleHealthCanary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	started := time.Now()
+	canaryCtx, canaryCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer canaryCancel()
+
+	body, err := json.Marshal(map[string]any{
+		"prompt":     "canary health check",
+		"profile":    "default",
+		"session_id": "health-canary",
+	})
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "fail",
+			"error":     "failed to build canary request: " + err.Error(),
+			"timestamp": nowISO(),
+		})
+		return
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/context/foveated", bytes.NewReader(body)).WithContext(canaryCtx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(syntheticCanaryHeader, "true")
+
+	rec := httptest.NewRecorder()
+	s.handleFoveatedContext(rec, req)
+
+	if err := canaryCtx.Err(); err != nil {
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "fail",
+			"error":     "canary timed out: " + err.Error(),
+			"timestamp": nowISO(),
+		})
+		return
+	}
+
+	if rec.Code != http.StatusOK {
+		var errResp struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil || strings.TrimSpace(errResp.Error.Message) == "" {
+			errResp.Error.Message = fmt.Sprintf("foveated context returned HTTP %d", rec.Code)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "fail",
+			"error":     errResp.Error.Message,
+			"timestamp": nowISO(),
+		})
+		return
+	}
+
+	var canaryResp struct {
+		Context        string  `json:"context"`
+		Tokens         int     `json:"tokens"`
+		CoherenceScore float64 `json:"coherence_score"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &canaryResp); err != nil {
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "fail",
+			"error":     "invalid foveated response: " + err.Error(),
+			"timestamp": nowISO(),
+		})
+		return
+	}
+
+	switch {
+	case strings.TrimSpace(canaryResp.Context) == "":
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "fail",
+			"error":     "foveated response missing context",
+			"timestamp": nowISO(),
+		})
+		return
+	case canaryResp.Tokens <= 0:
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "fail",
+			"error":     fmt.Sprintf("invalid token count: %d", canaryResp.Tokens),
+			"timestamp": nowISO(),
+		})
+		return
+	case canaryResp.CoherenceScore <= 0:
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":    "fail",
+			"error":     fmt.Sprintf("invalid coherence score: %.3f", canaryResp.CoherenceScore),
+			"timestamp": nowISO(),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":     "pass",
+		"latency_ms": float64(time.Since(started)) / float64(time.Millisecond),
+		"tokens":     canaryResp.Tokens,
+		"coherence":  canaryResp.CoherenceScore,
+		"timestamp":  nowISO(),
+	})
+}
+
 func (s *serveServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, claudeErr := exec.LookPath(claudeCommand)
 	_, codexErr := exec.LookPath(codexCommand)
+
 	status := "healthy"
+	var degradedReasons []string
+
+	checks := map[string]any{
+		"claude_cli": claudeErr == nil,
+		"codex_cli":  codexErr == nil,
+	}
+
 	if claudeErr != nil && codexErr != nil {
 		status = "degraded"
+		degradedReasons = append(degradedReasons, "no CLI providers available")
 	}
+
+	// Embedding service check: Ollama at localhost:11434 (2s timeout)
+	embeddingOK := false
+	ollamaCtx, ollamaCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer ollamaCancel()
+	ollamaReq, err := http.NewRequestWithContext(ollamaCtx, "GET", "http://localhost:11434/api/tags", nil)
+	if err == nil {
+		ollamaClient := &http.Client{}
+		resp, err := ollamaClient.Do(ollamaReq)
+		if err == nil {
+			resp.Body.Close()
+			embeddingOK = resp.StatusCode == http.StatusOK
+		}
+	}
+	checks["embedding_service"] = embeddingOK
+	if !embeddingOK {
+		if status == "healthy" {
+			status = "degraded"
+		}
+		degradedReasons = append(degradedReasons, "embedding_service unavailable")
+	}
+
+	// TRM model check: look for the ONNX model file
+	trmOK := false
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		trmPath := filepath.Join(homeDir, ".cache", "cogos-autoresearch", "model_mamba.onnx")
+		if fi, err := os.Stat(trmPath); err == nil && fi.Size() > 0 {
+			trmOK = true
+		}
+	}
+	checks["trm_model"] = trmOK
+	if !trmOK {
+		if status == "healthy" {
+			status = "degraded"
+		}
+		degradedReasons = append(degradedReasons, "trm_model not found")
+	}
+
+	// Workspace check: kernel root must exist on disk
+	workspaceOK := false
+	if s.kernel != nil {
+		root := s.kernel.Root()
+		if root != "" {
+			if fi, err := os.Stat(root); err == nil && fi.IsDir() {
+				workspaceOK = true
+			}
+		}
+	}
+	checks["workspace"] = workspaceOK
+	if !workspaceOK {
+		status = "unhealthy"
+		degradedReasons = append(degradedReasons, "workspace root missing or inaccessible")
+	}
+
+	// Bus count: count active buses from the registry
+	busCount := 0
+	if s.busChat != nil && s.busChat.manager != nil {
+		entries := s.busChat.manager.loadRegistry()
+		for _, e := range entries {
+			if e.State == "active" {
+				busCount++
+			}
+		}
+	}
+	checks["bus_count"] = busCount
 
 	resp := map[string]any{
 		"status":    status,
 		"timestamp": nowISO(),
-		"claude":    claudeErr == nil,
-		"codex":     codexErr == nil,
+		"checks":    checks,
 		"debug":     DebugMode.Load(),
+	}
+	if len(degradedReasons) > 0 {
+		resp["degraded_reasons"] = degradedReasons
 	}
 	if s.mcpManager != nil {
 		resp["mcp"] = map[string]any{
 			"sessions": s.mcpManager.SessionCount(),
 		}
 	}
+	if s.pipeline != nil {
+		resp["modality_pipeline"] = s.pipeline.Status()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleFoveatedMetrics returns rolling metrics for foveated context requests.
+// GET /v1/metrics/foveated
+func (s *serveServer) handleFoveatedMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if s.fceMetrics == nil {
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  "no_metrics",
+			"message": "Foveated metrics not initialized",
+		})
+		return
+	}
+
+	s.fceMetrics.mu.Lock()
+	reqCount := s.fceMetrics.requestCount
+	totalDocs := s.fceMetrics.totalDocs
+	avgCoherence := s.fceMetrics.avgCoherence
+	avgDocs := float64(0)
+	if reqCount > 0 {
+		avgDocs = float64(totalDocs) / float64(reqCount)
+	}
+	avgBudget := float64(0)
+	if reqCount > 0 {
+		avgBudget = float64(s.fceMetrics.totalBudget) / float64(reqCount)
+	}
+	avgPressure := float64(0)
+	if reqCount > 0 {
+		avgPressure = s.fceMetrics.totalPressure / float64(reqCount)
+	}
+	lastReq := s.fceMetrics.lastRequestTime
+	s.fceMetrics.mu.Unlock()
+
+	result := map[string]any{
+		"request_count": reqCount,
+		"total_docs":    totalDocs,
+		"avg_docs":      avgDocs,
+		"avg_coherence": avgCoherence,
+		"avg_budget":    avgBudget,
+		"avg_pressure":  avgPressure,
+		"timestamp":     nowISO(),
+	}
+	if !lastReq.IsZero() {
+		result["last_request_at"] = lastReq.Format(time.RFC3339)
+	}
+
+	json.NewEncoder(w).Encode(result)
 }
 
 func (s *serveServer) handleDebug(w http.ResponseWriter, r *http.Request) {

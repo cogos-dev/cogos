@@ -576,6 +576,23 @@ func cmdServeForeground(port int) int {
 			log.Printf("[service] capability advertisement failed: %v", err)
 		}
 
+		// 6d. Initialize modality pipeline and auto-register HTTP modules from service CRDs
+		{
+			pipelineSessionID := generateID()
+			pipeline := NewModalityPipeline(&PipelineConfig{
+				WorkspaceRoot: root,
+				SessionID:     pipelineSessionID,
+			})
+			registerHTTPModules(root, pipeline)
+			if startErr := pipeline.Start(context.Background()); startErr != nil {
+				log.Printf("[modality] pipeline start failed: %v", startErr)
+			} else {
+				log.Printf("[modality] pipeline started (session=%s, modules=%d)", pipelineSessionID, len(pipeline.Bus.HUD()))
+				server.pipeline = pipeline
+				defer pipeline.Stop(context.Background())
+			}
+		}
+
 		// 7. EventDiscordBridge: forward bus events to Discord (only if configured)
 		if webhookURL := loadEventsWebhookURL(root); webhookURL != "" {
 			bridge := NewEventDiscordBridge(webhookURL, server.busBroker)

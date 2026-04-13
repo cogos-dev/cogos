@@ -43,8 +43,9 @@ type ServiceCRDSpec struct {
 	Volumes   []ServiceVolume  `yaml:"volumes,omitempty"`
 	Health    ServiceHealth    `yaml:"health,omitempty"`
 	Restart   string           `yaml:"restart,omitempty"`
-	Tools     []ServiceTool    `yaml:"tools,omitempty"`
-	Bus       ServiceBus       `yaml:"bus,omitempty"`
+	Tools      []ServiceTool    `yaml:"tools,omitempty"`
+	Modalities []string         `yaml:"modalities,omitempty"` // e.g. ["voice"]
+	Bus        ServiceBus       `yaml:"bus,omitempty"`
 }
 
 // ServicePort maps a container port to a host port.

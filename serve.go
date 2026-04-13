@@ -72,6 +72,8 @@ type serveServer struct {
 	toolBridge    *ToolBridge        // Synchronous tool bridge for client-driven agent loops
 	mcpManager    *MCPSessionManager // MCP Streamable HTTP session manager
 	researchMgr   *researchManager   // Research orchestration (nil if no workspace)
+	pipeline      *ModalityPipeline  // Modality pipeline (nil if no workspace)
+	fceMetrics    *foveatedMetrics   // Rolling metrics for foveated context requests
 
 	// Context engine: normalizes threads, manages sessions, builds compressed context.
 	// Replaces the simple claudeSessionStore for context-aware inference.
@@ -101,6 +103,7 @@ func newServeServer(port int, kernel *sdk.Kernel) *serveServer {
 		contextEngine:      NewContextEngine(root),
 		claudeSessionStore: make(map[string]string),
 		lifecycle:          NewLifecycleManager(),
+		fceMetrics:         &foveatedMetrics{},
 	}
 }
 
@@ -222,6 +225,8 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("GET /v1/card", s.handleCard)                              // ADR-048: Kernel capability card
 	mux.HandleFunc("POST /v1/tool-bridge/pending", s.handleToolBridgePending) // Synchronous tool bridge
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("GET /v1/health/canary", s.handleHealthCanary)
+	mux.HandleFunc("GET /v1/metrics/foveated", s.handleFoveatedMetrics) // B4: FCE quality metrics
 	mux.HandleFunc("/debug", s.handleDebug)
 	mux.HandleFunc("/services", s.handleServices)
 
@@ -269,6 +274,9 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/api/cogfield/buses/", s.handleBusDetail)
 	mux.HandleFunc("/api/cogfield/expand/", s.handleExpandNode)
 	mux.HandleFunc("/api/cogfield/documents/", s.handleDocumentDetail)
+
+	// Modality pipeline endpoints
+	mux.HandleFunc("POST /v1/speak", s.handleSpeak)
 
 	// Research orchestration endpoints
 	mux.HandleFunc("POST /v1/research/start", s.handleResearchStart)
@@ -367,6 +375,10 @@ func (s *serveServer) Start() error {
 		fmt.Printf("\nWhirlpool (widget state):\n")
 		fmt.Printf("  GET    /state               - Workspace state\n")
 		fmt.Printf("  GET    /signals             - Signal field\n")
+	}
+	if s.pipeline != nil {
+		fmt.Printf("\nModality Pipeline:\n")
+		fmt.Printf("  POST   /v1/speak           - Voice output via modality pipeline\n")
 	}
 	if s.mcpManager != nil {
 		fmt.Printf("\nMCP (Streamable HTTP):\n")
