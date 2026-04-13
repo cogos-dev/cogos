@@ -5,10 +5,22 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
 const testWorkspaceRoot = "/Users/slowbro/cog-workspace"
+
+// skipIfNoAgentDefs skips the test when workspace agent definitions are not
+// available (e.g. in CI or a clean checkout without .cog/bin/agents/definitions).
+func skipIfNoAgentDefs(t *testing.T) {
+	t.Helper()
+	defsDir := filepath.Join(testWorkspaceRoot, ".cog", "bin", "agents", "definitions")
+	if _, err := os.Stat(defsDir); os.IsNotExist(err) {
+		t.Skip("skipping: agent definitions not available at " + defsDir)
+	}
+}
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
@@ -25,6 +37,7 @@ func containsStr(slice []string, s string) bool {
 // ─── Test 1: Load all agent CRDs ────────────────────────────────────────────
 
 func TestLoadAllAgentCRDs(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	crds, err := ListAgentCRDs(testWorkspaceRoot)
 	if err != nil {
 		t.Fatalf("ListAgentCRDs failed: %v", err)
@@ -49,6 +62,7 @@ func TestLoadAllAgentCRDs(t *testing.T) {
 // ─── Test 2: Pax8 CRD fields ──────────────────────────────────────────────
 
 func TestPax8CRDFields(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "pax8")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(pax8) failed: %v", err)
@@ -94,6 +108,7 @@ func TestPax8CRDFields(t *testing.T) {
 // ─── Test 3: HomeAssistant CRD fields ───────────────────────────────────────
 
 func TestHomeAssistantCRDFields(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "homeassistant")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(homeassistant) failed: %v", err)
@@ -144,6 +159,7 @@ func TestHomeAssistantCRDFields(t *testing.T) {
 // ─── Test 4: Exec CRD access model ─────────────────────────────────────────
 
 func TestExecCRDAccessModel(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "exec")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(exec) failed: %v", err)
@@ -197,6 +213,7 @@ func TestExecCRDAccessModel(t *testing.T) {
 // ─── Test 5: Sentinel cron entries ──────────────────────────────────────────
 
 func TestSentinelCronEntries(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "sentinel")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(sentinel) failed: %v", err)
@@ -233,6 +250,7 @@ func TestSentinelCronEntries(t *testing.T) {
 // ─── Test 6: Agent tool policies ────────────────────────────────────────────
 
 func TestAgentToolPolicies(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	t.Run("sentinel", func(t *testing.T) {
 		pol, err := GetAgentCRDToolPolicy(testWorkspaceRoot, "sentinel")
 		if err != nil {
@@ -307,6 +325,7 @@ func TestAgentToolPolicies(t *testing.T) {
 // ─── Test 7: Agent projection ───────────────────────────────────────────────
 
 func TestAgentProjection(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	crds, err := ListAgentCRDs(testWorkspaceRoot)
 	if err != nil {
 		t.Fatalf("ListAgentCRDs failed: %v", err)
@@ -431,6 +450,7 @@ func TestAgentProjection(t *testing.T) {
 // ─── Test 8: CRD schema compliance ─────────────────────────────────────────
 
 func TestCRDSchemaCompliance(t *testing.T) {
+	skipIfNoAgentDefs(t)
 	crds, err := ListAgentCRDs(testWorkspaceRoot)
 	if err != nil {
 		t.Fatalf("ListAgentCRDs failed: %v", err)

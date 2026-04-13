@@ -365,6 +365,11 @@ func TestExistingRoles(t *testing.T) {
 		t.Skip("No .cog directory found (test may be running in isolation)")
 	}
 
+	rolesDir := filepath.Join(cogDir, "roles")
+	if _, err := os.Stat(rolesDir); os.IsNotExist(err) {
+		t.Skip("No .cog/roles directory found (test requires workspace role definitions)")
+	}
+
 	loader, err := NewRoleLoader(cogDir)
 	if err != nil {
 		t.Fatalf("NewRoleLoader failed: %v", err)
