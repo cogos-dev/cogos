@@ -35,11 +35,12 @@ import (
 
 // MCPServer wraps the MCP server and its dependencies.
 type MCPServer struct {
-	server  *mcp.Server
-	handler http.Handler
-	cfg     *Config
-	nucleus *Nucleus
-	process *Process
+	server    *mcp.Server
+	handler   http.Handler
+	cfg       *Config
+	nucleus   *Nucleus
+	process   *Process
+	cogdocSvc *CogDocService
 }
 
 // NewMCPServer creates and configures the MCP server with all stage-1 tools.
@@ -50,10 +51,11 @@ func NewMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
 	}, nil)
 
 	m := &MCPServer{
-		server:  server,
-		cfg:     cfg,
-		nucleus: nucleus,
-		process: process,
+		server:    server,
+		cfg:       cfg,
+		nucleus:   nucleus,
+		process:   process,
+		cogdocSvc: NewCogDocService(cfg, process),
 	}
 
 	m.registerTools()
@@ -637,36 +639,21 @@ func (m *MCPServer) toolPatchFrontmatter(ctx context.Context, req *mcp.CallToolR
 		return textResult("at least one frontmatter patch is required")
 	}
 
-	res, err := ResolveURI(m.cfg.WorkspaceRoot, input.URI)
-	if err != nil {
-		return textResult(fmt.Sprintf("resolve failed: %v", err))
-	}
-
-	data, err := os.ReadFile(res.Path)
-	if err != nil {
-		return textResult(fmt.Sprintf("read failed: %v", err))
-	}
-
-	updated, fm, err := applyFrontmatterPatch(string(data), input.Patches)
+	result, err := m.cogdocSvc.PatchAndSync(input.URI, input.Patches)
 	if err != nil {
 		return textResult(fmt.Sprintf("patch failed: %v", err))
 	}
-	if err := os.WriteFile(res.Path, []byte(updated), 0o644); err != nil {
-		return textResult(fmt.Sprintf("write failed: %v", err))
-	}
 
-	if m.process != nil {
-		if idx, err := BuildIndex(m.cfg.WorkspaceRoot); err == nil {
-			m.process.indexMu.Lock()
-			m.process.index = idx
-			m.process.indexMu.Unlock()
-		}
+	// Read back the patched frontmatter for the response.
+	var fm cogdocFrontmatter
+	if data, readErr := os.ReadFile(result.Path); readErr == nil {
+		fm, _ = parseCogdocFrontmatter(string(data))
 	}
 
 	return marshalResult(map[string]any{
 		"updated":     true,
-		"uri":         input.URI,
-		"path":        res.Path,
+		"uri":         result.URI,
+		"path":        result.Path,
 		"frontmatter": fm,
 	})
 }
@@ -684,16 +671,15 @@ func (m *MCPServer) toolWriteCogdoc(ctx context.Context, req *mcp.CallToolReques
 		DocType: input.DocType,
 	}
 
-	uri, err := WriteCogDoc(m.cfg.WorkspaceRoot, input.Path, opts)
+	result, err := m.cogdocSvc.WriteAndSync(input.Path, opts)
 	if err != nil {
 		return textResult(fmt.Sprintf("write failed: %v", err))
 	}
 
-	fullPath := filepath.Join(m.cfg.WorkspaceRoot, ".cog", "mem", input.Path)
 	return marshalResult(map[string]any{
 		"written": true,
-		"path":    fullPath,
-		"uri":     uri,
+		"path":    result.Path,
+		"uri":     result.URI,
 	})
 }
 
@@ -958,27 +944,17 @@ func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, in
 		slog.Info("ingest: deferred by membrane policy", "reason", decision.Reason, "path", memPath)
 	}
 
-	uri, err := WriteCogDoc(m.cfg.WorkspaceRoot, memPath, opts)
+	writeResult, err := m.cogdocSvc.WriteAndSync(memPath, opts)
 	if err != nil {
 		return textResult(fmt.Sprintf("write cogdoc failed: %v", err))
 	}
-
-	if decision.Decision == Integrate && m.process != nil {
-		// Boost the attentional field immediately so the new CogDoc is visible
-		// in context assembly without waiting for the next full field.Update().
-		absPath := filepath.Join(m.cfg.WorkspaceRoot, ".cog", "mem", memPath)
-		m.process.Field().Boost(absPath, inboxRawBoost)
-	}
-
-	// Emit ledger event.
-	_ = EmitIngestEvent(m.cfg, result, memPath)
 
 	return marshalResult(map[string]any{
 		"ingested":     true,
 		"decision":     string(decision.Decision),
 		"reason":       decision.Reason,
 		"path":         memPath,
-		"uri":          uri,
+		"uri":          writeResult.URI,
 		"title":        result.Title,
 		"content_type": string(result.ContentType),
 	})
