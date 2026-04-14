@@ -2,22 +2,45 @@
 // End-to-end tests validating the Sentinel agent's cron-to-event-stream pipeline.
 // Covers: CRD loading, cron projection, event formatting, capability advertisement,
 // tool restrictions, event bridge formatting, and job ID stability.
+//
+// Tests that require real agent CRD files are skipped automatically when the
+// workspace is not available (e.g. in CI without a mounted workspace).
 
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// workspaceRoot is the real workspace root used for loading agent CRDs.
-const workspaceRoot = "/Users/slowbro/cog-workspace"
+// sentinelWorkspaceRoot returns the workspace root for sentinel e2e tests,
+// skipping the test if the CRD directory is not available.
+func sentinelWorkspaceRoot(t *testing.T) string {
+	t.Helper()
+	var root string
+	if ws := os.Getenv("COGOS_WORKSPACE"); ws != "" {
+		root = ws
+	} else {
+		var err error
+		root, _, err = ResolveWorkspace()
+		if err != nil || root == "" {
+			t.Skip("workspace root not available; set COGOS_WORKSPACE to run sentinel e2e tests")
+		}
+	}
+	crdDir := filepath.Join(root, ".cog", "bin", "agents", "definitions")
+	if _, err := os.Stat(crdDir); os.IsNotExist(err) {
+		t.Skipf("agent CRD directory not found at %s; skipping sentinel e2e test", crdDir)
+	}
+	return root
+}
 
 // ─── Test 1: CRD loads correctly ────────────────────────────────────────────────
 
 func TestSentinelCRDLoadsCorrectly(t *testing.T) {
-	crd, err := LoadAgentCRD(workspaceRoot, "sentinel")
+	crd, err := LoadAgentCRD(sentinelWorkspaceRoot(t), "sentinel")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD failed: %v", err)
 	}
@@ -49,7 +72,7 @@ func TestSentinelCRDLoadsCorrectly(t *testing.T) {
 // ─── Test 2: Cron projection ────────────────────────────────────────────────────
 
 func TestSentinelCronProjection(t *testing.T) {
-	crd, err := LoadAgentCRD(workspaceRoot, "sentinel")
+	crd, err := LoadAgentCRD(sentinelWorkspaceRoot(t), "sentinel")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD failed: %v", err)
 	}
@@ -251,7 +274,7 @@ func TestSentinelEventFormatting(t *testing.T) {
 // ─── Test 4: Capability advertisement ───────────────────────────────────────────
 
 func TestSentinelCapabilityAdvertisement(t *testing.T) {
-	crd, err := LoadAgentCRD(workspaceRoot, "sentinel")
+	crd, err := LoadAgentCRD(sentinelWorkspaceRoot(t), "sentinel")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD failed: %v", err)
 	}
@@ -312,7 +335,7 @@ func TestSentinelCapabilityAdvertisement(t *testing.T) {
 // ─── Test 5: Tool restrictions ──────────────────────────────────────────────────
 
 func TestSentinelToolRestrictions(t *testing.T) {
-	policy, err := GetAgentCRDToolPolicy(workspaceRoot, "sentinel")
+	policy, err := GetAgentCRDToolPolicy(sentinelWorkspaceRoot(t), "sentinel")
 	if err != nil {
 		t.Fatalf("GetAgentCRDToolPolicy failed: %v", err)
 	}
@@ -462,7 +485,7 @@ func TestSentinelEventBridgeFormatting(t *testing.T) {
 // ─── Test 7: Cron job ID stability ──────────────────────────────────────────────
 
 func TestCronJobIDStability(t *testing.T) {
-	crd, err := LoadAgentCRD(workspaceRoot, "sentinel")
+	crd, err := LoadAgentCRD(sentinelWorkspaceRoot(t), "sentinel")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD failed: %v", err)
 	}

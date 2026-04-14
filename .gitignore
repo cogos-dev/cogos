@@ -39,3 +39,6 @@ autoresearch-foveated/eval-details.json
 *.log
 *.pid
 run/
+
+# CogOS state (runtime-generated, may contain personal data)
+.cog/.state/

@@ -52,25 +52,25 @@ func testCRD(users map[string]AgentCRDUserAccess, defaultLevel string) *AgentCRD
 
 func TestMemoryScopeBuildUserScope(t *testing.T) {
 	users := map[string]AgentCRDUserAccess{
-		"chaz": {Level: "admin", MemoryScope: "users/chaz"},
+		"alice": {Level: "admin", MemoryScope: "users/alice"},
 		"erin": {Level: "rw", MemoryScope: "users/erin"},
 		"dana": {Level: "ro", MemoryScope: "users/dana"},
 	}
 
 	t.Run("admin user gets admin scope", func(t *testing.T) {
 		crd := testCRD(users, "none")
-		scope := BuildUserScope(crd, "chaz")
+		scope := BuildUserScope(crd, "alice")
 		if scope == nil {
 			t.Fatal("expected non-nil scope for admin user")
 		}
 		if scope.Level != "admin" {
 			t.Errorf("level = %q, want %q", scope.Level, "admin")
 		}
-		if scope.UserScope != "users/chaz" {
-			t.Errorf("userScope = %q, want %q", scope.UserScope, "users/chaz")
+		if scope.UserScope != "users/alice" {
+			t.Errorf("userScope = %q, want %q", scope.UserScope, "users/alice")
 		}
-		if scope.UserID != "chaz" {
-			t.Errorf("userID = %q, want %q", scope.UserID, "chaz")
+		if scope.UserID != "alice" {
+			t.Errorf("userID = %q, want %q", scope.UserID, "alice")
 		}
 	})
 
@@ -141,7 +141,7 @@ func TestMemoryScopeBuildUserScope(t *testing.T) {
 	t.Run("fallback base sector from agent name", func(t *testing.T) {
 		crd := testCRD(users, "none")
 		crd.Spec.Context.Memory.Sector = "" // clear explicit sector
-		scope := BuildUserScope(crd, "chaz")
+		scope := BuildUserScope(crd, "alice")
 		if scope == nil {
 			t.Fatal("expected non-nil scope")
 		}
@@ -163,17 +163,17 @@ func TestMemoryScopeResolveMemoryPath(t *testing.T) {
 		{
 			name:    "user path resolves to user scope",
 			relPath: "notes.md",
-			want:    "semantic/agents/exec/users/chaz/notes.md",
+			want:    "semantic/agents/exec/users/alice/notes.md",
 		},
 		{
 			name:    "nested user path",
 			relPath: "projects/alpha/tasks.md",
-			want:    "semantic/agents/exec/users/chaz/projects/alpha/tasks.md",
+			want:    "semantic/agents/exec/users/alice/projects/alpha/tasks.md",
 		},
 		{
 			name:    "empty path resolves to user base",
 			relPath: "",
-			want:    "semantic/agents/exec/users/chaz",
+			want:    "semantic/agents/exec/users/alice",
 		},
 		{
 			name:    "shared/ path resolves to shared sector",
@@ -207,7 +207,7 @@ func TestMemoryScopeResolveMemoryPath(t *testing.T) {
 		},
 	}
 
-	scope := testScope("chaz", "admin")
+	scope := testScope("alice", "admin")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -236,19 +236,19 @@ func TestMemoryScopeCanRead(t *testing.T) {
 		// admin can read everything
 		{
 			name:    "admin reads own path",
-			userID:  "chaz", level: "admin",
-			memPath: "semantic/agents/exec/users/chaz/notes.md",
+			userID:  "alice", level: "admin",
+			memPath: "semantic/agents/exec/users/alice/notes.md",
 			want:    true,
 		},
 		{
 			name:    "admin reads other users path",
-			userID:  "chaz", level: "admin",
+			userID:  "alice", level: "admin",
 			memPath: "semantic/agents/exec/users/erin/private.md",
 			want:    true,
 		},
 		{
 			name:    "admin reads shared path",
-			userID:  "chaz", level: "admin",
+			userID:  "alice", level: "admin",
 			memPath: "semantic/agents/exec/shared/policies.md",
 			want:    true,
 		},
@@ -269,7 +269,7 @@ func TestMemoryScopeCanRead(t *testing.T) {
 		{
 			name:    "rw cannot read other users path",
 			userID:  "erin", level: "rw",
-			memPath: "semantic/agents/exec/users/chaz/notes.md",
+			memPath: "semantic/agents/exec/users/alice/notes.md",
 			want:    false,
 		},
 
@@ -289,7 +289,7 @@ func TestMemoryScopeCanRead(t *testing.T) {
 		{
 			name:    "ro cannot read other users path",
 			userID:  "dana", level: "ro",
-			memPath: "semantic/agents/exec/users/chaz/secret.md",
+			memPath: "semantic/agents/exec/users/alice/secret.md",
 			want:    false,
 		},
 
@@ -349,25 +349,25 @@ func TestMemoryScopeCanWrite(t *testing.T) {
 		// admin can write everywhere
 		{
 			name:    "admin writes own path",
-			userID:  "chaz", level: "admin",
-			memPath: "semantic/agents/exec/users/chaz/notes.md",
+			userID:  "alice", level: "admin",
+			memPath: "semantic/agents/exec/users/alice/notes.md",
 			want:    true,
 		},
 		{
 			name:    "admin writes other users path",
-			userID:  "chaz", level: "admin",
+			userID:  "alice", level: "admin",
 			memPath: "semantic/agents/exec/users/erin/override.md",
 			want:    true,
 		},
 		{
 			name:    "admin writes shared path",
-			userID:  "chaz", level: "admin",
+			userID:  "alice", level: "admin",
 			memPath: "semantic/agents/exec/shared/new-policy.md",
 			want:    true,
 		},
 		{
 			name:    "admin writes agent-level path",
-			userID:  "chaz", level: "admin",
+			userID:  "alice", level: "admin",
 			memPath: "semantic/agents/exec/config.md",
 			want:    true,
 		},
@@ -388,7 +388,7 @@ func TestMemoryScopeCanWrite(t *testing.T) {
 		{
 			name:    "rw cannot write other users path",
 			userID:  "erin", level: "rw",
-			memPath: "semantic/agents/exec/users/chaz/notes.md",
+			memPath: "semantic/agents/exec/users/alice/notes.md",
 			want:    false,
 		},
 		{
@@ -448,7 +448,7 @@ func TestMemoryScopeIsUserScopedPath(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"semantic/agents/exec/users/chaz/notes.md", true},
+		{"semantic/agents/exec/users/alice/notes.md", true},
 		{"users/erin/tasks.md", true},
 		{"semantic/agents/exec/shared/policies.md", false},
 		{"semantic/agents/exec/config.md", false},
@@ -473,10 +473,10 @@ func TestMemoryScopeExtractUserFromPath(t *testing.T) {
 		path string
 		want string
 	}{
-		{"agents/exec/users/chaz/notes.md", "chaz"},
+		{"agents/exec/users/alice/notes.md", "alice"},
 		{"users/erin/drafts.md", "erin"},
 		{"semantic/agents/exec/users/dana/info.md", "dana"},
-		{"users/chaz", "chaz"},
+		{"users/alice", "alice"},
 		{"agents/exec/shared/policies.md", ""},
 		{"shared/readme.md", ""},
 		{"config.md", ""},
@@ -499,20 +499,20 @@ func TestMemoryScopeExtractUserFromPath(t *testing.T) {
 // the full isolation guarantee: two rw users cannot access each other's memory.
 func TestMemoryScopeCrossUserIsolation(t *testing.T) {
 	erin := testScope("erin", "rw")
-	chaz := testScope("chaz", "rw")
+	alice := testScope("alice", "rw")
 
 	// Each user resolves their own path
 	erinPath, err := erin.ResolveMemoryPath("secret.md")
 	if err != nil {
 		t.Fatalf("erin resolve: %v", err)
 	}
-	chazPath, err := chaz.ResolveMemoryPath("secret.md")
+	alicePath, err := alice.ResolveMemoryPath("secret.md")
 	if err != nil {
-		t.Fatalf("chaz resolve: %v", err)
+		t.Fatalf("alice resolve: %v", err)
 	}
 
 	// Paths must be different
-	if erinPath == chazPath {
+	if erinPath == alicePath {
 		t.Errorf("isolation violated: both users resolved to %q", erinPath)
 	}
 
@@ -524,28 +524,28 @@ func TestMemoryScopeCrossUserIsolation(t *testing.T) {
 		t.Error("erin should write her own path")
 	}
 
-	// Erin cannot read/write chaz's path
-	if erin.CanRead(chazPath) {
-		t.Error("erin should NOT read chaz's path")
+	// Erin cannot read/write alice's path
+	if erin.CanRead(alicePath) {
+		t.Error("erin should NOT read alice's path")
 	}
-	if erin.CanWrite(chazPath) {
-		t.Error("erin should NOT write chaz's path")
+	if erin.CanWrite(alicePath) {
+		t.Error("erin should NOT write alice's path")
 	}
 
 	// Chaz can read/write his own path
-	if !chaz.CanRead(chazPath) {
-		t.Error("chaz should read his own path")
+	if !alice.CanRead(alicePath) {
+		t.Error("alice should read his own path")
 	}
-	if !chaz.CanWrite(chazPath) {
-		t.Error("chaz should write his own path")
+	if !alice.CanWrite(alicePath) {
+		t.Error("alice should write his own path")
 	}
 
 	// Chaz cannot read/write erin's path
-	if chaz.CanRead(erinPath) {
-		t.Error("chaz should NOT read erin's path")
+	if alice.CanRead(erinPath) {
+		t.Error("alice should NOT read erin's path")
 	}
-	if chaz.CanWrite(erinPath) {
-		t.Error("chaz should NOT write erin's path")
+	if alice.CanWrite(erinPath) {
+		t.Error("alice should NOT write erin's path")
 	}
 
 	// Both can read/write shared
@@ -556,10 +556,10 @@ func TestMemoryScopeCrossUserIsolation(t *testing.T) {
 	if !erin.CanWrite(sharedPath) {
 		t.Error("erin should write shared")
 	}
-	if !chaz.CanRead(sharedPath) {
-		t.Error("chaz should read shared")
+	if !alice.CanRead(sharedPath) {
+		t.Error("alice should read shared")
 	}
-	if !chaz.CanWrite(sharedPath) {
-		t.Error("chaz should write shared")
+	if !alice.CanWrite(sharedPath) {
+		t.Error("alice should write shared")
 	}
 }

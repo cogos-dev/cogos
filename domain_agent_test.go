@@ -1,14 +1,47 @@
 // domain_agent_test.go
 // Integration tests that validate domain agent CRDs and their projection
 // into OpenClaw. Uses the real workspace root for CRD loading.
+//
+// These tests require the workspace to have agent CRD definitions at
+// .cog/bin/agents/definitions/. They are skipped automatically if the
+// workspace is not available (e.g. in CI without a mounted workspace).
 
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
-const testWorkspaceRoot = "/Users/slowbro/cog-workspace"
+// resolveTestWorkspaceRoot returns the workspace root for integration tests.
+// It prefers the COGOS_WORKSPACE env var, then the runtime-resolved workspace.
+// If neither is available or the CRD directory does not exist, it returns "".
+func resolveTestWorkspaceRoot() string {
+	if ws := os.Getenv("COGOS_WORKSPACE"); ws != "" {
+		return ws
+	}
+	root, _, err := ResolveWorkspace()
+	if err != nil {
+		return ""
+	}
+	return root
+}
+
+// requireWorkspaceRoot skips the test if the workspace root or its CRD directory
+// is not available on the current machine.
+func requireWorkspaceRoot(t *testing.T) string {
+	t.Helper()
+	root := resolveTestWorkspaceRoot()
+	if root == "" {
+		t.Skip("workspace root not available; set COGOS_WORKSPACE to run integration tests")
+	}
+	crdDir := filepath.Join(root, ".cog", "bin", "agents", "definitions")
+	if _, err := os.Stat(crdDir); os.IsNotExist(err) {
+		t.Skipf("agent CRD directory not found at %s; skipping integration test", crdDir)
+	}
+	return root
+}
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
@@ -25,6 +58,7 @@ func containsStr(slice []string, s string) bool {
 // ─── Test 1: Load all agent CRDs ────────────────────────────────────────────
 
 func TestLoadAllAgentCRDs(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	crds, err := ListAgentCRDs(testWorkspaceRoot)
 	if err != nil {
 		t.Fatalf("ListAgentCRDs failed: %v", err)
@@ -49,6 +83,7 @@ func TestLoadAllAgentCRDs(t *testing.T) {
 // ─── Test 2: Pax8 CRD fields ──────────────────────────────────────────────
 
 func TestPax8CRDFields(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "pax8")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(pax8) failed: %v", err)
@@ -94,6 +129,7 @@ func TestPax8CRDFields(t *testing.T) {
 // ─── Test 3: HomeAssistant CRD fields ───────────────────────────────────────
 
 func TestHomeAssistantCRDFields(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "homeassistant")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(homeassistant) failed: %v", err)
@@ -144,6 +180,7 @@ func TestHomeAssistantCRDFields(t *testing.T) {
 // ─── Test 4: Exec CRD access model ─────────────────────────────────────────
 
 func TestExecCRDAccessModel(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "exec")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(exec) failed: %v", err)
@@ -173,30 +210,27 @@ func TestExecCRDAccessModel(t *testing.T) {
 		t.Fatal("spec.access.users has no entries; expected at least one user")
 	}
 
-	// Verify specific user entry
-	chaz, ok := crd.Spec.Access.Users["chaz"]
-	if !ok {
-		t.Fatal("spec.access.users missing 'chaz'")
+	// Verify at least one admin user exists with a memoryScope set
+	foundAdmin := false
+	for uid, u := range crd.Spec.Access.Users {
+		if u.Level == "admin" {
+			foundAdmin = true
+			wantScope := "users/" + uid
+			if u.MemoryScope != wantScope {
+				t.Errorf("users[%s].memoryScope = %q, want %q", uid, u.MemoryScope, wantScope)
+			}
+			break
+		}
 	}
-	if chaz.Level != "admin" {
-		t.Errorf("users[chaz].level = %q, want %q", chaz.Level, "admin")
-	}
-	if chaz.MemoryScope != "users/chaz" {
-		t.Errorf("users[chaz].memoryScope = %q, want %q", chaz.MemoryScope, "users/chaz")
-	}
-
-	erin, ok := crd.Spec.Access.Users["erin"]
-	if !ok {
-		t.Fatal("spec.access.users missing 'erin'")
-	}
-	if erin.Level != "rw" {
-		t.Errorf("users[erin].level = %q, want %q", erin.Level, "rw")
+	if !foundAdmin {
+		t.Error("spec.access.users has no admin-level user; expected at least one")
 	}
 }
 
 // ─── Test 5: Sentinel cron entries ──────────────────────────────────────────
 
 func TestSentinelCronEntries(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	crd, err := LoadAgentCRD(testWorkspaceRoot, "sentinel")
 	if err != nil {
 		t.Fatalf("LoadAgentCRD(sentinel) failed: %v", err)
@@ -233,6 +267,7 @@ func TestSentinelCronEntries(t *testing.T) {
 // ─── Test 6: Agent tool policies ────────────────────────────────────────────
 
 func TestAgentToolPolicies(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	t.Run("sentinel", func(t *testing.T) {
 		pol, err := GetAgentCRDToolPolicy(testWorkspaceRoot, "sentinel")
 		if err != nil {
@@ -307,6 +342,7 @@ func TestAgentToolPolicies(t *testing.T) {
 // ─── Test 7: Agent projection ───────────────────────────────────────────────
 
 func TestAgentProjection(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	crds, err := ListAgentCRDs(testWorkspaceRoot)
 	if err != nil {
 		t.Fatalf("ListAgentCRDs failed: %v", err)
@@ -431,6 +467,7 @@ func TestAgentProjection(t *testing.T) {
 // ─── Test 8: CRD schema compliance ─────────────────────────────────────────
 
 func TestCRDSchemaCompliance(t *testing.T) {
+	testWorkspaceRoot := requireWorkspaceRoot(t)
 	crds, err := ListAgentCRDs(testWorkspaceRoot)
 	if err != nil {
 		t.Fatalf("ListAgentCRDs failed: %v", err)

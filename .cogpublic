@@ -1,0 +1,94 @@
+# .cogpublic — Public release gate for cogos-dev/cogos
+# Defines what crosses the constellation boundary outward.
+# Used by `cog plan upstream` / `cog apply upstream` to sanitize pushes.
+#
+# Gate 1: private dev → personal public fork (chazmaniandinkle/cogos)
+# Gate 2: personal fork → org upstream (cogos-dev/cogos)
+
+version: 1
+
+# Paths safe to push to the public repo
+allow:
+  # Core kernel source
+  - "*.go"
+  - go.mod
+  - go.sum
+  - Makefile
+  - Dockerfile
+  - Dockerfile.e2e
+  - LICENSE
+  - entitlements.plist
+
+  # Submodules
+  - sdk/**
+  - harness/**
+  - envspec/**
+
+  # Protocol definitions
+  - bep_proto/**
+
+  # Documentation
+  - README.md
+  - CHANGELOG.md
+  - CONTRIBUTING.md
+  - EXTRACTION_GAPS.md
+  - docs/**
+
+  # CI/CD
+  - .github/**
+  - .golangci.yml
+
+  # Scripts
+  - scripts/**
+
+  # Web assets (embedded dashboard)
+  - internal/engine/web/**
+  - internal/engine/defaults/**
+  - internal/engine/testdata/**
+
+  # Docker
+  - docker-compose.node.yml
+
+  # Autoresearch (public-safe subset)
+  - autoresearch-foveated/config.yaml
+  - autoresearch-foveated/eval.py
+  - autoresearch-foveated/program.md
+  - autoresearch-foveated/results.tsv
+
+# Paths that NEVER leave the constellation
+deny:
+  - .cog/**
+  - "*.db"
+  - "*.sqlite"
+  - "*.pt"
+  - "*.onnx"
+  - "*.safetensors"
+  - "*.gguf"
+  - autoresearch-foveated/eval-details.json
+  - autoresearch-foveated/__pycache__/**
+  - .gotmp/**
+  - .tmp/**
+
+# Content patterns that trigger rejection before any push
+content_guards:
+  - pattern: "/Users/slowbro"
+    description: "Hardcoded home directory path"
+  - pattern: "-Users-slowbro-"
+    description: "Claude project path encoding"
+  - pattern: "192404964621025291"
+    description: "Personal Discord user snowflake"
+  - pattern: 'sk-[a-zA-Z0-9]{20,}'
+    description: "OpenAI API key pattern"
+  - pattern: 'ghp_[a-zA-Z0-9]{20,}'
+    description: "GitHub personal access token"
+  - pattern: 'xoxb-[a-zA-Z0-9]+'
+    description: "Slack bot token"
+  - pattern: '@gmail\.com|@yahoo\.com|@hotmail\.com'
+    description: "Personal email address (git author emails exempt)"
+
+# Post-push structural checks
+post_guards:
+  - command: "go build ./..."
+    description: "Code compiles"
+  - command: "go vet ./..."
+    description: "Code passes vet"

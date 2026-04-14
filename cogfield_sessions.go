@@ -4,7 +4,7 @@
 //
 // Session waterfall: three message sources tried in order:
 //   1. CogOS threads (.cog/mem/episodic/threads/{id}/thread.jsonl)
-//   2. Claude Code transcripts (~/.claude/projects/-Users-slowbro-cog-workspace/{id}.jsonl)
+//   2. Claude Code transcripts (~/.claude/projects/{claudeProjectDir}/{id}.jsonl)
 //   3. Event stubs (.cog/.state/events/*.jsonl) — existing format
 
 package main
@@ -192,14 +192,38 @@ type claudeTranscriptMessage struct {
 	Content json.RawMessage `json:"content"`
 }
 
-// loadFromClaudeTranscript reads ~/.claude/projects/-Users-slowbro-cog-workspace/{sessionID}.jsonl
+// claudeProjectDirName returns the Claude Code project directory name for the
+// current workspace. Claude encodes the workspace path by replacing path
+// separators with dashes (e.g. /Users/alice/my-workspace → -Users-alice-my-workspace).
+// This is resolved at runtime from the actual workspace root rather than
+// hardcoding a specific user's path.
+func claudeProjectDirName(root string) string {
+	// Replace path separators with dashes, matching Claude's encoding scheme.
+	// On Unix: /foo/bar → -foo-bar
+	encoded := strings.ReplaceAll(root, string(filepath.Separator), "-")
+	// Ensure it starts with a dash (Claude always produces a leading dash for absolute paths)
+	if len(encoded) > 0 && encoded[0] != '-' {
+		encoded = "-" + encoded
+	}
+	return encoded
+}
+
+// loadFromClaudeTranscript reads ~/.claude/projects/{claudeProjectDir}/{sessionID}.jsonl
+// where claudeProjectDir is derived dynamically from the workspace root.
 func loadFromClaudeTranscript(sessionID string) (*SessionDetail, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
 
-	transcriptPath := filepath.Join(home, ".claude", "projects", "-Users-slowbro-cog-workspace", sessionID+".jsonl")
+	// Resolve workspace root to compute the Claude project directory name.
+	root, _, wsErr := ResolveWorkspace()
+	if wsErr != nil {
+		return nil, wsErr
+	}
+
+	projectDir := claudeProjectDirName(root)
+	transcriptPath := filepath.Join(home, ".claude", "projects", projectDir, sessionID+".jsonl")
 	f, err := os.Open(transcriptPath)
 	if err != nil {
 		return nil, err

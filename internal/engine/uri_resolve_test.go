@@ -57,7 +57,9 @@ func TestResolveToFieldKeyMemoryRelative(t *testing.T) {
 func TestResolveToFieldKeyAbsolutePassthrough(t *testing.T) {
 	t.Parallel()
 	root := "/workspace"
-	abs := "/Users/slowbro/workspaces/cog/.cog/mem/semantic/insights/foo.cog.md"
+	// Use a synthetic absolute path outside the workspace root to test passthrough.
+	// The function should return absolute paths unchanged regardless of content.
+	abs := "/some/other/workspace/.cog/mem/semantic/insights/foo.cog.md"
 
 	key := ResolveToFieldKey(root, abs)
 	if key != abs {

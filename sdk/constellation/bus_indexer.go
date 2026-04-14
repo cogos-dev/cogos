@@ -10,7 +10,7 @@ import (
 // Only chat.request and chat.response events with non-empty content
 // should be indexed — system events, tool invocations, etc. are skipped.
 type BusEvent struct {
-	BusID     string // Bus identifier (e.g., "bus_chat_cog-discord-192404964621025291")
+	BusID     string // Bus identifier (e.g., "bus_chat_cog-discord-100000000000000001")
 	Seq       int    // Sequence number within the bus
 	Timestamp string // RFC3339Nano timestamp
 	From      string // Sender (e.g., "http:user", "kernel:cogos")

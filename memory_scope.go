@@ -28,8 +28,8 @@ import (
 type UserMemoryScope struct {
 	AgentID    string // e.g., "exec-assistant"
 	BaseSector string // e.g., "cog://mem/semantic/agents/exec-assistant/"
-	UserID     string // e.g., "chaz"
-	UserScope  string // e.g., "users/chaz" (from CRD)
+	UserID     string // e.g., "alice"
+	UserScope  string // e.g., "users/alice" (from CRD)
 	Level      string // e.g., "admin", "rw", "ro", "none"
 }
 
@@ -38,11 +38,11 @@ type UserMemoryScope struct {
 // agent's shared memory sector (accessible to all users). Otherwise the path
 // is placed under the user's private scope.
 //
-// Examples (BaseSector = "agents/exec-assistant", UserScope = "users/chaz"):
+// Examples (BaseSector = "agents/exec-assistant", UserScope = "users/alice"):
 //
-//	"notes.md"         → "agents/exec-assistant/users/chaz/notes.md"
+//	"notes.md"         → "agents/exec-assistant/users/alice/notes.md"
 //	"shared/policies"  → "agents/exec-assistant/shared/policies"
-//	""                 → "agents/exec-assistant/users/chaz"
+//	""                 → "agents/exec-assistant/users/alice"
 func (s *UserMemoryScope) ResolveMemoryPath(relativePath string) (string, error) {
 	// Normalize base sector: strip cog://mem/ prefix and trailing slash
 	base := s.BaseSector
@@ -141,7 +141,7 @@ func (s *UserMemoryScope) isOwnPath(memPath string) bool {
 		return false
 	}
 	// Normalize: the user scope pattern we look for in the path
-	// e.g., "users/chaz/" or path ends with "users/chaz"
+	// e.g., "users/alice/" or path ends with "users/alice"
 	scope := s.UserScope
 	scope = strings.TrimSuffix(scope, "/")
 
@@ -220,7 +220,7 @@ func IsUserScopedPath(p string) bool {
 //
 // Examples:
 //
-//	"agents/exec/users/chaz/notes.md" → "chaz"
+//	"agents/exec/users/alice/notes.md" → "alice"
 //	"users/erin/drafts.md"            → "erin"
 //	"agents/exec/shared/policies.md"  → "" (not user-scoped)
 func ExtractUserFromPath(p string) string {
@@ -238,7 +238,7 @@ func ExtractUserFromPath(p string) string {
 }
 
 // firstPathSegment returns the first component of a slash-separated path.
-// e.g., "chaz/notes.md" → "chaz", "chaz" → "chaz", "" → ""
+// e.g., "alice/notes.md" → "alice", "alice" → "alice", "" → ""
 func firstPathSegment(p string) string {
 	if p == "" {
 		return ""

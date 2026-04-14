@@ -373,8 +373,8 @@ type InferenceRequest struct {
 	ClaudeSessionID string
 
 	// User identity (propagated from UCP or OpenClaw headers)
-	UserID   string // Canonical user ID (e.g., "chaz")
-	UserName string // Display name (e.g., "Chaz")
+	UserID   string // Canonical user ID (e.g., "alice")
+	UserName string // Display name (e.g., "Alice")
 
 	// Retry configuration
 	MaxRetries int           // Max retry attempts (0 = use default)

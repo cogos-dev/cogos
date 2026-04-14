@@ -45,7 +45,7 @@ func TestThreadParser_BasicParse(t *testing.T) {
 func TestThreadParser_MetadataExtraction(t *testing.T) {
 	tp := NewThreadParser()
 
-	userContent := "Hello world\n\nConversation info (untrusted metadata):\n```json\n{\n  \"message_id\": \"1482586305186496664\",\n  \"sender_id\": \"192404964621025291\",\n  \"conversation_label\": \"Guild #test channel id:123\",\n  \"sender\": \"192404964621025291\",\n  \"group_subject\": \"#test\"\n}\n```\n\nSender (untrusted metadata):\n```json\n{\n  \"label\": \"Slow Bro\",\n  \"name\": \"Slow Bro\",\n  \"username\": \"slowbrow\",\n  \"tag\": \"slowbrow\"\n}\n```"
+	userContent := "Hello world\n\nConversation info (untrusted metadata):\n```json\n{\n  \"message_id\": \"1482586305186496664\",\n  \"sender_id\": \"100000000000000001\",\n  \"conversation_label\": \"Guild #test channel id:123\",\n  \"sender\": \"100000000000000001\",\n  \"group_subject\": \"#test\"\n}\n```\n\nSender (untrusted metadata):\n```json\n{\n  \"label\": \"Test User\",\n  \"name\": \"Test User\",\n  \"username\": \"testuser\",\n  \"tag\": \"testuser\"\n}\n```"
 
 	messages := []ChatMessage{
 		testMsg("user", userContent),
@@ -64,14 +64,14 @@ func TestThreadParser_MetadataExtraction(t *testing.T) {
 	if msg.ID != "1482586305186496664" {
 		t.Errorf("ID = %q, want %q", msg.ID, "1482586305186496664")
 	}
-	if msg.SenderID != "192404964621025291" {
-		t.Errorf("SenderID = %q, want %q", msg.SenderID, "192404964621025291")
+	if msg.SenderID != "100000000000000001" {
+		t.Errorf("SenderID = %q, want %q", msg.SenderID, "100000000000000001")
 	}
-	if msg.Sender != "Slow Bro" {
-		t.Errorf("Sender = %q, want %q", msg.Sender, "Slow Bro")
+	if msg.Sender != "Test User" {
+		t.Errorf("Sender = %q, want %q", msg.Sender, "Test User")
 	}
-	if msg.Metadata["username"] != "slowbrow" {
-		t.Errorf("Metadata[username] = %v, want %q", msg.Metadata["username"], "slowbrow")
+	if msg.Metadata["username"] != "testuser" {
+		t.Errorf("Metadata[username] = %v, want %q", msg.Metadata["username"], "testuser")
 	}
 	if msg.Metadata["group_subject"] != "#test" {
 		t.Errorf("Metadata[group_subject] = %v, want %q", msg.Metadata["group_subject"], "#test")
