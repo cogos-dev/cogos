@@ -3,8 +3,15 @@
 // mcp_server.go — MCP Streamable HTTP server for CogOS v3
 //
 // Embeds the MCP server into the existing HTTP server at /mcp.
-// Implements the 11 stage-1 tools from MCP-SPEC.md using the
-// official Go MCP SDK (github.com/modelcontextprotocol/go-sdk).
+// Registers 10 MCP tools and 3 MCP resources. Four former tools
+// (resolve_uri, get_trust, get_nucleus, get_index) are no longer
+// registered as MCP tools but their implementations remain — used
+// by the internal tool loop (tool_loop.go).
+//
+// Resources (read-only addressable data):
+//   - cogos://state   — kernel process state
+//   - cogos://nucleus — identity context
+//   - cogos://field   — attentional field (top-20)
 //
 // Transport: Streamable HTTP (MCP spec 2025-03-26)
 // Endpoint: POST/GET /mcp
@@ -50,6 +57,7 @@ func NewMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
 	}
 
 	m.registerTools()
+	m.registerResources()
 
 	m.handler = mcp.NewStreamableHTTPHandler(
 		func(r *http.Request) *mcp.Server { return server },
@@ -119,8 +127,162 @@ func (m *MCPServer) registerTools() {
 	}, m.toolIngest)
 }
 
+// registerResources registers MCP Resources — read-only addressable data.
+// Unlike tools (actions with side effects), resources expose live kernel state
+// that clients can read without triggering mutations.
+func (m *MCPServer) registerResources() {
+	m.server.AddResource(&mcp.Resource{
+		URI:         "cogos://state",
+		Name:        "Kernel State",
+		Description: "Process state, uptime, trust, field size, and node health",
+		MIMEType:    "application/json",
+	}, m.resourceState)
+
+	m.server.AddResource(&mcp.Resource{
+		URI:         "cogos://nucleus",
+		Name:        "Identity",
+		Description: "Kernel identity context — name, role, summary",
+		MIMEType:    "application/json",
+	}, m.resourceNucleus)
+
+	m.server.AddResource(&mcp.Resource{
+		URI:         "cogos://field",
+		Name:        "Attentional Field",
+		Description: "Top-20 salience-scored CogDocs with cog:// URIs",
+		MIMEType:    "application/json",
+	}, m.resourceField)
+}
+
+// ── Resource Handlers ───────────────────────────────────────────────────────
+
+func (m *MCPServer) resourceState(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	if m.process == nil {
+		return nil, fmt.Errorf("process not initialized")
+	}
+
+	queue := ReadIngestionQueueState(m.cfg.WorkspaceRoot)
+	trust := m.process.TrustSnapshot()
+	lastHeartbeat := ""
+	if !trust.LastHeartbeatAt.IsZero() {
+		lastHeartbeat = trust.LastHeartbeatAt.Format(time.RFC3339)
+	}
+
+	identity := ""
+	if m.nucleus != nil {
+		identity = m.nucleus.Name
+	}
+
+	result := map[string]any{
+		"state":             m.process.State().String(),
+		"identity":          identity,
+		"session_id":        m.process.SessionID(),
+		"node_id":           m.process.NodeID,
+		"uptime_seconds":    int(time.Since(m.process.StartedAt()).Seconds()),
+		"field_size":        m.process.Field().Len(),
+		"trust_score":       trust.LocalScore,
+		"fingerprint":       m.process.Fingerprint(),
+		"last_heartbeat":    lastHeartbeat,
+		"coherence_state":   trust.CoherenceFingerprint,
+		"quarantined_count": queue.Quarantined,
+		"deferred_count":    queue.Deferred,
+	}
+
+	if nh := m.process.NodeHealth(); nh != nil {
+		if summary := nh.Summary(); len(summary) > 0 {
+			result["node"] = summary
+		}
+	}
+
+	b, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal state: %w", err)
+	}
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(b),
+		}},
+	}, nil
+}
+
+func (m *MCPServer) resourceNucleus(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	if m.nucleus == nil {
+		return nil, fmt.Errorf("nucleus not loaded")
+	}
+
+	result := map[string]any{
+		"name":      m.nucleus.Name,
+		"role":      m.nucleus.Role,
+		"summary":   m.nucleus.Summary(),
+		"workspace": m.cfg.WorkspaceRoot,
+		"port":      m.cfg.Port,
+		"build":     BuildTime,
+	}
+
+	b, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal nucleus: %w", err)
+	}
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(b),
+		}},
+	}, nil
+}
+
+func (m *MCPServer) resourceField(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	if m.process == nil || m.process.field == nil {
+		return nil, fmt.Errorf("attentional field not initialized")
+	}
+
+	const limit = 20
+	scores := m.process.field.AllScores()
+
+	type entry struct {
+		URI      string  `json:"uri"`
+		Salience float64 `json:"salience"`
+	}
+	var entries []entry
+	for absPath, score := range scores {
+		uri := FieldKeyToURI(m.cfg.WorkspaceRoot, absPath)
+		entries = append(entries, entry{URI: uri, Salience: score})
+	}
+	// Sort by salience descending.
+	for i := 0; i < len(entries); i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].Salience > entries[i].Salience {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+
+	result := map[string]any{
+		"count":   len(entries),
+		"entries": entries,
+	}
+
+	b, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal field: %w", err)
+	}
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{{
+			URI:      req.Params.URI,
+			MIMEType: "application/json",
+			Text:     string(b),
+		}},
+	}, nil
+}
+
 // ── Tool Inputs ──────────────────────────────────────────────────────────────
 
+// resolveURIInput — no longer an MCP tool; used by the internal tool loop (tool_loop.go).
 type resolveURIInput struct {
 	URI string `json:"uri" jsonschema:"A cog: URI to resolve. Examples: cog:mem/semantic/architecture/x or cog://cog-workspace/adr/059"`
 }
@@ -143,6 +305,7 @@ type getStateInput struct {
 	Verbose bool `json:"verbose,omitempty" jsonschema:"Include detailed field and process info"`
 }
 
+// getTrustInput — no longer an MCP tool; used by the internal tool loop (tool_loop.go).
 type getTrustInput struct{}
 
 type searchMemoryInput struct {
@@ -151,6 +314,8 @@ type searchMemoryInput struct {
 	Sector string `json:"sector,omitempty" jsonschema:"Filter by memory sector"`
 }
 
+// getNucleusInput — no longer an MCP tool; used by the internal tool loop (tool_loop.go).
+// Logic retained for C1 migration to MCP Resource.
 type getNucleusInput struct {
 	IncludeConfig bool `json:"include_config,omitempty" jsonschema:"Include workspace configuration details"`
 }
@@ -196,6 +361,7 @@ type emitEventInput struct {
 	Payload map[string]any `json:"payload,omitempty" jsonschema:"Event payload. attention.boost: {uri, weight}. session.marker: {label}. insight.captured: {summary, tags}. decision.made: {decision, rationale}."`
 }
 
+// getIndexInput — no longer an MCP tool; used by the internal tool loop (tool_loop.go).
 type getIndexInput struct {
 	Sector string `json:"sector,omitempty" jsonschema:"Filter by memory sector"`
 }
@@ -209,6 +375,7 @@ type ingestInput struct {
 
 // ── Tool Implementations ─────────────────────────────────────────────────────
 
+// toolResolveURI — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
 func (m *MCPServer) toolResolveURI(ctx context.Context, req *mcp.CallToolRequest, input resolveURIInput) (*mcp.CallToolResult, any, error) {
 	// Try v2 registry first (multi-scheme)
 	if URIRegistry != nil {
@@ -368,6 +535,7 @@ func (m *MCPServer) toolGetState(ctx context.Context, req *mcp.CallToolRequest, 
 	return marshalResult(result)
 }
 
+// toolGetTrust — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
 func (m *MCPServer) toolGetTrust(ctx context.Context, req *mcp.CallToolRequest, input getTrustInput) (*mcp.CallToolResult, any, error) {
 	if m.process == nil {
 		return textResult("process not initialized")
@@ -400,6 +568,8 @@ func (m *MCPServer) toolSearchMemory(ctx context.Context, req *mcp.CallToolReque
 	return marshalResult(results)
 }
 
+// toolGetNucleus — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
+// Logic retained for C1 migration to MCP Resource.
 func (m *MCPServer) toolGetNucleus(ctx context.Context, req *mcp.CallToolRequest, input getNucleusInput) (*mcp.CallToolResult, any, error) {
 	if m.nucleus == nil {
 		return textResult("nucleus not loaded")
@@ -673,6 +843,7 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 	})
 }
 
+// toolGetIndex — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
 func (m *MCPServer) toolGetIndex(ctx context.Context, req *mcp.CallToolRequest, input getIndexInput) (*mcp.CallToolResult, any, error) {
 	index, err := BuildMemoryIndex(m.cfg.WorkspaceRoot, input.Sector)
 	if err != nil {
