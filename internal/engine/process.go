@@ -121,6 +121,11 @@ type Process struct {
 	// heartbeat can reuse it instead of recomputing.
 	lastCoherenceReport *CoherenceReport
 
+	// nodeHealth tracks sibling service health, probed each heartbeat.
+	nodeHealth *NodeHealth
+	// nodeManifest is the parsed node manifest (nil if not found).
+	nodeManifest *NodeManifest
+
 	// lastIndexHEAD tracks the HEAD hash at last index rebuild, so we skip
 	// rebuilding when nothing has changed.
 	lastIndexHEAD string
@@ -150,7 +155,20 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		observer:            NewTrajectoryModel(),
 		lastConsolidation:   now,
 		lastMaintenanceTick: now,
+		nodeHealth:          NewNodeHealth(),
+		nodeManifest:        loadManifestQuiet(cfg),
 	}
+}
+
+// loadManifestQuiet loads the node manifest, returning nil if not found.
+func loadManifestQuiet(cfg *Config) *NodeManifest {
+	m, err := LoadManifest(DefaultManifestPath(cfg.WorkspaceRoot))
+	if err != nil {
+		slog.Debug("process: node manifest not found, sibling probes disabled", "err", err)
+		return nil
+	}
+	slog.Info("process: node manifest loaded", "services", len(m.Services))
+	return m
 }
 
 // State returns the current process state (safe for concurrent reads).
@@ -519,11 +537,23 @@ func (p *Process) runConsolidation() {
 	p.transition(StateReceptive)
 }
 
+// NodeHealth returns the current node health state (for use by the serve layer).
+func (p *Process) NodeHealth() *NodeHealth {
+	return p.nodeHealth
+}
+
 // emitHeartbeat fires during the dormant state.
 func (p *Process) emitHeartbeat() {
 	// Only emit heartbeat if not already in an active state.
 	if p.State() == StateActive {
 		return
+	}
+
+	// Probe sibling services.
+	if p.nodeManifest != nil {
+		p.nodeHealth.Probe(p.nodeManifest, p.cfg.Port)
+		healthy, total := p.nodeHealth.Counts()
+		slog.Debug("process: node probe", "healthy", healthy, "total", total)
 	}
 
 	// Reuse the cached coherence report from the last consolidation tick
