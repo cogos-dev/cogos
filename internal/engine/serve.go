@@ -76,6 +76,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// Block sync endpoints (Phase 3 block sync protocol)
 	s.registerBlockRoutes(mux)
 	s.registerCompatRoutes(mux)
+	s.registerMCPRoutes(mux)
 
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),

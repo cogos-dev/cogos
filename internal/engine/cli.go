@@ -84,6 +84,12 @@ func Main() {
 		case "experiment":
 			runExperimentCmd(args[1:], *workspace, *port)
 			return
+		case "manifest":
+			runManifestCmd(args[1:], *workspace)
+			return
+		case "node":
+			runNodeCmd(args[1:], *workspace)
+			return
 		}
 	}
 
