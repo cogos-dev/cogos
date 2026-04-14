@@ -64,90 +64,58 @@ func (m *MCPServer) Handler() http.Handler {
 	return m.handler
 }
 
-// registerTools registers all stage-1 MCP tools.
+// registerTools registers MCP tools.
+// Design: tools are actions with side effects or non-trivial computation.
+// Read-only state queries will migrate to MCP Resources in Phase 2.
 func (m *MCPServer) registerTools() {
-	// Tool 1: cog_resolve_uri
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_resolve_uri",
-		Description: "Resolve a cog: URI to its filesystem path and metadata. Supports all URI forms: cog:mem/semantic/..., cog://workspace/..., sha256:...",
-	}, m.toolResolveURI)
-
-	// Tool 2: cog_query_field
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_query_field",
-		Description: "Query the attentional field — the salience-scored map of all CogDocs currently tracked. Returns top-N items by salience, optionally filtered by memory sector.",
-	}, m.toolQueryField)
-
-	// Tool 3: cog_assemble_context
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_assemble_context",
-		Description: "Build a context package for a given token budget. Uses the foveated context engine to select and order the most relevant CogDocs.",
-	}, m.toolAssembleContext)
-
-	// Tool 4: cog_check_coherence
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_check_coherence",
-		Description: "Run coherence validation against the workspace. Checks cog: URI resolution, frontmatter validity, and reference integrity.",
-	}, m.toolCheckCoherence)
-
-	// Tool 5: cog_get_state
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_get_state",
-		Description: "Get the continuous process state — uptime, heartbeat, field size, consolidation stats, and runtime info.",
-	}, m.toolGetState)
-
-	// Tool 5b: cog_get_trust
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_get_trust",
-		Description: "Return kernel identity and trust metadata — node ID, trust score, fingerprint, heartbeat, and coherence state.",
-	}, m.toolGetTrust)
-
-	// Tool 6: cog_search_memory
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_search_memory",
-		Description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores.",
+		Description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores. Fallback: ./scripts/cog memory search \"query\"",
 	}, m.toolSearchMemory)
 
-	// Tool 7: cog_get_nucleus
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_get_nucleus",
-		Description: "Return the identity context (nucleus) — name, role, personality traits, and workspace configuration.",
-	}, m.toolGetNucleus)
-
-	// Tool 8: cog_read_cogdoc
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_read_cogdoc",
-		Description: "Read a CogDoc by URI or path. Returns the full content with parsed frontmatter metadata and optional schema patch hints.",
+		Description: "Read a CogDoc by URI or path. Resolves cog: URIs automatically. Returns full content with parsed frontmatter and optional section extraction via #fragment. Fallback: ./scripts/cog memory read <path>",
 	}, m.toolReadCogdoc)
 
-	// Tool 9: cog_patch_frontmatter
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_write_cogdoc",
+		Description: "Write or update a CogDoc at the specified memory path. Creates the file with proper frontmatter if it doesn't exist. Fallback: ./scripts/cog memory write <path> \"Title\"",
+	}, m.toolWriteCogdoc)
+
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_patch_frontmatter",
 		Description: "Merge description, tags, or type patches into a CogDoc frontmatter block.",
 	}, m.toolPatchFrontmatter)
 
-	// Tool 10: cog_write_cogdoc
 	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_write_cogdoc",
-		Description: "Write or update a CogDoc at the specified memory path. Creates the file if it doesn't exist.",
-	}, m.toolWriteCogdoc)
+		Name:        "cog_check_coherence",
+		Description: "Run coherence validation against the workspace. Checks URI resolution, frontmatter validity, and reference integrity. Fallback: ./scripts/cog coherence check",
+	}, m.toolCheckCoherence)
 
-	// Tool 11: cog_emit_event
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_get_state",
+		Description: "Get kernel state: process status, uptime, trust, node health (sibling services), field size, and heartbeat info. Includes identity and coherence metadata. Fallback: curl http://localhost:6931/health",
+	}, m.toolGetState)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_query_field",
+		Description: "Query the attentional field — the salience-scored map of all tracked CogDocs. Returns top-N items, optionally filtered by sector. Shows what the kernel considers most relevant right now.",
+	}, m.toolQueryField)
+
+	mcp.AddTool(m.server, &mcp.Tool{
+		Name:        "cog_assemble_context",
+		Description: "Build a context package for a given token budget with an explicit focus topic. Use this for intentional context assembly (subtasks, specific investigations). The automatic foveated-context hook handles ambient context on every prompt.",
+	}, m.toolAssembleContext)
+
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_emit_event",
-		Description: "Emit a custom event to the workspace ledger. Events are appended to the JSONL log.",
+		Description: "Emit a typed event to the workspace ledger. Events: attention.boost (uri + weight), session.marker (label), insight.captured (summary), decision.made (decision + rationale). Fallback: events are JSONL in .cog/ledger/",
 	}, m.toolEmitEvent)
 
-	// Tool 12: cog_get_index
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_get_index",
-		Description: "Return the CogDoc index — all tracked documents with their metadata, tags, and reference graph edges.",
-	}, m.toolGetIndex)
-
-	// Tool 13: cog_ingest
 	mcp.AddTool(m.server, &mcp.Tool{
 		Name:        "cog_ingest",
-		Description: "Ingest external material into the CogOS knowledge substrate. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents.",
+		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
 	}, m.toolIngest)
 }
 
@@ -224,8 +192,8 @@ type readCogdocResult struct {
 }
 
 type emitEventInput struct {
-	Type    string `json:"type" jsonschema:"Event type identifier"`
-	Payload string `json:"payload,omitempty" jsonschema:"JSON payload for the event"`
+	Type    string         `json:"type" jsonschema:"Event type: attention.boost, session.marker, insight.captured, decision.made"`
+	Payload map[string]any `json:"payload,omitempty" jsonschema:"Event payload. attention.boost: {uri, weight}. session.marker: {label}. insight.captured: {summary, tags}. decision.made: {decision, rationale}."`
 }
 
 type getIndexInput struct {
@@ -344,14 +312,15 @@ func (m *MCPServer) toolAssembleContext(ctx context.Context, req *mcp.CallToolRe
 func (m *MCPServer) toolCheckCoherence(ctx context.Context, req *mcp.CallToolRequest, input checkCoherenceInput) (*mcp.CallToolResult, any, error) {
 	report, err := CheckCoherenceMCP(m.cfg, m.nucleus)
 	if err != nil {
-		return textResult(fmt.Sprintf("coherence check failed: %v", err))
+		return fallbackResult(fmt.Sprintf("coherence check failed: %v", err),
+			"./scripts/cog coherence check")
 	}
 	return marshalResult(report)
 }
 
 func (m *MCPServer) toolGetState(ctx context.Context, req *mcp.CallToolRequest, input getStateInput) (*mcp.CallToolResult, any, error) {
 	if m.process == nil {
-		return textResult("process not initialized")
+		return fallbackResult("process not initialized", "curl http://localhost:6931/health")
 	}
 	queue := ReadIngestionQueueState(m.cfg.WorkspaceRoot)
 	trust := m.process.TrustSnapshot()
@@ -359,24 +328,40 @@ func (m *MCPServer) toolGetState(ctx context.Context, req *mcp.CallToolRequest, 
 	if !trust.LastHeartbeatAt.IsZero() {
 		lastHeartbeat = trust.LastHeartbeatAt.Format(time.RFC3339)
 	}
+
+	// Identity (nucleus)
+	identity := ""
+	if m.nucleus != nil {
+		identity = m.nucleus.Name
+	}
+
 	result := map[string]any{
 		"state":               m.process.State().String(),
+		"identity":            identity,
 		"session_id":          m.process.SessionID(),
 		"node_id":             m.process.NodeID,
 		"uptime_seconds":      int(time.Since(m.process.StartedAt()).Seconds()),
 		"field_size":          m.process.Field().Len(),
 		"trust_score":         trust.LocalScore,
+		"fingerprint":         m.process.Fingerprint(),
 		"last_heartbeat":      lastHeartbeat,
-		"last_heartbeat_hash": trust.LastHeartbeatHash,
 		"coherence_state":     trust.CoherenceFingerprint,
 		"quarantined_count":   queue.Quarantined,
 		"deferred_count":      queue.Deferred,
-		"last_quarantine":     queue.LastQuarantineRFC3339,
 	}
+
+	// Node health — sibling services probed on heartbeat.
+	if nh := m.process.NodeHealth(); nh != nil {
+		if summary := nh.Summary(); len(summary) > 0 {
+			result["node"] = summary
+		}
+	}
+
 	if input.Verbose {
 		result["workspace"] = m.cfg.WorkspaceRoot
-		result["fingerprint"] = m.process.Fingerprint()
 		result["started_at"] = m.process.StartedAt().Format(time.RFC3339)
+		result["last_heartbeat_hash"] = trust.LastHeartbeatHash
+		result["last_quarantine"] = queue.LastQuarantineRFC3339
 	}
 	return marshalResult(result)
 }
@@ -407,7 +392,8 @@ func (m *MCPServer) toolSearchMemory(ctx context.Context, req *mcp.CallToolReque
 
 	results, err := SearchMemory(m.cfg.WorkspaceRoot, input.Query, limit, input.Sector)
 	if err != nil {
-		return textResult(fmt.Sprintf("search failed: %v", err))
+		return fallbackResult(fmt.Sprintf("search failed: %v", err),
+			fmt.Sprintf("./scripts/cog memory search %q", input.Query))
 	}
 	return marshalResult(results)
 }
@@ -651,23 +637,30 @@ func WriteCogDoc(workspaceRoot string, path string, opts CogDocWriteOpts) (strin
 
 func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest, input emitEventInput) (*mcp.CallToolResult, any, error) {
 	if input.Type == "" {
-		return textResult("event type is required")
+		return textResult("event type is required. Valid types: attention.boost, session.marker, insight.captured, decision.made")
 	}
 
 	event := map[string]any{
 		"type": input.Type,
 	}
-	if input.Payload != "" {
-		var payload any
-		if err := json.Unmarshal([]byte(input.Payload), &payload); err == nil {
-			event["payload"] = payload
-		} else {
-			event["payload"] = input.Payload
+	if input.Payload != nil {
+		event["payload"] = input.Payload
+	}
+
+	// Handle attention.boost: write to the attentional field.
+	if input.Type == "attention.boost" && m.process != nil {
+		if uri, ok := input.Payload["uri"].(string); ok && uri != "" {
+			weight := 1.0
+			if w, ok := input.Payload["weight"].(float64); ok && w > 0 {
+				weight = w
+			}
+			m.process.Field().Boost(uri, weight)
+			event["field_boosted"] = true
 		}
 	}
 
 	if err := EmitLedgerEvent(m.cfg, event); err != nil {
-		return textResult(fmt.Sprintf("emit failed: %v", err))
+		return fallbackResult(fmt.Sprintf("emit failed: %v", err), "echo '{\"type\":\"...\"}' >> .cog/ledger/events.jsonl")
 	}
 
 	return marshalResult(map[string]any{
@@ -952,6 +945,19 @@ func textResult(text string) (*mcp.CallToolResult, any, error) {
 		Content: []mcp.Content{
 			&mcp.TextContent{Text: text},
 		},
+	}, nil, nil
+}
+
+// fallbackResult returns an error message with a CLI fallback command.
+// This is the graceful degradation path — when the kernel is unavailable,
+// the agent can fall back to shell commands that work without it.
+func fallbackResult(errMsg, fallbackCmd string) (*mcp.CallToolResult, any, error) {
+	text := fmt.Sprintf("%s\n\nFallback (kernel unavailable): %s", errMsg, fallbackCmd)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: text},
+		},
+		IsError: true,
 	}, nil, nil
 }
 
