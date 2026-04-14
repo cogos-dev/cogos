@@ -12,7 +12,6 @@ package engine
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -196,34 +195,36 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 	tier4Budget := 4000
 	renderedDocs, _ := evictForBudgetMode(knowledgeDocs, nil, tier4Budget, s.cfg.WorkspaceRoot, true)
 
-	// === Render context blocks ===
-	var sb strings.Builder
-	blocks := make([]foveatedBlock, 0, 3)
+	// === Build ContextFrame with all block builders ===
+	frame := &ContextFrame{
+		Anchor: anchor,
+		Goal:   goal,
+	}
 
-	// Tier 4: Knowledge
-	renderKnowledgeBlock(&sb, &blocks, renderedDocs)
+	// Tier 0, stability 90: Project block (CLAUDE.md)
+	if blk := buildProjectBlock(s.cfg.WorkspaceRoot); blk != nil {
+		frame.Blocks = append(frame.Blocks, *blk)
+	}
 
-	// Tier 2: Temporal context (placeholder — time-aware context)
-	renderBlock(&sb, &blocks, "tier2", "temporal-context", "# Temporal Context\n", 40, nil)
+	// Tier 2, stability 70: Node health (sibling services)
+	if blk := buildNodeBlock(s.process); blk != nil {
+		frame.Blocks = append(frame.Blocks, *blk)
+	}
 
-	// Tier 2: Current focus
-	focusContent := fmt.Sprintf("Topic: %s\n", anchor)
-	renderBlock(&sb, &blocks, "tier2", "current-focus", focusContent, 40, nil)
+	// Tier 2, stability 40: Attentional field top-10
+	if blk := buildFieldBlock(s.process, s.cfg.WorkspaceRoot); blk != nil {
+		frame.Blocks = append(frame.Blocks, *blk)
+	}
 
-	// Tier 2: User intent
-	goalContent := fmt.Sprintf("Goal: %s\n", goal)
-	renderBlock(&sb, &blocks, "tier2", "user-intent", goalContent, 40, nil)
+	// Tier 1, stability 30: Knowledge (foveated CogDocs — existing logic)
+	knowledgeContent := renderKnowledgeContent(renderedDocs)
+	knowledgeBlock := NewBlock(BlockKnowledge, knowledgeContent)
+	frame.Blocks = append(frame.Blocks, knowledgeBlock)
 
-	contextStr := sb.String()
-	tokens := estTokens(contextStr)
-
-	slog.Info("foveated: assembled",
-		"anchor", anchor,
-		"goal", goal,
-		"docs", len(renderedDocs),
-		"tokens", tokens,
-		"pressure", fmt.Sprintf("%.1f%%", pressure*100),
-	)
+	// Tier 2, stability 20: Recent ledger events
+	if blk := buildEventsBlock(s.cfg.WorkspaceRoot); blk != nil {
+		frame.Blocks = append(frame.Blocks, *blk)
+	}
 
 	// Compute effective budget from iris signal.
 	effectiveBudget := tier4Budget
@@ -234,6 +235,52 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Fit blocks within budget and render.
+	frame.FitBudget(effectiveBudget)
+	contextStr := frame.Render()
+	tokens := estTokens(contextStr)
+
+	slog.Info("foveated: assembled",
+		"anchor", anchor,
+		"goal", goal,
+		"docs", len(renderedDocs),
+		"frame_blocks", len(frame.Blocks),
+		"tokens", tokens,
+		"pressure", fmt.Sprintf("%.1f%%", pressure*100),
+	)
+
+	// Build response blocks from the frame for backward compatibility.
+	blocks := make([]foveatedBlock, 0, len(frame.Blocks))
+	tierBreakdown := make(map[string]int)
+	for _, b := range frame.Blocks {
+		tierKey := fmt.Sprintf("tier%d", b.Tier)
+		tierBreakdown[tierKey] += b.Tokens
+
+		var sources []foveatedBlockSource
+		if b.Name == BlockKnowledge {
+			for _, doc := range renderedDocs {
+				sources = append(sources, foveatedBlockSource{
+					URI:      doc.URI,
+					Title:    doc.Title,
+					Path:     doc.Path,
+					Salience: doc.Salience,
+					Reason:   doc.Reason,
+					Summary:  truncate(strings.TrimSpace(doc.Summary), 180),
+				})
+			}
+		}
+
+		blocks = append(blocks, foveatedBlock{
+			Tier:      tierKey,
+			Name:      b.Name,
+			Hash:      b.Hash,
+			Tokens:    b.Tokens,
+			Stability: b.Stability,
+			Preview:   truncate(b.Content, 280),
+			Sources:   sources,
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(foveatedResponse{
 		Context:         contextStr,
@@ -242,52 +289,21 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 		Goal:            goal,
 		IrisPressure:    pressure,
 		CoherenceScore:  1.0, // TODO: compute from tier quality scores
-		TierBreakdown:   map[string]int{"tier2": 80, "tier4": tokens - 80},
+		TierBreakdown:   tierBreakdown,
 		EffectiveBudget: effectiveBudget,
 		Blocks:          blocks,
 	})
 }
 
-// renderBlock writes a single CogBlock HTML comment block.
-func renderBlock(sb *strings.Builder, blocks *[]foveatedBlock, tier, name, content string, stability int, sources []foveatedBlockSource) {
-	h := sha256.Sum256([]byte(content))
-	hash := fmt.Sprintf("%x", h[:4])
-	tokens := estTokens(content)
-	fmt.Fprintf(sb, "<!-- block:%s:%s hash:%s tokens:%d stability:%d -->\n",
-		tier, name, hash, tokens, stability)
-	sb.WriteString(content)
-	sb.WriteString("\n---\n\n")
-	if blocks != nil {
-		*blocks = append(*blocks, foveatedBlock{
-			Tier:      tier,
-			Name:      name,
-			Hash:      hash,
-			Tokens:    tokens,
-			Stability: stability,
-			Preview:   truncate(content, 280),
-			Sources:   sources,
-		})
-	}
-}
 
-// renderKnowledgeBlock writes the tier4 knowledge block with constellation results.
-func renderKnowledgeBlock(sb *strings.Builder, blocks *[]foveatedBlock, docs []FovealDoc) {
+// renderKnowledgeContent builds the knowledge block content string from foveated docs.
+// This is the content-only portion; the block envelope is handled by ContextFrame.Render.
+func renderKnowledgeContent(docs []FovealDoc) string {
 	var content strings.Builder
-	sources := make([]foveatedBlockSource, 0, len(docs))
-	for _, doc := range docs {
-		sources = append(sources, foveatedBlockSource{
-			URI:      doc.URI,
-			Title:    doc.Title,
-			Path:     doc.Path,
-			Salience: doc.Salience,
-			Reason:   doc.Reason,
-			Summary:  truncate(strings.TrimSpace(doc.Summary), 180),
-		})
-	}
+
 	if docsUseManifest(docs) {
 		content.WriteString(renderWorkspaceManifest(docs))
-		renderBlock(sb, blocks, "tier4", "knowledge", content.String(), 50, sources)
-		return
+		return content.String()
 	}
 
 	content.WriteString("# Relevant Knowledge (Constellation)\n\n")
@@ -308,7 +324,7 @@ func renderKnowledgeBlock(sb *strings.Builder, blocks *[]foveatedBlock, docs []F
 		}
 	}
 
-	renderBlock(sb, blocks, "tier4", "knowledge", content.String(), 50, sources)
+	return content.String()
 }
 
 // extractAnchor derives the current topic from the user's prompt.

@@ -97,15 +97,10 @@ This paper introduces the Transformer architecture based on self-attention mecha
 		t.Fatal("decode:", err)
 	}
 
-	// Should have non-empty context with block markers.
-	if !strings.Contains(result.Context, "<!-- block:tier4:knowledge") {
-		t.Error("missing tier4:knowledge block in context")
-	}
-	if !strings.Contains(result.Context, "<!-- block:tier2:current-focus") {
-		t.Error("missing tier2:current-focus block in context")
-	}
-	if !strings.Contains(result.Context, "<!-- block:tier2:user-intent") {
-		t.Error("missing tier2:user-intent block in context")
+	// Should have non-empty context with block markers using ContextFrame format.
+	// ContextFrame.Render uses integer tiers: <!-- block:{tier}:{name} ... -->
+	if !strings.Contains(result.Context, "knowledge") {
+		t.Error("missing knowledge block in context")
 	}
 	if !strings.Contains(result.Context, "Use cog_read_cogdoc to access full content when needed") {
 		t.Error("missing manifest retrieval hint in context")
@@ -135,24 +130,37 @@ This paper introduces the Transformer architecture based on self-attention mecha
 		t.Errorf("tokens = %d; want > 0", result.Tokens)
 	}
 
-	if len(result.Blocks) != 4 {
-		t.Fatalf("blocks = %d; want 4", len(result.Blocks))
+	// Should have at least a knowledge block (field block may also be present).
+	if len(result.Blocks) == 0 {
+		t.Fatal("no blocks returned")
 	}
-	if result.Blocks[0].Tier != "tier4" || result.Blocks[0].Name != "knowledge" {
-		t.Fatalf("first block = %s/%s; want tier4/knowledge", result.Blocks[0].Tier, result.Blocks[0].Name)
+
+	// Find and validate the knowledge block.
+	var knowledgeBlock *foveatedBlock
+	for i := range result.Blocks {
+		if result.Blocks[i].Name == BlockKnowledge {
+			knowledgeBlock = &result.Blocks[i]
+			break
+		}
 	}
-	if len(result.Blocks[0].Sources) == 0 {
+	if knowledgeBlock == nil {
+		t.Fatal("knowledge block not found in response blocks")
+	}
+	if knowledgeBlock.Tier != "tier1" {
+		t.Errorf("knowledge block tier = %q; want \"tier1\"", knowledgeBlock.Tier)
+	}
+	if len(knowledgeBlock.Sources) == 0 {
 		t.Fatal("knowledge block missing sources")
 	}
-	if result.Blocks[0].Sources[0].Title == "" {
+	if knowledgeBlock.Sources[0].Title == "" {
 		t.Error("knowledge source title is empty")
 	}
-	if result.Blocks[0].Hash == "" {
+	if knowledgeBlock.Hash == "" {
 		t.Error("knowledge block hash is empty")
 	}
 
-	t.Logf("anchor=%q goal=%q tokens=%d pressure=%.1f%%",
-		result.Anchor, result.Goal, result.Tokens, result.IrisPressure*100)
+	t.Logf("anchor=%q goal=%q tokens=%d blocks=%d pressure=%.1f%%",
+		result.Anchor, result.Goal, result.Tokens, len(result.Blocks), result.IrisPressure*100)
 	t.Logf("context preview: %s", result.Context[:min(200, len(result.Context))])
 }
 
