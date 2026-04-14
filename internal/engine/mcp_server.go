@@ -267,10 +267,12 @@ func (m *MCPServer) toolQueryField(ctx context.Context, req *mcp.CallToolRequest
 		Salience float64 `json:"salience"`
 	}
 	var entries []entry
-	for uri, score := range scores {
-		if input.Sector != "" && !strings.Contains(uri, input.Sector) {
+	for absPath, score := range scores {
+		if input.Sector != "" && !strings.Contains(absPath, input.Sector) {
 			continue
 		}
+		// Project field key (abs path) to canonical URI.
+		uri := FieldKeyToURI(m.cfg.WorkspaceRoot, absPath)
 		entries = append(entries, entry{URI: uri, Salience: score})
 	}
 	// Sort by salience descending
@@ -647,15 +649,17 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 		event["payload"] = input.Payload
 	}
 
-	// Handle attention.boost: write to the attentional field.
+	// Handle attention.boost: resolve URI to field key, then boost.
 	if input.Type == "attention.boost" && m.process != nil {
 		if uri, ok := input.Payload["uri"].(string); ok && uri != "" {
+			fieldKey := ResolveToFieldKey(m.cfg.WorkspaceRoot, uri)
 			weight := 1.0
 			if w, ok := input.Payload["weight"].(float64); ok && w > 0 {
 				weight = w
 			}
-			m.process.Field().Boost(uri, weight)
+			m.process.Field().Boost(fieldKey, weight)
 			event["field_boosted"] = true
+			event["resolved_key"] = fieldKey
 		}
 	}
 

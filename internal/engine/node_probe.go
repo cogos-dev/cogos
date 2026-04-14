@@ -26,35 +26,46 @@ func NewNodeHealth() *NodeHealth {
 	return &NodeHealth{services: make(map[string]ServiceHealth)}
 }
 
-// Probe checks all sibling services defined in the manifest.
+// Probe checks all sibling services defined in the manifest concurrently.
 // Skips the kernel itself (it knows its own health).
+// Each probe has a 2s timeout; total wall time is ~2s regardless of service count.
 func (nh *NodeHealth) Probe(manifest *NodeManifest, selfPort int) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	now := time.Now().UTC()
 
+	type result struct {
+		name   string
+		health ServiceHealth
+	}
+
+	ch := make(chan result, len(manifest.Services))
+	count := 0
+
 	for name, svc := range manifest.Services {
 		if svc.Port == selfPort {
-			continue // don't probe ourselves
+			continue
 		}
-
-		status := "down"
-		url := fmt.Sprintf("http://localhost:%d%s", svc.Port, svc.Health)
-		resp, err := client.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				status = "healthy"
-			} else {
-				status = "degraded"
+		count++
+		go func(name string, svc ServiceDef) {
+			status := "down"
+			url := fmt.Sprintf("http://localhost:%d%s", svc.Port, svc.Health)
+			resp, err := client.Get(url)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == 200 {
+					status = "healthy"
+				} else {
+					status = "degraded"
+				}
 			}
-		}
+			ch <- result{name, ServiceHealth{Port: svc.Port, Status: status, At: now}}
+		}(name, svc)
+	}
 
+	for i := 0; i < count; i++ {
+		r := <-ch
 		nh.mu.Lock()
-		nh.services[name] = ServiceHealth{
-			Port:   svc.Port,
-			Status: status,
-			At:     now,
-		}
+		nh.services[r.name] = r.health
 		nh.mu.Unlock()
 	}
 }
