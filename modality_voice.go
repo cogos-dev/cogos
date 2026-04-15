@@ -90,7 +90,7 @@ func (m *VoiceModule) Stop(ctx context.Context) error {
 func (m *VoiceModule) Health() ModuleStatus {
 	worst := ModuleStatusHealthy
 	for _, cfg := range voiceSubprocesses {
-		st, err := m.supervisor.Status(cfg.Name)
+		st, err := m.supervisor.ModuleStatus(cfg.Name)
 		if err != nil {
 			return ModuleStatusStopped
 		}
@@ -114,12 +114,7 @@ func statusSeverity(s ModuleStatus) int {
 }
 
 func supervisorConn(sup *ProcessSupervisor, name string) *SubprocessConn {
-	sup.mu.RLock()
-	defer sup.mu.RUnlock()
-	if m, ok := sup.processes[name]; ok {
-		return m.Conn
-	}
-	return nil
+	return sup.Conn(name)
 }
 
 // --- voiceGate (VAD) — implements Gate ---

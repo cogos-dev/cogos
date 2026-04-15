@@ -1,95 +1,16 @@
-// modality_text.go — Text modality module: pure passthrough.
+// modality_text.go — Re-exports from pkg/modality for kernel use.
 //
-// No subprocess, no transformation. Text is the identity modality.
-// This is the reference implementation for ModalityModule.
+// The text module implementation lives in pkg/modality. This file
+// provides package-level aliases so existing kernel code compiles unchanged.
 
 package main
 
-import (
-	"context"
-	"time"
-)
+import "github.com/cogos-dev/cogos/pkg/modality"
 
-// ---------------------------------------------------------------------------
-// TextModule — implements ModalityModule
-// ---------------------------------------------------------------------------
-
-// TextModule implements ModalityModule for text — pure passthrough.
-// No subprocess, no transformation. Text is the identity modality.
-type TextModule struct {
-	status  ModuleStatus
-	decoder *textDecoder
-	encoder *textEncoder
-}
+// Type alias — text module.
+type TextModule = modality.TextModule
 
 // NewTextModule creates a text modality module.
 func NewTextModule() *TextModule {
-	return &TextModule{
-		status:  ModuleStatusStopped,
-		decoder: &textDecoder{},
-		encoder: &textEncoder{},
-	}
-}
-
-// Type returns ModalityText.
-func (m *TextModule) Type() ModalityType { return ModalityText }
-
-// Gate returns nil — text has no input gate, all input passes through.
-func (m *TextModule) Gate() Gate { return nil }
-
-// Decoder returns the text decoder.
-func (m *TextModule) Decoder() Decoder { return m.decoder }
-
-// Encoder returns the text encoder.
-func (m *TextModule) Encoder() Encoder { return m.encoder }
-
-// State returns the current module state.
-func (m *TextModule) State() *ModuleState {
-	return &ModuleState{
-		Status:   m.status,
-		Modality: ModalityText,
-	}
-}
-
-// Start sets status to healthy (no subprocess needed).
-func (m *TextModule) Start(_ context.Context) error {
-	m.status = ModuleStatusHealthy
-	return nil
-}
-
-// Stop sets status to stopped.
-func (m *TextModule) Stop(_ context.Context) error {
-	m.status = ModuleStatusStopped
-	return nil
-}
-
-// Health returns the current status.
-func (m *TextModule) Health() ModuleStatus { return m.status }
-
-// ---------------------------------------------------------------------------
-// textDecoder / textEncoder — identity transforms
-// ---------------------------------------------------------------------------
-
-// textDecoder decodes raw text bytes into a CognitiveEvent.
-type textDecoder struct{}
-
-func (d *textDecoder) Decode(raw []byte, modality ModalityType, channel string) (*CognitiveEvent, error) {
-	return &CognitiveEvent{
-		Modality:   ModalityText,
-		Channel:    channel,
-		Content:    string(raw),
-		Confidence: 1.0,
-		Timestamp:  time.Now(),
-	}, nil
-}
-
-// textEncoder encodes a CognitiveIntent into raw text bytes.
-type textEncoder struct{}
-
-func (e *textEncoder) Encode(intent *CognitiveIntent) (*EncodedOutput, error) {
-	return &EncodedOutput{
-		Modality: ModalityText,
-		Data:     []byte(intent.Content),
-		MimeType: "text/plain",
-	}, nil
+	return modality.NewTextModule()
 }
