@@ -18,102 +18,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/cogos-dev/cogos/pkg/cogfield"
 )
 
-// GraphBlock is the intermediate representation for CogField graph rendering.
-// Adapters convert their native data into GraphBlocks for visualization.
-type GraphBlock struct {
-	URI      string                 // cog://bus/{busID}/{seq}
-	Type     string                 // bus.message, session.turn, etc.
-	From     string
-	Ts       string
-	Hash     string
-	PrevHash string
-	Payload  map[string]interface{}
-	Meta     map[string]interface{}
-}
-
-// BlockAdapter lets any data source produce graph nodes.
-type BlockAdapter interface {
-	ID() string
-	NodeConfig() AdapterNodeConfig
-	SummaryNodes(root string) ([]CogFieldNode, []CogFieldEdge)
-	ExpandNode(root, nodeID string) ([]CogFieldNode, []CogFieldEdge, error)
-}
-
-// AdapterNodeConfig describes how an adapter's block types map to graph rendering.
-type AdapterNodeConfig struct {
-	BlockTypes    map[string]BlockTypeConfig `json:"block_types"`
-	DefaultSector string                     `json:"default_sector"`
-	ChainThread   string                     `json:"chain_thread"`
-}
-
-// BlockTypeConfig describes the visual config for a block type.
-type BlockTypeConfig struct {
-	EntityType string `json:"entity_type"`
-	Shape      string `json:"shape"`
-	Color      string `json:"color,omitempty"`
-	Label      string `json:"label"`
-}
+// Type aliases — canonical types live in pkg/cogfield.
+type GraphBlock = cogfield.GraphBlock
+type BlockAdapter = cogfield.BlockAdapter
+type AdapterNodeConfig = cogfield.AdapterNodeConfig
+type BlockTypeConfig = cogfield.BlockTypeConfig
 
 // adapters is the registry of all block adapters.
 var adapters = []BlockAdapter{&BusAdapter{}, &SessionAdapter{}, &ComponentAdapter{}, &SignalAdapter{}, &ReconcileAdapter{}}
 
-// graphBlockToNode converts a GraphBlock into a CogFieldNode for graph rendering.
-func graphBlockToNode(block GraphBlock) CogFieldNode {
-	// Map type prefix to sector
-	sector := "sessions"
-	if strings.HasPrefix(block.Type, "bus.") {
-		sector = "buses"
-	}
-
-	// Extract label from payload content (first 60 chars)
-	label := ""
-	if content, ok := block.Payload["content"]; ok {
-		if s, ok := content.(string); ok {
-			label = s
-			if len(label) > 60 {
-				label = label[:60] + "..."
-			}
-		}
-	}
-	if label == "" {
-		label = block.Type
-	}
-
-	meta := map[string]interface{}{
-		"block_type": block.Type,
-	}
-	if block.Hash != "" {
-		meta["hash"] = block.Hash
-	}
-	if block.PrevHash != "" {
-		meta["prev_hash"] = block.PrevHash
-	}
-	if block.From != "" {
-		meta["from"] = block.From
-	}
-	// Store full content for the detail panel
-	if content, ok := block.Payload["content"]; ok {
-		meta["full_content"] = content
-	}
-	// Merge any adapter-provided meta
-	for k, v := range block.Meta {
-		meta[k] = v
-	}
-
-	return CogFieldNode{
-		ID:         block.URI,
-		Label:      label,
-		EntityType: block.Type,
-		Sector:     sector,
-		Tags:       []string{},
-		Created:    block.Ts,
-		Modified:   block.Ts,
-		Strength:   3.0,
-		Meta:       meta,
-	}
-}
+// graphBlockToNode delegates to pkg/cogfield.
+var graphBlockToNode = cogfield.GraphBlockToNode
 
 // --- BusAdapter ---
 
@@ -370,13 +289,8 @@ func (a *SessionAdapter) ExpandNode(root, nodeID string) ([]CogFieldNode, []CogF
 
 // --- Expand endpoint ---
 
-// ExpandNodeResponse is the response for GET /api/cogfield/expand/{nodeId}
-type ExpandNodeResponse struct {
-	ParentID string           `json:"parent_id"`
-	Nodes    []CogFieldNode   `json:"nodes"`
-	Edges    []CogFieldEdge   `json:"edges"`
-	Config   AdapterNodeConfig `json:"config"`
-}
+// ExpandNodeResponse is a type alias — canonical type lives in pkg/cogfield.
+type ExpandNodeResponse = cogfield.ExpandNodeResponse
 
 // handleExpandNode handles GET /api/cogfield/expand/{nodeId}
 func (s *serveServer) handleExpandNode(w http.ResponseWriter, r *http.Request) {

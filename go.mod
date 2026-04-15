@@ -9,6 +9,7 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/cogos-dev/cogos/envspec v0.0.0
 	github.com/cogos-dev/cogos/harness v0.0.0
+	github.com/cogos-dev/cogos/pkg/cogfield v0.0.0
 	github.com/cogos-dev/cogos/sdk v0.0.0
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/go-git/go-git/v5 v5.16.4
@@ -101,3 +102,5 @@ replace github.com/cogos-dev/cogos/sdk => ./sdk
 replace github.com/cogos-dev/cogos/harness => ./harness
 
 replace github.com/cogos-dev/cogos/envspec => ./envspec
+
+replace github.com/cogos-dev/cogos/pkg/cogfield => ./pkg/cogfield

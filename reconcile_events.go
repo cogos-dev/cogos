@@ -1,41 +1,26 @@
 // reconcile_events.go
-// Reconciliation event types and emission helpers for the CogOS provider model.
-// Events follow the cog.reconcile.* naming convention and are emitted during
-// the plan/apply lifecycle. They are logged to stderr and returned to callers
-// for optional forwarding to CogBus (see task C2).
+// Thin re-export layer for event types and constants. Also provides
+// compatibility helpers that bridge legacy Discord types (PlanSummary,
+// ApplyResult) to the extracted package's types.
 
 package main
 
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"time"
-)
+import "github.com/cogos-dev/cogos/pkg/reconcile"
 
-// ─── Reconciliation event type constants ────────────────────────────────────
+// --- Re-exported event type aliases ---
+
+type ReconcileEvent = reconcile.Event
+
+// --- Re-exported constants ---
 
 const (
-	// EventReconcilePlanStart is emitted when plan computation begins.
-	EventReconcilePlanStart = "cog.reconcile.plan.start"
-
-	// EventReconcilePlanComplete is emitted when a plan is ready with its summary.
-	EventReconcilePlanComplete = "cog.reconcile.plan.complete"
-
-	// EventReconcileApplyStart is emitted when plan application begins.
-	EventReconcileApplyStart = "cog.reconcile.apply.start"
-
-	// EventReconcileApplyAction is emitted for each individual action executed.
-	EventReconcileApplyAction = "cog.reconcile.apply.action"
-
-	// EventReconcileApplyComplete is emitted when plan application finishes.
-	EventReconcileApplyComplete = "cog.reconcile.apply.complete"
-
-	// EventReconcileDrift is emitted when drift is detected during refresh or watch.
-	EventReconcileDrift = "cog.reconcile.drift.detected"
-
-	// EventReconcileError is emitted when a reconciliation fails.
-	EventReconcileError = "cog.reconcile.error"
+	EventReconcilePlanStart    = reconcile.EventPlanStart
+	EventReconcilePlanComplete = reconcile.EventPlanComplete
+	EventReconcileApplyStart   = reconcile.EventApplyStart
+	EventReconcileApplyAction  = reconcile.EventApplyAction
+	EventReconcileApplyComplete = reconcile.EventApplyComplete
+	EventReconcileDrift        = reconcile.EventDrift
+	EventReconcileError        = reconcile.EventError
 
 	// BlockComponentDrift is the CogBus block type for component drift events.
 	BlockComponentDrift = "component.drift"
@@ -44,114 +29,44 @@ const (
 	reconcileBusID = "bus_chat_system_capabilities"
 )
 
-// ─── ReconcileEvent struct ──────────────────────────────────────────────────
+// --- Re-exported functions ---
 
-// ReconcileEvent is the structured payload emitted for reconciliation lifecycle events.
-type ReconcileEvent struct {
-	Event        string         `json:"event"`
-	ResourceType string         `json:"resource_type"`
-	Timestamp    string         `json:"timestamp"`
-	DurationMs   int64          `json:"duration_ms,omitempty"`
-	Summary      map[string]any `json:"summary,omitempty"`
-	Error        string         `json:"error,omitempty"`
-}
+var (
+	EmitReconcileEvent = reconcile.EmitEvent
+	EmitPlanStart      = reconcile.EmitPlanStart
+	EmitApplyAction    = reconcile.EmitApplyAction
+	EmitDriftDetected  = reconcile.EmitDriftDetected
+	EmitReconcileError = reconcile.EmitError
+)
 
-// ─── Core emission function ─────────────────────────────────────────────────
+// --- Compatibility wrappers for legacy Discord types ---
 
-// EmitReconcileEvent creates a ReconcileEvent, logs it to stderr, and returns
-// it for callers who want to forward it to CogBus.
-func EmitReconcileEvent(eventType string, resourceType string, summary map[string]any) *ReconcileEvent {
-	evt := &ReconcileEvent{
-		Event:        eventType,
-		ResourceType: resourceType,
-		Timestamp:    time.Now().UTC().Format(time.RFC3339),
-		Summary:      summary,
-	}
-
-	data, err := json.Marshal(evt)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[reconcile] event=%s resource=%s error=marshal_failed\n", eventType, resourceType)
-		return evt
-	}
-	fmt.Fprintf(os.Stderr, "[reconcile] %s\n", string(data))
-	return evt
-}
-
-// ─── Typed helper functions ─────────────────────────────────────────────────
-
-// EmitPlanStart emits a plan.start event for the given resource type.
-func EmitPlanStart(resourceType string) *ReconcileEvent {
-	return EmitReconcileEvent(EventReconcilePlanStart, resourceType, nil)
-}
-
-// EmitPlanComplete emits a plan.complete event with plan summary and duration.
+// EmitPlanComplete bridges the legacy PlanSummary type to the extracted package.
 func EmitPlanComplete(resourceType string, summary PlanSummary, durationMs int64) *ReconcileEvent {
-	evt := EmitReconcileEvent(EventReconcilePlanComplete, resourceType, map[string]any{
-		"creates": summary.Creates,
-		"updates": summary.Updates,
-		"deletes": summary.Deletes,
-		"skipped": summary.Skipped,
-	})
-	evt.DurationMs = durationMs
-	return evt
+	return reconcile.EmitPlanComplete(resourceType, reconcile.Summary{
+		Creates: summary.Creates,
+		Updates: summary.Updates,
+		Deletes: summary.Deletes,
+		Skipped: summary.Skipped,
+	}, durationMs)
 }
 
 // EmitApplyStart emits an apply.start event with the number of actions to apply.
 func EmitApplyStart(resourceType string, actionCount int) *ReconcileEvent {
-	return EmitReconcileEvent(EventReconcileApplyStart, resourceType, map[string]any{
-		"action_count": actionCount,
-	})
+	return reconcile.EmitApplyStart(resourceType, actionCount)
 }
 
-// EmitApplyAction emits an apply.action event for an individual action execution.
-func EmitApplyAction(resourceType string, action, name, status string) *ReconcileEvent {
-	return EmitReconcileEvent(EventReconcileApplyAction, resourceType, map[string]any{
-		"action": action,
-		"name":   name,
-		"status": status,
-	})
-}
-
-// EmitApplyComplete emits an apply.complete event with aggregated results and duration.
+// EmitApplyComplete bridges the legacy ApplyResult type to the extracted package.
 func EmitApplyComplete(resourceType string, results []ApplyResult, durationMs int64) *ReconcileEvent {
-	succeeded := 0
-	failed := 0
-	skipped := 0
-	for _, r := range results {
-		switch r.Status {
-		case "succeeded":
-			succeeded++
-		case "failed":
-			failed++
-		case "skipped":
-			skipped++
+	pkgResults := make([]reconcile.Result, len(results))
+	for i, r := range results {
+		pkgResults[i] = reconcile.Result{
+			Phase:  r.Phase,
+			Action: r.Action,
+			Name:   r.Name,
+			Status: reconcile.ApplyStatus(r.Status),
+			Error:  r.Error,
 		}
 	}
-
-	evt := EmitReconcileEvent(EventReconcileApplyComplete, resourceType, map[string]any{
-		"total":     len(results),
-		"succeeded": succeeded,
-		"failed":    failed,
-		"skipped":   skipped,
-	})
-	evt.DurationMs = durationMs
-	return evt
-}
-
-// EmitDriftDetected emits a drift.detected event with the number of drifts found.
-func EmitDriftDetected(resourceType string, drifts int) *ReconcileEvent {
-	return EmitReconcileEvent(EventReconcileDrift, resourceType, map[string]any{
-		"drifts": drifts,
-	})
-}
-
-// EmitReconcileError emits an error event for a failed reconciliation.
-func EmitReconcileError(resourceType string, err error) *ReconcileEvent {
-	errMsg := ""
-	if err != nil {
-		errMsg = err.Error()
-	}
-	evt := EmitReconcileEvent(EventReconcileError, resourceType, nil)
-	evt.Error = errMsg
-	return evt
+	return reconcile.EmitApplyComplete(resourceType, pkgResults, durationMs)
 }

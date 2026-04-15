@@ -10,47 +10,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"time"
+
+	"github.com/cogos-dev/cogos/pkg/reconcile"
 )
 
-// Tokenable is an optional interface for providers that need auth tokens.
-// Providers that implement this can receive tokens from --token flags or
-// environment variables ({TYPE}_TOKEN, e.g. DISCORD_BOT_TOKEN).
-type Tokenable interface {
-	SetToken(token string)
-}
-
 // resolveGenericToken resolves an auth token from flag or environment.
-// Checks --token flag first, then {RESOURCE_TYPE}_TOKEN env vars.
 func resolveGenericToken(resourceType, flagToken string) string {
-	if flagToken != "" {
-		return flagToken
-	}
-
-	// Check common env var patterns
-	upper := strings.ToUpper(resourceType)
-	envNames := []string{
-		upper + "_BOT_TOKEN",
-		upper + "_TOKEN",
-		upper + "_API_TOKEN",
-	}
-	for _, name := range envNames {
-		if v := os.Getenv(name); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// configureProvider sets up a provider with auth token if needed.
-func configureProvider(provider Reconcilable, resourceType, flagToken string) {
-	if t, ok := provider.(Tokenable); ok {
-		token := resolveGenericToken(resourceType, flagToken)
-		if token != "" {
-			t.SetToken(token)
-		}
-	}
+	return reconcile.ResolveToken(resourceType, flagToken)
 }
 
 // parseGenericFlags parses common flags from args: --token, --json.
@@ -343,14 +310,6 @@ func cmdGenericRefresh(resourceType string, args []string) int {
 	fmt.Printf("Refreshed %s state: %d resources (serial %d)\n",
 		resourceType, len(newState.Resources), newState.Serial)
 	return 0
-}
-
-// ConfigExporter is an optional interface for providers that can generate
-// a declared config file (e.g., config.yaml) from live state.
-// When a provider implements this, `cog snapshot` will export config
-// in addition to refreshing state.
-type ConfigExporter interface {
-	ExportConfig(root string) error
 }
 
 // cmdGenericSnapshot crawls live and writes state for any registered provider.

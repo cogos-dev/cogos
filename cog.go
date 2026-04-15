@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/cogos-dev/cogos/pkg/coordination"
 )
 
 // === VERSION & BUILD INFO ===
@@ -4816,21 +4818,30 @@ func cmdCoordClaim(workspaceRoot string, args []string) error {
 	if len(args) > 1 {
 		reason = strings.Join(args[1:], " ")
 	}
-	return CreateClaim(workspaceRoot, path, reason)
+	claim, err := coordination.CreateClaim(workspaceRoot, path, reason)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Claimed: %s\n", PathToURI(workspaceRoot, claim.Path))
+	return nil
 }
 
 func cmdCoordRelease(workspaceRoot string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: cog coord release <path>")
 	}
-	return ReleaseClaim(workspaceRoot, args[0])
+	if err := coordination.ReleaseClaim(workspaceRoot, args[0]); err != nil {
+		return err
+	}
+	fmt.Printf("Released: %s\n", PathToURI(workspaceRoot, args[0]))
+	return nil
 }
 
 func cmdCoordClaimed(workspaceRoot string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: cog coord claimed <path>")
 	}
-	if IsClaimed(workspaceRoot, args[0]) {
+	if coordination.IsClaimed(workspaceRoot, args[0]) {
 		fmt.Println("claimed")
 		return nil
 	}
@@ -4842,7 +4853,7 @@ func cmdCoordOwner(workspaceRoot string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: cog coord owner <path>")
 	}
-	owner, err := ClaimOwner(workspaceRoot, args[0])
+	owner, err := coordination.ClaimOwner(workspaceRoot, args[0])
 	if err != nil {
 		return err
 	}
@@ -4851,7 +4862,7 @@ func cmdCoordOwner(workspaceRoot string, args []string) error {
 }
 
 func cmdCoordClaims(workspaceRoot string, args []string) error {
-	claims, err := ListClaims(workspaceRoot)
+	claims, err := coordination.ListClaims(workspaceRoot)
 	if err != nil {
 		return err
 	}
@@ -4866,7 +4877,12 @@ func cmdCoordCheckpoint(workspaceRoot string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: cog coord checkpoint <name>")
 	}
-	return CreateCheckpoint(workspaceRoot, args[0])
+	agent, err := coordination.CreateCheckpoint(workspaceRoot, args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Checkpoint created: %s/%s\n", args[0], agent)
+	return nil
 }
 
 func cmdCoordWait(workspaceRoot string, args []string) error {
@@ -4881,7 +4897,11 @@ func cmdCoordWait(workspaceRoot string, args []string) error {
 			timeout = t
 		}
 	}
-	return WaitCheckpoint(workspaceRoot, name, agents, timeout)
+	if err := coordination.WaitCheckpoint(workspaceRoot, name, agents, timeout); err != nil {
+		return err
+	}
+	fmt.Printf("Checkpoint reached: %s (all agents ready)\n", name)
+	return nil
 }
 
 func cmdCoordHandoff(workspaceRoot string, args []string) error {
@@ -4894,7 +4914,12 @@ func cmdCoordHandoff(workspaceRoot string, args []string) error {
 	if len(args) > 2 {
 		message = strings.Join(args[2:], " ")
 	}
-	return CreateHandoff(workspaceRoot, toAgent, artifact, message)
+	handoff, err := coordination.CreateHandoff(workspaceRoot, toAgent, artifact, message)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Handoff created: %s -> %s (%s)\n", handoff.From, handoff.To, handoff.Artifact)
+	return nil
 }
 
 func cmdCoordHandoffs(workspaceRoot string, args []string) error {
@@ -4902,7 +4927,7 @@ func cmdCoordHandoffs(workspaceRoot string, args []string) error {
 	if len(args) > 0 {
 		agent = args[0]
 	}
-	handoffs, err := ListHandoffs(workspaceRoot, agent)
+	handoffs, err := coordination.ListHandoffs(workspaceRoot, agent)
 	if err != nil {
 		return err
 	}
@@ -4917,7 +4942,11 @@ func cmdCoordAccept(workspaceRoot string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: cog coord accept <handoff_file>")
 	}
-	return AcceptHandoff(workspaceRoot, args[0])
+	if err := coordination.AcceptHandoff(workspaceRoot, args[0]); err != nil {
+		return err
+	}
+	fmt.Printf("Handoff accepted: %s\n", args[0])
+	return nil
 }
 
 func cmdCoordBroadcast(workspaceRoot string, args []string) error {
@@ -4926,7 +4955,12 @@ func cmdCoordBroadcast(workspaceRoot string, args []string) error {
 	}
 	channel := args[0]
 	message := strings.Join(args[1:], " ")
-	return CreateBroadcast(workspaceRoot, channel, message)
+	broadcast, err := coordination.CreateBroadcast(workspaceRoot, channel, message)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Broadcast sent: [%s] %s\n", broadcast.Channel, broadcast.Message)
+	return nil
 }
 
 func cmdCoordBroadcasts(workspaceRoot string, args []string) error {
@@ -4940,7 +4974,7 @@ func cmdCoordBroadcasts(workspaceRoot string, args []string) error {
 			since = seconds
 		}
 	}
-	broadcasts, err := ListBroadcasts(workspaceRoot, channel, since)
+	broadcasts, err := coordination.ListBroadcasts(workspaceRoot, channel, since)
 	if err != nil {
 		return err
 	}
@@ -5587,6 +5621,54 @@ func cmdWorkspaceRemove(name string) error {
 	return nil
 }
 
+// cmdClaude launches Claude Code with ANTHROPIC_BASE_URL pointed at the kernel.
+// If the kernel isn't running, falls back to plain `claude` without the proxy.
+func cmdClaude(args []string) int {
+	// Check if kernel is running
+	kernelURL := fmt.Sprintf("http://localhost:%d", defaultServePort)
+	kernelUp := false
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(kernelURL + "/health")
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			kernelUp = true
+		}
+	}
+
+	cmd := exec.Command(claudeCommand, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Inherit environment and add/override ANTHROPIC_BASE_URL if kernel is up
+	cmd.Env = os.Environ()
+	if kernelUp {
+		// Remove any existing ANTHROPIC_BASE_URL from env
+		filtered := make([]string, 0, len(cmd.Env)+1)
+		for _, e := range cmd.Env {
+			if !strings.HasPrefix(e, "ANTHROPIC_BASE_URL=") {
+				filtered = append(filtered, e)
+			}
+		}
+		filtered = append(filtered, "ANTHROPIC_BASE_URL="+kernelURL)
+		cmd.Env = filtered
+		fmt.Fprintf(os.Stderr, "cog: routing Claude Code through kernel at %s\n", kernelURL)
+	} else {
+		fmt.Fprintf(os.Stderr, "cog: kernel not running, launching claude directly\n")
+	}
+
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "cog: failed to run claude: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 func main() {
 	// Handle Android/Termux argument quirk
 	fixAndroidArgs()
@@ -5641,6 +5723,8 @@ func main() {
 		code = cmdInference(os.Args[2:])
 	case "mcp":
 		code = cmdMCP(os.Args[2:])
+	case "claude":
+		code = cmdClaude(os.Args[2:])
 	case "serve":
 		code = cmdServe(os.Args[2:])
 	case "health":

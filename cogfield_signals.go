@@ -15,24 +15,13 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cogos-dev/cogos/pkg/cogfield"
 )
 
-// signalFieldState mirrors the persisted format from sdk/signals.go.
-type signalFieldState struct {
-	Signals map[string]map[string]*persistedSignal `json:"signals"` // location -> type -> signal
-	SavedAt float64                                `json:"saved_at"`
-}
-
-// persistedSignal mirrors the kernel's signal format from sdk/signals.go.
-type persistedSignal struct {
-	SignalType  string         `json:"signal_type"`
-	Strength    float64        `json:"strength"`
-	DepositedBy string         `json:"deposited_by"`
-	DepositedAt float64        `json:"deposited_at"`
-	HalfLife    float64        `json:"half_life"`
-	DecayType   string         `json:"decay_type"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
-}
+// Type aliases — canonical types live in pkg/cogfield.
+type signalFieldState = cogfield.SignalFieldState
+type persistedSignal = cogfield.PersistedSignal
 
 // SignalAdapter produces signal entities for the cognitive field.
 type SignalAdapter struct{}
@@ -215,24 +204,8 @@ func loadSignalFieldState(root string) (*signalFieldState, error) {
 	return &state, nil
 }
 
-// computeRelevance computes the current signal relevance using the SRC decay formula.
-// relevance = strength * exp(-age/τ₂) * √(2/3)
-func computeRelevance(ps *persistedSignal, now time.Time) float64 {
-	tau2 := 1.3862943611198906  // 2*ln(2)
-	rhoSq := 0.816496580927726 // sqrt(2/3)
+// computeRelevance delegates to pkg/cogfield.
+var computeRelevance = cogfield.ComputeRelevance
 
-	depositedAt := time.Unix(int64(ps.DepositedAt), 0)
-	ageHours := now.Sub(depositedAt).Hours()
-	if ps.HalfLife <= 0 {
-		return ps.Strength * rhoSq
-	}
-	ageTurns := ageHours / ps.HalfLife
-	return ps.Strength * math.Exp(-ageTurns/tau2) * rhoSq
-}
-
-// signalIsActive returns true if the signal relevance exceeds the activity threshold.
-// Threshold is e^(-1) * √(2/3) ≈ 0.30.
-func signalIsActive(ps *persistedSignal, now time.Time) bool {
-	threshold := math.Exp(-1) * 0.816496580927726
-	return computeRelevance(ps, now) > threshold
-}
+// signalIsActive delegates to pkg/cogfield.
+var signalIsActive = cogfield.SignalIsActive

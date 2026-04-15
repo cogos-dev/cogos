@@ -11,32 +11,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/cogos-dev/cogos/pkg/cogfield"
 	"github.com/cogos-dev/cogos/sdk/constellation"
 )
 
-// DocRef represents a reference to/from another document
-type DocRef struct {
-	ID       string `json:"id"`
-	Title    string `json:"title"`
-	Relation string `json:"relation"`
-	Type     string `json:"type"`
-	Sector   string `json:"sector"`
-}
-
-// DocumentDetail is the full response for a document content request
-type DocumentDetail struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	Type      string   `json:"type"`
-	Sector    string   `json:"sector"`
-	Path      string   `json:"path"`
-	Created   string   `json:"created"`
-	Modified  string   `json:"modified"`
-	Content   string   `json:"content"`
-	Tags      []string `json:"tags"`
-	Refs      []DocRef `json:"refs"`
-	Backlinks []DocRef `json:"backlinks"`
-}
+// Type aliases — canonical types live in pkg/cogfield.
+type DocRef = cogfield.DocRef
+type DocumentDetail = cogfield.DocumentDetail
 
 // handleDocumentDetail handles GET /api/cogfield/documents/{id}
 func (s *serveServer) handleDocumentDetail(w http.ResponseWriter, r *http.Request) {

@@ -3,11 +3,16 @@ package engine
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/cogos-dev/cogos/pkg/cogblock"
 )
 
-// CogBlock is the canonical unit of interaction in the CogOS substrate.
-// Every inbound interaction is normalized into a CogBlock before routing,
-// context assembly, or inference. Every significant kernel action may emit one.
+// CogBlock is the engine-local CogBlock that includes typed Messages.
+// The canonical type definitions (CogBlockKind, BlockProvenance, TrustContext,
+// BlockArtifact) live in pkg/cogblock and are re-exported below.
+//
+// This struct mirrors cogblock.CogBlock but replaces the raw Messages field
+// with the engine's typed []ProviderMessage for internal processing.
 type CogBlock struct {
 	ID        string    `json:"id"`
 	Timestamp time.Time `json:"timestamp"`
@@ -40,31 +45,18 @@ type CogBlock struct {
 	Artifacts []BlockArtifact `json:"artifacts,omitempty"`
 }
 
-type CogBlockKind string
+// Re-export shared types from pkg/cogblock.
+// These are type aliases so existing code compiles without changes.
+type CogBlockKind = cogblock.CogBlockKind
+type BlockProvenance = cogblock.BlockProvenance
+type TrustContext = cogblock.TrustContext
+type BlockArtifact = cogblock.BlockArtifact
 
 const (
-	BlockMessage     CogBlockKind = "message"
-	BlockToolCall    CogBlockKind = "tool_call"
-	BlockToolResult  CogBlockKind = "tool_result"
-	BlockImport      CogBlockKind = "import"
-	BlockAttention   CogBlockKind = "attention"
-	BlockSystemEvent CogBlockKind = "system_event"
+	BlockMessage     = cogblock.BlockMessage
+	BlockToolCall    = cogblock.BlockToolCall
+	BlockToolResult  = cogblock.BlockToolResult
+	BlockImport      = cogblock.BlockImport
+	BlockAttention   = cogblock.BlockAttention
+	BlockSystemEvent = cogblock.BlockSystemEvent
 )
-
-type BlockProvenance struct {
-	OriginSession string    `json:"origin_session,omitempty"`
-	OriginChannel string    `json:"origin_channel,omitempty"`
-	IngestedAt    time.Time `json:"ingested_at"`
-	NormalizedBy  string    `json:"normalized_by"`
-}
-
-type TrustContext struct {
-	Authenticated bool    `json:"authenticated"`
-	TrustScore    float64 `json:"trust_score"`
-	Scope         string  `json:"scope"`
-}
-
-type BlockArtifact struct {
-	Kind string `json:"kind"`
-	Ref  string `json:"ref"`
-}

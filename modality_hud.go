@@ -30,10 +30,7 @@ func (h *ModalityHUD) fmtModules(hud map[string]any) string {
 	if len(modules) == 0 {
 		return "none"
 	}
-	h.bus.mu.RLock()
-	order := make([]ModalityType, len(h.bus.order))
-	copy(order, h.bus.order)
-	h.bus.mu.RUnlock()
+	order := h.bus.Order()
 	var parts []string
 	for _, mt := range order {
 		e, ok := modules[string(mt)].(map[string]any)

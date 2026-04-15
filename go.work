@@ -1,0 +1,13 @@
+go 1.25.0
+
+use (
+	.
+	./pkg/bep
+	./pkg/cogblock
+	./pkg/cogfield
+	./pkg/coordination
+	./pkg/modality
+	./pkg/reconcile
+	./pkg/uri
+	./sdk
+)

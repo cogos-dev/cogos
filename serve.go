@@ -35,7 +35,7 @@ import (
 // See: .cog/conf/ports.cog.md for port policy and ranges
 
 const (
-	defaultServePort = 5100 // Registered: cog://conf/ports#kernel
+	defaultServePort = 6931 // Registered: cog://conf/ports#kernel
 	claudeCommand    = "claude"
 	codexCommand     = "codex"
 	launchdLabel     = "com.cogos.kernel"
@@ -211,6 +211,9 @@ func (s *serveServer) Start() error {
 
 	mux := http.NewServeMux()
 
+	// Anthropic Messages API proxy (transparent passthrough to upstream)
+	mux.HandleFunc("POST /v1/messages", s.handleMessages)
+
 	// Inference routes (keep custom streaming implementation)
 	mux.HandleFunc("/v1/chat/completions", otelMiddleware("POST /v1/chat/completions", s.handleChatCompletions))
 	mux.HandleFunc("/v1/models", s.handleModels)
@@ -358,6 +361,8 @@ func (s *serveServer) Start() error {
 	}()
 
 	fmt.Printf("CogOS unified server starting on http://localhost:%d\n", s.port)
+	fmt.Printf("\nAnthropic Messages API Proxy:\n")
+	fmt.Printf("  POST   /v1/messages         - Proxy to Anthropic (ANTHROPIC_BASE_URL=http://localhost:%d)\n", s.port)
 	fmt.Printf("\nInference (OpenAI-compatible):\n")
 	fmt.Printf("  POST   /v1/chat/completions - Chat completions\n")
 	fmt.Printf("  GET    /v1/models           - List models\n")
@@ -559,6 +564,7 @@ func (s *serveServer) corsMiddleware(next http.Handler) http.Handler {
 
 func (s *serveServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	endpoints := []string{
+		"POST /v1/messages - Anthropic Messages API proxy",
 		"POST /v1/chat/completions - OpenAI-compatible inference",
 		"GET /v1/models - List models",
 		"GET /v1/providers - List providers with health status",

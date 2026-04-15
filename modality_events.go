@@ -1,83 +1,36 @@
+// modality_events.go — Event construction for the modality bus.
+//
+// Event data structs and constants are defined in pkg/modality.
+// This file provides the event construction functions that depend
+// on kernel ledger types (EventPayload).
+
 package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/cogos-dev/cogos/pkg/modality"
 )
 
-// Modality event type constants for the CogOS ledger.
+// Re-export event type constants.
 const (
-	EventModalityInput       = "modality.input"
-	EventModalityOutput      = "modality.output"
-	EventModalityTransform   = "modality.transform"
-	EventModalityGate        = "modality.gate"
-	EventModalityStateChange = "modality.state_change"
-	EventModalityError       = "modality.error"
+	EventModalityInput       = modality.EventInput
+	EventModalityOutput      = modality.EventOutput
+	EventModalityTransform   = modality.EventTransform
+	EventModalityGate        = modality.EventGate
+	EventModalityStateChange = modality.EventStateChange
+	EventModalityError       = modality.EventError
 )
 
-// ModalityInputData is the Data payload for a modality.input event.
-type ModalityInputData struct {
-	Modality       string  `json:"modality"`
-	Channel        string  `json:"channel"`
-	Transcript     string  `json:"transcript"`
-	GateConfidence float64 `json:"gate_confidence,omitempty"`
-	SpeechRatio    float64 `json:"speech_ratio,omitempty"`
-	LatencyMs      int     `json:"latency_ms,omitempty"`
-	Engine         string  `json:"engine,omitempty"`
-}
-
-// ModalityOutputData is the Data payload for a modality.output event.
-type ModalityOutputData struct {
-	Modality    string  `json:"modality"`
-	Channel     string  `json:"channel"`
-	Text        string  `json:"text"`
-	Engine      string  `json:"engine,omitempty"`
-	Voice       string  `json:"voice,omitempty"`
-	RTF         float64 `json:"rtf,omitempty"`
-	DurationSec float64 `json:"duration_sec,omitempty"`
-	LatencyMs   int     `json:"latency_ms,omitempty"`
-}
-
-// ModalityTransformData is the Data payload for a modality.transform event.
-type ModalityTransformData struct {
-	FromModality string `json:"from_modality"`
-	ToModality   string `json:"to_modality"`
-	Step         string `json:"step"`
-	Engine       string `json:"engine,omitempty"`
-	LatencyMs    int    `json:"latency_ms,omitempty"`
-	InputBytes   int    `json:"input_bytes,omitempty"`
-	OutputChars  int    `json:"output_chars,omitempty"`
-}
-
-// ModalityGateData is the Data payload for a modality.gate event.
-type ModalityGateData struct {
-	Modality    string  `json:"modality"`
-	Channel     string  `json:"channel"`
-	Decision    string  `json:"decision"`
-	Confidence  float64 `json:"confidence"`
-	SpeechRatio float64 `json:"speech_ratio,omitempty"`
-	DurationMs  int     `json:"duration_ms,omitempty"`
-	Gate        string  `json:"gate,omitempty"`
-}
-
-// ModalityStateChangeData is the Data payload for a modality.state_change event.
-type ModalityStateChangeData struct {
-	Modality  string `json:"modality"`
-	Module    string `json:"module"`
-	FromState string `json:"from_state"`
-	ToState   string `json:"to_state"`
-	PID       int    `json:"pid,omitempty"`
-}
-
-// ModalityErrorData is the Data payload for a modality.error event.
-type ModalityErrorData struct {
-	Modality    string `json:"modality"`
-	Module      string `json:"module"`
-	Error       string `json:"error"`
-	ErrorType   string `json:"error_type,omitempty"`
-	Recoverable bool   `json:"recoverable,omitempty"`
-}
+// Type aliases for event data structs.
+type ModalityInputData = modality.InputData
+type ModalityOutputData = modality.OutputData
+type ModalityTransformData = modality.TransformData
+type ModalityGateData = modality.GateData
+type ModalityStateChangeData = modality.StateChangeData
+type ModalityErrorData = modality.ErrorData
 
 // newModalityPayload builds an EventPayload from a typed data struct.
 func newModalityPayload(eventType, sessionID string, data any) (*EventPayload, error) {
@@ -99,12 +52,7 @@ func newModalityPayload(eventType, sessionID string, data any) (*EventPayload, e
 
 // requireFields returns an error naming the first empty field, or nil.
 func requireFields(eventType string, pairs ...string) error {
-	for i := 0; i < len(pairs)-1; i += 2 {
-		if pairs[i+1] == "" {
-			return fmt.Errorf("%s: %s is required", eventType, pairs[i])
-		}
-	}
-	return nil
+	return modality.RequireFields(eventType, pairs...)
 }
 
 // NewModalityInputEvent creates an EventPayload for a modality.input event.

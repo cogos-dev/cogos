@@ -23,33 +23,15 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cogos-dev/cogos/pkg/cogfield"
 	"github.com/cogos-dev/cogos/sdk/constellation"
 	"gopkg.in/yaml.v3"
 )
 
-// FieldCondition defines a reactive condition on the field graph.
-type FieldCondition struct {
-	Name      string            `yaml:"name" json:"name"`
-	Query     string            `yaml:"query" json:"query"`                                // Query params (e.g. "type=resource&min_strength=0")
-	Condition string            `yaml:"condition" json:"condition"`                         // "any", "none", "count_above", "count_below", "any_where"
-	Match     map[string]string `yaml:"match,omitempty" json:"match,omitempty"`             // For any_where: meta field matches
-	Threshold int               `yaml:"threshold,omitempty" json:"threshold,omitempty"`     // For count_above/below
-	Cooldown  int               `yaml:"cooldown" json:"cooldown"`                           // Cycles between firings
-	Handler   string            `yaml:"handler" json:"handler"`                             // Hook handler path
-	Context   string            `yaml:"context,omitempty" json:"context,omitempty"`         // Hook context (main/subtask/exploration)
-}
-
-// TriggeredCondition represents a condition that matched.
-type TriggeredCondition struct {
-	Condition    FieldCondition
-	MatchedNodes []CogFieldNode
-	MatchCount   int
-}
-
-// FieldConditionState tracks cooldown counters per condition.
-type FieldConditionState struct {
-	CyclesSinceFired map[string]int // condition name -> cycles since last fire
-}
+// Type aliases — canonical types live in pkg/cogfield.
+type FieldCondition = cogfield.FieldCondition
+type TriggeredCondition = cogfield.TriggeredCondition
+type FieldConditionState = cogfield.FieldConditionState
 
 // LoadFieldConditions reads field conditions from hook-config.yaml.
 func LoadFieldConditions(root string) ([]FieldCondition, error) {
@@ -93,63 +75,8 @@ func LoadFieldConditions(root string) ([]FieldCondition, error) {
 	return conditions, nil
 }
 
-// EvaluateFieldConditions checks all conditions against the current field graph.
-func EvaluateFieldConditions(graph *CogFieldGraph, conditions []FieldCondition, state *FieldConditionState) []TriggeredCondition {
-	var triggered []TriggeredCondition
-
-	for _, cond := range conditions {
-		// Check cooldown
-		cycles, exists := state.CyclesSinceFired[cond.Name]
-		if exists && cycles < cond.Cooldown {
-			continue
-		}
-
-		// Parse query into filter sets.
-		// The query string uses the same format as the /api/cogfield/query endpoint.
-		params := parseConditionQueryString(cond.Query)
-
-		typeSet := parseCSVSet(params["type"])
-		sectorSet := parseCSVSet(params["sector"])
-		tagSet := parseCSVSet(params["tag"])
-		var minStrength float64
-		if v, ok := params["min_strength"]; ok {
-			fmt.Sscanf(v, "%f", &minStrength)
-		}
-
-		// Filter nodes using the shared filter from cogfield.go
-		matched := filterCogFieldNodes(graph.Nodes, typeSet, sectorSet, tagSet, minStrength)
-
-		// Apply any_where meta matching
-		if cond.Condition == "any_where" && len(cond.Match) > 0 {
-			matched = filterByMeta(matched, cond.Match)
-		}
-
-		// Evaluate condition
-		fire := false
-		switch cond.Condition {
-		case "any", "any_where":
-			fire = len(matched) > 0
-		case "none":
-			fire = len(matched) == 0
-		case "count_above":
-			fire = len(matched) > cond.Threshold
-		case "count_below":
-			fire = len(matched) < cond.Threshold
-		default:
-			fire = len(matched) > 0 // Default to "any"
-		}
-
-		if fire {
-			triggered = append(triggered, TriggeredCondition{
-				Condition:    cond,
-				MatchedNodes: matched,
-				MatchCount:   len(matched),
-			})
-		}
-	}
-
-	return triggered
-}
+// EvaluateFieldConditions delegates to pkg/cogfield.
+var EvaluateFieldConditions = cogfield.EvaluateFieldConditions
 
 // EvaluateAndDispatchFieldConditions runs field condition checks.
 // Called at the end of each reconcile cycle. Zero cost if no conditions are loaded.
@@ -197,43 +124,11 @@ func EvaluateAndDispatchFieldConditions(root string, conditions []FieldCondition
 	}
 }
 
-// parseConditionQueryString parses a simple query string (key=value&key=value).
-func parseConditionQueryString(query string) map[string]string {
-	result := make(map[string]string)
-	for _, pair := range strings.Split(query, "&") {
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) == 2 {
-			result[parts[0]] = parts[1]
-		}
-	}
-	return result
-}
+// parseConditionQueryString delegates to pkg/cogfield.
+var parseConditionQueryString = cogfield.ParseConditionQueryString
 
-// filterByMeta filters nodes whose Meta fields match the given criteria.
-func filterByMeta(nodes []CogFieldNode, match map[string]string) []CogFieldNode {
-	var result []CogFieldNode
-	for _, n := range nodes {
-		if n.Meta == nil {
-			continue
-		}
-		allMatch := true
-		for key, want := range match {
-			got, ok := n.Meta[key]
-			if !ok {
-				allMatch = false
-				break
-			}
-			if fmt.Sprintf("%v", got) != want {
-				allMatch = false
-				break
-			}
-		}
-		if allMatch {
-			result = append(result, n)
-		}
-	}
-	return result
-}
+// filterByMeta delegates to pkg/cogfield.
+var filterByMeta = cogfield.FilterByMeta
 
 // dispatchFieldConditionHook dispatches a triggered condition through the hook system.
 func dispatchFieldConditionHook(root string, t TriggeredCondition) {
