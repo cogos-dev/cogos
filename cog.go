@@ -5621,6 +5621,56 @@ func cmdWorkspaceRemove(name string) error {
 	return nil
 }
 
+// cmdClaude launches Claude Code with ANTHROPIC_BASE_URL pointed at the kernel.
+// If the kernel isn't running, falls back to plain `claude` without the proxy.
+func cmdClaude(args []string) int {
+	port := defaultServePort
+
+	// Check if kernel is running by hitting /health
+	kernelURL := fmt.Sprintf("http://localhost:%d", port)
+	kernelUp := false
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(kernelURL + "/health")
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			kernelUp = true
+		}
+	}
+
+	cmd := exec.Command(claudeCommand, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Inherit environment and add/override ANTHROPIC_BASE_URL if kernel is up
+	cmd.Env = os.Environ()
+	if kernelUp {
+		// Remove any existing ANTHROPIC_BASE_URL from env
+		filtered := make([]string, 0, len(cmd.Env)+1)
+		for _, e := range cmd.Env {
+			if !strings.HasPrefix(e, "ANTHROPIC_BASE_URL=") {
+				filtered = append(filtered, e)
+			}
+		}
+		filtered = append(filtered, "ANTHROPIC_BASE_URL="+kernelURL)
+		cmd.Env = filtered
+		fmt.Fprintf(os.Stderr, "cog: routing Claude Code through kernel at %s\n", kernelURL)
+	} else {
+		fmt.Fprintf(os.Stderr, "cog: kernel not running, launching claude directly\n")
+	}
+
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "cog: failed to run claude: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 func main() {
 	// Handle Android/Termux argument quirk
 	fixAndroidArgs()
@@ -5675,6 +5725,8 @@ func main() {
 		code = cmdInference(os.Args[2:])
 	case "mcp":
 		code = cmdMCP(os.Args[2:])
+	case "claude":
+		code = cmdClaude(os.Args[2:])
 	case "serve":
 		code = cmdServe(os.Args[2:])
 	case "health":
