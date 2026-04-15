@@ -71,6 +71,7 @@ type serveServer struct {
 	consumerReg   *consumerRegistry  // Server-side consumer cursor tracking (ADR-061)
 	toolBridge    *ToolBridge        // Synchronous tool bridge for client-driven agent loops
 	mcpManager    *MCPSessionManager // MCP Streamable HTTP session manager
+	agent         *ServeAgent        // Homeostatic agent loop (nil if not started)
 	researchMgr   *researchManager   // Research orchestration (nil if no workspace)
 	pipeline      *ModalityPipeline  // Modality pipeline (nil if no workspace)
 	fceMetrics    *foveatedMetrics   // Rolling metrics for foveated context requests
@@ -227,6 +228,7 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("/v1/sessions/", s.handleSessionContext)                   // Per-session context detail
 	mux.HandleFunc("GET /v1/card", s.handleCard)                              // ADR-048: Kernel capability card
 	mux.HandleFunc("POST /v1/tool-bridge/pending", s.handleToolBridgePending) // Synchronous tool bridge
+	mux.HandleFunc("GET /v1/agent/status", s.handleAgentStatus)              // Homeostatic agent loop status
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/health/canary", s.handleHealthCanary)
 	mux.HandleFunc("GET /v1/metrics/foveated", s.handleFoveatedMetrics) // B4: FCE quality metrics
@@ -292,6 +294,7 @@ func (s *serveServer) Start() error {
 	mux.HandleFunc("POST /v1/research/stop", s.handleResearchStop)
 	mux.HandleFunc("GET /v1/research/results", s.handleResearchResults)
 
+	mux.HandleFunc("GET /dashboard", s.handleDashboardPage) // Embedded web dashboard
 	mux.HandleFunc("/", s.handleRoot)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)

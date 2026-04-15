@@ -425,6 +425,58 @@ body {
 .lt-accuracy-badge.mid { border-color: var(--accent); color: var(--accent); }
 .lt-accuracy-badge.low { border-color: var(--orange); color: var(--orange); }
 
+/* ── Agent Panel ── */
+.agent-big-number {
+  font-family: var(--font-mono); font-size: 36px; font-weight: 700;
+  color: var(--text); line-height: 1;
+}
+.agent-big-label {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px;
+}
+.agent-meta-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+  margin-top: 12px; font-family: var(--font-mono); font-size: 12px;
+}
+.agent-meta-item { color: var(--text-dim); }
+.agent-meta-item span { color: var(--text); font-weight: 500; }
+.agent-assessment {
+  margin-top: 12px; padding: 8px 10px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+}
+.agent-assessment .assessment-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.action-badge {
+  display: inline-block; padding: 1px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 600; font-family: var(--font-mono);
+  color: #0d1117;
+}
+.action-badge.sleep { background: #3fb950; }
+.action-badge.consolidate { background: #58a6ff; }
+.action-badge.observe { background: #d29922; }
+.action-badge.repair { background: #f0883e; }
+.action-badge.escalate { background: #f85149; }
+.urgency-bar {
+  display: inline-block; width: 60px; height: 6px; background: var(--bg-elevated);
+  border-radius: 3px; overflow: hidden; vertical-align: middle; margin-left: 6px;
+}
+.urgency-bar-fill {
+  height: 100%; border-radius: 3px; transition: width 0.3s ease;
+}
+.cycle-row {
+  display: flex; align-items: center; gap: 8px; padding: 5px 0;
+  border-bottom: 1px solid var(--border); font-family: var(--font-mono); font-size: 12px;
+}
+.cycle-row:last-child { border-bottom: none; }
+.cycle-time { color: var(--text-dim); width: 60px; flex-shrink: 0; }
+.cycle-reason {
+  flex: 1; color: var(--text-dim); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.cycle-duration { color: var(--text-dim); flex-shrink: 0; }
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -446,6 +498,7 @@ body {
       <span class="pill" id="pill-state">--</span>
       <span class="pill" id="pill-identity">--</span>
       <span class="pill" id="pill-field">field: --</span>
+      <span class="pill" id="pill-agent">agent: --</span>
     </div>
   </div>
 
@@ -466,6 +519,7 @@ body {
       <button class="panel-tab" data-tab="metrics">Metrics</button>
       <button class="panel-tab" data-tab="settings">Settings</button>
       <button class="panel-tab" data-tab="proprio">Proprioceptive</button>
+      <button class="panel-tab" data-tab="agent">Agent</button>
     </div>
 
     <div class="panel-content">
@@ -577,6 +631,34 @@ body {
           <div class="proprio-section-title">Last Turn Detail</div>
           <div class="proprio-card" id="proprio-last-turn">
             <div class="pred-graph-empty">No turns recorded yet</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel-section" id="tab-agent">
+        <!-- Agent Status Card -->
+        <div class="proprio-section">
+          <div class="proprio-section-title">Agent Status</div>
+          <div class="proprio-card" id="agent-status-card">
+            <div class="pred-graph-empty">Fetching agent status...</div>
+          </div>
+        </div>
+
+        <!-- Cycle History -->
+        <div class="proprio-section">
+          <div class="proprio-section-title">Cycle History</div>
+          <div class="proprio-card" id="agent-cycle-history">
+            <div class="pred-graph-empty">No cycle data yet</div>
+          </div>
+        </div>
+
+        <!-- Urgency Sparkline -->
+        <div class="proprio-section">
+          <div class="proprio-section-title">Urgency Sparkline</div>
+          <div class="proprio-card">
+            <div class="pred-graph-container" id="agent-urgency-graph">
+              <div class="pred-graph-empty">No urgency data yet</div>
+            </div>
           </div>
         </div>
       </div>
@@ -1355,10 +1437,236 @@ function startProprioPolling() {
   }, 10000);
 }
 
+// ── Agent Panel ──
+let agentRefreshTimer = null;
+let agentStatus = null;
+
+function parseInterval(intervalStr) {
+  // Parse Go duration like "5m0s" into seconds
+  if (!intervalStr) return 300;
+  let secs = 0;
+  const hMatch = intervalStr.match(/(\d+)h/);
+  const mMatch = intervalStr.match(/(\d+)m/);
+  const sMatch = intervalStr.match(/(\d+)s/);
+  if (hMatch) secs += parseInt(hMatch[1]) * 3600;
+  if (mMatch) secs += parseInt(mMatch[1]) * 60;
+  if (sMatch) secs += parseInt(sMatch[1]);
+  return secs || 300;
+}
+
+function relativeTime(isoStr) {
+  if (!isoStr) return '--';
+  const diff = (Date.now() - new Date(isoStr).getTime()) / 1000;
+  if (diff < 0) return 'just now';
+  if (diff < 60) return Math.round(diff) + 's ago';
+  if (diff < 3600) return Math.round(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.round(diff / 3600) + 'h ago';
+  return Math.round(diff / 86400) + 'd ago';
+}
+
+function urgencyColor(u) {
+  if (u >= 0.7) return 'var(--red)';
+  if (u >= 0.4) return 'var(--orange)';
+  return 'var(--green)';
+}
+
+function actionBadgeClass(action) {
+  const map = { sleep: 'sleep', consolidate: 'consolidate', observe: 'observe', repair: 'repair', escalate: 'escalate' };
+  return map[action] || 'observe';
+}
+
+async function pollAgentStatus() {
+  try {
+    const res = await fetch(API + '/v1/agent/status');
+    if (!res.ok) {
+      agentStatus = null;
+      updateAgentPill(null);
+      return;
+    }
+    agentStatus = await res.json();
+    updateAgentPill(agentStatus);
+  } catch {
+    agentStatus = null;
+    updateAgentPill(null);
+  }
+}
+
+function updateAgentPill(data) {
+  const pill = document.getElementById('pill-agent');
+  if (!data || !data.alive) {
+    pill.textContent = 'agent: --';
+    pill.className = 'pill warn';
+    return;
+  }
+  const intervalSec = parseInterval(data.interval);
+  const sinceLast = data.last_cycle ? (Date.now() - new Date(data.last_cycle).getTime()) / 1000 : Infinity;
+  const stale = sinceLast > intervalSec * 2;
+  const timeStr = relativeTime(data.last_cycle);
+  pill.textContent = '\u25B2 ' + (data.cycle_count || 0) + ' \u00b7 ' + timeStr;
+  pill.className = 'pill ' + (stale ? 'warn' : 'ok');
+}
+
+async function refreshAgentTab() {
+  await pollAgentStatus();
+  renderAgentStatus(agentStatus);
+  await fetchAndRenderCycleHistory();
+}
+
+function renderAgentStatus(data) {
+  const container = document.getElementById('agent-status-card');
+  if (!data || !data.alive) {
+    container.innerHTML = '<div class="pred-graph-empty">Agent not responding</div>';
+    return;
+  }
+
+  let html = '<div class="agent-big-number">' + (data.cycle_count || 0) + '</div>';
+  html += '<div class="agent-big-label">cycles completed</div>';
+
+  html += '<div class="agent-meta-grid">';
+  html += '<div class="agent-meta-item">model <span>' + esc(data.model || '--') + '</span></div>';
+  html += '<div class="agent-meta-item">interval <span>' + esc(data.interval || '--') + '</span></div>';
+  html += '<div class="agent-meta-item">uptime <span>' + esc(data.uptime || '--') + '</span></div>';
+  html += '<div class="agent-meta-item">last cycle <span>' + relativeTime(data.last_cycle) + '</span></div>';
+  html += '</div>';
+
+  if (data.last_action) {
+    html += '<div class="agent-assessment">';
+    html += '<div class="assessment-header">';
+    html += '<span class="action-badge ' + actionBadgeClass(data.last_action) + '">' + esc(data.last_action) + '</span>';
+    html += '<span style="color:var(--text-dim);font-size:11px">urgency: ' + (data.last_urgency != null ? data.last_urgency.toFixed(2) : '--') + '</span>';
+    html += '<span class="urgency-bar"><span class="urgency-bar-fill" style="width:' + ((data.last_urgency || 0) * 100) + '%;background:' + urgencyColor(data.last_urgency || 0) + '"></span></span>';
+    if (data.last_duration_ms) {
+      html += '<span style="color:var(--text-dim);font-size:11px;margin-left:auto">' + (data.last_duration_ms / 1000).toFixed(1) + 's</span>';
+    }
+    html += '</div>';
+    if (data.last_reason) {
+      html += '<div style="color:var(--text-dim);font-size:11px;margin-top:4px">' + esc(data.last_reason.length > 120 ? data.last_reason.substring(0, 120) + '...' : data.last_reason) + '</div>';
+    }
+    html += '</div>';
+  }
+
+  container.innerHTML = html;
+}
+
+async function fetchAndRenderCycleHistory() {
+  const container = document.getElementById('agent-cycle-history');
+  const graphContainer = document.getElementById('agent-urgency-graph');
+  try {
+    const res = await fetch(API + '/v1/bus/events?bus_id=bus_agent_harness&type=agent.cycle&limit=20');
+    if (!res.ok) {
+      container.innerHTML = '<div class="pred-graph-empty">No cycle data yet</div>';
+      graphContainer.innerHTML = '<div class="pred-graph-empty">No urgency data yet</div>';
+      return;
+    }
+    const events = await res.json();
+    if (!events || !Array.isArray(events) || events.length === 0) {
+      container.innerHTML = '<div class="pred-graph-empty">No cycle data yet</div>';
+      graphContainer.innerHTML = '<div class="pred-graph-empty">No urgency data yet</div>';
+      return;
+    }
+    renderCycleHistory(events, container);
+    renderUrgencySparkline(events, graphContainer);
+  } catch {
+    container.innerHTML = '<div class="pred-graph-empty">Failed to fetch cycle history</div>';
+    graphContainer.innerHTML = '<div class="pred-graph-empty">No urgency data yet</div>';
+  }
+}
+
+function renderCycleHistory(events, container) {
+  let html = '';
+  for (const ev of events) {
+    const p = ev.payload || {};
+    const action = p.action || '--';
+    const urgency = p.urgency != null ? p.urgency : null;
+    const reason = p.reason || '';
+    const durationMs = p.duration_ms || 0;
+    const timeStr = relativeTime(ev.timestamp);
+
+    html += '<div class="cycle-row">';
+    html += '<span class="cycle-time">' + timeStr + '</span>';
+    html += '<span class="action-badge ' + actionBadgeClass(action) + '">' + esc(action) + '</span>';
+    if (urgency != null) {
+      html += '<span style="font-size:11px;color:var(--text-dim)">urg: ' + urgency.toFixed(2) + '</span>';
+    }
+    html += '<span class="cycle-reason" title="' + esc(reason) + '">' + esc(reason.length > 40 ? reason.substring(0, 40) + '...' : reason) + '</span>';
+    if (durationMs > 0) {
+      html += '<span class="cycle-duration">' + (durationMs / 1000).toFixed(1) + 's</span>';
+    }
+    html += '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function renderUrgencySparkline(events, container) {
+  // Extract urgency values in chronological order (reverse if newest-first)
+  const points = events.map(ev => (ev.payload && ev.payload.urgency != null) ? ev.payload.urgency : null).filter(v => v != null);
+  if (points.length === 0) {
+    container.innerHTML = '<div class="pred-graph-empty">No urgency data yet</div>';
+    return;
+  }
+  // Reverse so oldest is first (bus events typically come newest-first)
+  points.reverse();
+
+  const W = 380, H = 100;
+  const pad = { top: 12, right: 12, bottom: 20, left: 32 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+
+  const xScale = (i) => pad.left + (points.length === 1 ? plotW / 2 : (i / (points.length - 1)) * plotW);
+  const yScale = (v) => pad.top + (1 - v) * plotH;
+
+  let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" xmlns="http://www.w3.org/2000/svg">';
+
+  // Horizontal grid lines at 0, 0.5, 1
+  for (const lv of [0, 0.5, 1.0]) {
+    const y = yScale(lv);
+    svg += '<line x1="' + pad.left + '" y1="' + y + '" x2="' + (W - pad.right) + '" y2="' + y + '" stroke="#30363d" stroke-width="0.5" stroke-dasharray="3,3"/>';
+    svg += '<text x="' + (pad.left - 4) + '" y="' + (y + 3.5) + '" fill="#8b949e" font-size="9" font-family="monospace" text-anchor="end">' + lv.toFixed(1) + '</text>';
+  }
+
+  // Line
+  if (points.length > 1) {
+    const pathD = points.map((v, i) => (i === 0 ? 'M' : 'L') + xScale(i).toFixed(1) + ',' + yScale(v).toFixed(1)).join(' ');
+    svg += '<path d="' + pathD + '" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" opacity="0.8"/>';
+  }
+
+  // Dots
+  for (let i = 0; i < points.length; i++) {
+    const cx = xScale(i).toFixed(1);
+    const cy = yScale(points[i]).toFixed(1);
+    svg += '<circle cx="' + cx + '" cy="' + cy + '" r="2.5" fill="' + urgencyColor(points[i]) + '" stroke="#0d1117" stroke-width="0.5"/>';
+  }
+
+  svg += '</svg>';
+  container.innerHTML = svg;
+}
+
+function startAgentPolling() {
+  if (agentRefreshTimer) return;
+  agentRefreshTimer = setInterval(() => {
+    const tab = document.querySelector('.panel-tab[data-tab="agent"]');
+    if (tab && tab.classList.contains('active')) {
+      refreshAgentTab();
+    }
+  }, 15000);
+}
+
+// Hook agent tab switching
+document.querySelectorAll('.panel-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    if (tab.dataset.tab === 'agent') {
+      refreshAgentTab();
+    }
+  });
+});
+
 // ── Init ──
 pollHealth();
+pollAgentStatus();
 setInterval(pollHealth, 5000);
+setInterval(pollAgentStatus, 15000);
 startProprioPolling();
+startAgentPolling();
 inputEl.focus();
 </script>
 </body>

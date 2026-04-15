@@ -18,14 +18,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +35,21 @@ const (
 	agentIntervalMax     = 30 * time.Minute // relax to this after consecutive sleeps
 	agentBusID           = "bus_agent_harness"
 )
+
+// AgentStatusResponse is the JSON payload for GET /v1/agent/status.
+type AgentStatusResponse struct {
+	Alive      bool    `json:"alive"`
+	Uptime     string  `json:"uptime"`
+	UptimeSec  int64   `json:"uptime_sec"`
+	CycleCount int64   `json:"cycle_count"`
+	LastCycle  string  `json:"last_cycle,omitempty"`  // RFC3339
+	LastAction string  `json:"last_action,omitempty"`
+	LastUrgency float64 `json:"last_urgency"`
+	LastReason string  `json:"last_reason,omitempty"`
+	LastDurMs  int64   `json:"last_duration_ms"`
+	Interval   string  `json:"interval"`
+	Model      string  `json:"model"`
+}
 
 // ServeAgent runs the homeostatic agent loop inside cog serve.
 type ServeAgent struct {
@@ -45,9 +61,50 @@ type ServeAgent struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 
-	// Metrics
-	lastRun    time.Time
-	cycleCount int64
+	// Metrics (read via Status())
+	mu          sync.RWMutex
+	startedAt   time.Time
+	lastRun     time.Time
+	cycleCount  int64
+	lastAction  string
+	lastUrgency float64
+	lastReason  string
+	lastDurMs   int64
+}
+
+// Status returns the current agent loop status for the API.
+func (sa *ServeAgent) Status() AgentStatusResponse {
+	sa.mu.RLock()
+	defer sa.mu.RUnlock()
+
+	uptime := time.Since(sa.startedAt)
+	resp := AgentStatusResponse{
+		Alive:       true,
+		Uptime:      agentFormatDuration(uptime),
+		UptimeSec:   int64(uptime.Seconds()),
+		CycleCount:  sa.cycleCount,
+		LastAction:  sa.lastAction,
+		LastUrgency: sa.lastUrgency,
+		LastReason:  sa.lastReason,
+		LastDurMs:   sa.lastDurMs,
+		Interval:    sa.interval.String(),
+		Model:       sa.harness.model,
+	}
+	if !sa.lastRun.IsZero() {
+		resp.LastCycle = sa.lastRun.Format(time.RFC3339)
+	}
+	return resp
+}
+
+// agentFormatDuration returns a human-readable duration like "4h 23m".
+func agentFormatDuration(d time.Duration) string {
+	d = d.Round(time.Minute)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh %dm", h, m)
+	}
+	return fmt.Sprintf("%dm", m)
 }
 
 // NewServeAgent creates an agent loop for the given workspace.
@@ -98,6 +155,10 @@ func (sa *ServeAgent) SetBus(mgr *busSessionManager) {
 func (sa *ServeAgent) Start() error {
 	log.Printf("[agent] starting homeostatic loop (interval=%s, model=%s)", sa.interval, sa.harness.model)
 
+	sa.mu.Lock()
+	sa.startedAt = time.Now()
+	sa.mu.Unlock()
+
 	// Ensure the agent bus exists and is registered so events appear
 	// in /v1/bus/list and cross-bus queries.
 	if sa.bus != nil {
@@ -140,7 +201,10 @@ func (sa *ServeAgent) Stop() {
 	sa.cancel()
 	close(sa.stopCh)
 	sa.wg.Wait()
-	log.Printf("[agent] stopped after %d cycles", atomic.LoadInt64(&sa.cycleCount))
+	sa.mu.RLock()
+	count := sa.cycleCount
+	sa.mu.RUnlock()
+	log.Printf("[agent] stopped after %d cycles", count)
 }
 
 // runLoop is the main ticker loop with adaptive interval.
@@ -208,7 +272,10 @@ func (sa *ServeAgent) updateSleepCount(action string, current int) int {
 // Returns the assessment action string for adaptive interval logic.
 func (sa *ServeAgent) runCycle(ctx context.Context) string {
 	start := time.Now()
-	cycle := atomic.AddInt64(&sa.cycleCount, 1)
+	sa.mu.Lock()
+	sa.cycleCount++
+	cycle := sa.cycleCount
+	sa.mu.Unlock()
 
 	log.Printf("[agent] cycle %d: starting", cycle)
 
@@ -242,7 +309,15 @@ Actions:
 		return "error"
 	}
 
+	// Update status fields for the API
+	sa.mu.Lock()
 	sa.lastRun = time.Now()
+	sa.cycleCount = cycle
+	sa.lastAction = assessment.Action
+	sa.lastUrgency = assessment.Urgency
+	sa.lastReason = assessment.Reason
+	sa.lastDurMs = duration.Milliseconds()
+	sa.mu.Unlock()
 
 	log.Printf("[agent] cycle %d: action=%s urgency=%.1f reason=%q (%s)",
 		cycle, assessment.Action, assessment.Urgency, assessment.Reason, duration.Round(time.Millisecond))
@@ -305,7 +380,10 @@ func (sa *ServeAgent) gatherObservation() string {
 	}
 
 	// Kernel uptime
-	sb.WriteString(fmt.Sprintf("Agent cycle: %d\n", atomic.LoadInt64(&sa.cycleCount)+1))
+	sa.mu.RLock()
+	currentCycle := sa.cycleCount
+	sa.mu.RUnlock()
+	sb.WriteString(fmt.Sprintf("Agent cycle: %d\n", currentCycle+1))
 	if !sa.lastRun.IsZero() {
 		sb.WriteString(fmt.Sprintf("Last cycle: %s ago\n", time.Since(sa.lastRun).Round(time.Second)))
 	}
@@ -321,6 +399,16 @@ func (sa *ServeAgent) emitEvent(eventType string, payload map[string]interface{}
 	if _, err := sa.bus.appendBusEvent(agentBusID, eventType, "kernel:agent", payload); err != nil {
 		log.Printf("[agent] bus event emit error: %v", err)
 	}
+}
+
+// handleAgentStatus serves GET /v1/agent/status.
+func (s *serveServer) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.agent == nil {
+		json.NewEncoder(w).Encode(AgentStatusResponse{Alive: false, Model: "none"})
+		return
+	}
+	json.NewEncoder(w).Encode(s.agent.Status())
 }
 
 // runQuietCommand runs a command and returns stdout, suppressing stderr.

@@ -569,6 +569,7 @@ func cmdServeForeground(port int) int {
 		// 8. Homeostatic agent loop (E4B via Ollama, 30-min cycle)
 		agent := NewServeAgent(root)
 		agent.SetBus(server.busChat.manager)
+		server.agent = agent
 		if startErr := agent.Start(); startErr != nil {
 			log.Printf("[agent] failed to start: %v", startErr)
 		} else {
