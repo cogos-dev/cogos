@@ -41,8 +41,8 @@ func TestEmitReconcileEvent_Structure(t *testing.T) {
 		"guild_id": "123",
 	})
 
-	if evt.Event != "cog.reconcile.plan.start" {
-		t.Errorf("Event = %q, want %q", evt.Event, "cog.reconcile.plan.start")
+	if evt.EventType != "cog.reconcile.plan.start" {
+		t.Errorf("Event = %q, want %q", evt.EventType, "cog.reconcile.plan.start")
 	}
 	if evt.ResourceType != "discord" {
 		t.Errorf("ResourceType = %q, want %q", evt.ResourceType, "discord")
@@ -58,8 +58,8 @@ func TestEmitReconcileEvent_Structure(t *testing.T) {
 func TestEmitReconcileEvent_NilSummary(t *testing.T) {
 	evt := EmitReconcileEvent("cog.reconcile.plan.start", "agent", nil)
 
-	if evt.Event != "cog.reconcile.plan.start" {
-		t.Errorf("Event = %q, want %q", evt.Event, "cog.reconcile.plan.start")
+	if evt.EventType != "cog.reconcile.plan.start" {
+		t.Errorf("Event = %q, want %q", evt.EventType, "cog.reconcile.plan.start")
 	}
 	if evt.Summary != nil {
 		t.Errorf("Summary should be nil, got %v", evt.Summary)
@@ -81,8 +81,8 @@ func TestEmitReconcileEvent_JSON(t *testing.T) {
 		t.Fatalf("json.Unmarshal failed: %v", err)
 	}
 
-	if decoded.Event != evt.Event {
-		t.Errorf("decoded.Event = %q, want %q", decoded.Event, evt.Event)
+	if decoded.EventType != evt.EventType {
+		t.Errorf("decoded.EventType = %q, want %q", decoded.EventType, evt.EventType)
 	}
 	if decoded.ResourceType != evt.ResourceType {
 		t.Errorf("decoded.ResourceType = %q, want %q", decoded.ResourceType, evt.ResourceType)
@@ -100,8 +100,8 @@ func TestEmitPlanComplete(t *testing.T) {
 	}
 	evt := EmitPlanComplete("discord", summary, 450)
 
-	if evt.Event != EventReconcilePlanComplete {
-		t.Errorf("Event = %q, want %q", evt.Event, EventReconcilePlanComplete)
+	if evt.EventType != EventReconcilePlanComplete {
+		t.Errorf("Event = %q, want %q", evt.EventType, EventReconcilePlanComplete)
 	}
 	if evt.DurationMs != 450 {
 		t.Errorf("DurationMs = %d, want 450", evt.DurationMs)
@@ -143,8 +143,8 @@ func TestEmitApplyComplete_Counts(t *testing.T) {
 	}
 	evt := EmitApplyComplete("discord", results, 1200)
 
-	if evt.Event != EventReconcileApplyComplete {
-		t.Errorf("Event = %q, want %q", evt.Event, EventReconcileApplyComplete)
+	if evt.EventType != EventReconcileApplyComplete {
+		t.Errorf("Event = %q, want %q", evt.EventType, EventReconcileApplyComplete)
 	}
 	if evt.DurationMs != 1200 {
 		t.Errorf("DurationMs = %d, want 1200", evt.DurationMs)
@@ -178,8 +178,8 @@ func TestEmitApplyComplete_Empty(t *testing.T) {
 
 func TestEmitPlanStart(t *testing.T) {
 	evt := EmitPlanStart("discord")
-	if evt.Event != EventReconcilePlanStart {
-		t.Errorf("Event = %q, want %q", evt.Event, EventReconcilePlanStart)
+	if evt.EventType != EventReconcilePlanStart {
+		t.Errorf("Event = %q, want %q", evt.EventType, EventReconcilePlanStart)
 	}
 	if evt.ResourceType != "discord" {
 		t.Errorf("ResourceType = %q, want %q", evt.ResourceType, "discord")
@@ -188,8 +188,8 @@ func TestEmitPlanStart(t *testing.T) {
 
 func TestEmitApplyStart(t *testing.T) {
 	evt := EmitApplyStart("discord", 7)
-	if evt.Event != EventReconcileApplyStart {
-		t.Errorf("Event = %q, want %q", evt.Event, EventReconcileApplyStart)
+	if evt.EventType != EventReconcileApplyStart {
+		t.Errorf("Event = %q, want %q", evt.EventType, EventReconcileApplyStart)
 	}
 	if evt.Summary["action_count"] != 7 {
 		t.Errorf("Summary[action_count] = %v, want 7", evt.Summary["action_count"])
@@ -198,8 +198,8 @@ func TestEmitApplyStart(t *testing.T) {
 
 func TestEmitApplyAction(t *testing.T) {
 	evt := EmitApplyAction("discord", "create", "general", "succeeded")
-	if evt.Event != EventReconcileApplyAction {
-		t.Errorf("Event = %q, want %q", evt.Event, EventReconcileApplyAction)
+	if evt.EventType != EventReconcileApplyAction {
+		t.Errorf("Event = %q, want %q", evt.EventType, EventReconcileApplyAction)
 	}
 	if evt.Summary["action"] != "create" {
 		t.Errorf("Summary[action] = %v, want create", evt.Summary["action"])
@@ -214,8 +214,8 @@ func TestEmitApplyAction(t *testing.T) {
 
 func TestEmitDriftDetected(t *testing.T) {
 	evt := EmitDriftDetected("discord", 4)
-	if evt.Event != EventReconcileDrift {
-		t.Errorf("Event = %q, want %q", evt.Event, EventReconcileDrift)
+	if evt.EventType != EventReconcileDrift {
+		t.Errorf("Event = %q, want %q", evt.EventType, EventReconcileDrift)
 	}
 	if evt.Summary["drifts"] != 4 {
 		t.Errorf("Summary[drifts] = %v, want 4", evt.Summary["drifts"])
@@ -224,8 +224,8 @@ func TestEmitDriftDetected(t *testing.T) {
 
 func TestEmitReconcileError_WithError(t *testing.T) {
 	evt := EmitReconcileError("discord", errors.New("token expired"))
-	if evt.Event != EventReconcileError {
-		t.Errorf("Event = %q, want %q", evt.Event, EventReconcileError)
+	if evt.EventType != EventReconcileError {
+		t.Errorf("Event = %q, want %q", evt.EventType, EventReconcileError)
 	}
 	if evt.Error != "token expired" {
 		t.Errorf("Error = %q, want %q", evt.Error, "token expired")
