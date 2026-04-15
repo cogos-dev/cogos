@@ -35,7 +35,7 @@ import (
 // See: .cog/conf/ports.cog.md for port policy and ranges
 
 const (
-	defaultServePort = 5100 // Registered: cog://conf/ports#kernel
+	defaultServePort = 6931 // Registered: cog://conf/ports#kernel
 	claudeCommand    = "claude"
 	codexCommand     = "codex"
 	launchdLabel     = "com.cogos.kernel"

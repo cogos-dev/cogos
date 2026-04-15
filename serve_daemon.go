@@ -566,6 +566,15 @@ func cmdServeForeground(port int) int {
 			defer reconciler.Stop()
 		}
 
+		// 8. Homeostatic agent loop (E4B via Ollama, 30-min cycle)
+		agent := NewServeAgent(root)
+		agent.SetBus(server.busChat.manager)
+		if startErr := agent.Start(); startErr != nil {
+			log.Printf("[agent] failed to start: %v", startErr)
+		} else {
+			defer agent.Stop()
+		}
+
 		// 6b. Service health monitor: polls container health every 30s, emits bus events
 		svcMonitor := NewServiceHealthMonitor(root, server.busChat.manager)
 		svcMonitor.Start()

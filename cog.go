@@ -5624,10 +5624,8 @@ func cmdWorkspaceRemove(name string) error {
 // cmdClaude launches Claude Code with ANTHROPIC_BASE_URL pointed at the kernel.
 // If the kernel isn't running, falls back to plain `claude` without the proxy.
 func cmdClaude(args []string) int {
-	port := defaultServePort
-
-	// Check if kernel is running by hitting /health
-	kernelURL := fmt.Sprintf("http://localhost:%d", port)
+	// Check if kernel is running
+	kernelURL := fmt.Sprintf("http://localhost:%d", defaultServePort)
 	kernelUp := false
 
 	client := &http.Client{Timeout: 2 * time.Second}
