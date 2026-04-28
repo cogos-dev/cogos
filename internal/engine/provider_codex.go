@@ -12,20 +12,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
 
+var (
+	codexLookPath = exec.LookPath
+	codexStat     = os.Stat
+	codexGOOS     = runtime.GOOS
+)
+
+const codexAppBundleBinary = "/Applications/Codex.app/Contents/Resources/codex"
+
 // CodexProvider implements Provider by spawning codex exec processes.
 type CodexProvider struct {
-	name    string
-	model   string // "gpt-5.4", "gpt-5.3-codex-spark", etc.
-	effort  string // "xhigh", "high", "medium", "low"
-	sandbox string // "read-only", "workspace-write", "danger-full-access"
-	timeout time.Duration
-	binary  string // path to codex binary (default: "codex")
-	workDir string // working directory for codex exec
+	name          string
+	model         string // "gpt-5.4", "gpt-5.3-codex-spark", etc.
+	effort        string // "xhigh", "high", "medium", "low"
+	sandbox       string // "read-only", "workspace-write", "danger-full-access"
+	timeout       time.Duration
+	binary        string // path to codex binary (default: "codex")
+	defaultBinary bool
+	workDir       string // working directory for codex exec
 }
 
 // NewCodexProvider creates a CodexProvider from a ProviderConfig.
@@ -39,8 +51,10 @@ func NewCodexProvider(name string, cfg ProviderConfig) *CodexProvider {
 		timeout = 120 * time.Second
 	}
 	binary := "codex"
+	defaultBinary := true
 	if cfg.Endpoint != "" {
 		binary = cfg.Endpoint
+		defaultBinary = false
 	}
 
 	var effort, sandbox, workDir string
@@ -63,20 +77,47 @@ func NewCodexProvider(name string, cfg ProviderConfig) *CodexProvider {
 	}
 
 	return &CodexProvider{
-		name:    name,
-		model:   model,
-		effort:  effort,
-		sandbox: sandbox,
-		timeout: timeout,
-		binary:  binary,
-		workDir: workDir,
+		name:          name,
+		model:         model,
+		effort:        effort,
+		sandbox:       sandbox,
+		timeout:       timeout,
+		binary:        binary,
+		defaultBinary: defaultBinary,
+		workDir:       workDir,
 	}
 }
 
 func (p *CodexProvider) Name() string { return p.name }
 
+func (p *CodexProvider) resolveBinary() (string, error) {
+	if path, err := codexLookPath(p.binary); err == nil && path != "" {
+		return path, nil
+	}
+
+	if !p.defaultBinary || p.binary != "codex" || codexGOOS != "darwin" {
+		return "", fmt.Errorf("codex binary %q not found", p.binary)
+	}
+
+	for _, path := range codexAppBundlePaths() {
+		if info, err := codexStat(path); err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("codex binary %q not found", p.binary)
+}
+
+func codexAppBundlePaths() []string {
+	paths := []string{codexAppBundleBinary}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		paths = append(paths, filepath.Join(home, "Applications/Codex.app/Contents/Resources/codex"))
+	}
+	return paths
+}
+
 func (p *CodexProvider) Available(ctx context.Context) bool {
-	path, err := exec.LookPath(p.binary)
+	path, err := p.resolveBinary()
 	return err == nil && path != ""
 }
 
@@ -98,7 +139,11 @@ func (p *CodexProvider) Capabilities() ProviderCapabilities {
 
 func (p *CodexProvider) Ping(ctx context.Context) (time.Duration, error) {
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, p.binary, "--version")
+	binary, err := p.resolveBinary()
+	if err != nil {
+		return 0, fmt.Errorf("codex binary not available: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, binary, "--version")
 	if err := cmd.Run(); err != nil {
 		return 0, fmt.Errorf("codex binary not available: %w", err)
 	}
@@ -167,7 +212,11 @@ func (p *CodexProvider) Complete(ctx context.Context, req *CompletionRequest) (*
 	args := p.buildArgs(req)
 	args = append(args, prompt)
 
-	cmd := exec.CommandContext(ctx, p.binary, args...)
+	binary, err := p.resolveBinary()
+	if err != nil {
+		return nil, fmt.Errorf("codex binary not available: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, binary, args...)
 	if p.workDir != "" {
 		cmd.Dir = p.workDir
 	}
@@ -222,7 +271,11 @@ func (p *CodexProvider) Stream(ctx context.Context, req *CompletionRequest) (<-c
 	args := p.buildArgs(req)
 	args = append(args, prompt)
 
-	cmd := exec.CommandContext(ctx, p.binary, args...)
+	binary, err := p.resolveBinary()
+	if err != nil {
+		return nil, fmt.Errorf("codex binary not available: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, binary, args...)
 	if p.workDir != "" {
 		cmd.Dir = p.workDir
 	}
