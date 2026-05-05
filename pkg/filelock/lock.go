@@ -1,4 +1,9 @@
-// Package filelock provides advisory file locking using syscall.Flock.
+// Package filelock provides advisory file locking with cross-platform
+// semantics.
+//
+// On Unix the lock is implemented via flock(2); on Windows via
+// LockFileEx (golang.org/x/sys/windows). The public API is identical on
+// both: Acquire returns a *FileLock, Release returns the descriptor.
 //
 // This package is used by pkg/alias and any other component that needs
 // exclusive write access to node-local YAML files (aliases.yaml, global.yaml).
@@ -19,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"syscall"
 	"time"
 )
 
@@ -27,8 +31,13 @@ import (
 // the requested timeout.
 var ErrLockTimeout = errors.New("filelock: timed out waiting for lock")
 
+// errLockBusy is the internal sentinel returned by tryLock when another
+// process currently holds the lock. Acquire converts it to ErrLockTimeout
+// after the deadline elapses.
+var errLockBusy = errors.New("filelock: lock busy")
+
 // lockPollInterval is how often Acquire retries after a failed non-blocking
-// flock attempt.
+// lock attempt.
 const lockPollInterval = 50 * time.Millisecond
 
 // FileLock holds an open file descriptor that has been exclusively locked.
@@ -37,15 +46,10 @@ type FileLock struct {
 	file *os.File
 }
 
-// Acquire opens (or creates) the file at path and takes an exclusive advisory
-// lock on it, retrying until the lock is obtained or timeout elapses.
-//
-// On darwin and Linux, the lock is implemented via syscall.Flock(LOCK_EX).
-// The lock file itself is typically a dedicated ".lock" companion file next
-// to the protected YAML, not the YAML file itself (though locking the YAML
-// directly is also safe).
-//
-// Returns ErrLockTimeout if the lock cannot be obtained before timeout.
+// Acquire opens (or creates) the file at path and takes an exclusive
+// advisory lock on it, retrying until the lock is obtained or timeout
+// elapses. Returns ErrLockTimeout if the lock cannot be obtained before
+// the deadline.
 func Acquire(path string, timeout time.Duration) (*FileLock, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -54,18 +58,14 @@ func Acquire(path string, timeout time.Duration) (*FileLock, error) {
 
 	deadline := time.Now().Add(timeout)
 	for {
-		// LOCK_EX | LOCK_NB — exclusive, non-blocking.
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := tryLock(f.Fd())
 		if err == nil {
-			// Lock acquired.
 			return &FileLock{file: f}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			// Unexpected error — not just "another process holds the lock".
+		if !errors.Is(err, errLockBusy) {
 			f.Close()
-			return nil, fmt.Errorf("filelock: flock %q: %w", path, err)
+			return nil, fmt.Errorf("filelock: lock %q: %w", path, err)
 		}
-		// Another process holds the lock. Wait and retry until deadline.
 		if time.Now().After(deadline) {
 			f.Close()
 			return nil, fmt.Errorf("%w: %s", ErrLockTimeout, path)
@@ -80,10 +80,7 @@ func (l *FileLock) Release() error {
 	if l == nil || l.file == nil {
 		return nil
 	}
-	// Unlock first, then close. Flock releases automatically on close anyway,
-	// but being explicit is clearer and avoids relying on that behaviour.
-	if err := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN); err != nil {
-		// Best-effort: still try to close.
+	if err := unlock(l.file.Fd()); err != nil {
 		l.file.Close()
 		l.file = nil
 		return fmt.Errorf("filelock: unlock: %w", err)

@@ -25,7 +25,6 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -156,17 +155,10 @@ func (p *ClaudeCodeProvider) Complete(ctx context.Context, req *CompletionReques
 	)
 
 	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.cliBinary, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		// Signal the whole process group so any helpers `claude` spawned
-		// die too. Without Setpgid+negative-PID kill, dash-style shells
-		// orphan their children on SIGTERM, the orphans keep stdout open,
-		// and our drainStreamJSON read blocks until they exit naturally.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return killProcessGroup(cmd)
 	}
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -261,17 +253,10 @@ func (p *ClaudeCodeProvider) Stream(ctx context.Context, req *CompletionRequest)
 	)
 
 	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.cliBinary, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		// Signal the whole process group so any helpers `claude` spawned
-		// die too. Without Setpgid+negative-PID kill, dash-style shells
-		// orphan their children on SIGTERM, the orphans keep stdout open,
-		// and our drainStreamJSON read blocks until they exit naturally.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return killProcessGroup(cmd)
 	}
 	cmd.Stdin = strings.NewReader(prompt)
 
@@ -724,17 +709,10 @@ func (p *ClaudeCodeProvider) SpawnBackground(opts BackgroundTaskOpts) (string, e
 	}
 
 	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild, Dir: opts.WorkDir}, p.cliBinary, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		// Signal the whole process group so any helpers `claude` spawned
-		// die too. Without Setpgid+negative-PID kill, dash-style shells
-		// orphan their children on SIGTERM, the orphans keep stdout open,
-		// and our drainStreamJSON read blocks until they exit naturally.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return killProcessGroup(cmd)
 	}
 	cmd.Stdin = strings.NewReader(opts.Prompt)
 
