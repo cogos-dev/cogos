@@ -2,11 +2,10 @@
 
 ## Prerequisites
 - All CI checks passing on main
-- CHANGELOG.md updated with changes since last release
 
 ## Steps
 
-1. Update CHANGELOG.md — move "Unreleased" items under a new version header
+1. Verify recent PR titles follow conventional-commit format — they become the auto-generated release notes (via `gh release create --generate-notes`; see CONTRIBUTING.md). Optionally amend the historical-entries section of CHANGELOG.md only if there is a specific note that does not fit a PR title.
 2. Commit: `git commit -am "release: prepare v0.x.y"`
 3. Tag: `git tag v0.x.y`
 4. Push: `git push origin main --tags`

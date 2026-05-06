@@ -9,15 +9,15 @@
 # What it does:
 #   1. Checks prerequisites (Go, Docker/Colima, git)
 #   2. Builds cogos from source
-#   3. Installs cogos binary to ~/.cogos/bin/
-#   4. Installs cog CLI wrapper to ~/.cogos/bin/
-#   5. Adds ~/.cogos/bin to PATH (shell profile)
+#   3. Installs cogos binary to ~/.cog/bin/cogos
+#   4. Installs cog CLI wrapper to ~/.cog/bin/cog
+#   5. Adds ~/.cog/bin to PATH (shell profile)
 #   6. Verifies the install
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALL_DIR="$HOME/.cogos/bin"
+INSTALL_DIR="$HOME/.cog/bin"
 SHELL_NAME="$(basename "$SHELL")"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -130,9 +130,9 @@ else
         *)    PROFILE="$HOME/.profile" ;;
     esac
 
-    PATH_LINE='export PATH="$HOME/.cogos/bin:$PATH"'
+    PATH_LINE='export PATH="$HOME/.cog/bin:$PATH"'
 
-    if [ -n "$PROFILE" ] && ! grep -qF '.cogos/bin' "$PROFILE" 2>/dev/null; then
+    if [ -n "$PROFILE" ] && ! grep -qF '.cog/bin' "$PROFILE" 2>/dev/null; then
         echo "" >> "$PROFILE"
         echo "# CogOS" >> "$PROFILE"
         echo "$PATH_LINE" >> "$PROFILE"
