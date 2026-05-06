@@ -106,7 +106,7 @@ func NewMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
 // that case so clients get a consistent error shape.
 func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Process, ctrl AgentController) *MCPServer {
 	server := mcp.NewServer(&mcp.Implementation{
-		Name:    "cogos-v3",
+		Name:    "cogos",
 		Version: BuildTime,
 	}, nil)
 

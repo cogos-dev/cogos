@@ -9,7 +9,7 @@
 //   - Total token count of assembled context
 //   - Model response (for manual quality review)
 //
-// Run with: cogos-v3 bench [--prompts path] [--model name] [--budget n]
+// Run with: cogos bench [--prompts path] [--model name] [--budget n]
 package engine
 
 import (
@@ -255,7 +255,7 @@ func SaveResults(workspaceRoot string, results []BenchmarkResult, model, method 
 
 // runBenchCmd is the entry point for the "bench" subcommand.
 //
-//	cogos-v3 bench [--workspace path] [--prompts path] [--model name] [--budget n] [--no-inference]
+//	cogos bench [--workspace path] [--prompts path] [--model name] [--budget n] [--no-inference]
 func runBenchCmd(args []string, workspaceRoot string, defaultPort int) {
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	workspace := fs.String("workspace", workspaceRoot, "Workspace root path (auto-detected if empty)")
@@ -311,7 +311,7 @@ func runBenchCmd(args []string, workspaceRoot string, defaultPort int) {
 		exe, _ := os.Executable()
 		candidates := []string{
 			filepath.Join(filepath.Dir(exe), "testdata", "benchmark_prompts.json"),
-			filepath.Join(cfg.WorkspaceRoot, "apps", "cogos-v3", "testdata", "benchmark_prompts.json"),
+			filepath.Join(cfg.WorkspaceRoot, "apps", "cogos", "testdata", "benchmark_prompts.json"),
 		}
 		for _, c := range candidates {
 			if _, serr := os.Stat(c); serr == nil {

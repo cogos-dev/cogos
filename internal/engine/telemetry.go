@@ -5,12 +5,12 @@
 //
 // Environment variables:
 //   OTEL_EXPORTER_OTLP_ENDPOINT — collector endpoint (default: http://localhost:4318)
-//   OTEL_SERVICE_NAME           — service name (default: cogos-v3)
+//   OTEL_SERVICE_NAME           — service name (default: cogos)
 //
 // Usage:
 //   shutdown := initTelemetry(ctx)
 //   defer shutdown(ctx)
-//   // Use otel.Tracer("cogos-v3") and otel.Meter("cogos-v3") anywhere.
+//   // Use otel.Tracer("cogos") and otel.Meter("cogos") anywhere.
 package engine
 
 import (
@@ -47,7 +47,7 @@ var instruments struct {
 func initTelemetry(ctx context.Context) func(context.Context) {
 	serviceName := os.Getenv("OTEL_SERVICE_NAME")
 	if serviceName == "" {
-		serviceName = "cogos-v3"
+		serviceName = "cogos"
 	}
 
 	res, _ := resource.New(ctx,
@@ -94,7 +94,7 @@ func initTelemetry(ctx context.Context) func(context.Context) {
 	}
 
 	// Register instruments.
-	meter := otel.Meter("cogos-v3")
+	meter := otel.Meter("cogos")
 	instruments.ChatRequests, _ = meter.Int64Counter("cogos.chat.requests",
 		metric.WithDescription("Total chat completion requests"))
 	instruments.ContextTokens, _ = meter.Int64Histogram("cogos.context.tokens",

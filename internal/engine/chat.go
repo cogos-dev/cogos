@@ -9,10 +9,10 @@
 //
 // Usage:
 //
-//	cogos-v3 chat              # connect to daemon on default port 6931
-//	cogos-v3 chat --port 6931  # explicit port
-//	cogos-v3 --port 6931 chat  # flags must precede subcommand name
-//	cogos-v3 chat --direct     # bypass daemon, talk directly to Ollama
+//	cogos chat              # connect to daemon on default port 6931
+//	cogos chat --port 6931  # explicit port
+//	cogos --port 6931 chat  # flags must precede subcommand name
+//	cogos chat --direct     # bypass daemon, talk directly to Ollama
 package engine
 
 import (
@@ -65,7 +65,7 @@ func runDirectChat(workspace, model string) {
 		os.Exit(1)
 	}
 
-	fmt.Fprintln(os.Stderr, "cogos-v3 chat (direct mode — Ctrl+C or Ctrl+D to exit)")
+	fmt.Fprintln(os.Stderr, "cogos chat (direct mode — Ctrl+C or Ctrl+D to exit)")
 
 	var messages []ProviderMessage
 	scanner := bufio.NewScanner(os.Stdin)
@@ -141,7 +141,7 @@ func runServerChat(workspace string, port int, model string) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/health", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: daemon not reachable at %s — start it with: cogos-v3 serve or cogos-v3 start\n", baseURL)
+		fmt.Fprintf(os.Stderr, "error: daemon not reachable at %s — start it with: cogos serve or cogos start\n", baseURL)
 		os.Exit(1)
 	}
 	_ = resp.Body.Close()
@@ -149,7 +149,7 @@ func runServerChat(workspace string, port int, model string) {
 		fmt.Fprintf(os.Stderr, "warning: daemon health check returned %d\n", resp.StatusCode)
 	}
 
-	fmt.Fprintf(os.Stderr, "cogos-v3 chat (daemon at %s — Ctrl+C or Ctrl+D to exit)\n", baseURL)
+	fmt.Fprintf(os.Stderr, "cogos chat (daemon at %s — Ctrl+C or Ctrl+D to exit)\n", baseURL)
 
 	var messages []oaiMessage
 	scanner := bufio.NewScanner(os.Stdin)
