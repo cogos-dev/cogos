@@ -11,7 +11,7 @@
 // This is the efferent pathway: knowledge flows OUT of the CogDoc substrate
 // as human-readable documentation. No LLM calls — purely deterministic.
 //
-// Usage: cogos-v3 docs [--workspace PATH]
+// Usage: cogos docs [--workspace PATH]
 package engine
 
 import (
@@ -34,7 +34,7 @@ func runDocsCmd(args []string, workspace string) {
 		workspace = ws
 	}
 
-	fmt.Printf("cogos-v3 docs: generating from %s\n", workspace)
+	fmt.Printf("cogos docs: generating from %s\n", workspace)
 
 	memDir := filepath.Join(workspace, ".cog", "mem")
 	if _, err := os.Stat(memDir); os.IsNotExist(err) {

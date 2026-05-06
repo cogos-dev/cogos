@@ -97,7 +97,7 @@ func Main() {
 		}
 	}
 
-	// Compatibility path: plain `cogos-v3` still serves in the foreground.
+	// Compatibility path: plain `cogos` still serves in the foreground.
 	runServe(*workspace, *port, "")
 }
 
@@ -144,7 +144,7 @@ func runServe(workspace string, port int, bindAddr string) {
 	}
 
 	setupLogger()
-	slog.Info("cogos-v3: starting", "build", BuildTime)
+	slog.Info("cogos: starting", "build", BuildTime)
 
 	// Load configuration.
 	cfg, err := LoadConfig(workspace, port)
@@ -275,7 +275,7 @@ func runServe(workspace string, port int, bindAddr string) {
 	// Wait for shutdown signal or fatal error.
 	select {
 	case <-ctx.Done():
-		slog.Info("cogos-v3: shutdown signal received")
+		slog.Info("cogos: shutdown signal received")
 	case err := <-serverDone:
 		if err != nil {
 			slog.Error("server error", "err", err)
@@ -303,7 +303,7 @@ func runServe(workspace string, port int, bindAddr string) {
 		slog.Warn("process did not stop in time")
 	}
 
-	slog.Info("cogos-v3: stopped")
+	slog.Info("cogos: stopped")
 }
 
 // runHealthCheck performs a quick health check and exits 0 (healthy) or 1 (unhealthy).

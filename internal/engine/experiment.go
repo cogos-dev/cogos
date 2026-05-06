@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	cogos-v3 experiment run <path-to-experiment.md>
+//	cogos experiment run <path-to-experiment.md>
 //
 // The runner:
 //  1. Loads the experiment config from YAML frontmatter
@@ -96,7 +96,7 @@ func RunExperiment(ctx context.Context, experimentPath, workspaceRoot string, pr
 
 	if cfg.Run.PromptsFile == "" {
 		cfg.Run.PromptsFile = filepath.Join(workspaceRoot,
-			"apps", "cogos-v3", "testdata", "benchmark_prompts.json")
+			"apps", "cogos", "testdata", "benchmark_prompts.json")
 	} else if !filepath.IsAbs(cfg.Run.PromptsFile) {
 		cfg.Run.PromptsFile = filepath.Join(workspaceRoot, cfg.Run.PromptsFile)
 	}
@@ -215,7 +215,7 @@ type: experiment
 title: "Foveated Context Experiment"
 created: "%s"
 run:
-  prompts_file: ""  # default: apps/cogos-v3/testdata/benchmark_prompts.json
+  prompts_file: ""  # default: apps/cogos/testdata/benchmark_prompts.json
   model: "qwen3.5:9b"
   budget: 4096
   method: "keyword-match"
@@ -243,14 +243,14 @@ func runExperimentCmd(args []string, workspaceRoot string, defaultPort int) {
 
 	subArgs := fs.Args()
 	if len(subArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: cogos-v3 experiment <run|new> [args...]")
+		fmt.Fprintln(os.Stderr, "usage: cogos experiment <run|new> [args...]")
 		os.Exit(1)
 	}
 
 	switch subArgs[0] {
 	case "run":
 		if len(subArgs) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: cogos-v3 experiment run <path-to-experiment.md>")
+			fmt.Fprintln(os.Stderr, "usage: cogos experiment run <path-to-experiment.md>")
 			os.Exit(1)
 		}
 		runExperimentRun(subArgs[1], *workspace)

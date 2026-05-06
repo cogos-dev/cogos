@@ -611,7 +611,7 @@ type oaiChatResponse struct {
 // handleChat is the OpenAI-compatible /v1/chat/completions endpoint.
 // Routes through the inference Router when set; returns 501 otherwise.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	ctx, span := otel.Tracer("cogos-v3").Start(r.Context(), "chat.request")
+	ctx, span := otel.Tracer("cogos").Start(r.Context(), "chat.request")
 	defer span.End()
 	r = r.WithContext(ctx)
 

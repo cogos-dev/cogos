@@ -1,4 +1,4 @@
-// testhelper_test.go — shared test utilities for cogos-v3
+// testhelper_test.go — shared test utilities for cogos
 //
 // All helpers follow these conventions:
 //   - Accept *testing.T as first argument

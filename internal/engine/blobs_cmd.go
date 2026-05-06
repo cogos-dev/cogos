@@ -2,12 +2,12 @@
 //
 // Usage:
 //
-//	cogos-v3 blobs list              — list all stored blobs
-//	cogos-v3 blobs store <file>      — manually store a file
-//	cogos-v3 blobs get <hash> <out>  — retrieve blob to file
-//	cogos-v3 blobs verify            — check all pointers have matching blobs
-//	cogos-v3 blobs gc [--dry-run]    — garbage collect unreferenced blobs
-//	cogos-v3 blobs init              — initialize the blob store
+//	cogos blobs list              — list all stored blobs
+//	cogos blobs store <file>      — manually store a file
+//	cogos blobs get <hash> <out>  — retrieve blob to file
+//	cogos blobs verify            — check all pointers have matching blobs
+//	cogos blobs gc [--dry-run]    — garbage collect unreferenced blobs
+//	cogos blobs init              — initialize the blob store
 package engine
 
 import (
@@ -50,7 +50,7 @@ func runBlobsCmd(args []string, workspace string) {
 
 	case "store":
 		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: cogos-v3 blobs store <file>")
+			fmt.Fprintln(os.Stderr, "usage: cogos blobs store <file>")
 			os.Exit(1)
 		}
 		filePath := args[1]
@@ -80,7 +80,7 @@ func runBlobsCmd(args []string, workspace string) {
 
 	case "get":
 		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: cogos-v3 blobs get <hash> <output-file>")
+			fmt.Fprintln(os.Stderr, "usage: cogos blobs get <hash> <output-file>")
 			os.Exit(1)
 		}
 		hash := args[1]
@@ -191,7 +191,7 @@ func runBlobsCmd(args []string, workspace string) {
 	case "dehydrate":
 		// Replace files with blob pointers (store content, write pointer).
 		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: cogos-v3 blobs dehydrate <file-or-dir>")
+			fmt.Fprintln(os.Stderr, "usage: cogos blobs dehydrate <file-or-dir>")
 			os.Exit(1)
 		}
 		target := args[1]
@@ -244,7 +244,7 @@ func runBlobsCmd(args []string, workspace string) {
 }
 
 func printBlobsUsage() {
-	fmt.Println(`Usage: cogos-v3 blobs <command>
+	fmt.Println(`Usage: cogos blobs <command>
 
 Commands:
   init              Initialize the blob store

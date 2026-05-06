@@ -159,7 +159,7 @@ func workspaceSlug(workspaceRoot string) string {
 }
 
 func containerNameForWorkspace(workspaceRoot string) string {
-	return "cogos-v3-" + workspaceSlug(workspaceRoot)
+	return "cogos-" + workspaceSlug(workspaceRoot)
 }
 
 func checkDaemonHealth(endpoint string, timeout time.Duration) (*DaemonHealth, error) {

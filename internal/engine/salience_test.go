@@ -108,7 +108,7 @@ func TestComputeFileSalienceRealRepo(t *testing.T) {
 
 	sig := &object.Signature{
 		Name:  "Test Author",
-		Email: "test@cogos-v3.test",
+		Email: "test@cogos.test",
 		When:  time.Now(),
 	}
 	if _, err := wt.Commit("feat: initial test commit", &git.CommitOptions{
