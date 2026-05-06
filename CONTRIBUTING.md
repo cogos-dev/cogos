@@ -11,7 +11,7 @@ make build
 ./scripts/setup-dev.sh
 ```
 
-Requirements: Go 1.24+, macOS or Linux.
+Requirements: Go 1.25+, macOS or Linux.
 
 ## Running tests
 

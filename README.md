@@ -7,6 +7,16 @@ make build && ./cogos serve --workspace ~/my-project
 # http://localhost:6931/health
 ```
 
+Or install a pre-built binary:
+
+```sh
+# macOS Apple Silicon (latest release)
+curl -L https://github.com/cogos-dev/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
+chmod +x cogos && mv cogos ~/.cog/bin/cogos
+```
+
+For Linux, Windows, and other architectures, see [docs/RELEASING.md](docs/RELEASING.md).
+
 ---
 
 ## What this is
@@ -323,7 +333,7 @@ cog claude
 ### Developer setup
 
 ```sh
-./scripts/setup-dev.sh    # Build, install to ~/.cogos/bin, configure PATH
+./scripts/setup-dev.sh    # Build, install to ~/.cog/bin, configure PATH
 ```
 
 ### Docker
