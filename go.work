@@ -2,6 +2,8 @@ go 1.25.0
 
 use (
 	.
+	./envspec
+	./harness
 	./pkg/bep
 	./pkg/cogblock
 	./pkg/cogfield

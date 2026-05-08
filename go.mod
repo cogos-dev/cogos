@@ -7,20 +7,23 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/coder/websocket v1.8.14
-	github.com/myrgic/cogos/envspec v0.0.0
-	github.com/myrgic/cogos/harness v0.0.0
-	github.com/myrgic/cogos/pkg/cogfield v0.0.0
-	github.com/myrgic/cogos/sdk v0.0.0
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/go-git/go-git/v5 v5.16.4
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/modelcontextprotocol/go-sdk v1.5.0
+	github.com/myrgic/cogos/envspec v0.0.0
+	github.com/myrgic/cogos/harness v0.0.0
+	github.com/myrgic/cogos/pkg/cogblock v0.0.0-00010101000000-000000000000
+	github.com/myrgic/cogos/pkg/cogfield v0.0.0
+	github.com/myrgic/cogos/pkg/coordination v0.0.0-00010101000000-000000000000
+	github.com/myrgic/cogos/pkg/modality v0.0.0-00010101000000-000000000000
+	github.com/myrgic/cogos/pkg/reconcile v0.0.0-00010101000000-000000000000
+	github.com/myrgic/cogos/sdk v0.0.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
-	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
 	github.com/zclconf/go-cty v1.17.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0
@@ -31,6 +34,7 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.43.0
 	go.opentelemetry.io/otel/trace v1.43.0
 	golang.org/x/net v0.52.0
+	golang.org/x/sys v0.42.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.6.0
@@ -88,7 +92,6 @@ require (
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	golang.org/x/tools v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
@@ -104,3 +107,15 @@ replace github.com/myrgic/cogos/harness => ./harness
 replace github.com/myrgic/cogos/envspec => ./envspec
 
 replace github.com/myrgic/cogos/pkg/cogfield => ./pkg/cogfield
+
+replace github.com/myrgic/cogos/pkg/cogblock => ./pkg/cogblock
+
+replace github.com/myrgic/cogos/pkg/coordination => ./pkg/coordination
+
+replace github.com/myrgic/cogos/pkg/modality => ./pkg/modality
+
+replace github.com/myrgic/cogos/pkg/reconcile => ./pkg/reconcile
+
+replace github.com/myrgic/cogos/pkg/uri => ./pkg/uri
+
+replace github.com/myrgic/cogos/pkg/bep => ./pkg/bep
