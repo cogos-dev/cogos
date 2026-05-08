@@ -1,4 +1,4 @@
-module github.com/cogos-dev/cogos/harness
+module github.com/myrgic/cogos/harness
 
 go 1.24.0
 

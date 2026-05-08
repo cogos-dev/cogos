@@ -18,12 +18,12 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/cogos-dev/cogos/internal/providers/daemon"
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/internal/providers/daemon"
+	"github.com/myrgic/cogos/pkg/reconcile"
 
 	// Blank import fires daemon.init(), registering all 10 providers; the named
 	// import above is for the new SetWorkspaceRoot regression test.
-	_ "github.com/cogos-dev/cogos/internal/providers/daemon"
+	_ "github.com/myrgic/cogos/internal/providers/daemon"
 )
 
 var expectedProviders = []string{

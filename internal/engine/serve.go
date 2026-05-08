@@ -49,8 +49,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/ui/canvas"
-	"github.com/cogos-dev/cogos/ui/dashboard"
+	"github.com/myrgic/cogos/ui/canvas"
+	"github.com/myrgic/cogos/ui/dashboard"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"

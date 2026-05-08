@@ -41,11 +41,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/providers/pin"
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/internal/providers/pin"
+	"github.com/myrgic/cogos/pkg/reconcile"
 
 	// Trigger internal/providers/component's init() which registers "component".
-	_ "github.com/cogos-dev/cogos/internal/providers/component"
+	_ "github.com/myrgic/cogos/internal/providers/component"
 )
 
 // workspaceRoot is set at daemon boot by SetWorkspaceRoot (called from

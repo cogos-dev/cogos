@@ -1,4 +1,4 @@
-module github.com/cogos-dev/cogos
+module github.com/myrgic/cogos
 
 go 1.25.0
 
@@ -7,10 +7,10 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/coder/websocket v1.8.14
-	github.com/cogos-dev/cogos/envspec v0.0.0
-	github.com/cogos-dev/cogos/harness v0.0.0
-	github.com/cogos-dev/cogos/pkg/cogfield v0.0.0
-	github.com/cogos-dev/cogos/sdk v0.0.0
+	github.com/myrgic/cogos/envspec v0.0.0
+	github.com/myrgic/cogos/harness v0.0.0
+	github.com/myrgic/cogos/pkg/cogfield v0.0.0
+	github.com/myrgic/cogos/sdk v0.0.0
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/go-git/go-git/v5 v5.16.4
 	github.com/google/uuid v1.6.0
@@ -97,10 +97,10 @@ require (
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 )
 
-replace github.com/cogos-dev/cogos/sdk => ./sdk
+replace github.com/myrgic/cogos/sdk => ./sdk
 
-replace github.com/cogos-dev/cogos/harness => ./harness
+replace github.com/myrgic/cogos/harness => ./harness
 
-replace github.com/cogos-dev/cogos/envspec => ./envspec
+replace github.com/myrgic/cogos/envspec => ./envspec
 
-replace github.com/cogos-dev/cogos/pkg/cogfield => ./pkg/cogfield
+replace github.com/myrgic/cogos/pkg/cogfield => ./pkg/cogfield

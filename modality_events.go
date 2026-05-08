@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/modality"
+	"github.com/myrgic/cogos/pkg/modality"
 )
 
 // Re-export event type constants.

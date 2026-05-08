@@ -30,8 +30,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/cogos-dev/cogos/internal/workspace"
-	"github.com/cogos-dev/cogos/pkg/coordination"
+	"github.com/myrgic/cogos/internal/workspace"
+	"github.com/myrgic/cogos/pkg/coordination"
 )
 
 // === VERSION & BUILD INFO ===

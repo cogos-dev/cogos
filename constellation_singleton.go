@@ -8,7 +8,7 @@ package main
 import (
 	"sync"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 var constellationCache sync.Map // map[string]*constellation.Constellation

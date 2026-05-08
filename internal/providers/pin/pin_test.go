@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/providers/pin"
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/internal/providers/pin"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // ─── Test helpers ────────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cogos-dev/cogos/pkg/alias"
+	"github.com/myrgic/cogos/pkg/alias"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────

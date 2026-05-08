@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // stubProvider is a minimal Reconcilable used for unit-testing the health

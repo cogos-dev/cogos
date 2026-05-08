@@ -24,7 +24,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // runReconcileCmd dispatches "cogos reconcile <type> [flags]".

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // --- Phase 2 Mutation Tests ---

@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	sdk "github.com/cogos-dev/cogos/sdk"
+	sdk "github.com/myrgic/cogos/sdk"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )

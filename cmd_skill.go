@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cogos-dev/cogos/pkg/skills"
+	"github.com/myrgic/cogos/pkg/skills"
 )
 
 // ─── Re-exported types ───────────────────────────────────────────────────────

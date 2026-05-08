@@ -28,7 +28,7 @@ import (
 	"encoding/json"
 	"os"
 
-	"github.com/cogos-dev/cogos/harness"
+	"github.com/myrgic/cogos/harness"
 )
 
 // kernelServicesAdapter implements harness.KernelServices by wrapping the

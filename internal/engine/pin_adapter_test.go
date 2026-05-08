@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cogos-dev/cogos/internal/providers/pin"
+	"github.com/myrgic/cogos/internal/providers/pin"
 )
 
 // realAdapterLocator adapts engine.ResolveWorkspacePath to pin.WorkspaceLocator.

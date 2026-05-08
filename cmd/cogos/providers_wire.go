@@ -37,12 +37,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cogos-dev/cogos/internal/engine"
-	"github.com/cogos-dev/cogos/internal/eval"
-	"github.com/cogos-dev/cogos/internal/providers/component"
-	"github.com/cogos-dev/cogos/internal/providers/daemon"
-	_ "github.com/cogos-dev/cogos/internal/providers/site" // registers "site" with pkg/reconcile
-	"github.com/cogos-dev/cogos/internal/workspace"
+	"github.com/myrgic/cogos/internal/engine"
+	"github.com/myrgic/cogos/internal/eval"
+	"github.com/myrgic/cogos/internal/providers/component"
+	"github.com/myrgic/cogos/internal/providers/daemon"
+	_ "github.com/myrgic/cogos/internal/providers/site" // registers "site" with pkg/reconcile
+	"github.com/myrgic/cogos/internal/workspace"
 	"gopkg.in/yaml.v3"
 )
 

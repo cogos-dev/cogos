@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // contextProjector handles cog:context namespace.

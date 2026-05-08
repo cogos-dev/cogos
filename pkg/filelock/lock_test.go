@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/filelock"
+	"github.com/myrgic/cogos/pkg/filelock"
 )
 
 // TestAcquireRelease verifies basic lock/unlock lifecycle.

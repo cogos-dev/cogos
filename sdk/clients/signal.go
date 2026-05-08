@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk"
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // SignalClient provides ergonomic access to cog:signals/*

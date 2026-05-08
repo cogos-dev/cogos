@@ -1,3 +1,3 @@
-module github.com/cogos-dev/cogos/pkg/coordination
+module github.com/myrgic/cogos/pkg/coordination
 
 go 1.25.0

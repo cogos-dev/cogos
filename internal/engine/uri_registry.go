@@ -25,8 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cogos-dev/cogos/internal/workspace"
-	"github.com/cogos-dev/cogos/pkg/alias"
+	"github.com/myrgic/cogos/internal/workspace"
+	"github.com/myrgic/cogos/pkg/alias"
 )
 
 // ── uriContent and resolver interface ────────────────────────────────────────

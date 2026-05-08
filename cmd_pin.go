@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/providers/pin"
+	"github.com/myrgic/cogos/internal/providers/pin"
 	"gopkg.in/yaml.v3"
 )
 

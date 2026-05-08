@@ -37,7 +37,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // ─── WorkspaceLocator ────────────────────────────────────────────────────────

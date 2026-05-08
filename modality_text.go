@@ -5,7 +5,7 @@
 
 package main
 
-import "github.com/cogos-dev/cogos/pkg/modality"
+import "github.com/myrgic/cogos/pkg/modality"
 
 // Type alias — text module.
 type TextModule = modality.TextModule

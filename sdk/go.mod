@@ -1,4 +1,4 @@
-module github.com/cogos-dev/cogos/sdk
+module github.com/myrgic/cogos/sdk
 
 go 1.24
 

@@ -19,8 +19,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/engine"
-	"github.com/cogos-dev/cogos/trace"
+	"github.com/myrgic/cogos/internal/engine"
+	"github.com/myrgic/cogos/trace"
 )
 
 // cycleIDFromContext extracts a cycle-trace correlation ID from ctx, or

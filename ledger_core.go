@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/cogos-dev/cogos/pkg/cogblock"
+	"github.com/myrgic/cogos/pkg/cogblock"
 )
 
 // Re-export ledger types and functions from pkg/cogblock so existing kernel

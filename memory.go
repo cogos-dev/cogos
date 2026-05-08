@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 	"gopkg.in/yaml.v3"
 )
 

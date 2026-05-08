@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // TestMemoryClientSearchOptions tests the functional options pattern for search.

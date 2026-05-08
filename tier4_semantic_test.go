@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 func TestQueryConstellationNoAnchor(t *testing.T) {

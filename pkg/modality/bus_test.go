@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cogos-dev/cogos/pkg/modality"
+	"github.com/myrgic/cogos/pkg/modality"
 )
 
 func TestBus_RegisterAndPerceive(t *testing.T) {

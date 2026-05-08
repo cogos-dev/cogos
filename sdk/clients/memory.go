@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/cogos-dev/cogos/sdk"
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // MemoryClient provides ergonomic access to cog:mem/*

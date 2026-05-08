@@ -25,7 +25,7 @@ import (
 
 	"os/exec"
 
-	"github.com/cogos-dev/cogos/envspec"
+	"github.com/myrgic/cogos/envspec"
 	"gopkg.in/yaml.v3"
 )
 

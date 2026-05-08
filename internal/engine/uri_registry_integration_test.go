@@ -15,7 +15,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/cogos-dev/cogos/pkg/alias"
+	"github.com/myrgic/cogos/pkg/alias"
 )
 
 // ── Fixture ───────────────────────────────────────────────────────────────────

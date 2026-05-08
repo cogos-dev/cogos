@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // sessionTranscriptEntry represents one line of a Claude Code JSONL transcript.

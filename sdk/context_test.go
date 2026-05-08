@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 func TestEstimateTokens(t *testing.T) {

@@ -19,9 +19,9 @@ package main
 import (
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/engine"
-	"github.com/cogos-dev/cogos/internal/eval"
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/internal/engine"
+	"github.com/myrgic/cogos/internal/eval"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // evalProviderInstance is the singleton EvalProvider registered with the

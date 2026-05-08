@@ -39,7 +39,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/filelock"
+	"github.com/myrgic/cogos/pkg/filelock"
 	"gopkg.in/yaml.v3"
 )
 

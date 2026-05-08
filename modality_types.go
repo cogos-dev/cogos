@@ -6,7 +6,7 @@
 
 package main
 
-import "github.com/cogos-dev/cogos/pkg/modality"
+import "github.com/myrgic/cogos/pkg/modality"
 
 // Type aliases — modality types.
 type ModalityType = modality.ModalityType

@@ -22,7 +22,7 @@
 package clients
 
 import (
-	"github.com/cogos-dev/cogos/sdk"
+	"github.com/myrgic/cogos/sdk"
 )
 
 // Clients provides access to all convenience clients.

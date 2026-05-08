@@ -10,7 +10,7 @@
 //	cogos version
 package main
 
-import "github.com/cogos-dev/cogos/internal/engine"
+import "github.com/myrgic/cogos/internal/engine"
 
 func main() {
 	engine.Main()
