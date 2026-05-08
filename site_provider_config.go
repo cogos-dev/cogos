@@ -14,7 +14,8 @@ import (
 )
 
 // siteLoadCRDs walks <root>/apps/*/site.yaml and returns parsed SiteCRDs.
-// Parse errors are hard failures; validation errors are logged as warnings.
+// Parse errors are hard failures; validation errors are logged as warnings
+// (invalid CRDs are still returned so the planner can surface them).
 func siteLoadCRDs(root string) ([]SiteCRD, error) {
 	pattern := filepath.Join(root, "apps", "*", "site.yaml")
 	matches, err := filepath.Glob(pattern)
@@ -37,6 +38,16 @@ func siteLoadCRDs(root string) ([]SiteCRD, error) {
 		crds = append(crds, crd)
 	}
 	return crds, nil
+}
+
+// siteCRDByName looks up a SiteCRD by metadata name from a pre-loaded slice.
+func siteCRDByName(crds []SiteCRD, name string) (SiteCRD, bool) {
+	for _, c := range crds {
+		if c.Metadata.Name == name {
+			return c, true
+		}
+	}
+	return SiteCRD{}, false
 }
 
 // siteBuild runs build.sh in the given app directory.

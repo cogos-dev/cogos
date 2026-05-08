@@ -274,12 +274,11 @@ func (s *SiteProvider) applyAction(ctx context.Context, action ReconcileAction) 
 		base.Error = fmt.Sprintf("reload config: %v", err)
 		return base
 	}
-	var crd SiteCRD
-	for _, c := range crds {
-		if c.Metadata.Name == name {
-			crd = c
-			break
-		}
+	crd, found := siteCRDByName(crds, name)
+	if !found {
+		base.Status = ApplyFailed
+		base.Error = fmt.Sprintf("CRD not found after reload: %s", name)
+		return base
 	}
 
 	distDir := appDir + "/dist"
