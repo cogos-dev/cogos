@@ -14,7 +14,7 @@
 package main
 
 import (
-	"github.com/cogos-dev/cogos/internal/providers/component"
+	"github.com/myrgic/cogos/internal/providers/component"
 )
 
 func init() {

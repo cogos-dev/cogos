@@ -60,7 +60,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // mlxSupervisedType is the value of ProviderConfig.Type that activates this driver.

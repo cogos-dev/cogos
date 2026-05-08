@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	sdk "github.com/cogos-dev/cogos/sdk"
+	sdk "github.com/myrgic/cogos/sdk"
 )
 
 // === INFERENCE REQUEST/RESPONSE TYPES ===

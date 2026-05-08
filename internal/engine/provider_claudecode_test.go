@@ -340,7 +340,7 @@ func TestParseStreamLine_ErrorResult(t *testing.T) {
 
 // TestComplete_ContextCancel_KillsSubprocess verifies that cancelling the
 // context actually kills the subprocess instead of leaving cmd.Wait() stuck in
-// waitpid(2). This is the regression test for cogos-dev/cogos#79.
+// waitpid(2). This is the regression test for myrgic/cogos#79.
 //
 // Strategy: point cliBinary at a tiny shell wrapper that ignores all its
 // arguments and just sleeps for 30 s. Cancel the context after 50 ms and

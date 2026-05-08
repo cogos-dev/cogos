@@ -1,6 +1,6 @@
 # The Constellation
 
-The Constellation is one substrate. What the codebase calls `constellation.db` and what the public `cogos-dev/constellation` repo calls "the identity protocol" are two node populations over the same architecture, not two systems. This doc formalizes that framing and names what Constellation means as a term of art inside CogOS.
+The Constellation is one substrate. What the codebase calls `constellation.db` and what the public `myrgic/constellation` repo calls "the identity protocol" are two node populations over the same architecture, not two systems. This doc formalizes that framing and names what Constellation means as a term of art inside CogOS.
 
 The framing landed on 2026-04-22, in the same arc that produced `channels-and-buses.md` and `identity-cycle.md`. It resolves what looked like a naming collision (kernel memory-graph vs. identity-protocol repo, both called "constellation") into a single architectural claim: the primitives converged because the primitives are what the substrate actually needs. The repos stay where they are. The term stops being ambiguous.
 
@@ -8,7 +8,7 @@ The framing landed on 2026-04-22, in the same arc that produced `channels-and-bu
 
 The Constellation is a hash-chained, git-backed event ledger plus a peer/reference graph indexed out of it plus EMA-weighted signals over the relationships. Everything that lives in CogOS's coordination layer — cogdocs, identities, channels, sessions, agents, peer nodes — is a node population in that one substrate. Edges between populations (references, trust attestations, attendance, mentions, derivations) compose freely because they share primitives. Signals over edges (attention, trust, salience) are all exponential moving averages over the same ledger.
 
-One substrate, many projections. The kernel's memory-graph is the cogdoc-and-reference projection. The `cogos-dev/constellation` reference implementation is the trust-node projection. Neither is the whole Constellation; both are views of it.
+One substrate, many projections. The kernel's memory-graph is the cogdoc-and-reference projection. The `myrgic/constellation` reference implementation is the trust-node projection. Neither is the whole Constellation; both are views of it.
 
 **Confidence: consensus (within this codebase and session).** The unification is verified at the primitive level (see § Shared Primitives below); the application to new populations (channels, sessions as nodes) is still a design target, not yet in code.
 
@@ -35,10 +35,10 @@ A node in the Constellation is anything the ledger can refer to by a stable iden
 
 - **Cogdocs** — `.cog.md` files under `.cog/mem/`, indexed in `constellation.db`. The oldest and most numerous population. Already production.
 - **Identities** — keyed by NodeID (SHA-256 of pubkey DER in the trust-node projection). Today's kernel tracks a subset via session records; the trust-node projection specifies the full node lifecycle.
-- **Channels** — first-class node type proposed by the channel-provider-interface RFC (`/Users/slowbro/workspaces/cog/.cog/mem/semantic/designs/channel-provider-interface.cog.md`). Storage: cogdocs under `.cog/mem/procedural/channels/`. Not yet implemented.
+- **Channels** — first-class node type proposed by the channel-provider-interface RFC (`${COGOS_WORKSPACE:-$HOME/workspaces/cog}/.cog/mem/semantic/designs/channel-provider-interface.cog.md`). Storage: cogdocs under `.cog/mem/procedural/channels/`. Not yet implemented.
 - **Sessions** — currently tracked by kernel session records; not yet canonicalized as Constellation nodes. Candidate for promotion.
 - **Agents** — partially represented (identity cards in `cog://agents/`, session records). No canonical node form yet; would compose from identity + session populations.
-- **Peer nodes** — remote CogOS instances federated via the trust-node projection. Today only present in the `cogos-dev/constellation` reference implementation; not yet integrated into the kernel's memory-graph.
+- **Peer nodes** — remote CogOS instances federated via the trust-node projection. Today only present in the `myrgic/constellation` reference implementation; not yet integrated into the kernel's memory-graph.
 
 The list is extensible by design. Adding a population does not require a substrate change — only a node type, a storage convention, and edge schemas. The Constellation's invariants (hash-chain integrity, EMA decay, tree-hash fingerprinting) apply automatically.
 
@@ -76,7 +76,7 @@ Trace a single event through the substrate to see populations interact.
 
 1. **Session registers.** The agent calls `cogos_session_register`. A session node enters the constellation (today via the kernel's session records; under the channel-provider RFC, also as a `type: channel` cogdoc's `attendance` field). A canonical-JSON event lands on the ledger; `prior_hash` chains to the previous event; the tree hash of `events/` advances.
 
-2. **User message arrives on the channel.** A `chat.request` block hits the gateway. `constellation_bus.go` (see `/Users/slowbro/workspaces/cogos-dev/cogos/constellation_bus.go`) indexes the content into the FTS-backed constellation database. Node population: event (bus block). Edges: event → session, event → user identity (by `user_id`/`user_name` payload fields). Signal update: the session's attention-EMA ticks.
+2. **User message arrives on the channel.** A `chat.request` block hits the gateway. `constellation_bus.go` (see `${MYRGIC_REPOS_ROOT:-$HOME/workspaces/myrgic}/cogos/constellation_bus.go`) indexes the content into the FTS-backed constellation database. Node population: event (bus block). Edges: event → session, event → user identity (by `user_id`/`user_name` payload fields). Signal update: the session's attention-EMA ticks.
 
 3. **Agent reads a cogdoc.** The agent queries `cogos_memory_search` and reads `cog://mem/semantic/.../some-insight.cog.md`. Population: cogdoc. Edge: event → cogdoc (a "read" relation, implicit today, explicit under the attention-EMA design). Signal update: the cogdoc's attention decay bumps upward.
 
@@ -130,9 +130,9 @@ From `identity-cycle.md`:
 
 Both neighboring docs assume a substrate. This doc names it.
 
-## The cogos-dev/constellation Repo's Role
+## The myrgic/constellation Repo's Role
 
-The public repo `cogos-dev/constellation` (at `/Users/slowbro/workspaces/cogos-dev/constellation/`) is the **canonical specification and reference implementation for the trust-node projection**. It stays published. It is not renamed. It is not deprecated. It is not a competitor to the kernel's memory-graph — it is specifying the trust semantics the kernel will eventually run natively over the same Constellation substrate.
+The public repo `myrgic/constellation` (at `${MYRGIC_REPOS_ROOT:-$HOME/workspaces/myrgic}/constellation/`) is the **canonical specification and reference implementation for the trust-node projection**. It stays published. It is not renamed. It is not deprecated. It is not a competitor to the kernel's memory-graph — it is specifying the trust semantics the kernel will eventually run natively over the same Constellation substrate.
 
 Why keep it separate as a repo even though the architecture is unified:
 
@@ -148,7 +148,7 @@ The convergence — running the trust-node semantics natively inside the kernel 
 
 To avoid overclaiming: this doc unifies the **architecture**, not the **code**.
 
-- **The code paths are still separate.** The memory-graph's indexing (`sdk/constellation/`, writes from `cog memory write`) and the trust-node projection's heartbeat loop (in the `cogos-dev/constellation` repo) run in different parts of the kernel process, or entirely different processes. They share the bridge but not the event loop.
+- **The code paths are still separate.** The memory-graph's indexing (`sdk/constellation/`, writes from `cog memory write`) and the trust-node projection's heartbeat loop (in the `myrgic/constellation` repo) run in different parts of the kernel process, or entirely different processes. They share the bridge but not the event loop.
 - **The 5-second heartbeat and the memory-graph's event ingestion are on different clocks today.** The trust-node projection emits a fresh heartbeat every 5 seconds by design (frequent, cheap, consistency-checking). The memory-graph writes when a cogdoc changes (on edit). Both feed the same ledger shape conceptually; operationally, they feed different ledgers today.
 - **No migration is specified here.** This doc does not say "delete constellation.db and replace it with the protocol repo's ledger." It says the primitives are the same. Convergence is a design target; the migration is its own RFC.
 - **Not every subsystem that touches the ledger is "in" the Constellation.** The bus layer writes ledger events; the kernel's scheduler reads them; the bridge emits fingerprints. Whether each of those is *part of* the Constellation or *adjacent to* it is an open boundary question. The substrate-vs-service distinction (see `channels-and-buses.md` § Providers per Kind — "Bus is not a reconciled resource. It is a service.") applies: the Constellation is the substrate; everything else is service.
@@ -174,8 +174,8 @@ To avoid overclaiming: this doc unifies the **architecture**, not the **code**.
 
 Two concrete tracks follow from this framing.
 
-**Near-term (design landed, code pending).** The channel-provider RFC at `/Users/slowbro/workspaces/cog/.cog/mem/semantic/designs/channel-provider-interface.cog.md` is the first adoption of this framing at the code level. It treats channels as a new node population in the Constellation, with attendance as the edge type and an attention-EMA as the signal — exactly the shape this doc makes generic. Adopting the RFC and prototyping the first `audio`-kind provider (mod3) validates whether the unified framing holds under implementation pressure.
+**Near-term (design landed, code pending).** The channel-provider RFC at `${COGOS_WORKSPACE:-$HOME/workspaces/cog}/.cog/mem/semantic/designs/channel-provider-interface.cog.md` is the first adoption of this framing at the code level. It treats channels as a new node population in the Constellation, with attendance as the edge type and an attention-EMA as the signal — exactly the shape this doc makes generic. Adopting the RFC and prototyping the first `audio`-kind provider (mod3) validates whether the unified framing holds under implementation pressure.
 
-**Medium-term (convergence).** The larger work is running the trust-node projection's semantics natively in the kernel over the same `constellation.db` the memory-graph uses. Concretely: promote the kernel's session-record surface into a first-class identity-node table (with the columns the trust-node projection specifies); wire the 5-second heartbeat loop into the kernel's process state; teach the memory-graph indexer to emit events into the same `events/{seq:08d}.json` ledger shape the trust-node projection already uses; keep the public `cogos-dev/constellation` repo as the specification the kernel implements. When that lands, "the Constellation" stops being an architectural claim layered over two implementations and becomes one running system. The bridge interface at `internal/engine/constellation_bridge.go` is the seam where that convergence will happen.
+**Medium-term (convergence).** The larger work is running the trust-node projection's semantics natively in the kernel over the same `constellation.db` the memory-graph uses. Concretely: promote the kernel's session-record surface into a first-class identity-node table (with the columns the trust-node projection specifies); wire the 5-second heartbeat loop into the kernel's process state; teach the memory-graph indexer to emit events into the same `events/{seq:08d}.json` ledger shape the trust-node projection already uses; keep the public `myrgic/constellation` repo as the specification the kernel implements. When that lands, "the Constellation" stops being an architectural claim layered over two implementations and becomes one running system. The bridge interface at `internal/engine/constellation_bridge.go` is the seam where that convergence will happen.
 
 Neither of those tracks is this doc's scope to execute. This doc is scope-setting: naming the substrate, making the populations explicit, making the shared primitives visible, so that future design work inherits the framing rather than re-deriving it each time.

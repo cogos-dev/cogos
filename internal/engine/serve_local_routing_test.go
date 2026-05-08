@@ -1,7 +1,7 @@
 // serve_local_routing_test.go — tests for model="local" routing semantics
 // and /v1/models advertisement.
 //
-// Covers cogos-dev/cogos#75:
+// Covers myrgic/cogos#75:
 //   - model="local" pins to the "ollama" provider when one is registered.
 //   - model="local" with no local provider falls through to default routing
 //     and emits a structured warning.

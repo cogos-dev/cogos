@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/providers/pin"
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/internal/providers/pin"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
@@ -119,8 +119,8 @@ func TestLoadConfig_EmptyPinsDir(t *testing.T) {
 
 func TestLoadConfig_SingleRecord(t *testing.T) {
 	root := setupWorkspace(t)
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: v0.4.1
 branch: main
@@ -140,16 +140,16 @@ func TestLoadConfig_TwoSourcesIndependent(t *testing.T) {
 	root1 := setupWorkspace(t)
 	root2 := setupWorkspace(t)
 
-	const target = "cogos-dev/cogos"
+	const target = "myrgic/cogos"
 
-	writePinYAML(t, root1, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	writePinYAML(t, root1, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: v0.4.0
 sync: read-only
 `)
-	writePinYAML(t, root2, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	writePinYAML(t, root2, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: v0.5.0
 sync: read-only
@@ -212,10 +212,10 @@ sync: read-only
 
 func TestReconcile_InSync_Green(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
+	const target = "myrgic/cogos"
 	const ref = "abc1234567890"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
 sync: read-only
@@ -236,9 +236,9 @@ sync: read-only
 
 func TestReconcile_Drift_Yellow(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc000000000
 sync: read-only
@@ -259,9 +259,9 @@ sync: read-only
 
 func TestReconcile_TargetUnreachable_Red(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc000000000
 sync: read-only
@@ -282,9 +282,9 @@ sync: read-only
 
 func TestReconcile_DigestMismatch_Red(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
   digest: sha256:aaaa
@@ -315,9 +315,9 @@ sync: read-only
 
 func TestApplyPlan_ReadOnly_Rejects(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: old000000000
 sync: read-only
@@ -355,7 +355,7 @@ func TestHealth_BeforeLoadConfig_Missing(t *testing.T) {
 func TestWriteAndRemovePinRecord(t *testing.T) {
 	root := t.TempDir() // no pins dir yet
 	rec := &pin.PinRecord{
-		Target: "cogos-dev/cogos",
+		Target: "myrgic/cogos",
 		Pin:    pin.PinRef{Ref: "v0.5.0"},
 		Branch: "main",
 		Sync:   pin.SyncReadOnly,
@@ -378,12 +378,12 @@ func TestWriteAndRemovePinRecord(t *testing.T) {
 	}
 
 	// Remove it.
-	if err := pin.RemovePinRecord(root, "cogos-dev/cogos"); err != nil {
+	if err := pin.RemovePinRecord(root, "myrgic/cogos"); err != nil {
 		t.Fatalf("RemovePinRecord: %v", err)
 	}
 
 	// Verify gone.
-	pinPath := filepath.Join(root, ".cog", "pins", "cogos-dev_cogos.yaml")
+	pinPath := filepath.Join(root, ".cog", "pins", "myrgic_cogos.yaml")
 	if _, err := os.Stat(pinPath); !os.IsNotExist(err) {
 		t.Errorf("expected pin file to be removed, got: %v", err)
 	}
@@ -393,9 +393,9 @@ func TestWriteAndRemovePinRecord(t *testing.T) {
 
 func TestBuildState_PopulatesResources(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: v0.4.1
 sync: read-only
@@ -437,9 +437,9 @@ sync: read-only
 // live digest, the result must be RED, not GREEN."
 func TestComputePlan_DeclaredDigest_EmptyLive_Red(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
   digest: sha256:deadbeef
@@ -506,9 +506,9 @@ sync: read-only
 // are the necessary precondition for correct verify output.
 func TestComputePlan_VerifyDigestMismatch_PlanHasReason(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
   digest: sha256:aaaa
@@ -565,9 +565,9 @@ sync: read-only
 // cmdPinVerify surfaces it correctly.
 func TestComputePlan_VerifyUnreachable_PlanHasReason(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
 sync: read-only
@@ -629,9 +629,9 @@ func runAndCheck(t *testing.T, p *pin.Provider, root string, check func(reconcil
 // non-nil error.
 func TestRunVerify_DigestUnverifiable(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
   digest: sha256:aabbcc
@@ -675,9 +675,9 @@ sync: read-only
 // Expects [DRIFT] output containing "digest mismatch".
 func TestRunVerify_DigestMismatch(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
   digest: sha256:aaaa
@@ -716,9 +716,9 @@ sync: read-only
 // output containing "unreachable".
 func TestRunVerify_TargetUnreachable(t *testing.T) {
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	const target = "myrgic/cogos"
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
 sync: read-only
@@ -774,10 +774,10 @@ func (l *stubLocator) LocateWorkspace(_ context.Context, name string) (string, e
 func TestSetWorkspaceLocator_ConsultedBeforeFallback(t *testing.T) {
 	t.Parallel()
 	root := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
+	const target = "myrgic/cogos"
 
-	writePinYAML(t, root, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	writePinYAML(t, root, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890
 sync: read-only
@@ -895,10 +895,10 @@ func (l *errLocator) LocateWorkspace(_ context.Context, _ string) (string, error
 func TestLocatorNonNotFoundError_Propagated(t *testing.T) {
 	t.Parallel()
 	source := setupWorkspace(t)
-	const target = "cogos-dev/cogos"
+	const target = "myrgic/cogos"
 
-	writePinYAML(t, source, "cogos-dev_cogos", `
-target: cogos-dev/cogos
+	writePinYAML(t, source, "myrgic_cogos", `
+target: myrgic/cogos
 pin:
   ref: abc1234567890abcdef1234567890abcdef123456
 sync: read-only

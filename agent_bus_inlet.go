@@ -25,7 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/engine"
+	"github.com/myrgic/cogos/internal/engine"
 )
 
 // --- Pending user-message queue ---

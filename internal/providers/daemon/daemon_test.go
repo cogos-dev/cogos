@@ -18,12 +18,12 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/cogos-dev/cogos/internal/providers/daemon"
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/internal/providers/daemon"
+	"github.com/myrgic/cogos/pkg/reconcile"
 
 	// Blank import fires daemon.init(), registering all 10 providers; the named
 	// import above is for the new SetWorkspaceRoot regression test.
-	_ "github.com/cogos-dev/cogos/internal/providers/daemon"
+	_ "github.com/myrgic/cogos/internal/providers/daemon"
 )
 
 var expectedProviders = []string{
@@ -115,13 +115,13 @@ func TestPinProvider_DaemonHealth_SurfacesDrift(t *testing.T) {
 	if err := os.MkdirAll(pinsDir, 0o755); err != nil {
 		t.Fatalf("mkdir pins: %v", err)
 	}
-	pinYAML := `target: cogos-dev/nonexistent-target
+	pinYAML := `target: myrgic/nonexistent-target
 pin:
   ref: abc000000000
 branch: main
 sync: read-only
 `
-	if err := os.WriteFile(filepath.Join(pinsDir, "cogos-dev_nonexistent-target.yaml"), []byte(pinYAML), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pinsDir, "myrgic_nonexistent-target.yaml"), []byte(pinYAML), 0o644); err != nil {
 		t.Fatalf("write pin yaml: %v", err)
 	}
 
@@ -144,7 +144,7 @@ sync: read-only
 	}
 
 	h := p.Health()
-	// The target "cogos-dev/nonexistent-target" cannot be found locally,
+	// The target "myrgic/nonexistent-target" cannot be found locally,
 	// so FetchLive marks it unreachable and ComputePlan emits a missing action.
 	// Health() must NOT be Healthy — it must be Degraded.
 	if h.Health == reconcile.HealthHealthy {
@@ -228,13 +228,13 @@ func TestPinProvider_ConcurrentHealth_NoParallelRefresh(t *testing.T) {
 	if err := os.MkdirAll(pinsDir, 0o755); err != nil {
 		t.Fatalf("mkdir pins: %v", err)
 	}
-	pinYAML := `target: cogos-dev/nonexistent-target
+	pinYAML := `target: myrgic/nonexistent-target
 pin:
   ref: abc000000000
 branch: main
 sync: read-only
 `
-	if err := os.WriteFile(filepath.Join(pinsDir, "cogos-dev_nonexistent-target.yaml"), []byte(pinYAML), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pinsDir, "myrgic_nonexistent-target.yaml"), []byte(pinYAML), 0o644); err != nil {
 		t.Fatalf("write pin yaml: %v", err)
 	}
 

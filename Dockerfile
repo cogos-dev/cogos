@@ -1,15 +1,15 @@
 # CogOS Kernel — Multi-stage OCI build
 #
 # Build:
-#   docker build -t cogos-dev/cogos:dev .
+#   docker build -t ghcr.io/myrgic/cogos:dev .
 #
 # Run:
 #   docker run -v /path/to/workspace:/workspace \
-#              -p 6931:6931 cogos-dev/cogos:dev \
+#              -p 6931:6931 ghcr.io/myrgic/cogos:dev \
 #              serve --workspace /workspace --port 6931
 #
 # Multi-platform:
-#   docker buildx build --platform linux/amd64,linux/arm64 -t cogos-dev/cogos:dev .
+#   docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/myrgic/cogos:dev .
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM golang:1.24-alpine AS builder
@@ -35,7 +35,7 @@ COPY . .
 # Build with CGO for SQLite FTS5 support
 RUN CGO_ENABLED=1 go build \
     -tags "fts5" \
-    -ldflags="-s -w -X github.com/cogos-dev/cogos/internal/engine.BuildTime=${BUILD_TIME}" \
+    -ldflags="-s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME}" \
     -o /cog ./cmd/cogos
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────

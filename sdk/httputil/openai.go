@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	sdk "github.com/cogos-dev/cogos/sdk"
-	"github.com/cogos-dev/cogos/sdk/types"
+	sdk "github.com/myrgic/cogos/sdk"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // OpenAIHandler provides an OpenAI-compatible /v1/chat/completions endpoint.

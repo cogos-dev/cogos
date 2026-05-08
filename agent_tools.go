@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cogos-dev/cogos/internal/linkfeed"
+	"github.com/myrgic/cogos/internal/linkfeed"
 )
 
 // linkfeedHarnessAdapter adapts *AgentHarness to linkfeed.Harness.

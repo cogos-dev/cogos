@@ -102,7 +102,7 @@ Afferent pipeline that accepts raw external material and converts it into substr
 
 ### Embodiment / modality
 
-The embodiment layer transduces between raw physical/channel signals and normalized cognitive events. [Mod³](https://github.com/cogos-dev/mod3) handles TTS with adaptive playback and speech queuing. The afferent path (STT, VAD) feeds the same attentional field.
+The embodiment layer transduces between raw physical/channel signals and normalized cognitive events. [Mod³](https://github.com/myrgic/mod3) handles TTS with adaptive playback and speech queuing. The afferent path (STT, VAD) feeds the same attentional field.
 
 ---
 
@@ -110,7 +110,7 @@ The embodiment layer transduces between raw physical/channel signals and normali
 
 ### Identity as dynamical property
 
-Identity is coherence with history — not a static credential. The [Constellation Protocol](https://github.com/cogos-dev/constellation) implements this:
+Identity is coherence with history — not a static credential. The [Constellation Protocol](https://github.com/myrgic/constellation) implements this:
 
 - **Publicly verifiable**: any peer can check a node's state in O(1)
 - **Privately irreproducible**: cannot be forged without the full hash chain
@@ -158,9 +158,9 @@ Each subsystem is its own repo, its own release cycle, its own organelle:
 
 | Repo | Role |
 |------|------|
-| [cogos-dev/cogos](https://github.com/cogos-dev/cogos) | Kernel — continuous process daemon |
-| [cogos-dev/constellation](https://github.com/cogos-dev/constellation) | Identity & trust protocol |
-| [cogos-dev/mod3](https://github.com/cogos-dev/mod3) | Modality server (TTS, VAD, speech queuing) |
+| [myrgic/cogos](https://github.com/myrgic/cogos) | Kernel — continuous process daemon |
+| [myrgic/constellation](https://github.com/myrgic/constellation) | Identity & trust protocol |
+| [myrgic/mod3](https://github.com/myrgic/mod3) | Modality server (TTS, VAD, speech queuing) |
 
 Organelles coordinate through the substrate, not through imports. Discovery happens at runtime through capability scanning.
 

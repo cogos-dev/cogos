@@ -3,7 +3,7 @@ package modality_test
 import (
 	"testing"
 
-	"github.com/cogos-dev/cogos/pkg/modality"
+	"github.com/myrgic/cogos/pkg/modality"
 )
 
 func TestChannelRegistry_RegisterAndGet(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // cmdConstellation handles constellation subcommands

@@ -30,8 +30,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/cogos-dev/cogos/internal/workspace"
-	"github.com/cogos-dev/cogos/pkg/coordination"
+	"github.com/myrgic/cogos/internal/workspace"
+	"github.com/myrgic/cogos/pkg/coordination"
 )
 
 // === VERSION & BUILD INFO ===
@@ -895,7 +895,7 @@ func globalConfigPath() string {
 }
 
 // globalConfigLegacyPath returns the old path (~/.cog/config) used before
-// the migration introduced in cogos-dev/cogos#161. Used only by the one-time
+// the migration introduced in myrgic/cogos#161. Used only by the one-time
 // migration helper; callers must not persist to this path.
 func globalConfigLegacyPath() string {
 	home, err := os.UserHomeDir()

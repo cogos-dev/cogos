@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // constellationBusIndexer indexes chat bus events into constellation FTS5.

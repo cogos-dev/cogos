@@ -5,7 +5,7 @@ Thanks for your interest in CogOS. This document covers how to set up a developm
 ## Development setup
 
 ```sh
-git clone https://github.com/cogos-dev/cogos.git
+git clone https://github.com/myrgic/cogos.git
 cd cogos
 make build
 ./scripts/setup-dev.sh
@@ -49,9 +49,9 @@ If your reproduction depends on a specific local arrangement (a particular provi
 
 ### Examples that meet this standard
 
-- [#75](https://github.com/cogos-dev/cogos/issues/75) -- model advertisement staleness + routing semantics. Three sub-bugs in one issue with shared fix surface, each cited at file:line.
-- [#79](https://github.com/cogos-dev/cogos/issues/79) -- kernel hang RCA. Filed with hypotheses honestly marked as hypotheses, then updated with a follow-up RCA that named the actual root cause.
-- [#80](https://github.com/cogos-dev/cogos/issues/80), [#81](https://github.com/cogos-dev/cogos/issues/81) -- companion issues cross-linked so a reader entering through any one can find the others.
+- [#75](https://github.com/myrgic/cogos/issues/75) -- model advertisement staleness + routing semantics. Three sub-bugs in one issue with shared fix surface, each cited at file:line.
+- [#79](https://github.com/myrgic/cogos/issues/79) -- kernel hang RCA. Filed with hypotheses honestly marked as hypotheses, then updated with a follow-up RCA that named the actual root cause.
+- [#80](https://github.com/myrgic/cogos/issues/80), [#81](https://github.com/myrgic/cogos/issues/81) -- companion issues cross-linked so a reader entering through any one can find the others.
 
 ## Submitting changes
 

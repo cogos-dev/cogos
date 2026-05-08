@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cogos-dev/cogos/trace"
+	"github.com/myrgic/cogos/trace"
 	"github.com/google/uuid"
 )
 

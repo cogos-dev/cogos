@@ -79,7 +79,7 @@ type MCPServer struct {
 	// snapshotToolDefinitions (which does an in-process ListTools); read
 	// by handleChat when the kernel-agent path needs to advertise its own
 	// tools. Frozen after construction returns — read-only afterwards.
-	// See mcp_tool_defs.go and cogos-dev/cogos#89.
+	// See mcp_tool_defs.go and myrgic/cogos#89.
 	toolDefs []ToolDefinition
 }
 
@@ -125,7 +125,7 @@ func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Pro
 	// Snapshot the registered tool list as kernel-side ToolDefinitions so the
 	// chat path can auto-advertise the kernel's MCP tool surface to the
 	// inference provider when the request targets the kernel-agent route
-	// without supplying its own tools (cogos-dev/cogos#89). Best-effort: a
+	// without supplying its own tools (myrgic/cogos#89). Best-effort: a
 	// snapshot failure logs a warning and leaves m.toolDefs nil — chat falls
 	// back to the previous behavior (no tools advertised) without breaking.
 	m.toolDefs = snapshotToolDefinitions(server)

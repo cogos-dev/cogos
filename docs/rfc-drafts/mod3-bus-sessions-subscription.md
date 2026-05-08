@@ -1,8 +1,8 @@
 # RFC Draft: mod3 subscribes to bus_sessions for cross-session voice presence
 
 **Status:** Draft — awaiting review and RFC number assignment  
-**Closes:** cogos-dev/cogos#156  
-**Depends on:** cogos-dev/cogos#154 (bus_sessions read path must be live before this data path is useful)  
+**Closes:** myrgic/cogos#156  
+**Depends on:** myrgic/cogos#154 (bus_sessions read path must be live before this data path is useful)  
 **Scope:** Design only — no implementation in this document
 
 ---
@@ -189,7 +189,7 @@ Mod3 maintains a new in-memory map `_bus_session_state`:
 {
     "slowbro-laptop-cogos-gap-closure": {
         "session_id": "slowbro-laptop-cogos-gap-closure",
-        "workspace": "/Users/slowbro/workspaces/cog",
+        "workspace": "${COGOS_WORKSPACE:-$HOME/workspaces/cog}",
         "role": "claude-code",
         "status": "active",
         "last_seen": <unix epoch float>,
@@ -265,7 +265,7 @@ returns current channel membership with joined agent-session state:
       "agent_session_id": "slowbro-laptop-cogos-gap-closure",
       "assigned_voice": "bm_lewis",
       "state": "speaking",
-      "workspace": "/Users/slowbro/workspaces/cog",
+      "workspace": "${COGOS_WORKSPACE:-$HOME/workspaces/cog}",
       "role": "claude-code",
       "agent_active": true,
       "last_seen": 1746212345.678
@@ -276,7 +276,7 @@ returns current channel membership with joined agent-session state:
       "agent_session_id": "slowbro-laptop-eval-runner",
       "assigned_voice": "af_heart",
       "state": "idle",
-      "workspace": "/Users/slowbro/workspaces/cogos-dev",
+      "workspace": "${MYRGIC_REPOS_ROOT:-$HOME/workspaces/myrgic}",
       "role": "claude-code",
       "agent_active": true,
       "last_seen": 1746212300.123
@@ -310,7 +310,7 @@ The section renders as:
 ```
 VOICE-CHANNEL CO-PRESENCE:
   channel general — 2 agents
-    af_heart (eval-runner, idle)  workspace: /Users/slowbro/workspaces/cogos-dev
+    af_heart (eval-runner, idle)  workspace: ${MYRGIC_REPOS_ROOT:-$HOME/workspaces/myrgic}
 ```
 
 The kernel calls mod3's `/v1/channels/{id}/peers` with a configurable timeout

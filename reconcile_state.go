@@ -3,7 +3,7 @@
 
 package main
 
-import "github.com/cogos-dev/cogos/pkg/reconcile"
+import "github.com/myrgic/cogos/pkg/reconcile"
 
 // reconcileStatePath returns the path to a provider's state file.
 func reconcileStatePath(root, resourceType string) string {

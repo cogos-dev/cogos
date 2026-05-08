@@ -1,7 +1,7 @@
 // serve_kernel_agent_tools.go — auto-injection of the kernel's MCP tool
 // registry on the kernel-agent chat route.
 //
-// Closes cogos-dev/cogos#89 (auto-injection) and #94 (server-side execution
+// Closes myrgic/cogos#89 (auto-injection) and #94 (server-side execution
 // of injected cog_* tools instead of client forwarding).
 //
 // Background: when a chat request lands on the kernel-agent route, the

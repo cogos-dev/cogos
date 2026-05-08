@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/engine"
+	"github.com/myrgic/cogos/internal/engine"
 )
 
 // HarnessDispatcher is the AgentDispatcher implementation backed by the

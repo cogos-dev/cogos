@@ -23,8 +23,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/cogos-dev/cogos/internal/workspace"
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/internal/workspace"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // --- Dependency-injection seams ----------------------------------------------

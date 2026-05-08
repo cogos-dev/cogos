@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/cogblock"
+	"github.com/myrgic/cogos/pkg/cogblock"
 )
 
 // CogBlock is the engine-local CogBlock that includes typed Messages.

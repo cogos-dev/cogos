@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk/internal/fs"
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk/internal/fs"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // threadProjector handles cog:thread/* namespace.

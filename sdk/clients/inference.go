@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cogos-dev/cogos/sdk"
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // InferenceClient provides ergonomic access to cog:inference

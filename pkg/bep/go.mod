@@ -1,4 +1,4 @@
-module github.com/cogos-dev/cogos/pkg/bep
+module github.com/myrgic/cogos/pkg/bep
 
 go 1.24.0
 

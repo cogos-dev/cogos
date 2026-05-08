@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/providers/pin"
+	"github.com/myrgic/cogos/internal/providers/pin"
 	"gopkg.in/yaml.v3"
 )
 
@@ -65,11 +65,11 @@ Flags for add / bump:
   --sync <policy>                 read-only | read-write | mirror (default: read-only)
 
 Examples:
-  cog pin add cogos-dev/cogos v0.5.0 --digest sha256:abc123 --branch main
-  cog pin verify cogos-dev/cogos
-  cog pin bump cogos-dev/cogos v0.6.0
+  cog pin add myrgic/cogos v0.5.0 --digest sha256:abc123 --branch main
+  cog pin verify myrgic/cogos
+  cog pin bump myrgic/cogos v0.6.0
   cog pin list
-  cog pin remove cogos-dev/cogos
+  cog pin remove myrgic/cogos
 `)
 	return nil
 }

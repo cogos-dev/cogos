@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
-	sdk "github.com/cogos-dev/cogos/sdk"
+	sdk "github.com/myrgic/cogos/sdk"
 )
 
 // EventClient emits events to the CogOS event system

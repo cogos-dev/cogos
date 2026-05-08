@@ -4,14 +4,14 @@
 # Downloads the latest release binary and installs cogos + cog.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/cogos-dev/cogos/main/scripts/setup.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/setup.sh | sh
 #
 # Or clone and run locally:
 #   ./scripts/setup.sh
 
 set -euo pipefail
 
-REPO="cogos-dev/cogos"
+REPO="myrgic/cogos"
 INSTALL_DIR="$HOME/.cogos/bin"
 
 # ── Colors ────────────────────────────────────────────────────────────────────

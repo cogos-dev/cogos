@@ -25,8 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cogos-dev/cogos/internal/workspace"
-	"github.com/cogos-dev/cogos/pkg/alias"
+	"github.com/myrgic/cogos/internal/workspace"
+	"github.com/myrgic/cogos/pkg/alias"
 )
 
 // ── uriContent and resolver interface ────────────────────────────────────────
@@ -380,17 +380,17 @@ func verifyDigest(path, expectedHex string) error {
 // All other errors are I/O or parse failures in the global.yaml registry file.
 //
 // name must be the raw workspace name as registered in global.yaml (e.g.
-// "cogos-dev/cogos"). It must NOT be constructed as a URI authority component:
+// "myrgic/cogos"). It must NOT be constructed as a URI authority component:
 // synthesising "cog://"+name and re-parsing would split the authority at the
-// first slash, looking up "cogos-dev" instead of "cogos-dev/cogos".
+// first slash, looking up "myrgic" instead of "myrgic/cogos".
 func ResolveWorkspacePath(ctx context.Context, name string) (string, error) {
 	if URIRegistry == nil {
 		return "", fmt.Errorf("%w: URIRegistry not initialised", ErrUnknownAuthority)
 	}
 	// Type-assert to *uriRegistryImpl so we can call resolveAuthority directly
 	// with the raw name.  This avoids the "cog://"+name round-trip through
-	// Resolve → strings.Cut(rest, "/") which splits "cogos-dev/cogos" into
-	// authority="cogos-dev" and path="cogos", losing the slash-bearing key.
+	// Resolve → strings.Cut(rest, "/") which splits "myrgic/cogos" into
+	// authority="myrgic" and path="cogos", losing the slash-bearing key.
 	impl, ok := URIRegistry.(*uriRegistryImpl)
 	if !ok {
 		// Fallback for test doubles that only implement uriResolver.

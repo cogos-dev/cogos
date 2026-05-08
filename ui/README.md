@@ -32,5 +32,5 @@ from anywhere in the module.
 ## Out of scope
 
 - Build pipelines (Vite, npm, etc.) — these are single-file static surfaces.
-- The `cogfield` panel: consumed via HTTP from `cogos-dev/cogfield`, not embedded here.
+- The `cogfield` panel: consumed via HTTP from `myrgic/cogfield`, not embedded here.
 - API-explorer / manifest-driven panel discovery: tracked in issue #98.

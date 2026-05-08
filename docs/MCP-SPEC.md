@@ -9,11 +9,11 @@
 
 ## Overview
 
-CogOS v3 exposes its cognitive infrastructure through a native MCP (Model Context Protocol) server written in Go, embedded directly in the `cogos-v3` daemon on port 6931. This replaces the v2 Python-based cogos-api (45 tools across 5 profiles) with a focused, stage-1 tool set that maps directly to v3's first-principles architecture.
+CogOS v3 exposes its cognitive infrastructure through a native MCP (Model Context Protocol) server written in Go, embedded directly in the `cogos` daemon on port 6931. This replaces the v2 Python-based cogos-api (45 tools across 5 profiles) with a focused, stage-1 tool set that maps directly to v3's first-principles architecture.
 
 ### Design Principles
 
-1. **One server, one process.** The MCP server is embedded in the cogos-v3 daemon, not a separate sidecar. Tools call internal Go functions directly — no HTTP round-trips to self.
+1. **One server, one process.** The MCP server is embedded in the cogos daemon, not a separate sidecar. Tools call internal Go functions directly — no HTTP round-trips to self.
 2. **Fewer tools, deeper integration.** v2 had 45 tools because it wrapped external systems (K8s, Docker, git). v3 stage-1 exposes 11 tools that map 1:1 to the six core components of the cognitive architecture.
 3. **Continuous process model.** The server is always running. Tools query a live attentional field, not a cold database. State is real-time.
 4. **cog:// URIs as first-class identifiers.** Every CogDoc, every resource, every reference uses the URI projection system. The MCP server speaks the same URI language as the rest of the organism.
@@ -35,7 +35,7 @@ CogOS v3 exposes its cognitive infrastructure through a native MCP (Model Contex
 
 ### SSE Transport (Primary)
 
-The MCP server runs as an HTTP handler on the existing cogos-v3 HTTP server at `http://localhost:6931/mcp`.
+The MCP server runs as an HTTP handler on the existing cogos HTTP server at `http://localhost:6931/mcp`.
 
 This uses the MCP SSE transport, which is the standard transport that Claude Code, Claude Desktop, Cursor, and other MCP clients expect for remote/networked servers.
 
@@ -51,7 +51,7 @@ This uses the MCP SSE transport, which is the standard transport that Claude Cod
 For local development and CLI integration, the daemon also supports stdio transport when invoked with `--mcp-stdio`:
 
 ```bash
-cogos-v3 serve --mcp-stdio
+cogos serve --mcp-stdio
 ```
 
 This is useful for `.mcp.json` configurations that launch the server as a subprocess.
@@ -65,7 +65,7 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
 ```json
 {
   "mcpServers": {
-    "cogos-v3": {
+    "cogos": {
       "url": "http://localhost:6931/mcp"
     }
   }
@@ -77,8 +77,8 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
 ```json
 {
   "mcpServers": {
-    "cogos-v3": {
-      "command": "cogos-v3",
+    "cogos": {
+      "command": "cogos",
       "args": ["serve", "--mcp-stdio"],
       "env": {
         "COG_WORKSPACE": "/path/to/cog-workspace"
@@ -414,7 +414,7 @@ Input: { "layers": ["ledger", "memory"], "verbose": true }
 
 ### Tool 5: `cog_get_state`
 
-**Description:** Get the current process state of the cogos-v3 daemon. Returns the four-state continuous process status, session metadata, uptime, and field statistics. This is a lightweight status query.
+**Description:** Get the current process state of the cogos daemon. Returns the four-state continuous process status, session metadata, uptime, and field statistics. This is a lightweight status query.
 
 **Internal component:** Continuous Process (process state machine)
 
@@ -971,7 +971,7 @@ Rationale:
 
 ### Wiring into serve.go
 
-The MCP server should be mounted as an HTTP handler on the existing cogos-v3 HTTP server. The daemon's `serve.go` already manages the HTTP listener on port 6931.
+The MCP server should be mounted as an HTTP handler on the existing cogos HTTP server. The daemon's `serve.go` already manages the HTTP listener on port 6931.
 
 ```go
 package main
@@ -988,7 +988,7 @@ import (
 func newMCPServer(kernel *Kernel) *mcp.Server {
     server := mcp.NewServer(
         &mcp.Implementation{
-            Name:    "cogos-v3",
+            Name:    "cogos",
             Version: "3.0.0-alpha",
         },
         nil, // default options
@@ -1155,9 +1155,9 @@ func setupHTTP(kernel *Kernel) *http.ServeMux {
 ### File Organization
 
 ```
-apps/cogos-v3/
+apps/cogos/
 ├── cmd/
-│   └── cogos-v3/
+│   └── cogos/
 │       └── main.go          # Entrypoint, flag parsing
 ├── internal/
 │   ├── kernel/

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	sdk "github.com/cogos-dev/cogos/sdk"
+	sdk "github.com/myrgic/cogos/sdk"
 )
 
 // testKernel creates a kernel connected to a temporary workspace.

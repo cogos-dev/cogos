@@ -1,9 +1,9 @@
-# .cogpublic — Public release gate for cogos-dev/cogos
+# .cogpublic — Public release gate for myrgic/cogos
 # Defines what crosses the constellation boundary outward.
 # Used by `cog plan upstream` / `cog apply upstream` to sanitize pushes.
 #
-# Gate 1: private dev → personal public fork (chazmaniandinkle/cogos)
-# Gate 2: personal fork → org upstream (cogos-dev/cogos)
+# Gate 1: private dev → org upstream (myrgic/cogos, direct branch workflow)
+# Gate 2: squash-merge to main
 
 version: 1
 

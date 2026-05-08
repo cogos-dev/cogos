@@ -5,7 +5,7 @@
 
 package main
 
-import "github.com/cogos-dev/cogos/pkg/reconcile"
+import "github.com/myrgic/cogos/pkg/reconcile"
 
 // --- Re-exported event type aliases ---
 

@@ -60,7 +60,7 @@ body:
         project's supported config. Don't include paths or PIDs from your
         machine here — those go in the Environment section below.
       placeholder: |
-        1. Start the kernel: `cogos-v3 serve --port 6931`
+        1. Start the kernel: `cogos serve --port 6931`
         2. Send: `curl -s http://localhost:6931/v1/models`
         3. Observe: response includes `claude-opus-4-6` (stale).
     validations:
@@ -160,8 +160,8 @@ body:
   - type: input
     id: env_build
     attributes:
-      label: cogos-v3 build / commit
-      description: Output of `cogos-v3 --version` or the build timestamp from `kernel.log.jsonl`.
+      label: cogos build / commit
+      description: Output of `cogos --version` or the build timestamp from `kernel.log.jsonl`.
       placeholder: 2026-04-27T23:09:52Z (build timestamp) or commit 72f2161
 
   - type: textarea

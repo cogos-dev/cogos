@@ -5,7 +5,7 @@
 
 package main
 
-import "github.com/cogos-dev/cogos/pkg/modality"
+import "github.com/myrgic/cogos/pkg/modality"
 
 // Type aliases — wire protocol types.
 type WireMessage = modality.WireMessage

@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/cogfield"
+	"github.com/myrgic/cogos/pkg/cogfield"
 )
 
 // registerBusRoutes attaches the nine /v1/bus/* routes + the two

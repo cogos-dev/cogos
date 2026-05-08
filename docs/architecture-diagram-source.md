@@ -258,7 +258,7 @@ Same three operations at every level: fork, merge, die.
 
 ```
     ┌────────────────────────────────────────────────────────────┐
-    │                    cogos-dev (org)                          │
+    │                    myrgic (org)                          │
     │                    Canonical upstream                       │
     │                                                            │
     │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │

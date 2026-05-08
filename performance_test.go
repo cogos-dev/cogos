@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/cogos-dev/cogos/sdk/types"
+	"github.com/myrgic/cogos/sdk/types"
 )
 
 // === PERFORMANCE BENCHMARKS ===

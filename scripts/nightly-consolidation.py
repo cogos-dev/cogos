@@ -34,7 +34,7 @@ from pathlib import Path
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 WORKSPACE = Path(os.environ.get("WORKSPACE", os.path.expanduser("~/workspaces/cog")))
-COGOS_DEV = Path(os.environ.get("COGOS_DEV", os.path.expanduser("~/workspaces/cogos-dev/cogos")))
+COGOS_DEV = Path(os.environ.get("COGOS_DEV", os.path.join(os.environ.get("MYRGIC_REPOS_ROOT", os.path.expanduser("~/workspaces/myrgic")), "cogos")))
 AUTORESEARCH = Path(os.environ.get("AUTORESEARCH", os.path.expanduser("~/cog-workspace/apps/cogos-v3/autoresearch")))
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 KERNEL_PORT = int(os.environ.get("KERNEL_PORT", "6931"))

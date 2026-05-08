@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/cogos-dev/cogos/pkg/modality"
+	"github.com/myrgic/cogos/pkg/modality"
 )
 
 func TestWireMessage_RoundTrip(t *testing.T) {

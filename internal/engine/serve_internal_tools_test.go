@@ -1,4 +1,4 @@
-// serve_internal_tools_test.go — coverage for cogos-dev/cogos#94 and #95:
+// serve_internal_tools_test.go — coverage for myrgic/cogos#94 and #95:
 // when a kernel-agent chat request lands and the provider emits a
 // tool_use event for an MCP-internal tool (cog_*, mod3_*, ...), the
 // kernel must execute the tool in-process, append a tool_result message,

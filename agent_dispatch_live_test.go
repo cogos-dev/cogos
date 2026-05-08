@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/engine"
+	"github.com/myrgic/cogos/internal/engine"
 )
 
 func TestDispatchLive_HelloFromGemma(t *testing.T) {

@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // ShadowLogEntry represents one Tier 4 query with dual scores for all candidates.

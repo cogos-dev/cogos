@@ -2,7 +2,7 @@
 
 > **Going forward (v0.4.0 onward):** this project does not maintain hand-curated changelog entries. PR titles and bodies are the canonical record; auto-generated GitHub release notes are the per-release projection.
 >
-> - **Per-release summaries:** [Releases page](https://github.com/cogos-dev/cogos/releases)
+> - **Per-release summaries:** [Releases page](https://github.com/myrgic/cogos/releases)
 > - **Detailed PR list per release:** auto-generated from PR titles since the previous tag (via `gh release create --generate-notes`)
 > - **Per-PR rationale:** the linked PR's description and discussion
 >
@@ -16,7 +16,17 @@ Pre-1.0. Per semver convention, breaking changes can land at any minor-version b
 
 # Historical entries
 
-The entries below predate the changelog policy above and are preserved as the historical record. For releases at v0.4.0 or later, see the [Releases page](https://github.com/cogos-dev/cogos/releases).
+The entries below predate the changelog policy above and are preserved as the historical record. For releases at v0.4.0 or later, see the [Releases page](https://github.com/myrgic/cogos/releases).
+
+## [0.5.0] - 2026-05-08
+
+### Changed (BREAKING)
+- Go module path renamed to `github.com/myrgic/cogos` (org rename: cogos-dev -> myrgic).
+  Downstream consumers must update imports.
+- `github.com/myrgic/constellation` v0.2.0 dependency (module path updated alongside org rename).
+- Docker images now published to `ghcr.io/myrgic/cogos`.
+- User-facing install script (`scripts/setup.sh`) now points to `myrgic/cogos` releases.
+- CI LDFLAGS embed the new module path; binary version strings updated.
 
 ## [Unreleased]
 

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/internal/engine"
-	"github.com/cogos-dev/cogos/trace"
+	"github.com/myrgic/cogos/internal/engine"
+	"github.com/myrgic/cogos/trace"
 )
 
 // resetTraceEmitterForTest clears the package-level atomics that

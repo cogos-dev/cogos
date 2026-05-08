@@ -1,3 +1,3 @@
-module github.com/cogos-dev/cogos/pkg/modality
+module github.com/myrgic/cogos/pkg/modality
 
 go 1.24

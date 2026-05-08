@@ -14,7 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cogos-dev/cogos/sdk/constellation"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // embedClientCache holds per-workspace embed clients.

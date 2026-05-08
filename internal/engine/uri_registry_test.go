@@ -64,7 +64,7 @@ func TestParseGlobalYAML(t *testing.T) {
 workspaces:
   cog-workspace:
     path: /home/user/workspaces/cog
-  cogos-dev/cogos:
+  myrgic/cogos:
     path: /home/user/workspaces/cogos
 `
 	got, err := parseGlobalYAML([]byte(yaml))
@@ -74,8 +74,8 @@ workspaces:
 	if got["cog-workspace"] != "/home/user/workspaces/cog" {
 		t.Errorf("cog-workspace: got %q", got["cog-workspace"])
 	}
-	if got["cogos-dev/cogos"] != "/home/user/workspaces/cogos" {
-		t.Errorf("cogos-dev/cogos: got %q", got["cogos-dev/cogos"])
+	if got["myrgic/cogos"] != "/home/user/workspaces/cogos" {
+		t.Errorf("myrgic/cogos: got %q", got["myrgic/cogos"])
 	}
 }
 
@@ -296,7 +296,7 @@ func TestResolveFragmentBeforeQuery_Rejected(t *testing.T) {
 // ── ResolveWorkspacePath: slash-bearing name regression (#175 fixup) ─────────
 
 // testNodeSetupWithSlashName creates a node dir whose global.yaml has a
-// slash-bearing workspace name ("cogos-dev/cogos"), swaps URIRegistry for the
+// slash-bearing workspace name ("myrgic/cogos"), swaps URIRegistry for the
 // duration of the test, and returns the node dir and workspace root.
 func testNodeSetupWithSlashName(t *testing.T) (nd, wsSlash string) {
 	t.Helper()
@@ -306,13 +306,13 @@ func testNodeSetupWithSlashName(t *testing.T) (nd, wsSlash string) {
 		t.Fatal(err)
 	}
 
-	wsSlash = filepath.Join(base, "cogos-dev", "cogos")
+	wsSlash = filepath.Join(base, "myrgic", "cogos")
 	if err := os.MkdirAll(wsSlash, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	global := "version: \"1.0\"\nworkspaces:\n" +
-		"  cogos-dev/cogos:\n    path: " + wsSlash + "\n"
+		"  myrgic/cogos:\n    path: " + wsSlash + "\n"
 	if err := os.WriteFile(filepath.Join(nd, "global.yaml"), []byte(global), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -328,9 +328,9 @@ func testNodeSetupWithSlashName(t *testing.T) (nd, wsSlash string) {
 // TestResolveWorkspacePathSlashBearing is the regression test for the bug found
 // by Codex review of PR #180.
 //
-// Before the fix, ResolveWorkspacePath built "cog://cogos-dev/cogos" and called
+// Before the fix, ResolveWorkspacePath built "cog://myrgic/cogos" and called
 // URIRegistry.Resolve, which split the authority at the first slash and looked
-// up workspace "cogos-dev" instead of "cogos-dev/cogos". The test would have
+// up workspace "cogos-dev" instead of "myrgic/cogos". The test would have
 // returned ErrUnknownAuthority.
 //
 // After the fix, ResolveWorkspacePath resolves the raw name directly via
@@ -338,9 +338,9 @@ func testNodeSetupWithSlashName(t *testing.T) (nd, wsSlash string) {
 func TestResolveWorkspacePathSlashBearing(t *testing.T) {
 	_, wsSlash := testNodeSetupWithSlashName(t)
 
-	got, err := ResolveWorkspacePath(context.Background(), "cogos-dev/cogos")
+	got, err := ResolveWorkspacePath(context.Background(), "myrgic/cogos")
 	if err != nil {
-		t.Fatalf("ResolveWorkspacePath(cogos-dev/cogos): %v", err)
+		t.Fatalf("ResolveWorkspacePath(myrgic/cogos): %v", err)
 	}
 	if got != wsSlash {
 		t.Errorf("path: got %q, want %q", got, wsSlash)
@@ -351,9 +351,9 @@ func TestResolveWorkspacePathSlashBearing(t *testing.T) {
 // name not in the registry returns ErrUnknownAuthority (not a panic or empty
 // string).
 func TestResolveWorkspacePathSlashBearing_NotFound(t *testing.T) {
-	testNodeSetupWithSlashName(t) // sets up URIRegistry with cogos-dev/cogos only
+	testNodeSetupWithSlashName(t) // sets up URIRegistry with myrgic/cogos only
 
-	_, err := ResolveWorkspacePath(context.Background(), "cogos-dev/other-repo")
+	_, err := ResolveWorkspacePath(context.Background(), "myrgic/other-repo")
 	if err == nil {
 		t.Fatal("expected ErrUnknownAuthority for unknown slash-bearing name, got nil")
 	}

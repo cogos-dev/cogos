@@ -2,7 +2,7 @@
 # setup-dev.sh — Developer setup for CogOS
 #
 # Run this after cloning the repo to set up your local dev environment:
-#   git clone https://github.com/cogos-dev/cogos.git
+#   git clone https://github.com/myrgic/cogos.git
 #   cd cogos
 #   ./scripts/setup-dev.sh
 #
@@ -82,7 +82,7 @@ cd "$REPO_DIR"
 
 VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS="-s -w -X github.com/cogos-dev/cogos/internal/engine.Version=${VERSION} -X github.com/cogos-dev/cogos/internal/engine.BuildTime=${BUILD_TIME}"
+LDFLAGS="-s -w -X github.com/myrgic/cogos/internal/engine.Version=${VERSION} -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME}"
 
 go build -ldflags="$LDFLAGS" -o cogos ./cmd/cogos
 

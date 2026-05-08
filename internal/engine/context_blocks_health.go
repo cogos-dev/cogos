@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // healthProbeTimeout is the per-provider Health() timeout. Health() is

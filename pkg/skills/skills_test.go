@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cogos-dev/cogos/pkg/skills"
+	"github.com/myrgic/cogos/pkg/skills"
 )
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────

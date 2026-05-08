@@ -42,8 +42,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/cogos-dev/cogos/internal/engine"
-	"github.com/cogos-dev/cogos/trace"
+	"github.com/myrgic/cogos/internal/engine"
+	"github.com/myrgic/cogos/trace"
 )
 
 // traceBusID is the dedicated bus that carries cycle-trace events (B5 /

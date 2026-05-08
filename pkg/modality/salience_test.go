@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cogos-dev/cogos/pkg/modality"
+	"github.com/myrgic/cogos/pkg/modality"
 )
 
 func TestSalience_OnEvent(t *testing.T) {

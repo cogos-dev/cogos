@@ -23,12 +23,12 @@
 ## Installing from a release
 ```sh
 # macOS (Apple Silicon)
-curl -L https://github.com/cogos-dev/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
+curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
 chmod +x cogos
 ./cogos serve
 
 # Linux
-curl -L https://github.com/cogos-dev/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
+curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
 chmod +x cogos
 ./cogos serve
 
@@ -48,13 +48,13 @@ Pick the right architecture for your machine (most users want `amd64`; `arm64` i
 Using PowerShell:
 ```powershell
 # amd64 (x86-64)
-Invoke-WebRequest -Uri https://github.com/cogos-dev/cogos/releases/latest/download/cogos-windows-amd64.exe -OutFile cogos.exe
+Invoke-WebRequest -Uri https://github.com/myrgic/cogos/releases/latest/download/cogos-windows-amd64.exe -OutFile cogos.exe
 
 # arm64
-Invoke-WebRequest -Uri https://github.com/cogos-dev/cogos/releases/latest/download/cogos-windows-arm64.exe -OutFile cogos.exe
+Invoke-WebRequest -Uri https://github.com/myrgic/cogos/releases/latest/download/cogos-windows-arm64.exe -OutFile cogos.exe
 ```
 
-Or download manually from the [latest release](https://github.com/cogos-dev/cogos/releases/latest) and rename to `cogos.exe`.
+Or download manually from the [latest release](https://github.com/myrgic/cogos/releases/latest) and rename to `cogos.exe`.
 
 Verify the SHA-256 against `checksums.txt` from the same release:
 ```powershell
