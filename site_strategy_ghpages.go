@@ -30,6 +30,22 @@ type GHPagesStrategy struct {
 	mu sync.Mutex
 }
 
+// init self-registers GHPagesStrategy with the global SiteProvider.
+// site_provider.go's init() runs first (alphabetical file order within the package),
+// so GetProvider("site") is guaranteed to find the SiteProvider before this fires.
+func init() {
+	p, err := GetProvider("site")
+	if err != nil {
+		// Should never happen in normal operation; log and continue rather than panic.
+		return
+	}
+	sp, ok := p.(*SiteProvider)
+	if !ok {
+		return
+	}
+	sp.RegisterStrategy("gh-pages", &GHPagesStrategy{})
+}
+
 // resolveRepo extracts the "repo" key from the CRD's deploy target map.
 func (g *GHPagesStrategy) resolveRepo(app SiteCRD) (string, error) {
 	raw, ok := app.Spec.Deploy.Target["repo"]
