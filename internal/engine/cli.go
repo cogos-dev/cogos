@@ -90,6 +90,9 @@ func Main() {
 		case "node":
 			runNodeCmd(args[1:], *workspace)
 			return
+		case "reconcile":
+			runReconcileCmd(args[1:], *workspace)
+			return
 		case "emit":
 			os.Exit(runEmitCmd(args[1:], *workspace))
 		case "mcp":
