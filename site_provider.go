@@ -35,6 +35,14 @@ func init() {
 // Type returns the resource type identifier.
 func (s *SiteProvider) Type() string { return "site" }
 
+// RegisterStrategy adds or replaces a DeployStrategy implementation.
+// Called by strategy init() functions (e.g. GHPagesStrategy) to self-register.
+func (s *SiteProvider) RegisterStrategy(name string, strat DeployStrategy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.strategies[name] = strat
+}
+
 // lookupStrategy retrieves a strategy by name, returning ErrUnsupportedStrategy if absent.
 func (s *SiteProvider) lookupStrategy(name string) (DeployStrategy, error) {
 	s.mu.Lock()
