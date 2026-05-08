@@ -11,7 +11,7 @@ Or install a pre-built binary:
 
 ```sh
 # macOS Apple Silicon (latest release)
-curl -L https://github.com/cogos-dev/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
+curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
 chmod +x cogos && mv cogos ~/.cog/bin/cogos
 ```
 
@@ -300,7 +300,7 @@ cog bus send ...        # Write to the bus. Direct JSONL by default; --http for 
 ### Build and run
 
 ```sh
-git clone https://github.com/cogos-dev/cogos.git
+git clone https://github.com/myrgic/cogos.git
 cd cogos
 make build
 
@@ -418,7 +418,7 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 
 ### Next
 
-- Direct import of the `cogos-dev/constellation` L1 trust-node protocol via the `ConstellationBridge` seam (the kernel already embeds `sdk/constellation/` for the Constellation memory graph of cogdocs; the external L1 peer protocol is the piece not yet wired)
+- Direct import of the `myrgic/constellation` L1 trust-node protocol via the `ConstellationBridge` seam (the kernel already embeds `sdk/constellation/` for the Constellation memory graph of cogdocs; the external L1 peer protocol is the piece not yet wired)
 - Multi-agent process management (the agent controller API is forward-compatible; only the `primary` instance is registered today)
 - Further agent state surface (beyond the v1 trigger/state/list)
 
@@ -430,17 +430,17 @@ CogOS is one piece of a larger system. Each component is its own repo with indep
 
 | Repo | Purpose | Status |
 |------|---------|--------|
-| **[cogos](https://github.com/cogos-dev/cogos)** | The daemon (this repo) | Active |
-| [constellation](https://github.com/cogos-dev/constellation) | L1 trust-node protocol for the Constellation substrate. Git-backed hash-chained ledger, ECDSA P-256 identity, EMA-weighted peer trust. Consumed via the kernel's `ConstellationBridge` seam. | Active |
-| [mod3](https://github.com/cogos-dev/mod3) | Modality bus: voice I/O, TTS, channel multiplexing | Active |
-| [skills](https://github.com/cogos-dev/skills) | Agent skill library (Claude Code compatible) | Active |
-| [charts](https://github.com/cogos-dev/charts) | Helm charts and Docker Compose for deployment | Active |
+| **[cogos](https://github.com/myrgic/cogos)** | The daemon (this repo) | Active |
+| [constellation](https://github.com/myrgic/constellation) | L1 trust-node protocol for the Constellation substrate. Git-backed hash-chained ledger, ECDSA P-256 identity, EMA-weighted peer trust. Consumed via the kernel's `ConstellationBridge` seam. | Active |
+| [mod3](https://github.com/myrgic/mod3) | Modality bus: voice I/O, TTS, channel multiplexing | Active |
+| [skills](https://github.com/myrgic/skills) | Agent skill library (Claude Code compatible) | Active |
+| [charts](https://github.com/myrgic/charts) | Helm charts and Docker Compose for deployment | Active |
 
 ---
 
 ## Releases & Changelog
 
-Per-release summaries: the [Releases page](https://github.com/cogos-dev/cogos/releases) (auto-generated from PR titles since the previous tag). See [CHANGELOG.md](CHANGELOG.md) for the policy and the historical entries (pre-v0.4.0).
+Per-release summaries: the [Releases page](https://github.com/myrgic/cogos/releases) (auto-generated from PR titles since the previous tag). See [CHANGELOG.md](CHANGELOG.md) for the policy and the historical entries (pre-v0.4.0).
 
 ---
 

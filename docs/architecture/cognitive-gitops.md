@@ -52,9 +52,9 @@ Each platform (Jenkins, GitHub Actions, GitLab, AWS) is a node in the cognitive 
 ## Current Ecosystem
 
 ```
-cogos-dev/cogos          → kernel (Go, public)
-cogos-dev/constellation  → identity & trust (Go, public)
-cogos-dev/mod3           → modality server (Python, public)
+myrgic/cogos          → kernel (Go, public)
+myrgic/constellation  → identity & trust (Go, public)
+myrgic/mod3           → modality server (Python, public)
 ```
 
 Each repo stands alone. They don't import each other. The workspace discovers them at runtime through capability scanning — like Kubernetes service discovery, but through content-addressed artifacts and attentional salience instead of DNS and labels.

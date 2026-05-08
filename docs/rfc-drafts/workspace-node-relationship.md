@@ -1,8 +1,8 @@
 # RFC Draft: workspace ⟷ node relationship (N:M)
 
 **Status:** Draft — awaiting review and RFC number assignment
-**Closes:** cogos-dev/cogos#160
-**Companion:** cogos-dev/cogos#161 (mechanical on-disk demonstration)
+**Closes:** myrgic/cogos#160
+**Companion:** myrgic/cogos#161 (mechanical on-disk demonstration)
 **Scope:** Design only — no implementation in this document
 
 ---
@@ -204,7 +204,7 @@ in the workspace, not in the node-only subtree.
 ### 5.2 Project workspace
 
 ```
-~/workspaces/cogos-dev/cogos/
+~/workspaces/myrgic/cogos/
 └── .cog/
     ├── config/
     │   └── node/
@@ -230,7 +230,7 @@ Node 1 (~/.cog/node/global.yaml):
   workspaces:
     - path: /Users/alice
       workspace_id: ws-abc123
-    - path: /Users/alice/workspaces/cogos-dev
+    - path: /Users/alice/workspaces/myrgic
       workspace_id: ws-def456
 
 Node 2 (~/.cog/node/global.yaml):

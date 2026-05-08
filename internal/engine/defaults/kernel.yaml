@@ -1,5 +1,5 @@
 # CogOS kernel configuration
-# See docs for all options: https://github.com/cogos-dev/cogos
+# See docs for all options: https://github.com/myrgic/cogos
 
 port: 6931
 consolidation_interval: 3600  # seconds between consolidation sweeps
