@@ -123,6 +123,8 @@ func (s *SiteProvider) FetchLive(ctx context.Context, config any) (any, error) {
 // ─── ComputePlan ────────────────────────────────────────────────────────────────
 
 // ComputePlan diffs declared SiteCRDs against live deployment state.
+// Drift detection in v0.0.1: absent live → create; ResolvedFromTarget=false → create;
+// ArtifactSHA empty → update; otherwise → skip. Full SHA comparison is planned for v0.1.
 func (s *SiteProvider) ComputePlan(config any, live any, state *ReconcileState) (*ReconcilePlan, error) {
 	crds, ok := config.([]SiteCRD)
 	if !ok {
@@ -156,6 +158,12 @@ func (s *SiteProvider) ComputePlan(config any, live any, state *ReconcileState) 
 			"strategy": crd.Spec.Deploy.Strategy,
 			"target":   crd.Spec.Deploy.Target,
 			"app_dir":  appDir,
+		}
+
+		// Warn if strategy is not registered (FetchLive will have logged it too)
+		if _, err := s.lookupStrategy(crd.Spec.Deploy.Strategy); err != nil {
+			plan.Warnings = append(plan.Warnings,
+				fmt.Sprintf("%s: strategy %q not registered — deploy will fail", name, crd.Spec.Deploy.Strategy))
 		}
 
 		if !liveState.ResolvedFromTarget {
