@@ -14,7 +14,7 @@
 #   make e2e      - Run e2e test in a container
 #   make e2e-local - Run e2e test locally
 
-VERSION := 0.5.0
+VERSION := 0.6.0
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=$(BUILD_TIME)
 BUILD_TAGS := fts5
