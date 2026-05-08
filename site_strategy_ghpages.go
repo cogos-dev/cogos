@@ -43,6 +43,10 @@ func (g *GHPagesStrategy) resolveRepo(app SiteCRD) (string, error) {
 	return repo, nil
 }
 
+// ghAPIRunner is the injectable runner for gh API calls.
+// Tests replace this variable to stub gh CLI responses without exec.
+var ghAPIRunner func(ctx context.Context, path string) ([]byte, error) = ghAPI
+
 // ghAPI runs: gh api <path> and returns stdout bytes.
 func ghAPI(ctx context.Context, path string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "gh", "api", path)
@@ -73,7 +77,7 @@ func (g *GHPagesStrategy) FetchLive(ctx context.Context, app SiteCRD) (LiveSiteS
 	}
 
 	// Query main branch SHA
-	refData, err := ghAPI(ctx, fmt.Sprintf("/repos/%s/git/refs/heads/main", repo))
+	refData, err := ghAPIRunner(ctx, fmt.Sprintf("/repos/%s/git/refs/heads/main", repo))
 	if err != nil {
 		// If the repo doesn't exist yet or has no main branch, treat as not deployed
 		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "Not Found") {
@@ -94,7 +98,7 @@ func (g *GHPagesStrategy) FetchLive(ctx context.Context, app SiteCRD) (LiveSiteS
 	state.ArtifactSHA = refResp.Object.SHA
 
 	// Query CNAME (optional — 404 is normal)
-	cnameData, err := ghAPI(ctx, fmt.Sprintf("/repos/%s/contents/CNAME", repo))
+	cnameData, err := ghAPIRunner(ctx, fmt.Sprintf("/repos/%s/contents/CNAME", repo))
 	if err == nil {
 		var cnameResp struct {
 			Content  string `json:"content"`
