@@ -43,12 +43,25 @@ func runReconcileCmd(args []string, defaultWorkspace string) {
 		fs.PrintDefaults()
 	}
 
-	if err := fs.Parse(args); err != nil {
+	// Pull out the provider type (first non-flag argument) before parsing flags.
+	// This lets the user write either:
+	//   cogos reconcile site --dry-run --json   (type before flags)
+	//   cogos reconcile --dry-run --json site   (flags before type)
+	providerType := ""
+	flagArgs := make([]string, 0, len(args))
+	for _, a := range args {
+		if providerType == "" && !strings.HasPrefix(a, "-") {
+			providerType = a
+		} else {
+			flagArgs = append(flagArgs, a)
+		}
+	}
+
+	if err := fs.Parse(flagArgs); err != nil {
 		os.Exit(1)
 	}
-	providerType := fs.Arg(0)
 	if providerType == "" {
-		fmt.Fprintf(os.Stderr, "error: provider type required (e.g. cogos reconcile sites)\n\n")
+		fmt.Fprintf(os.Stderr, "error: provider type required (e.g. cogos reconcile site)\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
