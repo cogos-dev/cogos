@@ -42,7 +42,7 @@ import (
 
 // ─── WorkspaceLocator ────────────────────────────────────────────────────────
 
-// WorkspaceLocator resolves a workspace name (e.g. "cogos-dev/cogos") to its
+// WorkspaceLocator resolves a workspace name (e.g. "myrgic/cogos") to its
 // absolute filesystem root path. In production it is backed by engine.URIRegistry
 // via an adapter wired at daemon startup. Tests inject a stub.
 type WorkspaceLocator interface {
@@ -84,7 +84,7 @@ type PinRef struct {
 // PinRecord is the on-disk schema for a single pin relationship.
 // Lives at <workspace>/.cog/pins/<sanitized-target-name>.yaml.
 type PinRecord struct {
-	// Target is the workspace name as registered in global.yaml (e.g. "cogos-dev/cogos").
+	// Target is the workspace name as registered in global.yaml (e.g. "myrgic/cogos").
 	// Must resolve via global workspace registry (URIRegistry in #167).
 	Target string `yaml:"target"`
 	// Pin holds the pinned position.
@@ -283,7 +283,7 @@ func (r *localGitHeadResolver) locateTarget(ctx context.Context, target, workspa
 	parent := filepath.Dir(workspaceRoot)
 	grandParent := filepath.Dir(parent)
 
-	// "cogos-dev/cogos" → last two components in sibling tree.
+	// "myrgic/cogos" → last two components in sibling tree.
 	parts := strings.SplitN(target, "/", 2)
 	switch len(parts) {
 	case 1:
@@ -293,7 +293,7 @@ func (r *localGitHeadResolver) locateTarget(ctx context.Context, target, workspa
 			return candidate, nil
 		}
 	case 2:
-		// two-component target (e.g., "cogos-dev/cogos") — look one level up.
+		// two-component target (e.g., "myrgic/cogos") — look one level up.
 		candidate := filepath.Join(grandParent, parts[0], parts[1])
 		if isGitRepo(candidate) {
 			return candidate, nil
@@ -780,7 +780,7 @@ func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (
 	return state, nil
 }
 
-// sanitiseName converts "cogos-dev/cogos" → "cogos-dev_cogos" for use as a
+// sanitiseName converts "myrgic/cogos" → "myrgic_cogos" for use as a
 // Reconcile State address component.
 func sanitiseName(name string) string {
 	return strings.ReplaceAll(name, "/", "_")
@@ -1076,7 +1076,7 @@ func RemovePinRecord(root, target string) error {
 }
 
 // sanitiseFilename converts a target workspace name to a safe filename stem.
-// "cogos-dev/cogos" → "cogos-dev_cogos"
+// "myrgic/cogos" → "myrgic_cogos"
 func sanitiseFilename(target string) string {
 	return strings.NewReplacer("/", "_", ":", "_", " ", "_").Replace(target)
 }

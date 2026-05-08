@@ -44,7 +44,7 @@ type IdentityCRDMeta struct {
 
 // IdentityCRDSpec holds the OIDC-shaped identity body.
 //
-//	Issuer     — OIDC `iss`; who minted this identity (e.g., "cogos-dev",
+//	Issuer     — OIDC `iss`; who minted this identity (e.g., "myrgic",
 //	             "https://accounts.google.com", "node:<hostname>", or a
 //	             federation URL). Required.
 //	Subject    — OIDC `sub`; globally stable identifier for the principal.

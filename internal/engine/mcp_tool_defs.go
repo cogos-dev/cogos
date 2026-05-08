@@ -12,7 +12,7 @@
 // the snapshot is read-only and lock-free — registerTools has already
 // returned, so nothing mutates the set after this point.
 //
-// See cogos-dev/cogos#89 (auto-inject kernel tool registry on
+// See myrgic/cogos#89 (auto-inject kernel tool registry on
 // `model: kernel-agent`) for the user-visible motivation.
 package engine
 

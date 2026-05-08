@@ -23,7 +23,7 @@ const (
 	daemonModeBareMetal = "bare-metal"
 	daemonModeContainer = "container"
 
-	defaultDaemonImage = "cogos/kernel-v3:dev"
+	defaultDaemonImage = "ghcr.io/myrgic/cogos:dev"
 	stateHealthTimeout = 1500 * time.Millisecond
 )
 

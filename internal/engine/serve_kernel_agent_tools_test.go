@@ -1,5 +1,5 @@
 // serve_kernel_agent_tools_test.go — coverage for the kernel-agent
-// tool-registry auto-injection added in cogos-dev/cogos#89.
+// tool-registry auto-injection added in myrgic/cogos#89.
 //
 // The dashboard chat path forwards `{model, messages, stream}` with no
 // `tools` array. Before #89 the kernel-agent route would advertise zero

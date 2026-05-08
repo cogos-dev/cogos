@@ -6,7 +6,7 @@
 // cog://authority/path URI:
 //
 //	cog://cog/mem/semantic/x    — "cog" resolves via alias to "cog-workspace"
-//	cog://kernel/adr/067         — "kernel" resolves to "cogos-dev/cogos"
+//	cog://kernel/adr/067         — "kernel" resolves to "myrgic/cogos"
 //
 // Aliases are a display/input convenience.  The kernel always stores and logs
 // the canonical workspace name; aliases are expanded at parse time.
@@ -17,7 +17,7 @@
 //	aliases:
 //	  cog: cog-workspace                         # short form
 //	  m3:                                        # long form with metadata
-//	    workspace: cogos-dev/mod3
+//	    workspace: myrgic/mod3
 //	    description: "mod3 voice server"
 //	    node: darkstar                           # optional node pin
 //

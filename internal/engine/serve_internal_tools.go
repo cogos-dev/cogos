@@ -1,7 +1,7 @@
 // serve_internal_tools.go — chat-handler glue for executing MCP-internal
 // tools (cog_*, mod3_*, ...) in-process.
 //
-// Closes cogos-dev/cogos#94. Background: #89 made the kernel auto-inject
+// Closes myrgic/cogos#94. Background: #89 made the kernel auto-inject
 // its MCP tool registry into kernel-agent chat requests so the inference
 // provider sees real tool definitions. But the chat handler still routed
 // every tool_use event to the client via OpenAI tool_calls, so the

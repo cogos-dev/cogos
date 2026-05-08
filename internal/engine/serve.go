@@ -753,7 +753,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// baseline), then any other provider with IsLocal=true. If no local
 		// provider is registered, fall through to default routing and warn so
 		// operators notice (silent cloud routing under a "local" alias is the
-		// bug this fixes; see cogos-dev/cogos#75).
+		// bug this fixes; see myrgic/cogos#75).
 		if name, ok := s.router.ProviderForName("ollama"); ok {
 			creq.Metadata.PreferProvider = name
 		} else if name, ok := s.router.FirstLocalProvider(); ok {
@@ -774,7 +774,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// see .cog/scratch/audit-inference-paths/REPORT.md.
 		creq.Metadata.PreferProvider = "ollama"
 		// Auto-inject the kernel's MCP tool registry when the client did not
-		// supply tools of its own. Closes cogos-dev/cogos#89: the dashboard's
+		// supply tools of its own. Closes myrgic/cogos#89: the dashboard's
 		// chat path constructs `{model, messages, stream}` with no `tools`
 		// array, so the model receives zero tool definitions and promises
 		// tool calls that never fire. Advertising the kernel surface lets

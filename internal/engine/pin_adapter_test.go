@@ -9,7 +9,7 @@
 // They are the tests that would have caught the bug reported in the Codex
 // review of PR #180 (#175 fixup): ResolveWorkspacePath was building
 // "cog://"+name and calling URIRegistry.Resolve, which splits the authority
-// at the first slash, so "cogos-dev/cogos" was looked up as "cogos-dev"
+// at the first slash, so "myrgic/cogos" was looked up as "myrgic"
 // instead of the full slash-bearing key.
 //
 // These tests must fail on the pre-fix code (Resolve round-trip) and pass
@@ -40,7 +40,7 @@ func (a *realAdapterLocator) LocateWorkspace(ctx context.Context, name string) (
 	return path, nil
 }
 
-// setupSlashNameRegistry writes a global.yaml with "cogos-dev/cogos" as a
+// setupSlashNameRegistry writes a global.yaml with "myrgic/cogos" as a
 // workspace, swaps URIRegistry for the duration of the test, creates the
 // workspace directory, and returns its path.
 func setupSlashNameRegistry(t *testing.T) (targetDir string) {
@@ -51,13 +51,13 @@ func setupSlashNameRegistry(t *testing.T) (targetDir string) {
 		t.Fatal(err)
 	}
 
-	targetDir = filepath.Join(base, "cogos-dev", "cogos")
+	targetDir = filepath.Join(base, "myrgic", "cogos")
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	global := "version: \"1.0\"\nworkspaces:\n" +
-		"  cogos-dev/cogos:\n    path: " + targetDir + "\n"
+		"  myrgic/cogos:\n    path: " + targetDir + "\n"
 	if err := os.WriteFile(filepath.Join(nd, "global.yaml"), []byte(global), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -74,16 +74,16 @@ func setupSlashNameRegistry(t *testing.T) (targetDir string) {
 // for the Codex finding on PR #180.
 //
 // It wires the real engine.ResolveWorkspacePath adapter (not a stub) against a
-// registry containing "cogos-dev/cogos" (slash-bearing), creates a minimal git
+// registry containing "myrgic/cogos" (slash-bearing), creates a minimal git
 // repo at that path, and asserts that pin FetchLive resolves HEAD without
 // error.
 //
-// Without the fix, ResolveWorkspacePath calls URIRegistry.Resolve("cog://cogos-dev/cogos"),
-// which splits authority at "/" → looks up "cogos-dev" → workspace not found →
+// Without the fix, ResolveWorkspacePath calls URIRegistry.Resolve("cog://myrgic/cogos"),
+// which splits authority at "/" → looks up "myrgic" → workspace not found →
 // returns ErrUnknownAuthority → pin.LocateWorkspace returns ErrWorkspaceNotFound
 // → FetchLive falls back to sibling scan → no sibling found → error.
 //
-// With the fix, ResolveWorkspacePath calls resolveAuthority("cogos-dev/cogos")
+// With the fix, ResolveWorkspacePath calls resolveAuthority("myrgic/cogos")
 // directly → global.yaml lookup succeeds → returns targetDir → FetchLive resolves HEAD.
 func TestPinAdapter_SlashBearingWorkspaceName(t *testing.T) {
 	targetDir := setupSlashNameRegistry(t)
@@ -101,13 +101,13 @@ func TestPinAdapter_SlashBearingWorkspaceName(t *testing.T) {
 		}
 	}
 
-	// Set up source workspace with a pin targeting "cogos-dev/cogos".
+	// Set up source workspace with a pin targeting "myrgic/cogos".
 	source := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(source, ".cog", "pins"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	pinYAML := "target: cogos-dev/cogos\npin:\n  ref: abc1234567890abcdef1234567890abcdef123456\nsync: read-only\n"
-	if err := os.WriteFile(filepath.Join(source, ".cog", "pins", "cogos-dev_cogos.yaml"), []byte(pinYAML), 0644); err != nil {
+	pinYAML := "target: myrgic/cogos\npin:\n  ref: abc1234567890abcdef1234567890abcdef123456\nsync: read-only\n"
+	if err := os.WriteFile(filepath.Join(source, ".cog", "pins", "myrgic_cogos.yaml"), []byte(pinYAML), 0644); err != nil {
 		t.Fatal(err)
 	}
 

@@ -91,11 +91,11 @@ aliases:
 }
 
 func TestLoadLongForm(t *testing.T) {
-	dir := nodeDir(t, "cogos-dev/mod3")
+	dir := nodeDir(t, "myrgic/mod3")
 	writeAliases(t, dir, `version: "1.0"
 aliases:
   m3:
-    workspace: cogos-dev/mod3
+    workspace: myrgic/mod3
     description: "mod3 voice server"
     node: darkstar
 `)
@@ -107,17 +107,17 @@ aliases:
 	if !ok {
 		t.Fatal("Expand: alias not found")
 	}
-	if ws != "cogos-dev/mod3" || node != "darkstar" {
+	if ws != "myrgic/mod3" || node != "darkstar" {
 		t.Fatalf("Expand: got ws=%q node=%q", ws, node)
 	}
 }
 
 func TestLoadMultiple(t *testing.T) {
-	dir := nodeDir(t, "cog-workspace", "cogos-dev/cogos")
+	dir := nodeDir(t, "cog-workspace", "myrgic/cogos")
 	writeAliases(t, dir, `version: "1.0"
 aliases:
   cog: cog-workspace
-  kernel: cogos-dev/cogos
+  kernel: myrgic/cogos
 `)
 	m, err := alias.Load(dir)
 	if err != nil {
@@ -393,9 +393,9 @@ func TestAddValidNames(t *testing.T) {
 // ── Round-trip long form ──────────────────────────────────────────────────────
 
 func TestAddLongFormRoundTrip(t *testing.T) {
-	dir := nodeDir(t, "cogos-dev/mod3")
+	dir := nodeDir(t, "myrgic/mod3")
 	m, _ := alias.Load(dir)
-	if err := m.Add("m3", "cogos-dev/mod3", alias.AliasOpts{
+	if err := m.Add("m3", "myrgic/mod3", alias.AliasOpts{
 		Description: "voice server",
 		Node:        "darkstar",
 	}); err != nil {

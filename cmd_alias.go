@@ -238,7 +238,7 @@ Schema (~/.cog/node/aliases.yaml):
   aliases:
     cog: cog-workspace            # short form
     m3:                           # long form with metadata
-      workspace: cogos-dev/mod3
+      workspace: myrgic/mod3
       description: "mod3 voice server"
       node: darkstar
 
