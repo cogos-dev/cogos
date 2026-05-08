@@ -21,7 +21,7 @@
 # Prerequisites:
 #   - Build kernel image:  docker build -t cogos/kernel:latest .
 #   - Build gateway image: docker build -t cogos/gateway:latest ../moltbot-gateway/
-#   - Bridge image:        once ghcr.io/cogos-dev/cog-sandbox-mcp is published,
+#   - Bridge image:        once ghcr.io/myrgic/cog-sandbox-mcp is published,
 #                          no build step needed. Until then, the bridge service
 #                          builds from ../cog-sandbox-mcp (expects sibling-dir
 #                          layout — i.e. cog-sandbox-mcp checked out alongside
@@ -108,8 +108,8 @@ services:
   # session substrate coordination — each client is an independent MCP peer on
   # this central server, emitting to and reading from the same bus.
   #
-  # Image source: once ghcr.io/cogos-dev/cog-sandbox-mcp is published, swap the
-  # `build:` block for `image: ghcr.io/cogos-dev/cog-sandbox-mcp:latest`. Until
+  # Image source: once ghcr.io/myrgic/cog-sandbox-mcp is published, swap the
+  # `build:` block for `image: ghcr.io/myrgic/cog-sandbox-mcp:latest`. Until
   # then, builds from ../cog-sandbox-mcp (sibling-dir layout).
   bridge-primary:
     build:

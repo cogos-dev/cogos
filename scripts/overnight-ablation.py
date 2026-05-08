@@ -128,7 +128,7 @@ WORKSPACE_QA = [
     },
     {
         "id": "ws-15",
-        "question": "How many skills are in the cogos-dev/skills marketplace?",
+        "question": "How many skills are in the myrgic/skills marketplace?",
         "answer_contains": ["17", "18"],
         "source": "skills/README.md",
     },

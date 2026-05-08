@@ -187,7 +187,7 @@ by default. Use the charts repo for Kubernetes deployments.
 Supported deployment modes:
 - Tier 1: Developer (cogos serve in terminal)
 - Tier 2: Desktop (CogOS.app via Wails)
-- Tier 3: Production (helm install via cogos-dev/charts)
+- Tier 3: Production (helm install via myrgic/charts)
 SEED
 
 check "seed doc: architecture"   test -f "$WORKSPACE/.cog/mem/semantic/insights/test-architecture.md"

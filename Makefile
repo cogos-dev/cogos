@@ -1,5 +1,5 @@
 # CogOS Kernel Build System
-# github.com/cogos-dev/cogos
+# github.com/myrgic/cogos
 #
 # Multi-platform binaries can be built for distribution.
 #
@@ -16,12 +16,12 @@
 
 VERSION := 0.4.2
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS := -s -w -X github.com/cogos-dev/cogos/internal/engine.BuildTime=$(BUILD_TIME)
+LDFLAGS := -s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=$(BUILD_TIME)
 BUILD_TAGS := fts5
 BINARY := cog
 GO := go
 
-IMAGE      := cogos-dev/cogos
+IMAGE      := ghcr.io/myrgic/cogos
 TAG        := dev
 PORT       := 6931
 WORKSPACE  ?= $(shell git rev-parse --show-toplevel 2>/dev/null || echo $$HOME/cog-workspace)
