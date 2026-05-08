@@ -168,13 +168,16 @@ func (g *GHPagesStrategy) Deploy(ctx context.Context, app SiteCRD, artifactDir s
 		return fmt.Errorf("Deploy: git commit: %w", err)
 	}
 
-	// Set remote origin using HTTPS form (gh CLI auth handles credentials)
+	// Set remote origin using HTTPS form (gh CLI auth handles credentials via git-credential-gh).
+	// gh CLI configures git-credential-helper on install, so no token embedding is needed.
 	remote := fmt.Sprintf("https://github.com/%s.git", repo)
 	if err := gitRun(ctx, tmpDir, "remote", "add", "origin", remote); err != nil {
 		return fmt.Errorf("Deploy: git remote add: %w", err)
 	}
 
-	// Force-push to main — deploy repo is auto-managed; history is replaced per deploy
+	// Force-push to main — deploy repo is auto-managed; history is replaced per deploy.
+	// This is the correct semantic for a gh-pages deploy target: no source lineage needed,
+	// only the latest artifact matters.
 	if err := gitRun(ctx, tmpDir, "push", "--force", "origin", "HEAD:main"); err != nil {
 		return fmt.Errorf("Deploy: git push: %w", err)
 	}
