@@ -111,7 +111,9 @@ type Config struct {
 	OllamaEmbedEndpoint string
 
 	// OllamaEmbedModel is the embedding model name for Ollama.
-	// Default: nomic-embed-text
+	// Default (when empty): bge-m3:latest — see trm_context.go defaultEmbedModel.
+	// Prefix-aware encoders (nomic-embed-text) automatically receive
+	// "search_query: " / "search_document: " prefixes; others receive raw text.
 	OllamaEmbedModel string
 
 	// ToolCallValidationEnabled gates runtime validation for model-emitted tool calls.

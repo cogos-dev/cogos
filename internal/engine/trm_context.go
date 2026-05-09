@@ -21,8 +21,25 @@ import (
 	"net/http"
 	"sort"
 	"os"
+	"strings"
 	"time"
 )
+
+// defaultEmbedModel is used when cfg.OllamaEmbedModel is empty. Aligned with
+// the canonical workspace pin (bge-m3 — wider embedding geometry than nomic,
+// see workspace research notes on encoder ceiling).
+const defaultEmbedModel = "bge-m3:latest"
+
+// queryPrefix returns the task-specific prefix to prepend to retrieval queries
+// for this model, or "" if the model wasn't trained on prefixed input. Only
+// nomic-class encoders use prefixes; bge-m3, e5, and others receive raw text.
+func queryPrefix(model string) string {
+	base, _, _ := strings.Cut(model, ":")
+	if base == "nomic-embed-text" {
+		return "search_query: "
+	}
+	return ""
+}
 
 // ollamaEmbedRequest is the request body for POST /api/embeddings.
 type ollamaEmbedRequest struct {
@@ -35,8 +52,12 @@ type ollamaEmbedResponse struct {
 	Embedding []float64 `json:"embedding"`
 }
 
-// OllamaEmbed calls Ollama to embed a query string. Returns a 384-dim float32 vector.
-// The endpoint and model are taken from config; defaults are localhost:11434 and nomic-embed-text.
+// OllamaEmbed calls Ollama to embed a query string. Native dimensionality
+// depends on the model (768 for nomic-embed-text, 1024 for bge-m3, etc.).
+//
+// The endpoint and model come from cfg; defaults are localhost:11434 and
+// defaultEmbedModel (bge-m3:latest). The task-specific query prefix is
+// applied only for prefix-aware models — see queryPrefix.
 func OllamaEmbed(ctx context.Context, cfg *Config, query string) ([]float32, error) {
 	endpoint := cfg.OllamaEmbedEndpoint
 	if endpoint == "" {
@@ -44,12 +65,12 @@ func OllamaEmbed(ctx context.Context, cfg *Config, query string) ([]float32, err
 	}
 	model := cfg.OllamaEmbedModel
 	if model == "" {
-		model = "nomic-embed-text"
+		model = defaultEmbedModel
 	}
 
 	reqBody, err := json.Marshal(ollamaEmbedRequest{
 		Model:  model,
-		Prompt: "search_query: " + query,
+		Prompt: queryPrefix(model) + query,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embed request: %w", err)
