@@ -178,7 +178,9 @@ The pipeline uses a local LLM (Gemma E4B) via Ollama for tiers 0-2.
 
 	// 7. Verify embeddings were attempted (best-effort — check if non-nil)
 	t.Run("embeddings_attempted", func(t *testing.T) {
-		embedResults(runCtx, ollamaURL, result)
+		// "" -> defaultEmbedModel (bge-m3:latest); set EMBED_MODEL env to override.
+		embedModel := os.Getenv("EMBED_MODEL")
+		embedResults(runCtx, ollamaURL, embedModel, result)
 		if result.Embeddings == nil {
 			t.Log("Embeddings are nil — embed model may not be available (acceptable)")
 		} else {

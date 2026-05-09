@@ -26,6 +26,22 @@ import (
 	"github.com/myrgic/cogos/sdk/constellation"
 )
 
+// defaultEmbedModel is used when callers don't specify one. Kept in sync with
+// the kernel's OllamaEmbedModel default in internal/engine/trm_context.go.
+const defaultEmbedModel = "bge-m3:latest"
+
+// nomic-class encoders are trained with task-specific prefixes; other dense
+// encoders (bge-m3, e5, etc.) are not, and prepending a prefix corrupts them.
+// documentPrefix returns the prefix to prepend at indexing time, or "" if
+// the model doesn't use prefixes.
+func documentPrefix(model string) string {
+	base, _, _ := strings.Cut(model, ":")
+	if base == "nomic-embed-text" {
+		return "search_document: "
+	}
+	return ""
+}
+
 // === C1+C2: Embedding Generation ===
 
 // ollamaEmbedRequest is the request body for Ollama's /api/embed endpoint.
@@ -40,10 +56,15 @@ type ollamaEmbedResponse struct {
 }
 
 // embedFromOllama calls Ollama's native embed endpoint for a single text.
-// Returns the full embedding vector (768-dim for nomic-embed-text) or error.
-func embedFromOllama(ctx context.Context, ollamaURL, text string) ([]float32, error) {
+// `model` is the Ollama model tag (e.g. "bge-m3:latest", "nomic-embed-text");
+// pass "" to use defaultEmbedModel. Returns the full embedding vector — native
+// dimensionality depends on the model (768 for nomic, 1024 for bge-m3).
+func embedFromOllama(ctx context.Context, ollamaURL, model, text string) ([]float32, error) {
+	if model == "" {
+		model = defaultEmbedModel
+	}
 	reqBody := ollamaEmbedRequest{
-		Model: "nomic-embed-text",
+		Model: model,
 		Input: text,
 	}
 	bodyBytes, err := json.Marshal(reqBody)
@@ -93,18 +114,25 @@ func truncateVec(v []float32, n int) []float32 {
 }
 
 // embedResults generates embeddings for each tier in the decomposition result.
+// `model` selects the Ollama embedding model; pass "" to use defaultEmbedModel.
+// The task-specific document prefix is applied conditionally — nomic-class
+// encoders get "search_document: ", others get nothing.
 // Best-effort: logs warnings on failure, never returns an error.
-func embedResults(ctx context.Context, ollamaURL string, result *DecompositionResult) {
+func embedResults(ctx context.Context, ollamaURL, model string, result *DecompositionResult) {
 	if result == nil {
 		return
 	}
+	if model == "" {
+		model = defaultEmbedModel
+	}
+	pfx := documentPrefix(model)
 
 	emb := &DecompEmbeddings{}
 	var generated bool
 
 	// Tier 0: embed the one-sentence summary
 	if result.Tier0 != nil && result.Tier0.Summary != "" {
-		vec, err := embedFromOllama(ctx, ollamaURL, "search_document: "+result.Tier0.Summary)
+		vec, err := embedFromOllama(ctx, ollamaURL, model, pfx+result.Tier0.Summary)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: tier 0 embedding failed: %v\n", err)
 		} else {
@@ -115,7 +143,7 @@ func embedResults(ctx context.Context, ollamaURL string, result *DecompositionRe
 
 	// Tier 1: embed the paragraph summary
 	if result.Tier1 != nil && result.Tier1.Summary != "" {
-		vec, err := embedFromOllama(ctx, ollamaURL, "search_document: "+result.Tier1.Summary)
+		vec, err := embedFromOllama(ctx, ollamaURL, model, pfx+result.Tier1.Summary)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: tier 1 embedding failed: %v\n", err)
 		} else {
@@ -138,7 +166,7 @@ func embedResults(ctx context.Context, ollamaURL string, result *DecompositionRe
 		}
 		if len(parts) > 0 {
 			fullText := strings.Join(parts, "\n")
-			vec, err := embedFromOllama(ctx, ollamaURL, "search_document: "+fullText)
+			vec, err := embedFromOllama(ctx, ollamaURL, model, pfx+fullText)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: tier 2 embedding failed: %v\n", err)
 			} else {
