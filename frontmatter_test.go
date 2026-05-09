@@ -327,9 +327,9 @@ func TestIsCogdoc(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "valid cogdoc with cogn8",
-			content:  "---\ntitle: Test\ncogn8:\n  version: 1.0\n---\nBody",
-			filename: "cogn8.md",
+			name:     "valid cogdoc with nested cog block",
+			content:  "---\ntitle: Test\ncog:\n  version: 1.0\n---\nBody",
+			filename: "cog-block.md",
 			expected: true,
 		},
 		{

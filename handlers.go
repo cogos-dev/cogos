@@ -175,8 +175,8 @@ func validateCogdocContent(content, filePath string) string {
 
 	frontmatter := strings.Join(lines[1:closingIndex], "\n")
 	if !strings.Contains(frontmatter, "type:") && !strings.Contains(frontmatter, "type :") {
-		// Check for nested type (cogn8 format)
-		if !regexp.MustCompile(`(?m)(cogn8|cog):\s*\n\s+.*type:`).MatchString(frontmatter) {
+		// Accept type: nested under a top-level cog: block
+		if !regexp.MustCompile(`(?m)cog:\s*\n\s+.*type:`).MatchString(frontmatter) {
 			return "Missing 'type' field in frontmatter."
 		}
 	}

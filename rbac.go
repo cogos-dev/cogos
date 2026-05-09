@@ -149,7 +149,7 @@ func (rl *RoleLoader) parseFrontmatter(data []byte) (*Role, error) {
 	// Parse YAML safely (no eval, no code execution)
 	var role Role
 	decoder := yaml.NewDecoder(strings.NewReader(frontmatterYAML))
-	decoder.KnownFields(false) // Allow extra fields (cogn8 metadata)
+	decoder.KnownFields(false) // Allow extra fields (cog block + other metadata)
 
 	if err := decoder.Decode(&role); err != nil {
 		return nil, fmt.Errorf("YAML parse error: %w", err)

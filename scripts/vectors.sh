@@ -140,13 +140,13 @@ cog_embed_update() {
 }
 
 # =============================================================================
-# INTEGRATION WITH COGN8
+# INTEGRATION WITH cog CLI
 # =============================================================================
 
-# These functions can be called via the unified cogn8 interface
-# Example: cogn8 embed index
-#          cogn8 embed search "query"
-#          cogn8 embed status
+# These functions can be called via the unified cog interface
+# Example: cog embed index
+#          cog embed search "query"
+#          cog embed status
 
 # Export functions for subshells (bash only)
 if [ -n "${BASH_VERSION:-}" ]; then
