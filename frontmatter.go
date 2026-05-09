@@ -339,11 +339,11 @@ func IsCogdoc(filePath string) (bool, error) {
 		return false, nil
 	}
 
-	// Must have either memory_sector or cogn8 block
+	// Must have either memory_sector or a cog: nested block
 	if _, hasSector := data["memory_sector"]; hasSector {
 		return true, nil
 	}
-	if _, hasCogn8 := data["cogn8"]; hasCogn8 {
+	if _, hasCog := data["cog"]; hasCog {
 		return true, nil
 	}
 
