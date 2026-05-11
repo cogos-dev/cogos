@@ -521,6 +521,14 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		return NewOllamaProvider(name, pc), nil
 	case "anthropic":
 		return NewAnthropicProvider(name, pc), nil
+	// "vllm" is a first-class config citizen: it routes through the same
+	// OpenAI-compatible HTTP dispatch path as lmstudio and llama.cpp servers.
+	// vLLM's /v1/chat/completions and /v1/models endpoints satisfy the
+	// OpenAICompatProvider contract; no separate provider implementation is
+	// required for the unsupervised case (operator runs vllm serve themselves).
+	// A future "vllm-supervised" type will add launchd/systemd lifecycle
+	// management, mirroring mlx-supervised. See docs/inference/vllm.md and
+	// the ollama-to-vllm-migration-plan cogdoc.
 	case "openai-compat", "openai", "lmstudio", "vllm", "llamacpp":
 		return NewOpenAICompatProvider(name, pc), nil
 	case "claude-code":

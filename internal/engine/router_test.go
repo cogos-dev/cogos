@@ -234,6 +234,28 @@ func TestMakeProviderInfersTypeFromName(t *testing.T) {
 	}
 }
 
+// TestMakeProviderVLLM verifies that type "vllm" is registered and routes to
+// the OpenAI-compatible provider implementation. vLLM exposes the OpenAI
+// /v1/chat/completions and /v1/models contract; no dedicated provider type
+// is required for the unsupervised case.
+func TestMakeProviderVLLM(t *testing.T) {
+	t.Parallel()
+	p, err := makeProvider("vllm-local", ProviderConfig{
+		Type:     "vllm",
+		Endpoint: "http://localhost:8000",
+		Model:    "gemma4:e4b",
+	}, nil)
+	if err != nil {
+		t.Fatalf("makeProvider(vllm): %v", err)
+	}
+	if _, ok := p.(*OpenAICompatProvider); !ok {
+		t.Errorf("vllm should resolve to *OpenAICompatProvider, got %T", p)
+	}
+	if p.Name() != "vllm-local" {
+		t.Errorf("Name() = %q; want vllm-local", p.Name())
+	}
+}
+
 // ── defaultProvidersConfig ────────────────────────────────────────────────────
 
 func TestDefaultProvidersConfig(t *testing.T) {

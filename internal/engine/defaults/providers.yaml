@@ -1,6 +1,23 @@
 # Inference provider configuration
 # The router loads enabled providers at startup and routes requests
 # based on capability, availability, and the sovereignty gradient.
+#
+# Additional provider types are first-class but disabled by default:
+#   - vllm           : OpenAI-compatible local server (Linux/CUDA). See
+#                      docs/inference/vllm.md for setup. The kernel
+#                      assumes the operator runs `vllm serve` themselves;
+#                      a future "vllm-supervised" type will add launchd /
+#                      systemd lifecycle management.
+#   - lmstudio       : LM Studio's local OpenAI-compatible server.
+#   - mlx-supervised : kernel-managed mlx_lm.server (Apple Silicon).
+# Add them to providers.local.yaml to opt in. Example for vLLM:
+#   vllm-local:
+#     type: vllm
+#     enabled: true
+#     endpoint: "http://localhost:8000"
+#     model: "google/gemma-2-9b-it"
+#     timeout: 300
+#     context_window: 32768
 
 providers:
   ollama:
