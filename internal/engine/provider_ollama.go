@@ -302,6 +302,15 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		}
 	}
 
+	// Resolve keep_alive: per-request override takes precedence over the
+	// global default of -1. A nil KeepAlive on the request means "use the
+	// provider default." A non-nil value (including 0 for cold-start
+	// simulation) is forwarded verbatim to Ollama.
+	keepAlive := any(-1) // provider default: keep model in VRAM indefinitely
+	if req.KeepAlive != nil {
+		keepAlive = *req.KeepAlive
+	}
+
 	return &ollamaChatRequest{
 		Model:     model,
 		Messages:  msgs,
@@ -309,7 +318,7 @@ func buildOllamaRequest(model string, req *CompletionRequest, stream bool, conte
 		Stream:    stream,
 		Think:     false, // prevent silent token burn in qwen3 thinking mode
 		Options:   opts,
-		KeepAlive: -1, // pin model in VRAM; Ollama's 5m default evicts between cycles
+		KeepAlive: keepAlive,
 	}
 }
 

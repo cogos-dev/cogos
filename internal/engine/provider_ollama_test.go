@@ -114,6 +114,54 @@ func TestBuildOllamaRequestKeepAlivePinsModel(t *testing.T) {
 	}
 }
 
+func TestBuildOllamaRequestKeepAliveOverride(t *testing.T) {
+	t.Parallel()
+
+	// Zero override: forces model eviction after the request (cold-start simulation).
+	zeroVal := any(0)
+	reqZero := &CompletionRequest{
+		Messages:  []ProviderMessage{{Role: "user", Content: "hi"}},
+		KeepAlive: &zeroVal,
+	}
+	rZero := buildOllamaRequest("m", reqZero, false, 0)
+	bodyZero, err := json.Marshal(rZero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	if !bytes.Contains(bodyZero, []byte(`"keep_alive":0`)) {
+		t.Errorf("zero override should produce keep_alive=0; got %s", bodyZero)
+	}
+
+	// Duration string override: "5m" passes through to Ollama as-is.
+	durVal := any("5m")
+	reqDur := &CompletionRequest{
+		Messages:  []ProviderMessage{{Role: "user", Content: "hi"}},
+		KeepAlive: &durVal,
+	}
+	rDur := buildOllamaRequest("m", reqDur, false, 0)
+	bodyDur, err := json.Marshal(rDur)
+	if err != nil {
+		t.Fatalf("marshal dur: %v", err)
+	}
+	if !bytes.Contains(bodyDur, []byte(`"keep_alive":"5m"`)) {
+		t.Errorf("duration string override should produce keep_alive=\"5m\"; got %s", bodyDur)
+	}
+
+	// Nil override: falls back to provider default (-1).
+	reqNil := &CompletionRequest{
+		Messages:  []ProviderMessage{{Role: "user", Content: "hi"}},
+		KeepAlive: nil,
+	}
+	rNil := buildOllamaRequest("m", reqNil, false, 0)
+	bodyNil, err := json.Marshal(rNil)
+	if err != nil {
+		t.Fatalf("marshal nil: %v", err)
+	}
+	if !bytes.Contains(bodyNil, []byte(`"keep_alive":-1`)) {
+		t.Errorf("nil override should fall back to keep_alive=-1; got %s", bodyNil)
+	}
+}
+
 func TestOllamaCapabilitiesContextWindow(t *testing.T) {
 	t.Parallel()
 	p := NewOllamaProvider("ollama", ProviderConfig{Model: "m", ContextWindow: 32768})
