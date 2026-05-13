@@ -872,7 +872,12 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	var provider Provider
 	var model string
 	var routeUsed DispatchModel
+	// note is a batch-level diagnostic string (e.g. state-routing path taken).
+	// slotNote carries per-slot warnings that must appear on each DispatchResult
+	// (e.g. "26b route unavailable, degraded to e4b") — distinct from note so
+	// state-routing diagnostics are not incorrectly surfaced in slot Error fields.
 	var note string
+	var slotNote string
 	var err error
 	// needsOllamaMu is true when the selected path goes through Ollama
 	// (either legacy Path 3 or an explicit/state-routed provider of type
@@ -961,7 +966,13 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 			if m == "" {
 				return nil, errors.New(n)
 			}
-			model, routeUsed, note = m, ru, n
+			model, routeUsed = m, ru
+			// Downgrade warnings (e.g. "26b route unavailable, degraded to e4b")
+			// are per-slot: each slot's result must carry the warning so callers
+			// that inspect individual slots know the requested model wasn't honored.
+			// These are distinct from batch-level diagnostics (state-routing note)
+			// which go into batch.Notes via the outer `note` variable.
+			slotNote = n
 			provider = buildLocalProvider(target, model, c.localProviderTimeout)
 		}
 	}
@@ -1025,7 +1036,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, note)
+			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote)
 		}(i)
 	}
 	wg.Wait()
@@ -1033,7 +1044,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	return batch, nil
 }
 
-func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, note string) DispatchResult {
+func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string) DispatchResult {
 	res := DispatchResult{
 		Index:        idx,
 		ModelUsed:    routeUsed,
@@ -1098,10 +1109,13 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	if res.Content == "" && len(transcript) > 0 {
 		res.Content = summarizeToolTranscript(transcript)
 	}
-	// Routing notes (e.g. "state-routing: state=receptive -> provider=mlx-lm")
-	// are batch-level diagnostics already captured in batch.Notes by the
-	// caller; do NOT copy them into res.Error on successful slots — that
-	// produces misleading success=true + non-empty error results.
+	// slotNote carries per-slot warnings (e.g. legacy "26b route unavailable,
+	// degraded to e4b") that the caller may need to surface per-result. These
+	// are distinct from batch-level state-routing diagnostics, which live in
+	// batch.Notes and must not be set here.
+	if slotNote != "" {
+		res.Error = slotNote
+	}
 	return res
 }
 

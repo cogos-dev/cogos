@@ -747,6 +747,69 @@ routing:
 	}
 }
 
+// TestDispatchToHarness_Legacy26bDowngradeWarningPerSlot is a regression test
+// ensuring that the "26b route unavailable, degraded to e4b" per-slot warning
+// from the legacy path still appears in each DispatchResult.Error even when
+// Success=true. This was silently dropped in an earlier iteration of the
+// state-routing patch; this test pins the contract.
+func TestDispatchToHarness_Legacy26bDowngradeWarningPerSlot(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.LocalModel = "gemma4:e4b"
+
+	// Ollama stub that only lists gemma4:e4b — no 26b-class model available.
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "26b downgrade test",
+		Model:          DispatchModel26B,
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if len(batch.Results) != 1 {
+		t.Fatalf("batch.Results len = %d; want 1", len(batch.Results))
+	}
+	res := batch.Results[0]
+
+	// Dispatch must succeed — it fell back to e4b.
+	if !res.Success {
+		t.Errorf("Success = false; want true (26b fallback to e4b should still succeed)")
+	}
+	// Per-slot Error must carry the downgrade warning so callers that inspect
+	// individual slot results can see that the requested model was not honored.
+	if res.Error == "" {
+		t.Errorf("Error is empty; want downgrade warning (e.g. %q)", "26b route unavailable, degraded to e4b")
+	}
+	if res.ModelUsed != DispatchModelE4B {
+		t.Errorf("ModelUsed = %q; want DispatchModelE4B", res.ModelUsed)
+	}
+}
+
 // TestDispatchToHarness_TypelessOllamaStillAcquiresOllamaMu verifies that a
 // provider named "ollama" WITHOUT an explicit type: field is still treated as
 // Ollama for lock-acquisition purposes. The isOllamaProvider helper must mirror
