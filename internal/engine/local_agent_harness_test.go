@@ -307,3 +307,422 @@ routing:
 		t.Errorf("mlx-lm endpoint was NOT called; expected state-routing (receptive -> mlx-lm) to route there instead of Ollama legacy path")
 	}
 }
+
+// TestDispatchToHarness_StateRouting_UnknownStateFallsBackToLegacy verifies
+// that a process in an unrecognised state (ProcessState outside the defined
+// iota range) falls back to the legacy Ollama probe path instead of routing
+// to process_state_routing["unknown"].
+func TestDispatchToHarness_StateRouting_UnknownStateFallsBackToLegacy(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var ollamaCalled atomic.Bool
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			ollamaCalled.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "ollama fallback"},
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+
+	// providers.yaml maps "unknown" state to a provider; this MUST NOT fire.
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    type: ollama
+    endpoint: `+ollamaSrv.URL+`
+    model: gemma4:e4b
+routing:
+  default: ollama
+  process_state_routing:
+    unknown: ollama
+`)
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	// Force the process into an out-of-range state so State().String() returns "unknown".
+	proc.transitionWithReason(ProcessState(99), "test: force unknown state")
+
+	if got := proc.State().String(); got != "unknown" {
+		t.Fatalf("proc.State().String() = %q; want \"unknown\"", got)
+	}
+
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	_, _ = ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "unknown-state fallback test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+
+	// The legacy Ollama probe should have been hit (via /api/tags), not state-routed.
+	if !ollamaCalled.Load() {
+		t.Errorf("Ollama /api/tags was NOT called; unknown state should fall back to legacy path, not route via process_state_routing[\"unknown\"]")
+	}
+}
+
+// TestDispatchToHarness_StateRouting_NoMappingFallsBackToLegacy verifies that
+// when a process state has no entry in process_state_routing, dispatch falls
+// through to the legacy local-LLM probe.
+func TestDispatchToHarness_StateRouting_NoMappingFallsBackToLegacy(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var ollamaCalled atomic.Bool
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			ollamaCalled.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+
+	// process_state_routing has no "receptive" entry — state has no mapping.
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    type: ollama
+    endpoint: `+ollamaSrv.URL+`
+    model: gemma4:e4b
+routing:
+  default: ollama
+  process_state_routing:
+    active: ollama
+`)
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	// NewProcess starts in StateReceptive — no mapping for "receptive" above.
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	_, _ = ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "no-mapping fallback test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+
+	if !ollamaCalled.Load() {
+		t.Errorf("Ollama /api/tags was NOT called; receptive state with no mapping should fall back to legacy path")
+	}
+}
+
+// TestDispatchToHarness_StateRouting_DisabledProviderFallsBackToLegacy verifies
+// that when state_routing resolves to a provider that is disabled (enabled: false),
+// dispatch falls through to the legacy local-LLM probe.
+func TestDispatchToHarness_StateRouting_DisabledProviderFallsBackToLegacy(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var ollamaCalled atomic.Bool
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			ollamaCalled.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+
+	// mlx-lm is mapped for receptive but marked enabled: false.
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    type: ollama
+    endpoint: `+ollamaSrv.URL+`
+    model: gemma4:e4b
+  mlx-lm:
+    type: openai
+    endpoint: http://127.0.0.1:1
+    model: gemma-4-e4b
+    enabled: false
+routing:
+  default: ollama
+  process_state_routing:
+    receptive: mlx-lm
+`)
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	_, _ = ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "disabled-provider fallback test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+
+	if !ollamaCalled.Load() {
+		t.Errorf("Ollama /api/tags was NOT called; disabled state-routed provider should fall back to legacy path")
+	}
+}
+
+// TestDispatchToHarness_StateRouting_MissingProviderFallsBackToLegacy verifies
+// that when state_routing names a provider that doesn't exist in the providers
+// map, dispatch falls through to the legacy local-LLM probe.
+func TestDispatchToHarness_StateRouting_MissingProviderFallsBackToLegacy(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var ollamaCalled atomic.Bool
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			ollamaCalled.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "ok"},
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+
+	// process_state_routing points "receptive" at "nonexistent" which is not
+	// in the providers map.
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    type: ollama
+    endpoint: `+ollamaSrv.URL+`
+    model: gemma4:e4b
+routing:
+  default: ollama
+  process_state_routing:
+    receptive: nonexistent
+`)
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	_, _ = ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "missing-provider fallback test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+
+	if !ollamaCalled.Load() {
+		t.Errorf("Ollama /api/tags was NOT called; missing provider in state_routing should fall back to legacy path")
+	}
+}
+
+// TestDispatchToHarness_StateRouting_HappyPath_ProviderUsedAndNoError verifies
+// the result shape on a successful state-routed dispatch:
+// - provider_used is populated with the resolved provider name
+// - error is empty on success
+// - success is true
+func TestDispatchToHarness_StateRouting_HappyPath_ProviderUsedAndNoError(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	mlxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":      "chatcmpl-test",
+				"object":  "chat.completion",
+				"model":   "gemma-4-e4b",
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "done"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+			})
+		}
+	}))
+	defer mlxSrv.Close()
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  mlx-lm:
+    type: openai
+    endpoint: `+mlxSrv.URL+`
+    model: gemma-4-e4b
+routing:
+  process_state_routing:
+    receptive: mlx-lm
+`)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "happy path provider_used test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if len(batch.Results) != 1 {
+		t.Fatalf("batch.Results len = %d; want 1", len(batch.Results))
+	}
+	res := batch.Results[0]
+
+	// provider_used must be populated so callers can distinguish state-routed from legacy.
+	if res.ProviderUsed == "" {
+		t.Errorf("ProviderUsed is empty; want \"mlx-lm\" on state-routed path")
+	}
+	if res.ProviderUsed != "mlx-lm" {
+		t.Errorf("ProviderUsed = %q; want \"mlx-lm\"", res.ProviderUsed)
+	}
+
+	// error must be empty on a successful dispatch — routing notes must NOT
+	// bleed into error.
+	if res.Error != "" {
+		t.Errorf("Error = %q; want empty on successful state-routed dispatch", res.Error)
+	}
+
+	if !res.Success {
+		t.Errorf("Success = false; want true")
+	}
+}
+
+// TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu verifies
+// that a state-routed dispatch to a non-Ollama provider does not hold ollamaMu,
+// allowing concurrent Ollama metabolic cycles to proceed without serialisation.
+func TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	// mlx-lm stub with a deliberate delay to hold the dispatch open.
+	mlxReady := make(chan struct{})
+	mlxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			close(mlxReady) // signal that mlx dispatch is in-flight
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":      "chatcmpl-test",
+				"object":  "chat.completion",
+				"model":   "gemma-4-e4b",
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "done"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer mlxSrv.Close()
+
+	// Ollama stub to verify the cycle can acquire the lock independently.
+	var ollamaCycles atomic.Int32
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			ollamaCycles.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`},
+				"done": true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  mlx-lm:
+    type: openai
+    endpoint: `+mlxSrv.URL+`
+    model: gemma-4-e4b
+routing:
+  process_state_routing:
+    receptive: mlx-lm
+`)
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Launch a state-routed (non-Ollama) dispatch in the background.
+	dispDone := make(chan error, 1)
+	go func() {
+		_, e := ctrl.DispatchToHarness(ctx, DispatchRequest{
+			Task:           "non-ollama dispatch",
+			N:              1,
+			TimeoutSeconds: 10,
+		})
+		dispDone <- e
+	}()
+
+	// Wait until the mlx dispatch is in-flight, then run a metabolic cycle.
+	// If ollamaMu were held by the mlx dispatch, this TriggerAgent call would
+	// deadlock for the dispatch's duration.
+	select {
+	case <-mlxReady:
+	case err := <-dispDone:
+		t.Fatalf("dispatch completed before mlxReady signal: %v", err)
+	}
+
+	_, cycleErr := ctrl.TriggerAgent(ctx, DefaultAgentID, "concurrent-cycle", true)
+	if cycleErr != nil {
+		t.Fatalf("TriggerAgent while mlx dispatch in-flight: %v", cycleErr)
+	}
+
+	// Wait for dispatch to finish.
+	if err := <-dispDone; err != nil {
+		t.Fatalf("DispatchToHarness: %v", err)
+	}
+
+	// The metabolic cycle hit Ollama (proving it wasn't blocked on ollamaMu).
+	if got := ollamaCycles.Load(); got == 0 {
+		t.Errorf("ollamaCycles = 0; want >= 1 (metabolic cycle should have run concurrently with mlx dispatch)")
+	}
+}

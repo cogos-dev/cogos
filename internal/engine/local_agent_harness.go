@@ -654,7 +654,10 @@ func (c *LocalHarnessController) resolveProviderByProcessState() (string, bool) 
 		return "", false
 	}
 	state := c.process.State().String()
-	if state == "" {
+	// "unknown" is the default-case sentinel from ProcessState.String(); treat
+	// it the same as empty string so an unrecognised state falls back to the
+	// legacy local-LLM path rather than routing to process_state_routing["unknown"].
+	if state == "" || state == "unknown" {
 		return "", false
 	}
 	pcfg, err := loadProvidersConfig(c.cfg)
@@ -857,6 +860,12 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	var routeUsed DispatchModel
 	var note string
 	var err error
+	// needsOllamaMu is true when the selected path goes through Ollama
+	// (either legacy Path 3 or an explicit/state-routed provider of type
+	// "ollama"). Non-Ollama state-routed dispatches (openai, mlx-lm, …)
+	// must NOT acquire the lock — they have no VRAM-sharing risk with the
+	// metabolic cycle and would needlessly block behind it.
+	needsOllamaMu := false
 	if req.Provider != "" {
 		pcfg, perr := loadProvidersConfig(c.cfg)
 		if perr != nil {
@@ -891,6 +900,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		}
 		provider = p
 		model = pc.Model
+		needsOllamaMu = pc.Type == "ollama"
 		// routeUsed stays empty; ProviderUsed on each slot is the canonical
 		// signal that the named-provider path fired.
 	} else {
@@ -913,6 +923,12 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 					}
 					provider = p
 					model = pc.Model
+					// Populate req.Provider so dispatchSlot records the
+					// resolved provider name in ProviderUsed — otherwise it
+					// stays empty and the caller can't distinguish this path
+					// from the legacy Ollama path.
+					req.Provider = stateProvider
+					needsOllamaMu = pc.Type == "ollama"
 					note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
 					usedStateRoute = true
 				}
@@ -921,6 +937,8 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		}
 		if !usedStateRoute {
 			// Path 3: legacy model-enum routing via local-LLM probe.
+			// Always Ollama — always needs the serialisation lock.
+			needsOllamaMu = true
 			target, terr := detectLocalLLMTarget(ctx, "")
 			if terr != nil {
 				return nil, terr
@@ -971,8 +989,14 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	// req.N slots also serialize against the cycle (they already share the same
 	// provider object, so they are already serialized at the Ollama layer, but
 	// holding the lock makes the exclusion explicit and testable).
-	c.ollamaMu.Lock()
-	defer c.ollamaMu.Unlock()
+	//
+	// Non-Ollama state-routed dispatches (openai, mlx-lm, …) skip the lock:
+	// they have no shared VRAM risk with the metabolic cycle and must not
+	// block behind Ollama-bound cycles.
+	if needsOllamaMu {
+		c.ollamaMu.Lock()
+		defer c.ollamaMu.Unlock()
+	}
 
 	batch := &DispatchBatchResult{
 		Results: make([]DispatchResult, req.N),
@@ -1060,9 +1084,10 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	if res.Content == "" && len(transcript) > 0 {
 		res.Content = summarizeToolTranscript(transcript)
 	}
-	if note != "" && res.Error == "" {
-		res.Error = note
-	}
+	// Routing notes (e.g. "state-routing: state=receptive -> provider=mlx-lm")
+	// are batch-level diagnostics already captured in batch.Notes by the
+	// caller; do NOT copy them into res.Error on successful slots — that
+	// produces misleading success=true + non-empty error results.
 	return res
 }
 
