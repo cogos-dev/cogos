@@ -162,13 +162,19 @@ const defaultMod3ForwardTimeout = 8 * time.Second
 // Server.mod3Client for isolation; when nil, handlers fall back to this.
 var mod3HTTPClient = &http.Client{Timeout: defaultMod3ForwardTimeout}
 
-// registerChannelSessionRoutes attaches the 4 channel-session routes onto mux.
+// registerChannelSessionRoutes attaches channel-session routes onto mux.
 // Called from NewServer.
 func (s *Server) registerChannelSessionRoutes(mux *http.ServeMux) {
 	s.route(mux, "POST /v1/channel-sessions/register", s.handleChannelSessionRegister)
 	s.route(mux, "POST /v1/channel-sessions/{id}/deregister", s.handleChannelSessionDeregister)
 	s.route(mux, "GET /v1/channel-sessions", s.handleChannelSessionList)
 	s.route(mux, "GET /v1/channel-sessions/{id}", s.handleChannelSessionGet)
+
+	// Issue #156: channel voice-presence. Returns the channel-membership view
+	// from mod3 so the kernel can surface it without requiring a direct
+	// mod3 import into callers. Mod3 is the authoritative source for which
+	// channel-sessions are in which voice room; the kernel proxies the query.
+	s.route(mux, "GET /v1/channels/{channel_id}/peers", s.handleChannelPeers)
 }
 
 // ─── wire types ──────────────────────────────────────────────────────────────
@@ -564,6 +570,63 @@ func (s *Server) forwardMod3(ctx context.Context, method, path string, body io.R
 		return json.RawMessage(wrapped), resp.StatusCode, nil
 	}
 	return json.RawMessage(raw), resp.StatusCode, nil
+}
+
+// ─── GET /v1/channels/{channel_id}/peers ─────────────────────────────────────
+
+// handleChannelPeers returns the voice-presence view for a named channel.
+// It proxies the query to mod3's GET /v1/channels/{channel_id}/peers endpoint
+// (tracked in issue #156 — mod3-side implementation is a follow-up).
+//
+// Until mod3 exposes /v1/channels/{id}/peers the kernel falls back to the
+// channel-session list filtered by the channel_id stored in session extras.
+//
+//	GET /v1/channels/{channel_id}/peers
+//	200 → { channel_id: str, peers: [channelSessionRecord...], count: int }
+//	503 → if mod3 is not reachable (returns kernel-only fallback)
+func (s *Server) handleChannelPeers(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channel_id")
+	if channelID == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request",
+			"channel_id required in path")
+		return
+	}
+
+	// Attempt to proxy to mod3 — mod3 is authoritative for channel membership.
+	mod3Path := "/v1/channels/" + channelID + "/peers"
+	body, status, err := s.forwardMod3(r.Context(), http.MethodGet, mod3Path, nil)
+	if err == nil && status >= 200 && status < 300 {
+		// mod3 answered — return its response verbatim.
+		writeJSONPassThrough(w, status, body)
+		return
+	}
+
+	// mod3 not reachable or returned an error — fall back to the kernel's
+	// channel-session registry. This is a best-effort degraded view: it
+	// shows sessions that registered via the kernel forwarder but does not
+	// have mod3's voice-room assignment information.
+	snap := s.channelSessionRegistry.Snapshot()
+	peers := make([]*ChannelSessionRecord, 0, len(snap))
+	for _, rec := range snap {
+		// Filter: the channel_id is embedded as metadata["channel_id"] when
+		// mod3 reports it back, or can be inferred from the participant_id
+		// prefix convention (channel_id-<suffix>). We do a prefix match for now.
+		if strings.HasPrefix(rec.ParticipantID, channelID+"-") ||
+			(rec.Metadata != nil && rec.Metadata["channel_id"] == channelID) {
+			peers = append(peers, rec)
+		}
+	}
+
+	w.Header().Set("X-Cogos-Source", "kernel-fallback")
+	if err != nil {
+		w.Header().Set("X-Cogos-Mod3-Error", err.Error())
+	}
+	writeJSONResp(w, http.StatusOK, map[string]any{
+		"channel_id": channelID,
+		"peers":      peers,
+		"count":      len(peers),
+		"source":     "kernel-fallback",
+	})
 }
 
 // mintChannelSessionID returns a 12-char lowercase-hex short UUID. Short
