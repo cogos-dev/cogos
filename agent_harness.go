@@ -504,6 +504,12 @@ type ExecuteScopedOptions struct {
 	// Model overrides h.model for this call. Empty keeps the default.
 	Model string
 
+	// APIKey, when non-empty, is sent as `Authorization: Bearer <APIKey>`
+	// on OpenAI-compat backend calls. Required for LM Studio when API-token
+	// auth is enabled. Empty omits the header — correct for Ollama and for
+	// LM Studio servers with auth disabled. Per RFC-0007 Layer 1.
+	APIKey string
+
 	// Thinking, when non-nil, overrides the think flag for this call.
 	Thinking *bool
 
@@ -590,7 +596,7 @@ func (h *AgentHarness) ExecuteScoped(ctx context.Context, task string, opts Exec
 			KeepAlive: -1, // pin model in VRAM across dispatch turns
 		}
 
-		resp, err := h.chatCompletionTo(ctx, backendURL, backendKind, req)
+		resp, err := h.chatCompletionTo(ctx, backendURL, backendKind, opts.APIKey, req)
 		if err != nil {
 			return result, fmt.Errorf("execute-scoped turn %d: %w", turn, err)
 		}
@@ -782,8 +788,9 @@ const (
 // chatCompletionTo is the per-call variant of chatCompletion: takes an
 // explicit backend URL and kind so a dispatch can route to LM Studio without
 // mutating h.ollamaURL. Ollama path is the existing /api/chat shape; OpenAI
-// path translates to /v1/chat/completions and back.
-func (h *AgentHarness) chatCompletionTo(ctx context.Context, backendURL, kind string, req agentChatRequest) (*agentChatResponse, error) {
+// path translates to /v1/chat/completions and back. apiKey is forwarded to
+// the OpenAI branch as a Bearer token; the Ollama branch ignores it.
+func (h *AgentHarness) chatCompletionTo(ctx context.Context, backendURL, kind, apiKey string, req agentChatRequest) (*agentChatResponse, error) {
 	if backendURL == "" {
 		backendURL = h.ollamaURL
 	}
@@ -791,7 +798,7 @@ func (h *AgentHarness) chatCompletionTo(ctx context.Context, backendURL, kind st
 		kind = backendKindOllama
 	}
 	if kind == backendKindOpenAI {
-		return h.chatCompletionOpenAI(ctx, backendURL, req)
+		return h.chatCompletionOpenAI(ctx, backendURL, apiKey, req)
 	}
 	// Ollama native — same as chatCompletion but parameterized URL.
 	body, err := json.Marshal(req)
@@ -827,7 +834,7 @@ func (h *AgentHarness) chatCompletionTo(ctx context.Context, backendURL, kind st
 // OpenAI shape and translates the response back. Tool-call ID and arguments
 // shape match the Ollama native format already, so the rest of the loop
 // doesn't need to know which backend served a turn.
-func (h *AgentHarness) chatCompletionOpenAI(ctx context.Context, backendURL string, req agentChatRequest) (*agentChatResponse, error) {
+func (h *AgentHarness) chatCompletionOpenAI(ctx context.Context, backendURL, apiKey string, req agentChatRequest) (*agentChatResponse, error) {
 	type openaiToolCallFn struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
@@ -882,6 +889,9 @@ func (h *AgentHarness) chatCompletionOpenAI(ctx context.Context, backendURL stri
 		return nil, fmt.Errorf("create openai request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	httpResp, err := h.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http openai request: %w", err)

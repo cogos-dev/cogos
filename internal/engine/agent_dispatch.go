@@ -70,7 +70,16 @@ type DispatchRequest struct {
 	Tools []string
 
 	// Model selects the inference backend. Unknown values default to e4b.
+	// When Provider is set, Model is ignored — the resolved provider supplies
+	// its own model id.
 	Model DispatchModel
+
+	// Provider, when non-empty, names a provider declared in providers.yaml
+	// or providers.local.yaml. The dispatcher resolves the name to a
+	// concrete backend (URL, kind, model, api-key) via the wired
+	// ProviderResolver and uses those values instead of the Model-based
+	// fallback. Unknown names are rejected at Normalize time. See RFC-0007.
+	Provider string
 
 	// TimeoutSeconds is the per-dispatch wall-clock budget. Clamped to
 	// [1,120] by the controller. Default 30s.
@@ -122,6 +131,33 @@ type DispatchResult struct {
 	// differ from DispatchRequest.Model when "26b" degraded to e4b due to
 	// LM Studio being unreachable — Error then carries the warning.
 	ModelUsed DispatchModel `json:"model_used,omitempty"`
+	// ProviderUsed is the resolved provider name when DispatchRequest.Provider
+	// fired, otherwise empty. Surfaced for observability so a caller can tell
+	// the difference between "ran on the legacy e4b/26b path" and "ran on
+	// the named provider X." Per RFC-0007 Layer 1.
+	ProviderUsed string `json:"provider_used,omitempty"`
+}
+
+// ResolvedProvider is the materialized backend a ProviderResolver returns
+// for a named provider lookup. Mirrors the four fields the harness needs
+// at ExecuteScoped time. APIKey is pre-resolved from the provider's
+// api_key_env at lookup time so the dispatcher does not have to know
+// which env var any given provider uses.
+type ResolvedProvider struct {
+	BackendURL  string // e.g. http://192.168.10.191:1234 (no /v1 suffix; harness appends)
+	BackendKind string // "openai" | "ollama"
+	Model       string // e.g. google/gemma-4-26b-a4b
+	APIKey      string // already materialized; empty when the provider has no api_key_env
+}
+
+// ProviderResolver translates a dispatch-time provider name into the
+// concrete backend the harness needs. ok=false signals the name is not
+// in the providers registry; the dispatcher surfaces that as
+// invalid_input rather than silently falling through to the Model-based
+// path. Implementations are typically thin wrappers over the live router
+// config. See RFC-0007 Layer 1.
+type ProviderResolver interface {
+	ResolveDispatchProvider(name string) (ResolvedProvider, bool)
 }
 
 // DispatchBatchResult is the envelope returned to the caller. Results is

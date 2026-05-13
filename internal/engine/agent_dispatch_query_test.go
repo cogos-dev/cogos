@@ -111,6 +111,31 @@ func TestQueryDispatchToHarness_ControllerWithoutDispatcher(t *testing.T) {
 	}
 }
 
+// RFC-0007 Layer 1: Provider field flows through Normalize without
+// mutation. The Normalize step only trims; unknown-name validation is
+// deferred to the dispatcher, which holds the live ProviderResolver.
+func TestQueryDispatchToHarness_ProviderFieldFlowsThrough(t *testing.T) {
+	disp := &fakeAgentDispatcher{cannedOk: true}
+	req := DispatchRequest{Task: "do thing", Provider: "  desktop  "}
+	if _, err := QueryDispatchToHarness(context.Background(), disp, req); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if got := disp.lastReq.Provider; got != "desktop" {
+		t.Errorf("Provider not trimmed/preserved, got %q", got)
+	}
+}
+
+func TestQueryDispatchToHarness_EmptyProviderUnchanged(t *testing.T) {
+	disp := &fakeAgentDispatcher{cannedOk: true}
+	req := DispatchRequest{Task: "do thing"}
+	if _, err := QueryDispatchToHarness(context.Background(), disp, req); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if got := disp.lastReq.Provider; got != "" {
+		t.Errorf("Provider should default empty, got %q", got)
+	}
+}
+
 func TestDispatchRequest_NormalizeDedupesTools(t *testing.T) {
 	req := DispatchRequest{Task: "x", Tools: []string{"a", " ", "a", "b", "", "b"}}
 	if err := req.Normalize(); err != nil {

@@ -506,3 +506,48 @@ func makeContentResponse(content string) agentChatResponse {
 	resp.Message.Content = content
 	return resp
 }
+
+// RFC-0007 Layer 1: chatCompletionOpenAI sets `Authorization: Bearer ...`
+// when an API key is supplied, and omits the header otherwise. Validates
+// the bearer plumbing that lets a dispatch reach an auth-enabled LM Studio
+// (the desktop endpoint with token-required mode).
+func TestExecuteScoped_OpenAIBearerHeader(t *testing.T) {
+	cases := []struct {
+		name      string
+		apiKey    string
+		wantAuth  string // expected Authorization header value; empty means must be absent
+	}{
+		{name: "with-key", apiKey: "sk-lm-test-token", wantAuth: "Bearer sk-lm-test-token"},
+		{name: "no-key", apiKey: "", wantAuth: ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotAuth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAuth = r.Header.Get("Authorization")
+				// Minimal OpenAI-shaped response with one assistant message
+				// that has no tool calls — terminates the harness tool loop.
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+			}))
+			defer srv.Close()
+
+			h := NewAgentHarness(AgentHarnessConfig{OllamaURL: "http://unused", Model: "gemma-test"})
+			opts := ExecuteScopedOptions{
+				BackendURL:  srv.URL,
+				BackendKind: backendKindOpenAI,
+				Model:       "gemma-test",
+				APIKey:      tc.apiKey,
+				MaxTurns:    1,
+			}
+			_, err := h.ExecuteScoped(context.Background(), "hi", opts)
+			if err != nil {
+				t.Fatalf("ExecuteScoped: %v", err)
+			}
+			if gotAuth != tc.wantAuth {
+				t.Errorf("Authorization header: got %q, want %q", gotAuth, tc.wantAuth)
+			}
+		})
+	}
+}
