@@ -310,6 +310,31 @@ type CacheHintProvider interface {
 }
 ```
 
+## Cross-RFC integration: KVBlockHashProvider
+
+The vLLM provider implements the `KVBlockHashProvider` interface so that the
+`cog_fork_session` fork handler (RFC-0005) can obtain the parent session's KV block
+hash when forking over a kvcache layer. RFC-0005 is the consumer; this RFC is the
+implementing provider.
+
+```go
+// KVBlockHashProvider is implemented by inference providers that expose
+// a content-addressed KV-block layer (e.g., vLLM PagedAttention).
+// The fork-session handler queries this when forking over a kvcache layer
+// to obtain the parent's KV block hash.
+type KVBlockHashProvider interface {
+    // ParentKVBlockHash returns the hash of the KV block representing
+    // the session's KV state at the given message ID, or an error if
+    // the block is no longer addressable (evicted, runtime restarted).
+    ParentKVBlockHash(ctx context.Context, sessionID string, atMessageID string) (BlockHash, error)
+}
+```
+
+The vLLM `VLLMClient` (cgo binding or Python sidecar) provides the block hash by
+querying `vllm.core.block_manager` for the block covering the given message's token
+range. When the block has been evicted or the runtime has restarted, `ParentKVBlockHash`
+returns a typed error; the fork handler in RFC-0005 degrades gracefully to a cold start.
+
 ## Fork-over-kvcache stub (RFC-0005 integration)
 
 The `KVCacheOverlay.InheritParentKV` field in RFC-0005 is the integration point.
