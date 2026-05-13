@@ -100,6 +100,15 @@ type CompletionRequest struct {
 
 	// Metadata carries routing/ledger information not sent to the model.
 	Metadata RequestMetadata `json:"metadata"`
+
+	// KeepAlive overrides the Ollama keep_alive value for this request only.
+	// Accepts a Go duration string ("5m", "1h"), an integer number of seconds,
+	// or -1 to keep the model loaded indefinitely. When nil, the provider's
+	// default is used (currently -1 to keep the model warm across cycles).
+	// Set to 0 to force model eviction after this request completes — useful
+	// for cold-start simulation in eval workloads.
+	// Non-Ollama providers ignore this field.
+	KeepAlive *any `json:"keep_alive,omitempty"`
 }
 
 // ProviderMessage is a single conversation turn.
