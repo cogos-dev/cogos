@@ -295,15 +295,22 @@ the session-management surface without additional kernel changes.
 - [ ] RFC merged (this document).
 - [ ] `session.fork` CogBlock Kind constant + `SessionForkBody` + `SessionOverlay`
       types committed to `internal/engine/`.
+- [ ] Prerequisite (separate sub-issue before implementing `session.fork` Kind):
+      Refactor existing Kind dispatch from switch-based to registry pattern so that
+      adding the `session.fork` Kind requires no modification to Kind-handler switch
+      statements; the Kind infrastructure dispatches via registry, not switch.
 - [ ] `cog_fork_session` MCP tool registered and functional.
 - [ ] `POST /api/sessions/{id}/fork` HTTP endpoint wired.
 - [ ] `ForkChildren` and `ForkAncestors` projection functions implemented.
-- [ ] `cog_fork_children` and `cog_fork_ancestors` MCP tools registered.
 - [ ] `/btw` consumer skill committed to the cog-workspace skills directory.
 - [ ] Unit tests cover: fork creation, overlay merge, GC eligibility calculation,
       lineage projection (parent→children, child→ancestors).
 - [ ] Cross-workspace fork returns `501 Not Implemented`.
 - [ ] Integration test: fork a session, resume child, verify lineage projection.
+- [ ] All `cog_fork_session` operations emit structured logs per the kernel log
+      convention with fields: `operation` (=`fork`), `parent_session_id`,
+      `child_session_id`, `overlay_layers` (comma-separated), `ts`. Ledger-walk
+      projection tools follow the same convention.
 
 ## Out of scope
 
