@@ -361,8 +361,12 @@ The stub is explicitly marked:
 
 ## Provider directory structure
 
+Per RFC-0004's package convention, provider files land in `internal/providers/vllm/`
+rather than `internal/engine/`. If RFC-0004 lands with a different convention, this
+section rebases to match.
+
 ```
-internal/engine/
+internal/providers/vllm/
 ├── provider_vllm.go          # Provider interface implementation
 ├── provider_vllm_test.go     # Unit tests against MockVLLMClient
 ├── provider_vllm_client.go   # VLLMClient interface + WarmRequest/etc types
