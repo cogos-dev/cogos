@@ -61,12 +61,24 @@ type HarnessDispatcher struct {
 	// identifier prefix).
 	LMStudioModel string
 
-	// reachable cache for LM Studio. mu protects the two fields together.
-	// reachableUntil is the wall-clock instant after which we re-probe;
-	// reachableOK records the last probe result.
-	mu             sync.Mutex
-	reachableUntil time.Time
-	reachableOK    bool
+	// ProviderResolver, when non-nil, lets a caller pass an explicit
+	// provider name via DispatchRequest.Provider. The resolver materializes
+	// the backend URL, kind, model id, and API key from the providers
+	// registry. Empty (nil resolver, empty name) keeps the legacy
+	// Model-enum routing path. See RFC-0007.
+	ProviderResolver engine.ProviderResolver
+
+	// reachable cache. mu protects reachByURL together with the legacy
+	// single-URL fields below. Keyed by BackendURL so multiple providers
+	// with distinct endpoints don't collide on the cache.
+	mu        sync.Mutex
+	reachByURL map[string]reachabilityEntry
+}
+
+// reachabilityEntry records one probe outcome with a TTL.
+type reachabilityEntry struct {
+	ok    bool
+	until time.Time
 }
 
 // reachabilityCacheTTL is how long a successful or failed LM Studio probe
@@ -110,13 +122,43 @@ func (d *HarnessDispatcher) DispatchToHarness(ctx context.Context, req engine.Di
 		}
 	}
 
-	// Decide model routing once per batch. If the caller asked for 26B and
-	// LM Studio is unreachable, every slot degrades to e4b with the same
-	// warning attached.
+	// Resolve a named provider once per batch when the caller supplied one.
+	// Unknown names fail fast — the dispatcher will not silently fall through
+	// to the Model-enum path because that would mask a config typo.
+	var resolved engine.ResolvedProvider
+	if req.Provider != "" {
+		if d.ProviderResolver == nil {
+			return nil, &engine.AgentControllerError{
+				Code:    "invalid_input",
+				Message: "provider override requested but no provider resolver is wired into the dispatcher",
+			}
+		}
+		r, ok := d.ProviderResolver.ResolveDispatchProvider(req.Provider)
+		if !ok {
+			return nil, &engine.AgentControllerError{
+				Code:    "invalid_input",
+				Message: fmt.Sprintf("provider %q is not registered", req.Provider),
+			}
+		}
+		if r.BackendURL == "" {
+			return nil, &engine.AgentControllerError{
+				Code:    "invalid_input",
+				Message: fmt.Sprintf("provider %q resolved with empty BackendURL", req.Provider),
+			}
+		}
+		resolved = r
+	}
+
+	// Decide model routing once per batch. Precedence: explicit Provider
+	// override (already resolved above) > Model enum. If the caller asked
+	// for 26B and LM Studio is unreachable, every slot degrades to e4b with
+	// the same warning attached. Provider overrides do *not* degrade — an
+	// unreachable named provider surfaces as a slot error so the caller
+	// learns about the misconfiguration.
 	resolvedModel := req.Model
 	var degradeNote string
-	if resolvedModel == engine.DispatchModel26B {
-		if d.lmStudioReachable(ctx) {
+	if req.Provider == "" && resolvedModel == engine.DispatchModel26B {
+		if d.endpointReachable(ctx, d.LMStudioBaseURL) {
 			// stay on 26b
 		} else {
 			resolvedModel = engine.DispatchModelE4B
@@ -143,7 +185,7 @@ func (d *HarnessDispatcher) DispatchToHarness(ctx context.Context, req engine.Di
 		idx := i
 		go func() {
 			defer wg.Done()
-			batch.Results[idx] = d.runSlot(parentCtx, idx, req, resolvedModel)
+			batch.Results[idx] = d.runSlot(parentCtx, idx, req, resolvedModel, resolved)
 		}()
 	}
 	wg.Wait()
@@ -162,8 +204,10 @@ func (d *HarnessDispatcher) DispatchToHarness(ctx context.Context, req engine.Di
 }
 
 // runSlot runs one dispatch index to completion. Returns a populated
-// DispatchResult with Success, Content, Error, etc filled in.
-func (d *HarnessDispatcher) runSlot(parentCtx context.Context, idx int, req engine.DispatchRequest, resolvedModel engine.DispatchModel) engine.DispatchResult {
+// DispatchResult with Success, Content, Error, etc filled in. resolved is
+// the named-provider override pre-computed at batch entry (zero value when
+// the caller did not pass a Provider name).
+func (d *HarnessDispatcher) runSlot(parentCtx context.Context, idx int, req engine.DispatchRequest, resolvedModel engine.DispatchModel, resolved engine.ResolvedProvider) engine.DispatchResult {
 	res := engine.DispatchResult{
 		Index:     idx,
 		ModelUsed: resolvedModel,
@@ -177,7 +221,20 @@ func (d *HarnessDispatcher) runSlot(parentCtx context.Context, idx int, req engi
 		AllowedTools: req.Tools,
 		Thinking:     req.Thinking,
 	}
-	if resolvedModel == engine.DispatchModel26B {
+	switch {
+	case req.Provider != "":
+		// Named-provider override path (RFC-0007 Layer 1). The resolver
+		// already materialized URL/kind/model/api-key; we just hand them
+		// to the harness.
+		opts.BackendURL = resolved.BackendURL
+		opts.BackendKind = resolved.BackendKind
+		if opts.BackendKind == "" {
+			opts.BackendKind = backendKindOpenAI
+		}
+		opts.Model = resolved.Model
+		opts.APIKey = resolved.APIKey
+		res.ProviderUsed = req.Provider
+	case resolvedModel == engine.DispatchModel26B:
 		opts.BackendURL = d.LMStudioBaseURL
 		opts.BackendKind = backendKindOpenAI
 		opts.Model = d.LMStudioModel
@@ -219,17 +276,20 @@ func (d *HarnessDispatcher) runSlot(parentCtx context.Context, idx int, req engi
 	return res
 }
 
-// lmStudioReachable returns true when the LM Studio /v1/models endpoint
+// endpointReachable returns true when the /v1/models endpoint at url
 // responded OK within reachabilityProbeTimeout in the last
-// reachabilityCacheTTL. Empty LMStudioBaseURL always returns false (the
-// route is disabled).
-func (d *HarnessDispatcher) lmStudioReachable(ctx context.Context) bool {
-	if d.LMStudioBaseURL == "" {
+// reachabilityCacheTTL. Empty url always returns false (route disabled).
+// Per-URL cache so multiple providers don't share state.
+func (d *HarnessDispatcher) endpointReachable(ctx context.Context, url string) bool {
+	if url == "" {
 		return false
 	}
 	d.mu.Lock()
-	if time.Now().Before(d.reachableUntil) {
-		ok := d.reachableOK
+	if d.reachByURL == nil {
+		d.reachByURL = make(map[string]reachabilityEntry)
+	}
+	if ent, found := d.reachByURL[url]; found && time.Now().Before(ent.until) {
+		ok := ent.ok
 		d.mu.Unlock()
 		return ok
 	}
@@ -237,30 +297,38 @@ func (d *HarnessDispatcher) lmStudioReachable(ctx context.Context) bool {
 
 	probeCtx, cancel := context.WithTimeout(ctx, reachabilityProbeTimeout)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(probeCtx, http.MethodGet, d.LMStudioBaseURL+"/v1/models", nil)
+	httpReq, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url+"/v1/models", nil)
 	if err != nil {
-		d.cacheReachability(false)
+		d.cacheReachability(url, false)
 		return false
 	}
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		log.Printf("[dispatch] lm-studio probe failed: %v", err)
-		d.cacheReachability(false)
+		log.Printf("[dispatch] endpoint probe failed (%s): %v", url, err)
+		d.cacheReachability(url, false)
 		return false
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
-	ok := resp.StatusCode == http.StatusOK
-	d.cacheReachability(ok)
+	// LM Studio with auth required returns 401 for unauthenticated /v1/models.
+	// That still counts as "reachable" — the server is up; auth happens on the
+	// real chat request. Anything < 500 is treated as reachable.
+	ok := resp.StatusCode < 500
+	d.cacheReachability(url, ok)
 	return ok
 }
 
-// cacheReachability stores the probe result with a TTL.
-func (d *HarnessDispatcher) cacheReachability(ok bool) {
+// cacheReachability stores a per-URL probe result with a TTL.
+func (d *HarnessDispatcher) cacheReachability(url string, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.reachableOK = ok
-	d.reachableUntil = time.Now().Add(reachabilityCacheTTL)
+	if d.reachByURL == nil {
+		d.reachByURL = make(map[string]reachabilityEntry)
+	}
+	d.reachByURL[url] = reachabilityEntry{
+		ok:    ok,
+		until: time.Now().Add(reachabilityCacheTTL),
+	}
 }
 
 // dispatchIdentityKey is the context key used to thread DispatchIdentity

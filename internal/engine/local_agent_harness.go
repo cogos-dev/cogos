@@ -810,13 +810,66 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		return nil, err
 	}
 
-	target, err := detectLocalLLMTarget(ctx, "")
-	if err != nil {
-		return nil, err
-	}
-	model, routeUsed, note := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
-	if model == "" {
-		return nil, errors.New(note)
+	// Resolve the inference provider. Two paths:
+	//   1. Explicit named provider via req.Provider (RFC-0007 Layer 1):
+	//      look the name up in providers.yaml + providers.local.yaml, build
+	//      the matching Provider, and use its declared model.
+	//   2. Legacy Model-enum routing ("e4b" | "26b") via local-LLM probe.
+	//
+	// Unknown provider names error fast — never silently fall through to
+	// the legacy path because that would mask a config typo.
+	var provider Provider
+	var model string
+	var routeUsed DispatchModel
+	var note string
+	var err error
+	if req.Provider != "" {
+		pcfg, perr := loadProvidersConfig(c.cfg)
+		if perr != nil {
+			return nil, &AgentControllerError{
+				Code:    "internal_error",
+				Message: fmt.Sprintf("failed to load providers config: %v", perr),
+			}
+		}
+		pc, ok := pcfg.Providers[req.Provider]
+		if !ok {
+			known := make([]string, 0, len(pcfg.Providers))
+			for k := range pcfg.Providers {
+				known = append(known, k)
+			}
+			return nil, &AgentControllerError{
+				Code:    "invalid_input",
+				Message: fmt.Sprintf("provider %q is not configured (known: %v)", req.Provider, known),
+			}
+		}
+		if !pc.IsEnabled() {
+			return nil, &AgentControllerError{
+				Code:    "invalid_input",
+				Message: fmt.Sprintf("provider %q is disabled in config", req.Provider),
+			}
+		}
+		p, merr := makeProvider(req.Provider, pc, nil)
+		if merr != nil {
+			return nil, &AgentControllerError{
+				Code:    "internal_error",
+				Message: fmt.Sprintf("failed to construct provider %q: %v", req.Provider, merr),
+			}
+		}
+		provider = p
+		model = pc.Model
+		// routeUsed stays empty; ProviderUsed on each slot is the canonical
+		// signal that the named-provider path fired.
+	} else {
+		target, terr := detectLocalLLMTarget(ctx, "")
+		if terr != nil {
+			return nil, terr
+		}
+		m, ru, n := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
+		if m == "" {
+			return nil, errors.New(n)
+		}
+		model, routeUsed, note = m, ru, n
+		provider = buildLocalProvider(target, model, c.localProviderTimeout)
 	}
 
 	// Resolve the named scope. Empty scope means the harness's own default
@@ -859,7 +912,6 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	c.ollamaMu.Lock()
 	defer c.ollamaMu.Unlock()
 
-	provider := buildLocalProvider(target, model, c.localProviderTimeout)
 	batch := &DispatchBatchResult{
 		Results: make([]DispatchResult, req.N),
 	}
@@ -883,8 +935,9 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 
 func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, note string) DispatchResult {
 	res := DispatchResult{
-		Index:     idx,
-		ModelUsed: routeUsed,
+		Index:        idx,
+		ModelUsed:    routeUsed,
+		ProviderUsed: req.Provider,
 	}
 	slotCtx, cancel := context.WithTimeout(parent, time.Duration(req.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -907,9 +960,10 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		Temperature:   &temp,
 		ModelOverride: model,
 		Metadata: RequestMetadata{
-			RequestID:   fmt.Sprintf("local-harness-dispatch-%d-%d", time.Now().UnixNano(), idx),
-			PreferLocal: true,
-			Source:      "local-harness-dispatch",
+			RequestID:      fmt.Sprintf("local-harness-dispatch-%d-%d", time.Now().UnixNano(), idx),
+			PreferLocal:    true,
+			PreferProvider: req.Provider,
+			Source:         "local-harness-dispatch",
 		},
 	}
 

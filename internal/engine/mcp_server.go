@@ -727,7 +727,8 @@ type dispatchToHarnessInput struct {
 	Task         string                 `json:"task" jsonschema:"Required. The user-role prompt the harness's Execute loop will receive."`
 	Scope        string                 `json:"scope,omitempty" jsonschema:"Named tool scope for this dispatch. \"consolidation\" (default, 11 substrate tools: memory/field/coherence/identity) or \"audit\" (consolidation + cog_read_file + cog_grep_files for read-only filesystem inspection). Unknown scope names error immediately. The tools parameter, if set, narrows further within the chosen scope."`
 	Tools        []string               `json:"tools,omitempty" jsonschema:"Optional tool allowlist (subset of the chosen scope's tools). nil/empty uses the full scope set. Unknown names error in the per-slot result rather than silently dropping."`
-	Model        string                 `json:"model,omitempty" jsonschema:"Inference backend. \"e4b\" (default, local Ollama) or \"26b\" (configured remote OpenAI-compatible endpoint). Unknown values fall back to e4b."`
+	Model        string                 `json:"model,omitempty" jsonschema:"Inference backend. \"e4b\" (default, local Ollama) or \"26b\" (configured remote OpenAI-compatible endpoint). Unknown values fall back to e4b. Ignored when provider is set."`
+	Provider     string                 `json:"provider,omitempty" jsonschema:"Optional named provider override (e.g. \"desktop\", \"lmstudio-mlx\"). Must match a provider declared in providers.yaml or providers.local.yaml; unknown names error before any slot runs. When set, takes precedence over model. Per RFC-0007."`
 	Timeout      int                    `json:"timeout_seconds,omitempty" jsonschema:"Per-slot wall-clock budget in seconds. Default 30, max 120. On exceed, that slot returns success=false error=\"timeout\"; sibling slots continue."`
 	N            int                    `json:"n,omitempty" jsonschema:"Parallel fan-out, [1,4]. Default 1. Each slot gets its own context, its own deadline, and its own result entry; failures don't abort siblings."`
 	SystemPrompt string                 `json:"system_prompt,omitempty" jsonschema:"Optional system-prompt override for this dispatch only. Empty keeps the harness default. Used by output-alignment roles (validator/rewriter/modality-matcher)."`
@@ -1758,6 +1759,7 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 		Scope:          input.Scope,
 		Tools:          input.Tools,
 		Model:          DispatchModel(input.Model),
+		Provider:       input.Provider,
 		TimeoutSeconds: input.Timeout,
 		N:              input.N,
 		SystemPrompt:   input.SystemPrompt,

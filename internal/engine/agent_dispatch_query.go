@@ -45,6 +45,11 @@ func (r *DispatchRequest) Normalize() error {
 	if r.Task == "" {
 		return &AgentControllerError{Code: "invalid_input", Message: "task is required"}
 	}
+	r.Provider = strings.TrimSpace(r.Provider)
+	// Provider unknown-name validation happens in the dispatcher: only it
+	// holds the live ProviderResolver. Normalize merely trims and lets a
+	// non-empty value through; the dispatcher fails fast on unknown names
+	// before any slot starts.
 	switch r.Model {
 	case "", DispatchModelE4B:
 		r.Model = DispatchModelE4B
