@@ -22,17 +22,11 @@ func (p DefaultMembranePolicy) Evaluate(block *CogBlock) IngestionResult {
 		return result
 	}
 
-	if block.Kind == BlockToolResult && (block.SourceChannel == "mcp" || block.SourceTransport == "mcp" || block.Provenance.NormalizedBy == "mcp") {
-		result.Decision = Integrate
-		result.Reason = "trusted mcp tool result"
-		return result
-	}
-
-	if block.Kind == BlockImport && strings.TrimSpace(block.Provenance.OriginChannel) == "" {
-		result.Decision = Quarantine
-		result.Reason = "external import missing provenance"
-		result.QuarantineReason = "unknown provenance"
-		return result
+	// Delegate to the Kind-specific membrane policy registry (ADR-090).
+	// EvaluateKindPolicy returns (result, true) if a registered policy
+	// short-circuits the default logic for this Kind.
+	if kindResult, handled := EvaluateKindPolicy(block); handled {
+		return kindResult
 	}
 
 	if block.TrustContext.TrustScore >= 0.8 && (block.TrustContext.Scope == "local" || block.TrustContext.Scope == "workspace") {
