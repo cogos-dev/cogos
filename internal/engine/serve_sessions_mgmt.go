@@ -51,6 +51,8 @@ func (s *Server) registerSessionMgmtRoutes(mux *http.ServeMux) {
 	s.route(mux, "GET /v1/sessions/presence", s.handleSessionPresence)
 	s.route(mux, "POST /v1/sessions/{id}/heartbeat", s.handleSessionHeartbeat)
 	s.route(mux, "POST /v1/sessions/{id}/end", s.handleSessionEnd)
+	// RFC-0005: session fork.
+	s.route(mux, "POST /v1/sessions/{id}/fork", s.handleSessionFork)
 
 	// Handoffs.
 	s.route(mux, "POST /v1/handoffs/offer", s.handleHandoffOffer)
