@@ -262,6 +262,31 @@ over the projection functions). Also accessible via HTTP:
 - `GET /api/sessions/{session_id}/fork/children`
 - `GET /api/sessions/{session_id}/fork/ancestors`
 
+## Cross-RFC integration: KVBlockHashProvider
+
+The fork handler queries the inference provider for the parent's KV block hash when
+`KVCacheOverlay.InheritParentKV` is true. The integration point is the
+`KVBlockHashProvider` interface, called by this RFC's fork handler and implemented by
+the vLLM provider specified in RFC-0006.
+
+```go
+// KVBlockHashProvider is implemented by inference providers that expose
+// a content-addressed KV-block layer (e.g., vLLM PagedAttention).
+// The fork-session handler queries this when forking over a kvcache layer
+// to obtain the parent's KV block hash.
+type KVBlockHashProvider interface {
+    // ParentKVBlockHash returns the hash of the KV block representing
+    // the session's KV state at the given message ID, or an error if
+    // the block is no longer addressable (evicted, runtime restarted).
+    ParentKVBlockHash(ctx context.Context, sessionID string, atMessageID string) (BlockHash, error)
+}
+```
+
+The vLLM provider (RFC-0006) implements this interface; the fork handler in
+`cog_fork_session` calls it. When no provider implementing `KVBlockHashProvider` is
+active, the fork handler degrades gracefully: `ParentKVBlockHash` returns an empty
+hash and the child starts cold.
+
 ## Consumer skill: `/btw`
 
 The proof-of-concept consumer is substrate-native `/btw` — a skill that forks the
