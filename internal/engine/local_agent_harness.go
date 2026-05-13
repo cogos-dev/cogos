@@ -640,6 +640,34 @@ func (c *LocalHarnessController) localModelHint() string {
 	return defaultOllamaModel
 }
 
+// resolveProviderByProcessState consults process_state_routing in the merged
+// providers config and returns the configured provider name for the current
+// process state. Returns ("", false) when no process is attached, no state
+// routing applies, or the config cannot be loaded.
+//
+// This implements Path 2 in DispatchToHarness: harness dispatches without an
+// explicit req.Provider consult the same routing table as the SimpleRouter,
+// so the autonomic loop honours the operator's per-state provider preferences
+// (e.g., receptive -> mlx-lm, active -> claude-code).
+func (c *LocalHarnessController) resolveProviderByProcessState() (string, bool) {
+	if c.process == nil {
+		return "", false
+	}
+	state := c.process.State().String()
+	if state == "" {
+		return "", false
+	}
+	pcfg, err := loadProvidersConfig(c.cfg)
+	if err != nil {
+		return "", false
+	}
+	name, ok := pcfg.Routing.ProcessStateRouting[state]
+	if !ok || name == "" {
+		return "", false
+	}
+	return name, true
+}
+
 func (c *LocalHarnessController) summary() AgentSummary {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -810,11 +838,17 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		return nil, err
 	}
 
-	// Resolve the inference provider. Two paths:
+	// Resolve the inference provider. Three paths, evaluated in order:
 	//   1. Explicit named provider via req.Provider (RFC-0007 Layer 1):
 	//      look the name up in providers.yaml + providers.local.yaml, build
 	//      the matching Provider, and use its declared model.
-	//   2. Legacy Model-enum routing ("e4b" | "26b") via local-LLM probe.
+	//   2. Process-state routing (new): when req.Provider is empty and the
+	//      controller has an associated process, consult process_state_routing
+	//      in providers config. If the current state maps to a configured
+	//      provider, dispatch there. This wires the autonomic loop and harness
+	//      dispatches through the same routing table as the main router.
+	//   3. Legacy Model-enum routing ("e4b" | "26b") via local-LLM probe.
+	//      Backward-compatible fallback when no process-state route applies.
 	//
 	// Unknown provider names error fast — never silently fall through to
 	// the legacy path because that would mask a config typo.
@@ -860,16 +894,44 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		// routeUsed stays empty; ProviderUsed on each slot is the canonical
 		// signal that the named-provider path fired.
 	} else {
-		target, terr := detectLocalLLMTarget(ctx, "")
-		if terr != nil {
-			return nil, terr
+		// Path 2: process-state routing — try before falling back to legacy.
+		// When the controller has a process with a known state, consult
+		// process_state_routing in providers config. If the state maps to a
+		// valid, enabled provider, dispatch there. Otherwise fall through to
+		// the legacy local-LLM probe (Path 3).
+		usedStateRoute := false
+		if stateProvider, stateOK := c.resolveProviderByProcessState(); stateOK {
+			pcfg, perr := loadProvidersConfig(c.cfg)
+			if perr == nil {
+				if pc, pok := pcfg.Providers[stateProvider]; pok && pc.IsEnabled() {
+					p, merr := makeProvider(stateProvider, pc, nil)
+					if merr != nil {
+						return nil, &AgentControllerError{
+							Code:    "internal_error",
+							Message: fmt.Sprintf("state-routing: failed to construct provider %q: %v", stateProvider, merr),
+						}
+					}
+					provider = p
+					model = pc.Model
+					note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
+					usedStateRoute = true
+				}
+				// If provider not found or disabled: fall through to legacy path silently.
+			}
 		}
-		m, ru, n := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
-		if m == "" {
-			return nil, errors.New(n)
+		if !usedStateRoute {
+			// Path 3: legacy model-enum routing via local-LLM probe.
+			target, terr := detectLocalLLMTarget(ctx, "")
+			if terr != nil {
+				return nil, terr
+			}
+			m, ru, n := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
+			if m == "" {
+				return nil, errors.New(n)
+			}
+			model, routeUsed, note = m, ru, n
+			provider = buildLocalProvider(target, model, c.localProviderTimeout)
 		}
-		model, routeUsed, note = m, ru, n
-		provider = buildLocalProvider(target, model, c.localProviderTimeout)
 	}
 
 	// Resolve the named scope. Empty scope means the harness's own default
