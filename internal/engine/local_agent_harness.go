@@ -671,6 +671,20 @@ func (c *LocalHarnessController) resolveProviderByProcessState() (string, bool) 
 	return name, true
 }
 
+// isOllamaProvider reports whether a named ProviderConfig resolves to the
+// Ollama backend. It mirrors makeProvider's type inference: when pc.Type is
+// empty the provider name itself is the effective type (see router.go
+// makeProvider). This means a provider named "ollama" without an explicit
+// type: field is correctly identified as Ollama — required so ollamaMu is
+// acquired even when the config omits the redundant type: ollama annotation.
+func isOllamaProvider(name string, pc ProviderConfig) bool {
+	t := pc.Type
+	if t == "" {
+		t = name
+	}
+	return t == "ollama"
+}
+
 func (c *LocalHarnessController) summary() AgentSummary {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -900,7 +914,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		}
 		provider = p
 		model = pc.Model
-		needsOllamaMu = pc.Type == "ollama"
+		needsOllamaMu = isOllamaProvider(req.Provider, pc)
 		// routeUsed stays empty; ProviderUsed on each slot is the canonical
 		// signal that the named-provider path fired.
 	} else {
@@ -928,7 +942,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 					// stays empty and the caller can't distinguish this path
 					// from the legacy Ollama path.
 					req.Provider = stateProvider
-					needsOllamaMu = pc.Type == "ollama"
+					needsOllamaMu = isOllamaProvider(stateProvider, pc)
 					note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
 					usedStateRoute = true
 				}

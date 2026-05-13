@@ -631,15 +631,20 @@ func TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu(t *testi
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
 
-	// mlx-lm stub with a deliberate delay to hold the dispatch open.
+	// mlx-lm stub: signals mlxReady when the completions call arrives, then
+	// waits on mlxUnblock before sending the response. This ensures the mlx
+	// dispatch is genuinely in-flight (holding any lock it might hold) while
+	// the Ollama metabolic cycle runs, proving the two don't serialize.
 	mlxReady := make(chan struct{})
+	mlxUnblock := make(chan struct{})
 	mlxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
 		case "/v1/chat/completions":
-			close(mlxReady) // signal that mlx dispatch is in-flight
+			close(mlxReady)  // signal: mlx dispatch is now in-flight
+			<-mlxUnblock     // hold open until the Ollama cycle has started
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":      "chatcmpl-test",
@@ -652,7 +657,9 @@ func TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu(t *testi
 	}))
 	defer mlxSrv.Close()
 
-	// Ollama stub to verify the cycle can acquire the lock independently.
+	// Ollama stub: signals ollamaStarted on the first /api/chat, proving the
+	// metabolic cycle ran while the mlx dispatch was still blocked.
+	ollamaStarted := make(chan struct{})
 	var ollamaCycles atomic.Int32
 	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -661,7 +668,9 @@ func TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu(t *testi
 				"models": []map[string]any{{"name": "gemma4:e4b"}},
 			})
 		case "/api/chat":
-			ollamaCycles.Add(1)
+			if ollamaCycles.Add(1) == 1 {
+				close(ollamaStarted) // first Ollama call started while mlx is in-flight
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"message": map[string]any{"role": "assistant", "content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`},
@@ -691,38 +700,134 @@ routing:
 
 	ctx := context.Background()
 
-	// Launch a state-routed (non-Ollama) dispatch in the background.
+	// Launch a state-routed (non-Ollama) dispatch in the background. The mlx
+	// handler will block until we unblock it below.
 	dispDone := make(chan error, 1)
 	go func() {
 		_, e := ctrl.DispatchToHarness(ctx, DispatchRequest{
 			Task:           "non-ollama dispatch",
 			N:              1,
-			TimeoutSeconds: 10,
+			TimeoutSeconds: 30,
 		})
 		dispDone <- e
 	}()
 
-	// Wait until the mlx dispatch is in-flight, then run a metabolic cycle.
-	// If ollamaMu were held by the mlx dispatch, this TriggerAgent call would
-	// deadlock for the dispatch's duration.
+	// Wait until the mlx dispatch is genuinely in-flight (blocked in the handler).
 	select {
 	case <-mlxReady:
 	case err := <-dispDone:
 		t.Fatalf("dispatch completed before mlxReady signal: %v", err)
 	}
 
+	// With mlx dispatch in-flight, run a metabolic cycle via Ollama. If
+	// ollamaMu were held by the mlx dispatch this would deadlock until the
+	// dispatch timed out (30s). The test would fail with TriggerAgent error.
 	_, cycleErr := ctrl.TriggerAgent(ctx, DefaultAgentID, "concurrent-cycle", true)
 	if cycleErr != nil {
-		t.Fatalf("TriggerAgent while mlx dispatch in-flight: %v", cycleErr)
+		t.Fatalf("TriggerAgent while mlx dispatch in-flight: %v (may indicate ollamaMu contention)", cycleErr)
 	}
+
+	// Wait for Ollama to have started so we know overlap happened, then
+	// unblock the mlx handler.
+	select {
+	case <-ollamaStarted:
+	case err := <-dispDone:
+		t.Fatalf("dispatch finished before ollamaStarted signal: %v", err)
+	}
+	close(mlxUnblock)
 
 	// Wait for dispatch to finish.
 	if err := <-dispDone; err != nil {
 		t.Fatalf("DispatchToHarness: %v", err)
 	}
 
-	// The metabolic cycle hit Ollama (proving it wasn't blocked on ollamaMu).
+	// Confirm the metabolic cycle ran Ollama while mlx was in-flight.
 	if got := ollamaCycles.Load(); got == 0 {
 		t.Errorf("ollamaCycles = 0; want >= 1 (metabolic cycle should have run concurrently with mlx dispatch)")
+	}
+}
+
+// TestDispatchToHarness_TypelessOllamaStillAcquiresOllamaMu verifies that a
+// provider named "ollama" WITHOUT an explicit type: field is still treated as
+// Ollama for lock-acquisition purposes. The isOllamaProvider helper must mirror
+// makeProvider's inference rule (empty type == provider name) so that the
+// documented short-form config shape is not silently misclassified as non-Ollama.
+func TestDispatchToHarness_TypelessOllamaStillAcquiresOllamaMu(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			cur := inFlight.Add(1)
+			for {
+				old := maxInFlight.Load()
+				if cur <= old {
+					break
+				}
+				if maxInFlight.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			defer inFlight.Add(-1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`},
+				"done": true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+
+	// Provider named "ollama" with NO explicit type: field — the documented
+	// short-form config shape. isOllamaProvider must still return true.
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  ollama:
+    endpoint: `+ollamaSrv.URL+`
+    model: gemma4:e4b
+routing:
+  process_state_routing:
+    receptive: ollama
+`)
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	ctx := context.Background()
+
+	errs := make(chan error, 2)
+	go func() {
+		_, err := ctrl.TriggerAgent(ctx, DefaultAgentID, "cycle", true)
+		errs <- err
+	}()
+	go func() {
+		_, err := ctrl.DispatchToHarness(ctx, DispatchRequest{
+			Task:           "typeless-ollama lock test",
+			N:              1,
+			TimeoutSeconds: 10,
+		})
+		errs <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("goroutine %d error: %v", i, err)
+		}
+	}
+
+	if got := maxInFlight.Load(); got > 1 {
+		t.Errorf("max concurrent Ollama /api/chat = %d; want <= 1 (typeless ollama provider should still hold ollamaMu)", got)
 	}
 }
