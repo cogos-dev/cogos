@@ -291,25 +291,6 @@ const (
 )
 ```
 
-## Cache-aware dispatch routing
-
-The vLLM provider registers a `CacheHint` method with the router. When dispatching
-a completion request, the router calls `CacheHint(req)` on all available providers.
-Providers that recognize the request's prefix return a hint score (0.0 = cold,
-1.0 = fully warm). The router routes same-prefix dispatches to the provider with the
-highest hint score, even when other providers are less loaded.
-
-```go
-// CacheHintProvider is an optional interface providers may implement to
-// participate in cache-aware dispatch routing.
-type CacheHintProvider interface {
-    Provider
-    // CacheHint returns a [0,1] score indicating how warm this provider's
-    // cache is for the given request. 0 = cold start, 1 = full prefix hit.
-    CacheHint(req *CompletionRequest) float64
-}
-```
-
 ## Cross-RFC integration: KVBlockHashProvider
 
 The vLLM provider implements the `KVBlockHashProvider` interface so that the
@@ -463,6 +444,27 @@ lifecycle without CUDA hardware.
       structured logs per the kernel log convention with fields: `operation` (one of
       `warm`, `evict`, `hit_rate_change`, `frag_high`), `channel_id`, `block_count`,
       `hit_rate` (0-1 float), `ts`.
+
+## Future scope (post-v0.5.0)
+
+Cache-aware routing deferred until Linux/CUDA hardware available to validate routing
+benefits empirically; a follow-up RFC introduces `CacheHintProvider` and the
+dispatch-side hint consumer after v0.5.0 scaffolding ships and hardware is available.
+
+```go
+// CacheHintProvider is an optional interface providers may implement to
+// participate in cache-aware dispatch routing.
+type CacheHintProvider interface {
+    Provider
+    // CacheHint returns a [0,1] score indicating how warm this provider's
+    // cache is for the given request. 0 = cold start, 1 = full prefix hit.
+    CacheHint(req *CompletionRequest) float64
+}
+```
+
+The cache-aware dispatch routing section (router calling `CacheHint(req)` on all
+providers and routing to the highest-scoring provider) is also deferred to the same
+follow-up RFC.
 
 ## Out of scope
 
