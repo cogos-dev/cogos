@@ -394,16 +394,23 @@ lifecycle without CUDA hardware.
 - [ ] RFC merged (this document).
 - [ ] `cache.kv_block` Kind constant + `KVBlockBody` + `KVSamplingConfig` types
       committed to `internal/engine/`.
+- [ ] Prerequisite (separate sub-issue before implementing `cache.kv_block` Kind):
+      Refactor existing Kind dispatch from switch-based to registry pattern so that
+      adding the `cache.kv_block` Kind requires no modification to Kind-handler switch
+      statements; the Kind infrastructure dispatches via registry, not switch.
 - [ ] `KVCacheProvider` implementing `Reconcilable` — all seven methods — committed.
 - [ ] `VLLMClient` interface + `MockVLLMClient` committed.
 - [ ] Bus event types (`KVCacheWarmedEvent` etc.) + topic constants committed.
-- [ ] `CacheHintProvider` optional interface committed.
 - [ ] Fork-over-kvcache stub committed with `TODO(rfc-0006)` marker.
 - [ ] Unit tests covering: mock warm/evict cycle, Health() transitions, CacheStats
       propagation to bus events, hash computation for equivalence tuple.
 - [ ] `internal/engine/README-vllm.md` committed documenting cgo and sidecar paths.
 - [ ] Implementation PR body explicitly states hardware blocker (Linux/CUDA required).
 - [ ] `go build ./...` and `go test ./...` green.
+- [ ] All `KVCacheProvider` Reconcilable operations and bus event emissions emit
+      structured logs per the kernel log convention with fields: `operation` (one of
+      `warm`, `evict`, `hit_rate_change`, `frag_high`), `channel_id`, `block_count`,
+      `hit_rate` (0-1 float), `ts`.
 
 ## Out of scope
 
