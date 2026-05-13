@@ -17,7 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/myrgic/cogos/internal/engine"
@@ -102,11 +102,9 @@ func (p *Provider) ParentKVBlockHash(ctx context.Context, sessionID string, atMe
 	var hash BlockHash
 	err := vllmCall(func() error {
 		// TODO(rfc-0006/requires-cuda): query vllm.core.block_manager for block
-		// covering the message's token range.
-		h, err := p.client.BlockHashForPrompt(atMessageID, p.modelName, KVSamplingConfig{})
-		if err != nil {
-			return err
-		}
+		// covering the message's token range. In scaffolding, derive hash from
+		// the messageID as prompt key using the standard equivalence tuple.
+		h := p.client.BlockHashForPrompt(atMessageID, p.modelName, KVSamplingConfig{})
 		hash = BlockHash(h)
 		return nil
 	})
@@ -139,7 +137,7 @@ func vllmCall(fn func() error) (err error) {
 			err = fmt.Errorf("vllm cgo failure (recovered): %v", r)
 		}
 	}()
-	runtime.SetPanicOnFault(true)
-	defer runtime.SetPanicOnFault(false)
+	debug.SetPanicOnFault(true)
+	defer debug.SetPanicOnFault(false)
 	return fn()
 }
