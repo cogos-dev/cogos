@@ -7,6 +7,7 @@
 | Tracking | [#TBD](https://github.com/myrgic/cogos/issues/)                                                          |
 | Target   | `v0.7.0`                                                                                                 |
 | Relates  | [RFC-0006 vLLM provider](0006-vllm-pagedattention-provider.md), [RFC-0007 named-provider dispatch](0007-dispatch-provider-override.md), [ADR-090 kind-dispatch-via-registry](../adrs/090-kind-dispatch-via-registry.md) |
+| Amended  | 2026-05-13 — vocabulary aligned with Observer-as-Reconciler pattern per RFC-034 |
 
 ## Summary
 
@@ -47,40 +48,91 @@ An **Observatory** is a substrate component with these four properties:
 |-------------|---------|---------|---------------------------|
 | Registry    | Named catalog of declared things | No | Config / declaration |
 | Reconciler  | A resource type | Yes — converges declared → live | Its own domain |
-| Observatory | A view of observed state | No | Runtime / world |
+| Observatory | A substrate-internal endpoint for observed state | No (written to by Observer instances) | Runtime / world |
 
-A Registry knows what providers are configured. A Reconciler knows what providers *should* be running and can restart them. An Observatory knows what providers *are* running right now and what state they are in.
+Per RFC-034 (Observer-as-Reconciler vocabulary): an **Observer** is a Reconcilable instance with read-only external authority and a substrate-writing `ApplyPlan`. The Observer writes its observations to the Observatory endpoint, which is a substrate-internal storage location (not a standalone agent). The Observatory endpoint is what the router reads; the Observer instance is what drives the probe loop and writes to it.
 
-The Inference Control Plane is naturally an Observatory because most of what it observes is NOT under the substrate's authority: LM Studio, Ollama, and remote API providers are externally managed. For cog-native runtimes (cog-mlx, future vLLM), a separate Reconciler takes Observatory output and acts — it may evict a stale model or restart a crashed process. The Observatory just observes; the Reconciler decides.
+Concretely: the `NodeStateObserver` is a Reconcilable instance (per RFC-034's Reconcilable Binding Pattern) with:
+- Read-only external authority over runtime processes and endpoints
+- An `ApplyPlan` that writes observation results to `cog://mem/semantic/observations/node-state/`
+- A reconcile interval (default 30s) driven by the standard Reconcilable scheduler
+
+This framing unifies Observatory with the rest of the substrate's reconciler hierarchy: the
+Observatory endpoint at `cog://mem/semantic/observations/node-state/` is written by the
+NodeStateObserver instance, readable by the router at zero-copy cost.
+
+A Registry knows what providers are configured. A Reconciler knows what providers *should* be running and can restart them. An Observer (Reconcilable instance) knows what providers *are* running right now and writes that view to an Observatory endpoint. The router reads the endpoint; it does not poll the observer directly.
+
+The Inference Control Plane is naturally Observer-shaped because most of what it observes is NOT under the substrate's authority: LM Studio, Ollama, and remote API providers are externally managed. For cog-native runtimes (cog-mlx, future vLLM), a separate Reconciler takes the Observatory endpoint contents and acts — it may evict a stale model or restart a crashed process. The Observer just observes and writes; the Reconciler decides and applies.
+
+### Relationship to RFC-034
+
+RFC-034 (Substrate Kernel Categorical Split) introduced the Observer-as-Reconciler vocabulary: Observer instances are realizations of an ObserverClass per the Reconcilable Binding Pattern, where each ObserverClass declares the observation target, observation frequency, and the substrate path it writes to. RFC-0008 is the first concrete instantiation of that pattern at the inference layer.
+
+This RFC uses "Observatory" consistently as the substrate endpoint (the storage location written to), and "Observer" or "NodeStateObserver" consistently as the Reconcilable instance (the agent doing the probing and writing).
 
 ### Follow-up ADR
 
-This RFC introduces the Observatory term and uses it consistently throughout. Formalizing Observatory as a first-class substrate primitive alongside Registry and Reconciler — with interface contract, event taxonomy, and composition rules — is **out of scope for RFC-0008** but warrants a dedicated ADR. RFC-0008 is the origin of the term in the kernel codebase; that ADR should reference this RFC as the motivating introduction.
+This RFC introduces the Observatory endpoint concept and the Observer-as-Reconciler instantiation pattern. Formalizing ObserverClass as a first-class substrate primitive alongside Registry and Reconciler — with interface contract, event taxonomy, and composition rules — is **out of scope for RFC-0008** but is captured in RFC-034. RFC-0008 is the origin of the Observatory term in the kernel inference codebase; the ObserverClass ADR should reference both this RFC and RFC-034 as motivating introductions.
 
-## 3. NodeStateObservatory
+## 3. NodeStateObserver and NodeStateObservatory
 
-The **NodeStateObservatory** is the specific Observatory implementation for inference runtime state on a single node.
+The **NodeStateObserver** is a Reconcilable instance (per RFC-034's Observer-as-Reconciler
+pattern) that probes inference runtime state on the local node and writes its observations
+to the **NodeStateObservatory** substrate endpoint at `cog://mem/semantic/observations/node-state/`.
+
+The distinction matters:
+- **NodeStateObserver** = the Reconcilable instance doing the probing. It has read-only
+  external authority (it does not modify runtimes) and an `ApplyPlan` that writes to the
+  substrate. It is reconciled on a 30s interval by the standard Reconcilable scheduler.
+- **NodeStateObservatory** = the substrate endpoint (storage location) that the Observer
+  writes to and the router reads from. It is a substrate-internal endpoint, not a
+  standalone agent or interface.
 
 ### Identity
 
-- **Package**: `internal/observatory`
-- **Interface**: `NodeStateObservatory`
+- **Observer package**: `internal/observatory`
+- **Observer interface**: `NodeStateObserver` (Reconcilable; per RFC-034)
+- **Observatory endpoint**: `cog://mem/semantic/observations/node-state/`
 - **Scope**: local node only. Cross-node inference federation is future scope (§10).
 - **Source of truth**: direct process probes, HTTP health checks, `sysctl`/`vm_stat` for memory pressure, `diskutil`/`lsblk` for storage tier classification.
 
 ### Probe loop
 
-The Observatory runs a background goroutine that probes each known InferenceChannel on a configurable interval (default 30s). On first observation of a new channel it emits `runtime.observed`. On each subsequent probe it diffs the current view against the prior view and emits change events as needed.
+The NodeStateObserver runs its reconcile loop on a configurable interval (default 30s).
+On each reconcile cycle it probes each known InferenceChannel, diffs the result against
+the prior observation, writes the updated view to the Observatory endpoint, and emits
+bus events for any state transitions. On first observation of a new channel it emits
+`runtime.observed`. On each subsequent probe it diffs and emits change events as needed.
 
-New channels can also be discovered dynamically (probe-and-adopt): if a probe detects a healthy HTTP endpoint at a known port that is not yet in the channel registry, the Observatory emits `runtime.adopted` and begins tracking it.
+New channels can also be discovered dynamically (probe-and-adopt): if a reconcile cycle
+detects a healthy HTTP endpoint at a known port that is not yet in the channel registry,
+the NodeStateObserver emits `runtime.adopted` and begins tracking it.
 
 ### Interface
 
+The router-facing interface reads from the Observatory endpoint; it does not interact
+with the Observer instance directly.
+
 ```go
-// NodeStateObservatory materializes a live view of inference runtime state
-// on the local node. All methods are read-only; the Observatory does not
-// modify any runtime.
-type NodeStateObservatory interface {
+// NodeStateObserverInterface is the Reconcilable interface for the Observer instance.
+// It follows RFC-034's Observer-as-Reconciler pattern: read-only external authority,
+// substrate-writing ApplyPlan. Callers outside the reconciler scheduler should use
+// the Observatory endpoint directly rather than calling this interface.
+type NodeStateObserverInterface interface {
+    // Reconcile runs one observation cycle: probe all known InferenceChannels,
+    // diff against prior state, write updates to the Observatory endpoint,
+    // emit bus events for transitions.
+    Reconcile(ctx context.Context) error
+
+    // Close stops the reconcile loop and releases resources.
+    Close() error
+}
+
+// NodeStateObservatoryReader is the router-facing interface for reading from
+// the Observatory endpoint. The router uses this; it does not hold a reference
+// to the NodeStateObserverInterface.
+type NodeStateObservatoryReader interface {
     // Channels returns the current materialized view of all known
     // InferenceChannels, including their model residency state.
     Channels() []InferenceChannel
@@ -93,11 +145,8 @@ type NodeStateObservatory interface {
     MemoryPressure() MemoryPressureLevel
 
     // Subscribe returns a channel that receives bus events emitted by the
-    // Observatory. The caller is responsible for draining the channel.
+    // Observer. The caller is responsible for draining the channel.
     Subscribe() <-chan ObservatoryEvent
-
-    // Close stops the probe loop and releases resources.
-    Close() error
 }
 ```
 
@@ -431,12 +480,17 @@ type ChannelColdStartObservedPayload struct {
 
 ### Routing diagram
 
+The router reads from the Observatory endpoint (`NodeStateObservatoryReader`), not from
+the NodeStateObserver instance directly. The Observer writes to the endpoint on its
+reconcile cycle; the router reads the latest cached view without triggering fresh probes.
+
 ```
 Agent dispatch request
         │
         ▼
   InferenceChannel router
   (SimpleRouter.Route)
+  reads: Observatory endpoint
         │
         ├─── cog-native classification ──────────────────────────────────────────┐
         │                                                                         │
@@ -495,9 +549,11 @@ The router weighs the following factors, in priority order:
 ### Interface extension
 
 ```go
-// RoutingContext carries Observable runtime state into the router.
+// RoutingContext carries the Observatory endpoint reader into the router.
+// The router reads from the Observatory endpoint; it does not hold a reference
+// to the NodeStateObserverInterface (the Reconcilable instance that writes it).
 type RoutingContext struct {
-    Observatory NodeStateObservatory
+    Observatory NodeStateObservatoryReader
 }
 
 // Route is extended to accept an optional RoutingContext.
@@ -522,8 +578,8 @@ The classification of an InferenceChannel determines what the substrate is permi
 ### Cog-native (substrate-managed)
 
 - **Who manages**: the substrate, via launchd plists (same pattern as `com.cogos.mod3`).
-- **Observatory role**: observe and emit events.
-- **Reconciler role** (separate component, future work): receive Observatory events, apply plans (restart crashed runtime, swap model, evict stale model). The Reconciler is the *only* component permitted to modify a cog-native runtime.
+- **NodeStateObserver role**: probe runtime state, write to Observatory endpoint, emit bus events.
+- **Reconciler role** (separate component, future work): subscribe to Observatory endpoint bus events, apply plans (restart crashed runtime, swap model, evict stale model). The Reconciler is the *only* component permitted to modify a cog-native runtime. Per RFC-034, the NodeStateObserver (Observer role) and the runtime Reconciler are distinct instances — Observer writes, Reconciler acts.
 - **Router behavior on crash**: immediately reroute to next eligible channel; emit `runtime.crashed`; Reconciler decides restart policy.
 
 ### External-on-node (externally managed)
@@ -531,7 +587,7 @@ The classification of an InferenceChannel determines what the substrate is permi
 Runtimes on the same hardware but outside the substrate's authority: LM Studio, Ollama, local instances of third-party tools.
 
 - **Who manages**: the external operator (the user, a separate launchd, etc.).
-- **Observatory role**: probe-and-adopt; emit `runtime.adopted` on first discovery; emit state change events.
+- **NodeStateObserver role**: probe-and-adopt; emit `runtime.adopted` on first discovery; emit state change events; write observed state to Observatory endpoint.
 - **Reconciler role**: none. The substrate does NOT restart, reconfigure, or modify external runtimes.
 - **Router behavior on crash**: reroute to next eligible channel; emit `runtime.crashed`. Do not attempt recovery.
 
@@ -540,7 +596,7 @@ Runtimes on the same hardware but outside the substrate's authority: LM Studio, 
 Remote endpoints (Anthropic API, OpenAI API, desktop machine at 192.168.x.x).
 
 - **Who manages**: the remote provider.
-- **Observatory role**: health-check probes only (HTTP GET to health path or model-list endpoint); no process probing.
+- **NodeStateObserver role**: health-check probes only (HTTP GET to health path or model-list endpoint); no process probing. Writes health state to Observatory endpoint.
 - **Reconciler role**: none.
 - **Router behavior on unhealthy**: reroute; emit `channel.health_changed`.
 
@@ -548,7 +604,7 @@ Remote endpoints (Anthropic API, OpenAI API, desktop machine at 192.168.x.x).
 
 ## 9. Acceptance Criteria
 
-- [ ] `NodeStateObservatory` interface defined in `internal/observatory/` (new package)
+- [ ] `NodeStateObserverInterface` (Reconcilable) and `NodeStateObservatoryReader` defined in `internal/observatory/` (new package); Observer writes to Observatory endpoint per RFC-034 Observer-as-Reconciler pattern
 - [ ] `InferenceChannel`, `ModelResidency`, `StorageTier` as Go structs in `internal/observatory/types.go`
 - [ ] 9 bus event types (`ObservatoryEventKind`) declared with payload structs in `internal/observatory/events.go`
 - [ ] `InferenceClassification` enum (`cog-native` | `external-on-node` | `external-remote`) in channel config and types
