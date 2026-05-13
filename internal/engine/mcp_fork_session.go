@@ -228,16 +228,30 @@ func (m *MCPServer) toolForkSession(ctx context.Context, _ *mcp.CallToolRequest,
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 // mintForkChildID creates a child session ID in the format
-// "fork-<parent_trunc>-<hex>" so it's always a valid 3-component hyphenated ID.
+// "fork-<parent_trunc>-<hex><ms>" so it's always a valid 3-component
+// hyphenated ID that passes ValidateSessionID.
+//
+// Trailing hyphens from the truncated parent slice are stripped so the
+// resulting ID never contains consecutive hyphens (e.g. "fork-root-m--abc"
+// would fail validation).
 func mintForkChildID(parentID string, now time.Time) string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
-	// Truncate parent to first component to keep ID reasonable length.
+	// Use up to the first 12 chars of the parent ID, stripped of trailing
+	// hyphens to prevent consecutive-hyphen sequences in the child ID.
 	first := parentID
-	if idx := len(first); idx > 12 {
+	if len(first) > 12 {
 		first = first[:12]
 	}
-	return fmt.Sprintf("fork-%s-%s%d", first, hex.EncodeToString(b[:]), now.UnixMilli()%10000)
+	// Strip trailing hyphens so "fork-root-m-" becomes "fork-root-m".
+	for len(first) > 0 && first[len(first)-1] == '-' {
+		first = first[:len(first)-1]
+	}
+	// Ensure first is non-empty (degenerate input guard).
+	if first == "" {
+		first = "p"
+	}
+	return fmt.Sprintf("fork-%s-%s%04d", first, hex.EncodeToString(b[:]), now.UnixMilli()%10000)
 }
 
 // deriveChildState builds a SessionState for the child session by inheriting
