@@ -178,6 +178,12 @@ fork point**. After 7 days, the ledger entry for the `session.fork` CogBlock is 
 for GC; the parent session state it references is GC'd only when no other reference
 (fork or otherwise) pins it.
 
+**Parent-reference integrity**: the fork registry holds a GC root on each parent
+session's ledger state for as long as any unexpired child fork exists. Parent ledger
+gc-eligibility is computed as: `max(child_fork_expiry) over children + retention_margin`.
+This prevents premature parent gc and ensures `ForkAncestors` walks succeed for all
+live forks.
+
 **Pinning**: the `PinnedUntil` field in `SessionForkBody` overrides GC. Setting it
 explicitly marks the fork as pinned until the given timestamp. The `cog_fork_session`
 tool accepts a `pin_duration` input (ISO 8601 duration string, e.g. `"P30D"`) to set
