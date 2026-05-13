@@ -256,11 +256,9 @@ type ForkAncestor struct {
 }
 ```
 
-Exposed via MCP as `cog_fork_children` and `cog_fork_ancestors` tools (thin wrappers
-over the projection functions). Also accessible via HTTP:
-
-- `GET /api/sessions/{session_id}/fork/children`
-- `GET /api/sessions/{session_id}/fork/ancestors`
+The projection functions are internal to v0.5.0. The `cog_fork_children` and
+`cog_fork_ancestors` MCP tools and their HTTP endpoints are deferred to post-v0.5.0
+(see §Future scope).
 
 ## Cross-RFC integration: KVBlockHashProvider
 
@@ -342,6 +340,18 @@ the session-management surface without additional kernel changes.
       convention with fields: `operation` (=`fork`), `parent_session_id`,
       `child_session_id`, `overlay_layers` (comma-separated), `ts`. Ledger-walk
       projection tools follow the same convention.
+
+## Future scope (post-v0.5.0)
+
+Lineage query tools deferred until the `/btw` consumer proves the primitive in
+practice; a follow-up RFC will introduce `cog_fork_children` and `cog_fork_ancestors`
+once usage patterns surface.
+
+When ready, the MCP tools are thin wrappers over the projection functions already
+implemented in v0.5.0, exposed via HTTP:
+
+- `GET /api/sessions/{session_id}/fork/children`
+- `GET /api/sessions/{session_id}/fork/ancestors`
 
 ## Out of scope
 
