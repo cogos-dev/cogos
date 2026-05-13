@@ -640,6 +640,37 @@ func (c *LocalHarnessController) localModelHint() string {
 	return defaultOllamaModel
 }
 
+// resolveProviderByProcessState consults process_state_routing in the merged
+// providers config and returns the configured provider name for the current
+// process state. Returns ("", false) when no process is attached, no state
+// routing applies, or the config cannot be loaded.
+//
+// This implements Path 2 in DispatchToHarness: harness dispatches without an
+// explicit req.Provider consult the same routing table as the SimpleRouter,
+// so the autonomic loop honours the operator's per-state provider preferences
+// (e.g., receptive -> mlx-lm, active -> claude-code).
+func (c *LocalHarnessController) resolveProviderByProcessState() (string, bool) {
+	if c.process == nil {
+		return "", false
+	}
+	state := c.process.State().String()
+	// "unknown" is the default-case sentinel from ProcessState.String(); treat
+	// it the same as empty string so an unrecognised state falls back to the
+	// legacy local-LLM path rather than routing to process_state_routing["unknown"].
+	if state == "" || state == "unknown" {
+		return "", false
+	}
+	pcfg, err := loadProvidersConfig(c.cfg)
+	if err != nil {
+		return "", false
+	}
+	name, ok := pcfg.Routing.ProcessStateRouting[state]
+	if !ok || name == "" {
+		return "", false
+	}
+	return name, true
+}
+
 func (c *LocalHarnessController) summary() AgentSummary {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -810,18 +841,29 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		return nil, err
 	}
 
-	// Resolve the inference provider. Two paths:
+	// Resolve the inference provider. Three paths, evaluated in order:
 	//   1. Explicit named provider via req.Provider (RFC-0007 Layer 1):
 	//      look the name up in providers.yaml + providers.local.yaml, build
 	//      the matching Provider, and use its declared model.
-	//   2. Legacy Model-enum routing ("e4b" | "26b") via local-LLM probe.
+	//   2. Process-state routing (new): when req.Provider is empty and the
+	//      controller has an associated process, consult process_state_routing
+	//      in providers config. If the current state maps to a configured
+	//      provider, dispatch there. This wires the autonomic loop and harness
+	//      dispatches through the same routing table as the main router.
+	//   3. Legacy Model-enum routing ("e4b" | "26b") via local-LLM probe.
+	//      Backward-compatible fallback when no process-state route applies.
 	//
 	// Unknown provider names error fast — never silently fall through to
 	// the legacy path because that would mask a config typo.
 	var provider Provider
 	var model string
 	var routeUsed DispatchModel
+	// note is a batch-level diagnostic string (e.g. state-routing path taken).
+	// slotNote carries per-slot warnings that must appear on each DispatchResult
+	// (e.g. "26b route unavailable, degraded to e4b") — distinct from note so
+	// state-routing diagnostics are not incorrectly surfaced in slot Error fields.
 	var note string
+	var slotNote string
 	var err error
 	if req.Provider != "" {
 		pcfg, perr := loadProvidersConfig(c.cfg)
@@ -860,16 +902,55 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		// routeUsed stays empty; ProviderUsed on each slot is the canonical
 		// signal that the named-provider path fired.
 	} else {
-		target, terr := detectLocalLLMTarget(ctx, "")
-		if terr != nil {
-			return nil, terr
+		// Path 2: process-state routing — try before falling back to legacy.
+		// When the controller has a process with a known state, consult
+		// process_state_routing in providers config. If the state maps to a
+		// valid, enabled provider, dispatch there. Otherwise fall through to
+		// the legacy local-LLM probe (Path 3).
+		usedStateRoute := false
+		if stateProvider, stateOK := c.resolveProviderByProcessState(); stateOK {
+			pcfg, perr := loadProvidersConfig(c.cfg)
+			if perr == nil {
+				if pc, pok := pcfg.Providers[stateProvider]; pok && pc.IsEnabled() {
+					p, merr := makeProvider(stateProvider, pc, nil)
+					if merr != nil {
+						return nil, &AgentControllerError{
+							Code:    "internal_error",
+							Message: fmt.Sprintf("state-routing: failed to construct provider %q: %v", stateProvider, merr),
+						}
+					}
+					provider = p
+					model = pc.Model
+					// Populate req.Provider so dispatchSlot records the
+					// resolved provider name in ProviderUsed — otherwise it
+					// stays empty and the caller can't distinguish this path
+					// from the legacy Ollama path.
+					req.Provider = stateProvider
+					note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
+					usedStateRoute = true
+				}
+				// If provider not found or disabled: fall through to legacy path silently.
+			}
 		}
-		m, ru, n := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
-		if m == "" {
-			return nil, errors.New(n)
+		if !usedStateRoute {
+			// Path 3: legacy model-enum routing via local-LLM probe.
+			target, terr := detectLocalLLMTarget(ctx, "")
+			if terr != nil {
+				return nil, terr
+			}
+			m, ru, n := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
+			if m == "" {
+				return nil, errors.New(n)
+			}
+			model, routeUsed = m, ru
+			// Downgrade warnings (e.g. "26b route unavailable, degraded to e4b")
+			// are per-slot: each slot's result must carry the warning so callers
+			// that inspect individual slots know the requested model wasn't honored.
+			// These are distinct from batch-level diagnostics (state-routing note)
+			// which go into batch.Notes via the outer `note` variable.
+			slotNote = n
+			provider = buildLocalProvider(target, model, c.localProviderTimeout)
 		}
-		model, routeUsed, note = m, ru, n
-		provider = buildLocalProvider(target, model, c.localProviderTimeout)
 	}
 
 	// Resolve the named scope. Empty scope means the harness's own default
@@ -903,14 +984,20 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	}
 
 	// ollamaMu serializes dispatch inference calls against concurrent metabolic
-	// cycles. Ollama is single-threaded by default; a dispatch arriving while
-	// runCycle is mid-stream would issue a concurrent /api/chat that loads a
-	// second model copy into VRAM. The lock is held for the full batch so that
-	// req.N slots also serialize against the cycle (they already share the same
-	// provider object, so they are already serialized at the Ollama layer, but
-	// holding the lock makes the exclusion explicit and testable).
-	c.ollamaMu.Lock()
-	defer c.ollamaMu.Unlock()
+	// cycles for all local-inference backends. "Local" backends (Ollama,
+	// OpenAI-compat mlx-lm/vllm/lmstudio, mlx-supervised, pi) compete for the
+	// same on-device accelerator/VRAM; a dispatch arriving while runCycle is
+	// mid-stream would issue a concurrent inference call that may load a second
+	// model copy into VRAM or cause memory pressure.
+	//
+	// The gate is keyed on provider.Capabilities().IsLocal so it covers all
+	// local backends uniformly, not just the "ollama" type name. Remote
+	// providers (anthropic, etc.) are excluded — they have no shared hardware
+	// resource with the local metabolic cycle.
+	if provider.Capabilities().IsLocal {
+		c.ollamaMu.Lock()
+		defer c.ollamaMu.Unlock()
+	}
 
 	batch := &DispatchBatchResult{
 		Results: make([]DispatchResult, req.N),
@@ -925,7 +1012,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, note)
+			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote)
 		}(i)
 	}
 	wg.Wait()
@@ -933,7 +1020,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	return batch, nil
 }
 
-func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, note string) DispatchResult {
+func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string) DispatchResult {
 	res := DispatchResult{
 		Index:        idx,
 		ModelUsed:    routeUsed,
@@ -998,8 +1085,18 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	if res.Content == "" && len(transcript) > 0 {
 		res.Content = summarizeToolTranscript(transcript)
 	}
-	if note != "" && res.Error == "" {
-		res.Error = note
+	// slotNote carries per-slot warnings (e.g. legacy "26b route unavailable,
+	// degraded to e4b") that the caller may need to surface per-result. These
+	// are distinct from batch-level state-routing diagnostics, which live in
+	// batch.Notes and must not be set here.
+	// Preserve any existing res.Error (e.g. unsupported client tool calls)
+	// rather than clobbering it; append the downgrade note instead.
+	if slotNote != "" {
+		if res.Error == "" {
+			res.Error = slotNote
+		} else {
+			res.Error += "; " + slotNote
+		}
 	}
 	return res
 }
