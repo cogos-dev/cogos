@@ -226,7 +226,7 @@ type forkSessionOutput struct {
 
 ## HTTP endpoint
 
-`POST /api/sessions/{parent_session_id}/fork`
+`POST /v1/sessions/{parent_session_id}/fork`
 
 Request body: `forkSessionInput` JSON (with `parent_session_id` from the path param).
 Response: `forkSessionOutput` JSON, 201 Created on success.
@@ -329,7 +329,7 @@ the session-management surface without additional kernel changes.
       adding the `session.fork` Kind requires no modification to Kind-handler switch
       statements; the Kind infrastructure dispatches via registry, not switch.
 - [ ] `cog_fork_session` MCP tool registered and functional.
-- [ ] `POST /api/sessions/{id}/fork` HTTP endpoint wired.
+- [ ] `POST /v1/sessions/{id}/fork` HTTP endpoint wired.
 - [ ] `ForkChildren` and `ForkAncestors` projection functions implemented.
 - [ ] `/btw` consumer skill committed to the cog-workspace skills directory.
 - [ ] Unit tests cover: fork creation, overlay merge, GC eligibility calculation,
@@ -350,8 +350,8 @@ once usage patterns surface.
 When ready, the MCP tools are thin wrappers over the projection functions already
 implemented in v0.5.0, exposed via HTTP:
 
-- `GET /api/sessions/{session_id}/fork/children`
-- `GET /api/sessions/{session_id}/fork/ancestors`
+- `GET /v1/sessions/{session_id}/fork/children`
+- `GET /v1/sessions/{session_id}/fork/ancestors`
 
 ## Out of scope
 

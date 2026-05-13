@@ -360,18 +360,21 @@ internal/providers/vllm/
 ## cgo failure isolation
 
 All cgo callouts into the vLLM Python runtime are wrapped in a deferred recover that
-converts panics (and Go-recoverable SIGSEGV via `runtime.SetPanicOnFault(true)`) into
-typed Go errors. cgo failure never propagates to crash the kernel process. The wrapper:
+converts panics (and Go-recoverable SIGSEGV via `debug.SetPanicOnFault(true)` from
+the `runtime/debug` package) into typed Go errors. cgo failure never propagates to
+crash the kernel process. The wrapper:
 
 ```go
+import "runtime/debug"
+
 func vllmCall(fn func() error) (err error) {
     defer func() {
         if r := recover(); r != nil {
             err = fmt.Errorf("vllm cgo failure (recovered): %v", r)
         }
     }()
-    runtime.SetPanicOnFault(true)
-    defer runtime.SetPanicOnFault(false)
+    debug.SetPanicOnFault(true)
+    defer debug.SetPanicOnFault(false)
     return fn()
 }
 ```
