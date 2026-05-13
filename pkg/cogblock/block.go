@@ -69,6 +69,14 @@ const (
 
 	// Session types.
 	BlockSessionTurn CogBlockKind = "session.turn"
+
+	// Inference cache types (RFC-0006).
+	//
+	// KindCacheKVBlock represents a single PagedAttention block in the vLLM
+	// block manager — a fixed-size chunk of key-value tensors addressable by
+	// content hash. Each block is registered in the Kind registry via
+	// engine.RegisterKindHandler in internal/engine/kinds_vllm.go.
+	KindCacheKVBlock CogBlockKind = "cache.kv_block"
 )
 
 // BlockProvenance records the origin and ingestion metadata of a CogBlock.
