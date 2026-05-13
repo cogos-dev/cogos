@@ -36,8 +36,13 @@ jobs:
         with:
           go-version: '1.25'
 
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      # ripgrep is pre-installed on ubuntu-latest runners; the cog_grep_files
+      # code path also has a graceful fallback to a pure-Go walk when rg is
+      # unavailable. Previously this step ran `apt-get update && install -y
+      # ripgrep`, which occasionally wedged on apt mirror refresh (release run
+      # 25808237369 hung 50+ min on apt-get update before being cancelled).
+      - name: Verify ripgrep available
+        run: which rg && rg --version | head -1
 
       - name: Unit tests
         run: go test -race -count=1 ./...
