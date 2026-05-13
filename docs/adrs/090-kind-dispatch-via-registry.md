@@ -45,37 +45,55 @@ codebase today). The registry is the target pattern going forward:
 
 ### Package placement
 
-The registry lives in `pkg/cogblock/kindregistry/` rather than
-`internal/kind/` because Kind registration is a kernel-wide cross-cutting
-concern. Packages under `internal/engine/` need to register handlers; packages
-under `pkg/` (e.g. future provider packages) may also need to register. Placing
-the registry in `pkg/` avoids an import cycle.
+The registry lives in `internal/engine/kindregistry.go` rather than a
+separate `pkg/` sub-module. The engine's `CogBlock` type (with typed
+`[]ProviderMessage`) is the correct dispatch target for Kind-aware processing;
+`pkg/cogblock.CogBlock` uses `json.RawMessage` for Messages and is the wire
+format, not the dispatch target. Keeping the registry in `internal/engine`
+avoids a type-boundary mismatch and an import cycle.
+
+Two registries are introduced:
+
+1. `kindHandlers` (`RegisterKindHandler`/`DispatchKind`) for processing
+   handlers -- the RFC-0005/RFC-0006 use case (ledger writes, session state
+   updates, etc.).
+2. `membraneKindPolicies` (`EvaluateKindPolicy`) for membrane policy overrides
+   -- the existing `if block.Kind ==` guards, now registered per Kind in
+   `membrane_handlers.go`.
 
 ### Registry contract
 
+**Processing registry** (`kindregistry.go`):
+
 ```go
-// Handler is the contract a Kind owner registers to handle its Kind.
-// The returned error is surfaced to the caller of Dispatch.
-type Handler func(block *cogblock.CogBlock) error
+// KindHandler is the contract a Kind owner registers to handle its Kind.
+type KindHandler func(block *CogBlock) error
 
-// Register associates a handler with a Kind.
-// Panics if the Kind is already registered (catches double-init bugs early).
-func Register(k cogblock.CogBlockKind, h Handler)
+// RegisterKindHandler panics on duplicate registration.
+func RegisterKindHandler(k CogBlockKind, h KindHandler)
 
-// Dispatch routes a block to its registered handler.
-// Returns ErrNoHandler if no handler is registered for the block's Kind.
-func Dispatch(block *cogblock.CogBlock) error
+// DispatchKind routes a block to its registered handler.
+// Returns ErrNoKindHandler if no handler is registered for the block's Kind.
+func DispatchKind(block *CogBlock) error
 
-// Registered returns the sorted list of registered Kinds (for diagnostics).
-func Registered() []cogblock.CogBlockKind
+// RegisteredKinds returns the sorted list of registered Kinds.
+func RegisteredKinds() []CogBlockKind
+```
 
-// Reset clears the registry. For use in test packages only.
-func Reset()
+**Membrane policy registry** (`membrane_handlers.go`):
+
+```go
+// MembraneKindPolicy returns (result, true) to short-circuit DefaultMembranePolicy;
+// (IngestionResult{}, false) to fall through to the default logic.
+type MembraneKindPolicy func(block *CogBlock) (IngestionResult, bool)
+
+// EvaluateKindPolicy looks up and invokes the Kind-specific membrane policy.
+func EvaluateKindPolicy(block *CogBlock) (IngestionResult, bool)
 ```
 
 ### Sentinel error
 
-`ErrNoHandler` is a package-level sentinel so callers can distinguish
+`ErrNoKindHandler` is a package-level sentinel so callers can distinguish
 "no registered handler" from handler-internal errors via `errors.Is`.
 
 ## Rationale
@@ -122,16 +140,17 @@ through to a Defer decision.
 
 ### New
 
-- `pkg/cogblock/kindregistry/registry.go` -- registry implementation
-- `pkg/cogblock/kindregistry/registry_test.go` -- register / dispatch /
-  duplicate-panic / ErrNoHandler / concurrent-safety tests
+- `internal/engine/kindregistry.go` -- processing registry implementation
+- `internal/engine/kindregistry_test.go` -- register / dispatch /
+  duplicate-panic / ErrNoKindHandler / concurrent-safety tests (7 tests)
+- `internal/engine/membrane_handlers.go` -- `init()` registrations for
+  BlockToolResult and BlockImport membrane policies
 
 ### Modified
 
-- `internal/engine/membrane_default.go` -- convert the two `if block.Kind ==`
-  guards to registered handlers; `Evaluate` calls `Dispatch` for those cases
-- `internal/engine/membrane_handlers.go` (new file) -- `init()` registrations
-  for the membrane's Kind handlers (BlockToolResult, BlockImport)
+- `internal/engine/membrane_default.go` -- replaces the two `if block.Kind ==`
+  guards with a call to `EvaluateKindPolicy(block)`, delegating to the
+  membrane policy registry
 
 ### No change
 
