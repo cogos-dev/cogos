@@ -376,6 +376,29 @@ internal/providers/vllm/
 └── README-vllm.md            # cgo/sidecar path docs, hardware requirements
 ```
 
+## cgo failure isolation
+
+All cgo callouts into the vLLM Python runtime are wrapped in a deferred recover that
+converts panics (and Go-recoverable SIGSEGV via `runtime.SetPanicOnFault(true)`) into
+typed Go errors. cgo failure never propagates to crash the kernel process. The wrapper:
+
+```go
+func vllmCall(fn func() error) (err error) {
+    defer func() {
+        if r := recover(); r != nil {
+            err = fmt.Errorf("vllm cgo failure (recovered): %v", r)
+        }
+    }()
+    runtime.SetPanicOnFault(true)
+    defer runtime.SetPanicOnFault(false)
+    return fn()
+}
+```
+
+If SIGSEGV cannot be recovered in Go's runtime (some C library failures bypass the
+panic-handler), the Python-sidecar IPC fallback path becomes the primary; the cgo path
+is then opt-in for trusted vLLM versions only.
+
 ## Hardware blocker
 
 **Full integration requires Linux/CUDA and a running vLLM instance.** The v0.5.0
