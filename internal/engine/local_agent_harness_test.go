@@ -624,27 +624,44 @@ routing:
 	}
 }
 
-// TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu verifies
-// that a state-routed dispatch to a non-Ollama provider does not hold ollamaMu,
-// allowing concurrent Ollama metabolic cycles to proceed without serialisation.
-func TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu(t *testing.T) {
+// TestDispatchToHarness_StateRouting_LocalProviderSerializesWithCycle verifies
+// that a state-routed dispatch to a local OpenAI-compatible provider (mlx-lm,
+// vllm, lmstudio, etc.) still acquires ollamaMu and serialises against the
+// metabolic cycle. Local providers compete for the same on-device
+// accelerator/VRAM as the Ollama metabolic path; concurrent access can cause
+// memory pressure. This test pins the contract that provider.Capabilities().IsLocal
+// governs the lock, not the provider type name "ollama".
+func TestDispatchToHarness_StateRouting_LocalProviderSerializesWithCycle(t *testing.T) {
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
 
-	// mlx-lm stub: signals mlxReady when the completions call arrives, then
-	// waits on mlxUnblock before sending the response. This ensures the mlx
-	// dispatch is genuinely in-flight (holding any lock it might hold) while
-	// the Ollama metabolic cycle runs, proving the two don't serialize.
-	mlxReady := make(chan struct{})
-	mlxUnblock := make(chan struct{})
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+
+	// Track calls across both the mlx-lm dispatch stub and the Ollama cycle
+	// stub using a shared in-flight counter.
+	recordInFlight := func() func() {
+		cur := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if cur <= old {
+				break
+			}
+			if maxInFlight.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		return func() { inFlight.Add(-1) }
+	}
+
 	mlxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
 		case "/v1/chat/completions":
-			close(mlxReady)  // signal: mlx dispatch is now in-flight
-			<-mlxUnblock     // hold open until the Ollama cycle has started
+			done := recordInFlight()
+			defer done()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":      "chatcmpl-test",
@@ -657,10 +674,6 @@ func TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu(t *testi
 	}))
 	defer mlxSrv.Close()
 
-	// Ollama stub: signals ollamaStarted on the first /api/chat, proving the
-	// metabolic cycle ran while the mlx dispatch was still blocked.
-	ollamaStarted := make(chan struct{})
-	var ollamaCycles atomic.Int32
 	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/tags":
@@ -668,9 +681,8 @@ func TestDispatchToHarness_StateRouting_NonOllamaDoesNotBlockOnOllamaMu(t *testi
 				"models": []map[string]any{{"name": "gemma4:e4b"}},
 			})
 		case "/api/chat":
-			if ollamaCycles.Add(1) == 1 {
-				close(ollamaStarted) // first Ollama call started while mlx is in-flight
-			}
+			done := recordInFlight()
+			defer done()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"message": map[string]any{"role": "assistant", "content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`},
@@ -700,50 +712,31 @@ routing:
 
 	ctx := context.Background()
 
-	// Launch a state-routed (non-Ollama) dispatch in the background. The mlx
-	// handler will block until we unblock it below.
-	dispDone := make(chan error, 1)
+	// Fire a state-routed dispatch (mlx-lm, IsLocal=true) and a metabolic
+	// cycle concurrently. Both should acquire ollamaMu and therefore serialize;
+	// max concurrent in-flight should be <= 1.
+	errs := make(chan error, 2)
+	go func() {
+		_, e := ctrl.TriggerAgent(ctx, DefaultAgentID, "cycle", true)
+		errs <- e
+	}()
 	go func() {
 		_, e := ctrl.DispatchToHarness(ctx, DispatchRequest{
-			Task:           "non-ollama dispatch",
+			Task:           "local non-Ollama serialization test",
 			N:              1,
-			TimeoutSeconds: 30,
+			TimeoutSeconds: 10,
 		})
-		dispDone <- e
+		errs <- e
 	}()
 
-	// Wait until the mlx dispatch is genuinely in-flight (blocked in the handler).
-	select {
-	case <-mlxReady:
-	case err := <-dispDone:
-		t.Fatalf("dispatch completed before mlxReady signal: %v", err)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("goroutine %d error: %v", i, err)
+		}
 	}
 
-	// With mlx dispatch in-flight, run a metabolic cycle via Ollama. If
-	// ollamaMu were held by the mlx dispatch this would deadlock until the
-	// dispatch timed out (30s). The test would fail with TriggerAgent error.
-	_, cycleErr := ctrl.TriggerAgent(ctx, DefaultAgentID, "concurrent-cycle", true)
-	if cycleErr != nil {
-		t.Fatalf("TriggerAgent while mlx dispatch in-flight: %v (may indicate ollamaMu contention)", cycleErr)
-	}
-
-	// Wait for Ollama to have started so we know overlap happened, then
-	// unblock the mlx handler.
-	select {
-	case <-ollamaStarted:
-	case err := <-dispDone:
-		t.Fatalf("dispatch finished before ollamaStarted signal: %v", err)
-	}
-	close(mlxUnblock)
-
-	// Wait for dispatch to finish.
-	if err := <-dispDone; err != nil {
-		t.Fatalf("DispatchToHarness: %v", err)
-	}
-
-	// Confirm the metabolic cycle ran Ollama while mlx was in-flight.
-	if got := ollamaCycles.Load(); got == 0 {
-		t.Errorf("ollamaCycles = 0; want >= 1 (metabolic cycle should have run concurrently with mlx dispatch)")
+	if got := maxInFlight.Load(); got > 1 {
+		t.Errorf("max concurrent local inference calls = %d; want <= 1 (mlx-lm IsLocal=true should still serialize via ollamaMu)", got)
 	}
 }
 

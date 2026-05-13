@@ -671,20 +671,6 @@ func (c *LocalHarnessController) resolveProviderByProcessState() (string, bool) 
 	return name, true
 }
 
-// isOllamaProvider reports whether a named ProviderConfig resolves to the
-// Ollama backend. It mirrors makeProvider's type inference: when pc.Type is
-// empty the provider name itself is the effective type (see router.go
-// makeProvider). This means a provider named "ollama" without an explicit
-// type: field is correctly identified as Ollama — required so ollamaMu is
-// acquired even when the config omits the redundant type: ollama annotation.
-func isOllamaProvider(name string, pc ProviderConfig) bool {
-	t := pc.Type
-	if t == "" {
-		t = name
-	}
-	return t == "ollama"
-}
-
 func (c *LocalHarnessController) summary() AgentSummary {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -879,12 +865,6 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	var note string
 	var slotNote string
 	var err error
-	// needsOllamaMu is true when the selected path goes through Ollama
-	// (either legacy Path 3 or an explicit/state-routed provider of type
-	// "ollama"). Non-Ollama state-routed dispatches (openai, mlx-lm, …)
-	// must NOT acquire the lock — they have no VRAM-sharing risk with the
-	// metabolic cycle and would needlessly block behind it.
-	needsOllamaMu := false
 	if req.Provider != "" {
 		pcfg, perr := loadProvidersConfig(c.cfg)
 		if perr != nil {
@@ -919,7 +899,6 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		}
 		provider = p
 		model = pc.Model
-		needsOllamaMu = isOllamaProvider(req.Provider, pc)
 		// routeUsed stays empty; ProviderUsed on each slot is the canonical
 		// signal that the named-provider path fired.
 	} else {
@@ -947,7 +926,6 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 					// stays empty and the caller can't distinguish this path
 					// from the legacy Ollama path.
 					req.Provider = stateProvider
-					needsOllamaMu = isOllamaProvider(stateProvider, pc)
 					note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
 					usedStateRoute = true
 				}
@@ -956,8 +934,6 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		}
 		if !usedStateRoute {
 			// Path 3: legacy model-enum routing via local-LLM probe.
-			// Always Ollama — always needs the serialisation lock.
-			needsOllamaMu = true
 			target, terr := detectLocalLLMTarget(ctx, "")
 			if terr != nil {
 				return nil, terr
@@ -1008,17 +984,17 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	}
 
 	// ollamaMu serializes dispatch inference calls against concurrent metabolic
-	// cycles. Ollama is single-threaded by default; a dispatch arriving while
-	// runCycle is mid-stream would issue a concurrent /api/chat that loads a
-	// second model copy into VRAM. The lock is held for the full batch so that
-	// req.N slots also serialize against the cycle (they already share the same
-	// provider object, so they are already serialized at the Ollama layer, but
-	// holding the lock makes the exclusion explicit and testable).
+	// cycles for all local-inference backends. "Local" backends (Ollama,
+	// OpenAI-compat mlx-lm/vllm/lmstudio, mlx-supervised, pi) compete for the
+	// same on-device accelerator/VRAM; a dispatch arriving while runCycle is
+	// mid-stream would issue a concurrent inference call that may load a second
+	// model copy into VRAM or cause memory pressure.
 	//
-	// Non-Ollama state-routed dispatches (openai, mlx-lm, …) skip the lock:
-	// they have no shared VRAM risk with the metabolic cycle and must not
-	// block behind Ollama-bound cycles.
-	if needsOllamaMu {
+	// The gate is keyed on provider.Capabilities().IsLocal so it covers all
+	// local backends uniformly, not just the "ollama" type name. Remote
+	// providers (anthropic, etc.) are excluded — they have no shared hardware
+	// resource with the local metabolic cycle.
+	if provider.Capabilities().IsLocal {
 		c.ollamaMu.Lock()
 		defer c.ollamaMu.Unlock()
 	}
@@ -1113,8 +1089,14 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	// degraded to e4b") that the caller may need to surface per-result. These
 	// are distinct from batch-level state-routing diagnostics, which live in
 	// batch.Notes and must not be set here.
+	// Preserve any existing res.Error (e.g. unsupported client tool calls)
+	// rather than clobbering it; append the downgrade note instead.
 	if slotNote != "" {
-		res.Error = slotNote
+		if res.Error == "" {
+			res.Error = slotNote
+		} else {
+			res.Error += "; " + slotNote
+		}
 	}
 	return res
 }
