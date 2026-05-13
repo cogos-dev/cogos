@@ -49,3 +49,7 @@ run/
 
 # Moved to standalone autoresearch repo (2026-04-20)
 autoresearch-foveated/
+
+# Harness scratch + ephemeral parallel-agent worktrees
+.claude/
+agent-worktrees/
