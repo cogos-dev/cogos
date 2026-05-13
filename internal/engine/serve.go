@@ -83,6 +83,9 @@ type Server struct {
 	// these are derived views rebuilt from bus replay at startup.
 	sessionRegistry *SessionRegistry
 	handoffRegistry *HandoffRegistry
+	// forkRegistry is the derived in-memory view of fork relationships
+	// (RFC-0005). Warm cache rebuilt from bus replay at startup.
+	forkRegistry *ForkRegistry
 
 	// ADR-082 Wave 2: kernel-owned identity registry for channel-participant
 	// sessions. The kernel mints session_id, mod3 stores per-channel state
@@ -129,6 +132,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// the warm cache is ready before any HTTP request lands.
 	s.sessionRegistry = NewSessionRegistry()
 	s.handoffRegistry = NewHandoffRegistry()
+	s.forkRegistry = NewForkRegistry()
 
 	// ADR-082 Wave 2 kernel-owned channel-session identity.
 	s.channelSessionRegistry = NewChannelSessionRegistry()

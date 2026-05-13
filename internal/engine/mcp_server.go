@@ -81,6 +81,16 @@ type MCPServer struct {
 	// tools. Frozen after construction returns — read-only afterwards.
 	// See mcp_tool_defs.go and myrgic/cogos#89.
 	toolDefs []ToolDefinition
+
+	// forkRegistry is the derived in-memory view of fork relationships.
+	// Wired by SetForkRegistry. Nil-safe — fork operations work without it
+	// but the lineage projection will be empty until it is wired.
+	forkRegistry *ForkRegistry
+
+	// kvBlockHashProvider is optionally implemented by inference providers
+	// that expose content-addressed KV blocks (RFC-0006 vLLM provider).
+	// Nil-safe — fork handler degrades to cold start when nil.
+	kvBlockHashProvider KVBlockHashProvider
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
