@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -132,5 +133,96 @@ func TestServerLegacyAgentStatusRoute(t *testing.T) {
 	}
 	if body["uptime"].(string) != "1m0s" {
 		t.Fatalf("uptime = %v; want 1m0s", body["uptime"])
+	}
+}
+
+// TestLocalHarnessOllamaConcurrencySerialized verifies that ollamaMu prevents
+// runCycle and DispatchToHarness from issuing concurrent /api/chat requests.
+// It spins up a fake Ollama server that increments an in-flight counter on
+// entry and decrements on exit; any counter value > 1 means concurrent calls
+// leaked through and would load duplicate model copies on a real Ollama node.
+func TestLocalHarnessOllamaConcurrencySerialized(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.LocalModel = "gemma4:e4b"
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+
+	model := "gemma4:e4b"
+
+	var (
+		inFlight    atomic.Int32
+		maxInFlight atomic.Int32
+	)
+
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": model}},
+			})
+		case "/api/chat":
+			cur := inFlight.Add(1)
+			// Record the peak concurrency seen.
+			for {
+				old := maxInFlight.Load()
+				if cur <= old {
+					break
+				}
+				if maxInFlight.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			defer inFlight.Add(-1)
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`,
+				},
+				"done":              true,
+				"prompt_eval_count": 1,
+				"eval_count":        1,
+			})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer llm.Close()
+	t.Setenv(localLLMEndpointEnv, llm.URL)
+
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Fire a metabolic cycle and a dispatch concurrently. Without ollamaMu
+	// both would immediately call buildLocalProvider and hit /api/chat at
+	// the same time.
+	errs := make(chan error, 2)
+	go func() {
+		_, err := ctrl.TriggerAgent(ctx, DefaultAgentID, "concurrency-test", true)
+		errs <- err
+	}()
+	go func() {
+		_, err := ctrl.DispatchToHarness(ctx, DispatchRequest{
+			Task:           "concurrency-check",
+			N:              1,
+			TimeoutSeconds: 10,
+		})
+		errs <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("goroutine %d error: %v", i, err)
+		}
+	}
+
+	if got := maxInFlight.Load(); got > 1 {
+		t.Errorf("max concurrent Ollama /api/chat calls = %d; want <= 1 (ollamaMu not working)", got)
 	}
 }

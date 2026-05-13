@@ -185,6 +185,14 @@ type LocalHarnessController struct {
 	// Cleared whenever the snapshot returns to AllGreen.
 	lastEscalatedFingerprint string
 	history                  []localHarnessCycleRecord
+
+	// ollamaMu serializes all Ollama inference calls across both the metabolic
+	// cycle (runCycle) and user-initiated dispatches (DispatchToHarness).
+	// Ollama defaults to OLLAMA_NUM_PARALLEL=1; concurrent requests from the
+	// same controller cause duplicate model copies in VRAM and queued waits
+	// that look like hangs. One lock per controller, held for the duration of
+	// the inference call, makes the serialization explicit and debuggable.
+	ollamaMu sync.Mutex
 }
 
 func NewLocalHarnessController(cfg *Config, nucleus *Nucleus, process *Process, mcpSrv *MCPServer) (*LocalHarnessController, error) {
@@ -427,9 +435,15 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	}
 	outcome.record.Model = model
 
+	// ollamaMu serializes this cycle's inference calls against concurrent
+	// DispatchToHarness calls. Ollama is single-threaded by default; holding
+	// the lock for the full assess+execute block prevents two concurrent
+	// /api/chat requests from loading duplicate model copies into VRAM.
+	c.ollamaMu.Lock()
 	provider := buildLocalProvider(target, model, c.localProviderTimeout)
 	assessment, err := c.assessCycle(ctx, provider, outcome.record.Observation)
 	if err != nil {
+		c.ollamaMu.Unlock()
 		outcome.record.Action = "error"
 		outcome.record.Reason = err.Error()
 		c.finishCycle(outcome.record)
@@ -460,6 +474,7 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 			outcome.record.Result = result
 		}
 	}
+	c.ollamaMu.Unlock()
 
 	if ctx.Err() == context.DeadlineExceeded {
 		outcome.timedOut = true
@@ -833,6 +848,16 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 			return nil, err
 		}
 	}
+
+	// ollamaMu serializes dispatch inference calls against concurrent metabolic
+	// cycles. Ollama is single-threaded by default; a dispatch arriving while
+	// runCycle is mid-stream would issue a concurrent /api/chat that loads a
+	// second model copy into VRAM. The lock is held for the full batch so that
+	// req.N slots also serialize against the cycle (they already share the same
+	// provider object, so they are already serialized at the Ollama layer, but
+	// holding the lock makes the exclusion explicit and testable).
+	c.ollamaMu.Lock()
+	defer c.ollamaMu.Unlock()
 
 	provider := buildLocalProvider(target, model, c.localProviderTimeout)
 	batch := &DispatchBatchResult{
