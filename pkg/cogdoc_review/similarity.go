@@ -146,51 +146,110 @@ func cosineSimilarity(a, b []float32) float32 {
 
 // cogdocFrontmatter is the minimal frontmatter we need for similarity search.
 type cogdocFrontmatter struct {
-	Type     string   `yaml:"type"`
-	ID       string   `yaml:"id"`
-	Title    string   `yaml:"title"`
-	Abstract string   `yaml:"abstract"`
-	Tags     []string `yaml:"tags"`
+	Type        string   `yaml:"type"`
+	ID          string   `yaml:"id"`
+	Title       string   `yaml:"title"`
+	Abstract    string   `yaml:"abstract"`
+	Description string   `yaml:"description"`
+	Tags        []string `yaml:"tags"`
 }
 
-// parseFrontmatter extracts YAML frontmatter from a cogdoc file (--- ... ---).
+// cogdocFile holds frontmatter plus the first content paragraph for richer embedding.
+type cogdocFile struct {
+	FM             cogdocFrontmatter
+	FirstParagraph string // first non-empty paragraph after the closing ---
+}
+
+// parseCogdocFile extracts YAML frontmatter and the first content paragraph.
 // Returns zero-value struct if no frontmatter found or parse fails.
-func parseFrontmatter(path string) (cogdocFrontmatter, error) {
+func parseCogdocFile(path string) (cogdocFile, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return cogdocFrontmatter{}, err
+		return cogdocFile{}, err
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	// Increase scanner buffer for large files.
+	scanner.Buffer(make([]byte, 64*1024), 512*1024)
 
 	// Must start with ---
 	if !scanner.Scan() || strings.TrimSpace(scanner.Text()) != "---" {
-		return cogdocFrontmatter{}, nil // no frontmatter
+		return cogdocFile{}, nil // no frontmatter
 	}
 
-	var buf strings.Builder
+	var fmBuf strings.Builder
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "---" {
 			break
 		}
-		buf.WriteString(line + "\n")
+		fmBuf.WriteString(line + "\n")
 	}
 
 	var fm cogdocFrontmatter
-	if err := yaml.Unmarshal([]byte(buf.String()), &fm); err != nil {
-		return cogdocFrontmatter{}, fmt.Errorf("parse frontmatter %s: %w", path, err)
+	if err := yaml.Unmarshal([]byte(fmBuf.String()), &fm); err != nil {
+		return cogdocFile{}, fmt.Errorf("parse frontmatter %s: %w", path, err)
 	}
-	return fm, nil
+
+	// Read the first non-empty, non-heading, non-YAML content paragraph.
+	var paraLines []string
+	var inPara bool
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "" {
+			if inPara && len(paraLines) > 0 {
+				break // end of first paragraph
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") ||
+			strings.HasPrefix(trimmed, "---") ||
+			strings.HasPrefix(trimmed, "```") ||
+			strings.HasPrefix(trimmed, "|") {
+			if inPara {
+				break
+			}
+			continue
+		}
+		inPara = true
+		paraLines = append(paraLines, trimmed)
+		if len(paraLines) >= 4 { // cap at 4 lines
+			break
+		}
+	}
+
+	firstPara := strings.Join(paraLines, " ")
+
+	return cogdocFile{FM: fm, FirstParagraph: firstPara}, nil
 }
 
-// queryText returns the text used for embedding from a cogdoc frontmatter.
-func (fm cogdocFrontmatter) queryText() string {
+// parseFrontmatter is a compatibility wrapper that returns just the frontmatter.
+func parseFrontmatter(path string) (cogdocFrontmatter, error) {
+	cf, err := parseCogdocFile(path)
+	return cf.FM, err
+}
+
+// queryText returns the text used for embedding from a cogdoc.
+// Uses: title + (abstract or description) + first content paragraph.
+// More context = better semantic signal for similarity matching.
+func (cf cogdocFile) queryText() string {
+	fm := cf.FM
+	parts := []string{fm.Title}
+
 	if fm.Abstract != "" {
-		return fm.Title + "\n\n" + fm.Abstract
+		parts = append(parts, fm.Abstract)
+	} else if fm.Description != "" {
+		parts = append(parts, fm.Description)
 	}
-	return fm.Title
+
+	if cf.FirstParagraph != "" {
+		parts = append(parts, cf.FirstParagraph)
+	}
+
+	return strings.Join(parts, "\n\n")
 }
 
 // --- Corpus walker ---
@@ -199,10 +258,11 @@ func (fm cogdocFrontmatter) queryText() string {
 type corpusEntry struct {
 	FilePath string
 	FM       cogdocFrontmatter
+	Doc      cogdocFile // full parsed file including first paragraph
 }
 
 // walkCorpus walks each path in corpusPaths (relative to workspaceRoot),
-// finds all *.cog.md files, and parses their frontmatter.
+// finds all *.cog.md files, and parses their content.
 // Skips files without valid frontmatter or without an id field.
 func walkCorpus(workspaceRoot string, corpusPaths []string) ([]corpusEntry, error) {
 	if len(corpusPaths) == 0 {
@@ -226,13 +286,13 @@ func walkCorpus(workspaceRoot string, corpusPaths []string) ([]corpusEntry, erro
 			}
 			seen[path] = true
 
-			fm, err := parseFrontmatter(path)
-			if err != nil || fm.ID == "" {
+			doc, err := parseCogdocFile(path)
+			if err != nil || doc.FM.ID == "" {
 				return nil // skip unparseable or id-less files
 			}
 
 			rel, _ := filepath.Rel(workspaceRoot, path)
-			entries = append(entries, corpusEntry{FilePath: rel, FM: fm})
+			entries = append(entries, corpusEntry{FilePath: rel, FM: doc.FM, Doc: doc})
 			return nil
 		})
 		if err != nil {
@@ -321,7 +381,8 @@ func SearchSimilar(ctx context.Context, cfg SimilaritySearchConfig, queryText st
 			continue
 		}
 
-		docText := entry.FM.queryText()
+		// Use richer query text: title + abstract/description + first paragraph.
+		docText := entry.Doc.queryText()
 		if docText == "" {
 			continue
 		}
