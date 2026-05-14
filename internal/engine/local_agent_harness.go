@@ -46,6 +46,7 @@ var harnessToolScopes = map[string][]string{
 		"cog_get_index",
 		"cog_assemble_context",
 		"cog_emit_event",
+		engineRespondToolName, // Piece 3a: respond tool in consolidation scope
 	},
 	"audit": {
 		"cog_resolve_uri",
@@ -157,6 +158,11 @@ type LocalHarnessController struct {
 	// KernelHealthSnapshot to bus_kernel_proprio. Nil is a safe no-op.
 	busSessions *BusSessionManager
 
+	// dashboardBus is optional; when set, the harness drains enginePendingMsgs
+	// on each runCycle and publishes agent_response events to
+	// bus_dashboard_response. Wired via SetDashboardBus after construction.
+	dashboardBus *BusSessionManager
+
 	runCtx context.Context
 
 	running atomic.Bool
@@ -214,6 +220,10 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		return nil, fmt.Errorf("unknown harness scope %q (known: consolidation, audit)", scopeName)
 	}
 	registry := NewKernelToolRegistry(mcpSrv)
+	// Piece 3b: inject the respond native tool into the full registry before
+	// scoping. The bus manager is wired later via SetDashboardBus; until then
+	// the executor returns errEngineDashboardNotInstalled at invocation time.
+	AddRespondTool(registry)
 	dispatchTools, err := registry.Scoped(toolNames)
 	if err != nil {
 		return nil, err
@@ -243,6 +253,25 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 // a safe no-op (snapshots are computed but not persisted).
 func (c *LocalHarnessController) SetBusSessionManager(mgr *BusSessionManager) {
 	c.busSessions = mgr
+}
+
+// SetDashboardBus wires the dashboard chat bridge into the harness.
+//
+// After this call, each runCycle will:
+//  1. Drain enginePendingMsgs (the queue filled by InstallEngineDashboardInlet).
+//  2. Enrich the observation with pending user message text.
+//  3. Stamp the cycle ctx with session IDs for fan-out respond publishing.
+//  4. Fire the ensureUserTurnReply fallback if the agent did not invoke respond.
+//
+// The respond native tool is already registered on the tool registry at
+// construction time (AddRespondTool in NewLocalHarnessControllerWithScope).
+// This call simply marks the bus active so runCycle starts draining pending
+// messages. Safe to call after construction and before Start().
+func (c *LocalHarnessController) SetDashboardBus(mgr *BusSessionManager) {
+	if mgr == nil {
+		return
+	}
+	c.dashboardBus = mgr
 }
 
 func (c *LocalHarnessController) Start(ctx context.Context) {
@@ -400,6 +429,36 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	ctx, cancel := context.WithTimeout(parent, localHarnessCycleTimeout)
 	defer cancel()
 
+	// --- Piece 2: Drain pending dashboard user messages ---
+	//
+	// Pull any messages that arrived on bus_dashboard_chat since the last cycle.
+	// Enrich the observation so the LLM sees them, and stamp ctx with the
+	// collected session IDs so the respond tool can fan-out replies correctly.
+	var pendingMsgs []EnginePendingUserMsg
+	if c.dashboardBus != nil {
+		pendingMsgs = DrainEnginePendingUserMessages()
+	}
+	// Snapshot the respond counter BEFORE the execute phase so we can detect
+	// whether the agent called it during this turn.
+	respondSnapshot := EngineRespondInvokeSnapshot()
+
+	// Thread session IDs onto ctx for the respond tool's fan-out path.
+	if len(pendingMsgs) > 0 {
+		ids := make([]string, 0, len(pendingMsgs))
+		seen := make(map[string]bool, len(pendingMsgs))
+		for _, m := range pendingMsgs {
+			if m.SessionID != "" && !seen[m.SessionID] {
+				seen[m.SessionID] = true
+				ids = append(ids, m.SessionID)
+			}
+		}
+		if len(ids) > 0 {
+			ctx = WithSessionIDs(ctx, ids)
+		} else if len(pendingMsgs) > 0 && pendingMsgs[0].SessionID != "" {
+			ctx = WithSessionID(ctx, pendingMsgs[0].SessionID)
+		}
+	}
+
 	start := time.Now().UTC()
 	record := localHarnessCycleRecord{
 		Cycle:     c.cycleSeq.Add(1),
@@ -407,7 +466,7 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 		Action:    "sleep",
 		Reason:    "idle",
 	}
-	record.Observation = c.buildObservation(reason)
+	record.Observation = c.buildObservationWithPending(reason, pendingMsgs)
 
 	outcome := localHarnessCycleOutcome{record: record}
 
@@ -484,6 +543,30 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 		if outcome.record.Reason == "" {
 			outcome.record.Reason = "cycle timeout"
 		}
+	}
+
+	// --- Piece 3c: ensureUserTurnReply fallback ---
+	//
+	// If there were pending user messages this cycle AND the agent did not call
+	// the respond tool, publish a default agent_response so Mod³ doesn't wait
+	// forever. This mirrors the pre-sweep "auto-fallback" behaviour evidenced by
+	// the 2026-04-18 bus_dashboard_response events.
+	if len(pendingMsgs) > 0 && !EngineRespondInvokedSince(respondSnapshot) {
+		fallbackText := outcome.record.Result
+		if fallbackText == "" {
+			fallbackText = "I observed your message but did not produce a direct reply this cycle."
+		}
+		// Fan out across all session IDs from this turn.
+		sessionIDs := sessionIDsFromContext(ctx)
+		if len(sessionIDs) == 0 {
+			sessionIDs = []string{sessionIDFromContext(ctx)}
+		}
+		for _, sid := range sessionIDs {
+			if _, err := engineRespondPublish(fallbackText, "auto-fallback: model did not invoke respond tool", sid); err != nil {
+				slog.Warn("dashboard-inlet: fallback publish failed", "session", sid, "err", err)
+			}
+		}
+		slog.Info("dashboard-inlet: auto-fallback published", "sessions", len(sessionIDs))
 	}
 
 	c.finishCycle(outcome.record)
@@ -596,6 +679,23 @@ func (c *LocalHarnessController) buildExecutionTask(assessment *localHarnessAsse
 	if assessment.Task != "" {
 		b.WriteString("\nNext step: ")
 		b.WriteString(assessment.Task)
+	}
+	return b.String()
+}
+
+// buildObservationWithPending builds the cycle observation string enriched
+// with any pending dashboard user messages. When msgs is empty it falls back
+// to buildObservation (the standard autonomic observation).
+func (c *LocalHarnessController) buildObservationWithPending(triggerReason string, msgs []EnginePendingUserMsg) string {
+	base := c.buildObservation(triggerReason)
+	if len(msgs) == 0 {
+		return base
+	}
+	var b strings.Builder
+	b.WriteString(base)
+	fmt.Fprintf(&b, "\npending_user_messages=%d\n", len(msgs))
+	for i, m := range msgs {
+		fmt.Fprintf(&b, "user_message[%d]: session=%s text=%s\n", i, m.SessionID, m.Text)
 	}
 	return b.String()
 }
