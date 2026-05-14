@@ -183,6 +183,11 @@ func (s *Server) handleClaudeCodeSessions(w http.ResponseWriter, r *http.Request
 //   - number of "user" turns (turn_count)
 //   - total message count
 //
+// Claude Code JSONL uses a wrapper envelope:
+//
+//	{"type":"user","message":{"role":"user","content":"..."},...}
+//	{"type":"assistant","message":{"role":"assistant","content":[...]},...}
+//
 // Reads only enough lines to extract the summary; bails early once found.
 func scanSessionFile(path string) (summary string, turns, total int) {
 	f, err := os.Open(path)
@@ -192,7 +197,7 @@ func scanSessionFile(path string) (summary string, turns, total int) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 64*1024)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 
 	var firstPrompt string
 	for scanner.Scan() {
@@ -201,22 +206,49 @@ func scanSessionFile(path string) (summary string, turns, total int) {
 			continue
 		}
 		total++
-		var msg struct {
-			Role    string `json:"role"`
-			Content any    `json:"content"` // string or []map
+
+		// Claude Code wraps every record in an envelope with a top-level "type"
+		// field. The actual conversation message lives in the "message" field.
+		var envelope struct {
+			Type            string `json:"type"` // "user", "assistant", "system", etc.
+			IsCompactSummary bool   `json:"isCompactSummary"`
+			Message         struct {
+				Role    string `json:"role"`
+				Content any    `json:"content"` // string or []map
+			} `json:"message"`
+			// Some records (queue-operation, pr-link, etc.) have no "message".
 		}
-		if err := json.Unmarshal(line, &msg); err != nil {
+		if err := json.Unmarshal(line, &envelope); err != nil {
 			continue
 		}
-		if msg.Role == "user" {
-			turns++
-			if firstPrompt == "" {
-				firstPrompt = extractPromptText(msg.Content)
-			}
+
+		// Count user turns: top-level type=="user" with a message payload.
+		if envelope.Type != "user" || envelope.Message.Role == "" {
+			continue
+		}
+		// Skip compact-summary placeholders and UI-injected meta messages.
+		if envelope.IsCompactSummary || isMeta(envelope.Message.Content) {
+			continue
+		}
+		turns++
+		if firstPrompt == "" {
+			firstPrompt = extractPromptText(envelope.Message.Content)
 		}
 	}
 	summary = truncateToChars(firstPrompt, 120)
 	return summary, turns, total
+}
+
+// isMeta returns true for UI-injected wrapper messages that should not count
+// as real user turns (e.g. local-command-caveat, compact summaries).
+func isMeta(content any) bool {
+	s, ok := content.(string)
+	if !ok {
+		return false
+	}
+	return strings.HasPrefix(s, "<local-command-caveat>") ||
+		strings.HasPrefix(s, "<command-name>") ||
+		strings.HasPrefix(s, "<local-command-stdout>")
 }
 
 // extractPromptText pulls plain text from a content field that may be a
