@@ -131,11 +131,27 @@ func DrainEnginePendingUserMessages() []EnginePendingUserMsg {
 	return out
 }
 
-// --- Bus manager registry ---
+// --- Bus manager registry and controller reference ---
 
 // engineDashboardBusMgr holds the bus manager for publishing responses.
 // Atomic pointer for lock-free hot-path reads in the respond executor.
 var engineDashboardBusMgr atomic.Pointer[BusSessionManager]
+
+// engineDashboardController holds a reference to the harness controller so
+// that handleEngineDashboardChatEvent can trigger a cycle immediately when a
+// user message arrives, rather than waiting for the next autonomic tick.
+// Set via BindDashboardController when the agent controller is wired.
+var engineDashboardController atomic.Pointer[LocalHarnessController]
+
+// BindDashboardController registers the harness controller with the inlet so
+// that incoming user messages trigger an immediate cycle. Called by
+// SetAgentController when the controller is a *LocalHarnessController.
+func BindDashboardController(ctrl *LocalHarnessController) {
+	if ctrl == nil {
+		return
+	}
+	engineDashboardController.Store(ctrl)
+}
 
 // InstallEngineDashboardInlet wires bus_dashboard_chat → engine pending queue.
 //
@@ -214,6 +230,18 @@ func handleEngineDashboardChatEvent(busID string, block *BusBlock) {
 	})
 	slog.Info("dashboard-inlet: queued user message",
 		"text_len", len(text), "session", sessionID, "from", block.From)
+
+	// Trigger the harness cycle immediately so the response arrives promptly
+	// rather than waiting for the next autonomic tick (up to 60 seconds away).
+	// Non-blocking: if a cycle is already running, TriggerAgent returns
+	// already_running and the pending message will be drained on the next cycle.
+	if ctrl := engineDashboardController.Load(); ctrl != nil {
+		go func() {
+			if _, err := ctrl.TriggerAgent(context.Background(), DefaultAgentID, "dashboard-user-message", false); err != nil {
+				slog.Debug("dashboard-inlet: trigger agent failed", "err", err)
+			}
+		}()
+	}
 }
 
 // extractEngineDashboardText pulls message body from a BusBlock payload.
