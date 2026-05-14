@@ -76,7 +76,8 @@ func buildFieldBlock(process *Process, workspaceRoot string) *ContextBlock {
 	if field == nil {
 		return nil
 	}
-	fovea := field.Fovea(10)
+	// chat-read view: no inbox-raw boost (see field.go BaseFovea vs Fovea)
+	fovea := field.BaseFovea(10)
 	if len(fovea) == 0 {
 		return nil
 	}
