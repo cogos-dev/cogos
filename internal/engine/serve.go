@@ -255,9 +255,12 @@ func (s *Server) SetAgentController(ctrl AgentController) {
 		s.mcpServer.SetAgentController(ctrl)
 	}
 	// Piece 2+3: wire dashboard bus into the harness so runCycle drains
-	// pending messages and the respond tool has a publish target.
+	// pending messages and the respond tool has a publish target. Also bind
+	// the controller to the inlet so incoming messages trigger an immediate
+	// cycle rather than waiting for the next autonomic tick.
 	if lhc, ok := ctrl.(*LocalHarnessController); ok && s.busSessions != nil {
 		lhc.SetDashboardBus(s.busSessions)
+		BindDashboardController(lhc)
 	}
 }
 
