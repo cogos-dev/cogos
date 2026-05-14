@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/myrgic/cogos/internal/engine/inference"
 )
 
 // Default context-gating knobs for the foveated assembler.
@@ -154,6 +156,11 @@ type Config struct {
 	LocalModel string
 
 	localModelConfigured bool
+
+	// CoreInference is the node's declared N-tier inference contract.
+	// Loaded from .cog/config/core-inference.yaml; falls back to
+	// inference.DefaultCoreInferenceConfig() if the file is absent.
+	CoreInference inference.CoreInferenceConfig
 }
 
 // kernelConfigSection holds settings that can appear at the top level or inside v3:.
@@ -180,6 +187,10 @@ type kernelConfigSection struct {
 	DigestPaths           map[string]string `yaml:"digest_paths"`
 	KernelLogPath         string            `yaml:"kernel_log_path"`
 	Mod3URL               string            `yaml:"mod3_url"`
+	// CoreInferencePath is an optional override for the core-inference.yaml file path.
+	// When empty, LoadConfig uses workspaceRoot/.cog/config/core-inference.yaml.
+	// Reserved for future use — not yet wired into the loader.
+	CoreInferencePath string `yaml:"core_inference_path,omitempty"`
 }
 
 // kernelConfig is the on-disk YAML shape of .cog/config/kernel.yaml.
@@ -239,6 +250,14 @@ func LoadConfig(workspaceRoot string, port int) (*Config, error) {
 	if v := os.Getenv("COGOS_MOD3_URL"); v != "" {
 		cfg.Mod3URL = v
 	}
+
+	// Load core inference contract. Non-fatal: falls back to default if absent.
+	ci, ciErr := inference.LoadCoreInferenceConfig(workspaceRoot)
+	if ciErr != nil {
+		// File exists but is unreadable or unparseable — use default and continue.
+		ci = inference.DefaultCoreInferenceConfig()
+	}
+	cfg.CoreInference = ci
 
 	// Flag override.
 	if port != 0 {
