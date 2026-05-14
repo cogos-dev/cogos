@@ -367,17 +367,25 @@ IsBlockWarm(ctx context.Context, blockHash string) (bool, error)
 
 ### Registration in the provider registry
 
-The vLLM provider registers `KVCacheProvider` as a `KVBlockHashProvider` during
-channel init:
+The vLLM provider wires `KVCacheProvider` into `MCPServer` as a `KVBlockHashProvider`
+during channel init. The binding is a direct field assignment on `MCPServer`, not a
+separate registry object — `MCPServer.kvBlockHashProvider` is the single provider slot:
 
 ```go
-// In internal/providers/vllm/provider_vllm.go, during channel registration:
-registry.RegisterKVBlockHashProvider(p.cache) // p.cache is *KVCacheProvider
+// In the kernel startup path (e.g. cmd/cogos or serve_kernel.go), after
+// the vLLM provider channel is initialized:
+mcpServer.kvBlockHashProvider = vllmProvider.cache // *KVCacheProvider implements KVBlockHashProvider
 ```
 
-The fork handler calls `registry.LookupKVBlockHashProvider()` at fork time. If the
-vLLM channel has not been initialized, the lookup returns `nil, false` and the fork
-handler degrades to cold start as specified in RFC-0005.
+The fork handler reads `m.kvBlockHashProvider` directly at fork time. If the field is
+`nil` (vLLM channel not initialized), the fork handler degrades to cold start as
+specified in RFC-0005. There is no `RegisterKVBlockHashProvider` /
+`LookupKVBlockHashProvider` registry method pair; the field is the registry.
+
+> **Implementation note:** the field is unexported (`kvBlockHashProvider`) and
+> typed to the `engine.KVBlockHashProvider` interface defined in
+> `internal/engine/session_fork_types.go`. The vLLM package satisfies it via
+> `KVCacheProvider.ParentKVBlockHash`.
 
 The vLLM `VLLMClient` (cgo binding or Python sidecar) provides the block hash by
 querying `vllm.core.block_manager` for the block covering the given message's token

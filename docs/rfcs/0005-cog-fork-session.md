@@ -541,17 +541,26 @@ the session-management surface without additional kernel changes.
       adding the `session.fork` Kind requires no modification to Kind-handler switch
       statements; the Kind infrastructure dispatches via registry, not switch.
 - [ ] `cog_fork_session` MCP tool registered and functional.
+- [ ] `cog_fork_disown` MCP tool registered and functional: accepts `child_session_id`,
+      removes the child's GC root on the parent in `ForkRegistry`, returns
+      `{"status": "disowned", "child_session_id": "<id>"}`. Must be nil-safe when
+      `ForkRegistry` is not wired (returns a clean "not configured" error).
 - [ ] `POST /v1/sessions/{id}/fork` HTTP endpoint wired.
 - [ ] `ForkChildren` and `ForkAncestors` projection functions implemented.
 - [ ] `/btw` consumer skill committed to the cog-workspace skills directory.
 - [ ] Unit tests cover: fork creation, overlay merge, GC eligibility calculation,
       lineage projection (parent→children, child→ancestors).
+- [ ] Unit test for `cog_fork_disown`: disown removes GC root; parent becomes
+      GC-eligible immediately when no other child holds a reference and no
+      `PinnedUntil` is active; child's `session.fork` CogBlock remains readable.
 - [ ] Cross-workspace fork returns `501 Not Implemented`.
 - [ ] Integration test: fork a session, resume child, verify lineage projection.
-- [ ] All `cog_fork_session` operations emit structured logs per the kernel log
-      convention with fields: `operation` (=`fork`), `parent_session_id`,
-      `child_session_id`, `overlay_layers` (comma-separated), `ts`. Ledger-walk
-      projection tools follow the same convention.
+- [ ] Integration test: fork a session, call `cog_fork_disown`, verify parent GC
+      eligibility without requiring retention window expiry.
+- [ ] All `cog_fork_session` and `cog_fork_disown` operations emit structured logs
+      per the kernel log convention with fields: `operation` (=`fork` or `disown`),
+      `parent_session_id`, `child_session_id`, `overlay_layers` (comma-separated,
+      fork only), `ts`. Ledger-walk projection tools follow the same convention.
 
 ## Future scope (post-v0.5.0)
 
