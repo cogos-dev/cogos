@@ -129,6 +129,34 @@ Invalid: cog://adrs/..., cog://docs/... with raw fs paths.
 If cog_search_memory returns a bus event path (".cog/.state/buses/.../events.jsonl#N"),
 that is a chat log entry, not a readable CogDoc — do not try to read it.`
 
+// localHarnessChatPrompt is the system prompt used during the execute phase
+// when pending dashboard user messages are present. It replaces the maintenance
+// agent framing with a conversational one so the model replies naturally rather
+// than narrating its own dispatch discipline.
+//
+// Key differences from localHarnessExecutePrompt:
+//   - Framed as a workspace assistant, not a maintenance agent.
+//   - Instructs the model to call `respond` with the actual reply text — not to
+//     describe what it is about to do or narrate the tool invocation.
+//   - Explicitly prohibits meta-commentary like "I have received your command"
+//     or "My highest priority is replying to the user".
+const localHarnessChatPrompt = `You are Cog, a workspace assistant for this CogOS node.
+The operator has sent you a message via the dashboard chat interface.
+Read the user_message in the observation, then call the respond tool with a direct, natural reply.
+
+Rules:
+- Call respond exactly once per turn. Put the actual reply text in the "text" field.
+- Do NOT narrate your own process. Never say things like "I have received your command",
+  "My highest priority is replying", or "I will now invoke the respond tool". Just reply.
+- Speak like a person, not a status report. Be conversational and concise.
+- You may use other kernel tools (cog_search_memory, cog_read_cogdoc, etc.) before
+  calling respond if they would help you answer accurately. Keep it brief.
+- If you are uncertain, say so plainly. Do not invent facts about the workspace.
+
+CogDoc URIs use the bare form cog:<type>/<path>. Types: mem, adr, role, skill, agent,
+spec, status, ledger, crystal, kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks.
+Cross-workspace refs: cog://other-workspace/mem/...`
+
 const localHarnessDispatchPrompt = `You are the resident local CogOS harness.
 Stay local-only. Use only the provided kernel tools. Be concise and finish with a direct answer.
 
@@ -594,7 +622,14 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	}
 
 	if assessment.Action != "sleep" {
-		result, err := c.executeCycleTask(ctx, provider, assessment, outcome.record.Observation, cycleTools)
+		// When pending user messages are present, use the chat-tuned system
+		// prompt so the model replies conversationally rather than narrating its
+		// own dispatch discipline. Pure autonomic cycles use the default prompt.
+		execPrompt := ""
+		if len(pendingMsgs) > 0 {
+			execPrompt = localHarnessChatPrompt
+		}
+		result, err := c.executeCycleTaskWithPrompt(ctx, provider, assessment, outcome.record.Observation, cycleTools, execPrompt)
 		if err != nil {
 			outcome.record.Action = "error"
 			outcome.record.Reason = err.Error()
@@ -617,14 +652,14 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	// --- Piece 3c: ensureUserTurnReply fallback ---
 	//
 	// If there were pending user messages this cycle AND the agent did not call
-	// the respond tool, publish a default agent_response so Mod³ doesn't wait
-	// forever. This mirrors the pre-sweep "auto-fallback" behaviour evidenced by
-	// the 2026-04-18 bus_dashboard_response events.
+	// the respond tool, publish a contextual fallback so Mod³ doesn't wait
+	// forever. The fallback text echoes the first ~40 chars of the user's message
+	// so it is distinct across different inputs and clearly placeholder rather
+	// than a fully-formed reply.
 	if len(pendingMsgs) > 0 && !EngineRespondInvokedSince(respondSnapshot) {
-		fallbackText := outcome.record.Result
-		if fallbackText == "" {
-			fallbackText = "I observed your message but did not produce a direct reply this cycle."
-		}
+		// Build a contextual fallback from the first pending message's text.
+		fallbackText := buildContextualFallback(pendingMsgs)
+
 		// Fan out across all session IDs from this turn.
 		sessionIDs := sessionIDsFromContext(ctx)
 		if len(sessionIDs) == 0 {
@@ -635,7 +670,7 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 				slog.Warn("dashboard-inlet: fallback publish failed", "session", sid, "err", err)
 			}
 		}
-		slog.Info("dashboard-inlet: auto-fallback published", "sessions", len(sessionIDs))
+		slog.Info("dashboard-inlet: auto-fallback published", "sessions", len(sessionIDs), "text_preview", fallbackText[:min(len(fallbackText), 40)])
 	}
 
 	c.finishCycle(outcome.record)
@@ -700,10 +735,21 @@ func (c *LocalHarnessController) assessCycle(ctx context.Context, provider Provi
 }
 
 func (c *LocalHarnessController) executeCycleTask(ctx context.Context, provider Provider, assessment *localHarnessAssessment, observation string, registry *KernelToolRegistry) (string, error) {
+	return c.executeCycleTaskWithPrompt(ctx, provider, assessment, observation, registry, "")
+}
+
+// executeCycleTaskWithPrompt is like executeCycleTask but accepts an explicit
+// system prompt override. Pass "" to use the default localHarnessExecutePrompt.
+// The chat path passes localHarnessChatPrompt when pending user messages are present.
+func (c *LocalHarnessController) executeCycleTaskWithPrompt(ctx context.Context, provider Provider, assessment *localHarnessAssessment, observation string, registry *KernelToolRegistry, systemPromptOverride string) (string, error) {
 	temp := 0.1
 	task := c.buildExecutionTask(assessment, observation)
+	sysPrompt := localHarnessExecutePrompt
+	if systemPromptOverride != "" {
+		sysPrompt = systemPromptOverride
+	}
 	req := &CompletionRequest{
-		SystemPrompt: localHarnessExecutePrompt,
+		SystemPrompt: sysPrompt,
 		Messages: []ProviderMessage{
 			{Role: "user", Content: task},
 		},
@@ -807,6 +853,33 @@ func (c *LocalHarnessController) localModelHint() string {
 		return strings.TrimSpace(c.cfg.LocalModel)
 	}
 	return defaultOllamaModel
+}
+
+// buildContextualFallback produces a short placeholder text for the
+// ensureUserTurnReply fallback path. It echoes the first ~40 chars of the
+// first pending user message so the operator sees something distinct per input
+// rather than an identical canned string on every unanswered turn.
+//
+// The text is clearly a placeholder, not a fully-formed reply. If the pending
+// queue is empty (should not happen at the call site, but defensive), it
+// returns a generic acknowledgment.
+func buildContextualFallback(msgs []EnginePendingUserMsg) string {
+	if len(msgs) == 0 {
+		return "Received your message. Working on it..."
+	}
+	text := strings.TrimSpace(msgs[0].Text)
+	if text == "" {
+		return "Received your message. Working on it..."
+	}
+	const maxPreview = 40
+	preview := text
+	ellipsis := ""
+	if len([]rune(text)) > maxPreview {
+		runes := []rune(text)
+		preview = string(runes[:maxPreview])
+		ellipsis = "..."
+	}
+	return fmt.Sprintf("Got: %q%s — working on it.", preview, ellipsis)
 }
 
 // resolveProviderByProcessState consults process_state_routing in the merged
