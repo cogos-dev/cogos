@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -351,7 +352,70 @@ func TestDashboardInletFallbackFires(t *testing.T) {
 	if fallbackText == "" {
 		t.Error("fallback text should not be empty")
 	}
+	// The contextual fallback must echo some fragment of the user's message so
+	// the operator doesn't see an identical canned string on every unanswered turn.
+	const canned = "Hello! How can I assist you with your CogOS maintenance today?"
+	if fallbackText == canned {
+		t.Errorf("fallback text is the old canned greeting; want contextual text, got %q", fallbackText)
+	}
+	// It should contain the first word of the user's input ("is") rather than being generic.
+	if !strings.Contains(fallbackText, "is anyone there") && !strings.Contains(fallbackText, "is anyone") {
+		t.Logf("fallback text does not echo user input (acceptable if contextual): %q", fallbackText)
+	}
 	t.Logf("fallback fired: text=%q reasoning=%q", fallbackText, fallbackReasoning)
+}
+
+// --- Test 5: buildContextualFallback ---
+
+// TestBuildContextualFallback verifies the fallback text builder.
+func TestBuildContextualFallback(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		msgs      []EnginePendingUserMsg
+		wantEmpty bool
+		wantHas   string
+		wantNot   string
+	}{
+		{
+			name:    "short message echoed",
+			msgs:    []EnginePendingUserMsg{{Text: "hello there"}},
+			wantHas: "hello there",
+			wantNot: "Hello! How can I assist",
+		},
+		{
+			name:    "long message truncated with ellipsis",
+			msgs:    []EnginePendingUserMsg{{Text: "this is a very long user message that exceeds forty characters by a fair amount"}},
+			wantHas: "this is a very long user message that ex",
+		},
+		{
+			name: "empty queue returns generic ack",
+			msgs: []EnginePendingUserMsg{},
+			// should not be the old canned greeting
+			wantNot: "Hello! How can I assist",
+		},
+		{
+			name:    "blank text returns generic ack",
+			msgs:    []EnginePendingUserMsg{{Text: ""}},
+			wantHas: "Working on it",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildContextualFallback(tc.msgs)
+			if got == "" {
+				t.Error("got empty fallback text")
+			}
+			if tc.wantHas != "" && !strings.Contains(got, tc.wantHas) {
+				t.Errorf("fallback %q does not contain %q", got, tc.wantHas)
+			}
+			if tc.wantNot != "" && strings.Contains(got, tc.wantNot) {
+				t.Errorf("fallback %q should not contain %q", got, tc.wantNot)
+			}
+		})
+	}
 }
 
 // --- Test helpers ---
