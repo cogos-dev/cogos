@@ -105,6 +105,9 @@ func (m *MCPServer) registerSessionTools() {
 			"409 if the handoff has not been claimed yet or is already " +
 			"complete. Optional outcome, notes, and next_handoff_id.",
 	}), withToolObserver(m, "cog_complete_handoff", m.toolCompleteHandoff))
+
+	// RFC-0005: session forking primitive.
+	m.registerForkSessionTool()
 }
 
 // ─── input/output types ──────────────────────────────────────────────────────

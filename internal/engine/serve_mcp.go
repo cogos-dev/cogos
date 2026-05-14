@@ -17,6 +17,7 @@ func (s *Server) registerMCPRoutes(mux *http.ServeMux) {
 	// these are nil — NewMCPServer (used by tests that only care about
 	// memory tools) doesn't call this, which is fine.
 	mcpSrv.SetSessionsBackend(s.busSessions, s.sessionRegistry, s.handoffRegistry)
+	mcpSrv.SetForkRegistry(s.forkRegistry)
 	// ADR-082 Wave 3.5: route the mod3 session-family MCP tools through
 	// the kernel's shared channel-session methods so session-ID minting
 	// happens in exactly one place (this Server). Handlers dispatching

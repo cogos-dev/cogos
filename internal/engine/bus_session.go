@@ -385,6 +385,16 @@ func (m *BusSessionManager) getLastEvent(busID string) (int, string) {
 	return block.Seq, block.Hash
 }
 
+// LatestEventHash returns the seq and content-addressed hash of the latest
+// event written to busID, without appending. Returns ("", 0) if no event has
+// been written yet. Acquires the bus mutex for a moment, then releases it.
+func (m *BusSessionManager) LatestEventHash(busID string) (hash string, seq int64, err error) {
+	m.mu.Lock()
+	s, h := m.getLastEvent(busID)
+	m.mu.Unlock()
+	return h, int64(s), nil
+}
+
 // updateRegistrySeqLocked updates the last event seq/timestamp in the registry.
 // Caller must hold m.mu.
 func (m *BusSessionManager) updateRegistrySeqLocked(busID string, seq int, ts string) {
