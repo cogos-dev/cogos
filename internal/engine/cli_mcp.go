@@ -126,6 +126,16 @@ func runMCPServeEngine(args []string, defaultWorkspace string, stderr io.Writer)
 	process := NewProcess(cfg, nucleus)
 	server := NewMCPServer(cfg, nucleus, process)
 
+	// Wire session-management backends so cog_register_session /
+	// cog_list_sessions / cog_offer_handoff / cog_list_handoffs / etc. work
+	// over stdio (same registries the HTTP path uses, just no live Server).
+	busSessions := NewBusSessionManager(cfg.WorkspaceRoot)
+	sessionRegistry := NewSessionRegistry()
+	handoffRegistry := NewHandoffRegistry()
+	_ = ReplaySessionRegistry(busSessions, sessionRegistry)
+	_ = ReplayHandoffRegistry(busSessions, handoffRegistry)
+	server.SetSessionsBackend(busSessions, sessionRegistry, handoffRegistry)
+
 	// Wire a signal-aware context so shells (or hosts like Claude Desktop)
 	// that send SIGINT/SIGTERM on shutdown get a clean exit.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
