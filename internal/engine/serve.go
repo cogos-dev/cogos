@@ -8,6 +8,7 @@
 //	POST /v1/chat/completions              — OpenAI-compatible chat (streaming + non-streaming)
 //	POST /v1/messages                      — Anthropic Messages-compatible chat
 //	POST /v1/context/foveated              — foveated context assembly for Claude Code hook
+//	GET  /v1/hud/state                     — compact kernel state snapshot for Claude Code HUD hook
 //	GET  /v1/proprioceptive                — last 50 proprioceptive log entries + light cone status
 //	GET  /v1/ledger                        — query the hash-chained event ledger
 //	GET  /v1/lightcone                     — light cone metadata (placeholder)
@@ -172,6 +173,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "PATCH /v1/settings/context", s.handlePatchContextSettings)
 	s.route(mux, "POST /v1/chat/completions", s.handleChat)
 	s.route(mux, "POST /v1/messages", s.handleAnthropicMessages)
+	s.route(mux, "GET /v1/hud/state", s.handleHUDState)
 	s.route(mux, "GET /v1/proprioceptive", s.handleProprioceptive)
 	s.route(mux, "GET /v1/ledger", s.handleLedger)
 	s.route(mux, "GET /v1/traces", s.handleTraces)
