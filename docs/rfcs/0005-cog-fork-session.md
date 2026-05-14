@@ -267,18 +267,144 @@ The fork handler queries the inference provider for the parent's KV block hash w
 `KVBlockHashProvider` interface, called by this RFC's fork handler and implemented by
 the vLLM provider specified in RFC-0006.
 
+### Interface definition
+
 ```go
 // KVBlockHashProvider is implemented by inference providers that expose
 // a content-addressed KV-block layer (e.g., vLLM PagedAttention).
 // The fork-session handler queries this when forking over a kvcache layer
 // to obtain the parent's KV block hash.
+//
+// Package: internal/engine (canonical definition; RFC-0006 implements it)
 type KVBlockHashProvider interface {
-    // ParentKVBlockHash returns the hash of the KV block representing
-    // the session's KV state at the given message ID, or an error if
-    // the block is no longer addressable (evicted, runtime restarted).
+    // ParentKVBlockHash returns the content-addressed hash of the KV block
+    // representing the session's KV state at the given message ID.
+    //
+    // sessionID: the parent session whose KV state is being queried.
+    // atMessageID: the message ID at the fork point (the last message in the
+    //   parent's context window to be inherited by the child). Providers use
+    //   this to identify which KV block covers the token range up to this message.
+    //
+    // Returns:
+    //   - (BlockHash, nil) on success: the child can carry this hash as a warm-start
+    //     hint to the inference channel.
+    //   - ("", ErrKVBlockEvicted) if the block existed but has been evicted from the
+    //     vLLM block manager. The fork handler treats this as a recoverable miss:
+    //     the fork proceeds with a cold start.
+    //   - ("", ErrKVProviderUnavailable) if the inference channel is unreachable or
+    //     has restarted. Recoverable: fork proceeds cold.
+    //   - ("", ErrKVBlockNotFound) if no KV block exists for the given session and
+    //     message ID (session never reached a KV-addressable state). Recoverable.
+    //   - ("", err) for any other error: treated as fatal by the fork handler —
+    //     the fork is aborted and the error is returned to the caller.
     ParentKVBlockHash(ctx context.Context, sessionID string, atMessageID string) (BlockHash, error)
 }
+
+// BlockHash is a hex-encoded SHA-256 content-addressed identifier for a KV block.
+// An empty BlockHash ("") signals absence; it is not a valid block reference.
+type BlockHash string
+
+// Sentinel errors returned by KVBlockHashProvider implementations.
+// The fork handler checks these explicitly to distinguish recoverable from fatal.
+var (
+    // ErrKVBlockEvicted: block existed but was evicted from the block manager.
+    // The fork handler degrades to cold start; this is not an error condition.
+    ErrKVBlockEvicted = errors.New("kv block evicted")
+
+    // ErrKVProviderUnavailable: the inference channel is unreachable.
+    // The fork handler degrades to cold start.
+    ErrKVProviderUnavailable = errors.New("kv provider unavailable")
+
+    // ErrKVBlockNotFound: no KV block for this session+message combination.
+    // The fork handler degrades to cold start.
+    ErrKVBlockNotFound = errors.New("kv block not found")
+)
 ```
+
+### Ownership and lifecycle
+
+**Who defines the interface**: `internal/engine` owns the canonical
+`KVBlockHashProvider` interface definition. It lives alongside the fork handler, not
+in the provider package, so that the fork handler does not import the provider.
+
+**Who implements the interface**: RFC-0006's `internal/providers/vllm` package
+implements `KVBlockHashProvider` on its `KVCacheProvider` struct. No other provider
+in v0.5.0 implements the interface; all others degrade gracefully (see below).
+
+**Who creates the provider**: the kernel's provider registry at startup. The
+`KVCacheProvider` is registered into the provider registry by the vLLM provider
+init path. The fork handler obtains it via a registry lookup at fork time — it does
+not hold a long-lived reference to the provider instance.
+
+**Who calls the interface**: the fork handler in `toolForkSession`
+(`internal/engine/mcp_sessions.go`). The call happens exactly once per fork invocation,
+inside the fork transaction, before the `session.fork` CogBlock is written to the
+ledger.
+
+**Lifecycle**: the `KVBlockHashProvider` implementation is active for as long as the
+vLLM inference channel is registered in the provider registry. If the vLLM channel
+is removed (e.g. runtime restart, explicit unregister), the registry lookup returns
+nil and the fork handler degrades to cold start for the duration of the channel
+absence. No dangling references: the fork handler does not cache the provider pointer
+across calls.
+
+### Error semantics
+
+| Error returned                | Recoverable? | Fork handler action              |
+|-------------------------------|--------------|----------------------------------|
+| `ErrKVBlockEvicted`           | Yes          | Degrade to cold start; log warn  |
+| `ErrKVProviderUnavailable`    | Yes          | Degrade to cold start; log warn  |
+| `ErrKVBlockNotFound`          | Yes          | Degrade to cold start; log info  |
+| `nil` provider (no vLLM)      | Yes          | Degrade to cold start; no log    |
+| Any other non-nil error       | No (fatal)   | Abort fork; return error to caller |
+
+"Degrade to cold start" means: `KVCacheOverlay.ParentKVBlockHash` is set to `""` in
+the `session.fork` body; the child session starts without a KV warm-start hint. The
+fork itself succeeds; only the KV warm-start is lost.
+
+### Example invocation (fork handler)
+
+```go
+// Inside toolForkSession, after resolving the fork point and before writing
+// the session.fork CogBlock to the ledger:
+
+var kvBlockHash BlockHash
+if input.Overlay != nil && input.Overlay.KVCache != nil && input.Overlay.KVCache.InheritParentKV {
+    provider, ok := m.registry.LookupKVBlockHashProvider()
+    if ok {
+        hash, err := provider.ParentKVBlockHash(ctx, input.ParentSessionID, forkPoint.LastMessageID)
+        switch {
+        case err == nil:
+            kvBlockHash = hash
+        case errors.Is(err, ErrKVBlockEvicted),
+             errors.Is(err, ErrKVProviderUnavailable),
+             errors.Is(err, ErrKVBlockNotFound):
+            // Recoverable: proceed with cold start.
+            m.logger.Warn("kv block unavailable for fork; degrading to cold start",
+                "session", input.ParentSessionID,
+                "message", forkPoint.LastMessageID,
+                "err", err)
+        default:
+            // Fatal: surface to caller.
+            return nil, fmt.Errorf("fork aborted: KVBlockHashProvider error: %w", err)
+        }
+    }
+    // No provider registered: silent cold start (no log; expected when vLLM absent).
+}
+input.Overlay.KVCache.ParentKVBlockHash = string(kvBlockHash)
+```
+
+### Graceful degradation when provider is absent
+
+When no vLLM channel is registered (e.g. local dev with mlx-engine only), the
+provider registry returns `ok = false` from `LookupKVBlockHashProvider()`. The fork
+handler silently sets `ParentKVBlockHash = ""` and proceeds. The child session starts
+cold. This is the correct and expected behavior for all non-vLLM inference channels.
+
+The `KVCacheOverlay.InheritParentKV = true` field is accepted and written into the
+`session.fork` CogBlock regardless of provider availability — it records the caller's
+intent. The empty `ParentKVBlockHash` signals that the intent could not be satisfied
+at fork time.
 
 The vLLM provider (RFC-0006) implements this interface; the fork handler in
 `cog_fork_session` calls it. When no provider implementing `KVBlockHashProvider` is

@@ -298,18 +298,86 @@ The vLLM provider implements the `KVBlockHashProvider` interface so that the
 hash when forking over a kvcache layer. RFC-0005 is the consumer; this RFC is the
 implementing provider.
 
+### Interface (canonical definition in `internal/engine`)
+
+The `KVBlockHashProvider` interface is defined in `internal/engine` (not in this
+provider package) so that the fork handler does not import `internal/providers/vllm`.
+The full interface specification — including `BlockHash` type, sentinel errors
+(`ErrKVBlockEvicted`, `ErrKVProviderUnavailable`, `ErrKVBlockNotFound`), ownership,
+lifecycle, error semantics table, and example fork-handler invocation — is in RFC-0005
+§"Cross-RFC integration: KVBlockHashProvider". This section describes the
+implementation side only.
+
+### Implementation: `KVCacheProvider.ParentKVBlockHash`
+
+`KVCacheProvider` (defined in `provider_vllm_cache.go`) implements `KVBlockHashProvider`
+by satisfying the interface contract:
+
 ```go
-// KVBlockHashProvider is implemented by inference providers that expose
-// a content-addressed KV-block layer (e.g., vLLM PagedAttention).
-// The fork-session handler queries this when forking over a kvcache layer
-// to obtain the parent's KV block hash.
-type KVBlockHashProvider interface {
-    // ParentKVBlockHash returns the hash of the KV block representing
-    // the session's KV state at the given message ID, or an error if
-    // the block is no longer addressable (evicted, runtime restarted).
-    ParentKVBlockHash(ctx context.Context, sessionID string, atMessageID string) (BlockHash, error)
+// ParentKVBlockHash implements engine.KVBlockHashProvider.
+// It queries the vLLM block manager via VLLMClient for the KV block
+// covering the token range up to atMessageID in sessionID.
+//
+// The method maps vLLM-internal errors to the sentinel errors defined
+// in internal/engine so the fork handler can apply its recovery policy
+// without importing this package.
+func (p *KVCacheProvider) ParentKVBlockHash(
+    ctx context.Context,
+    sessionID string,
+    atMessageID string,
+) (engine.BlockHash, error) {
+    // 1. Resolve the prompt prefix for this session up to atMessageID.
+    //    The session registry maps message IDs to their prompt prefix hash.
+    prefix, err := p.resolvePromptPrefix(ctx, sessionID, atMessageID)
+    if err != nil {
+        // Cannot resolve prefix: block not found.
+        return "", engine.ErrKVBlockNotFound
+    }
+
+    // 2. Ask the VLLMClient for the block hash for this prefix.
+    hash := p.client.BlockHashForPrompt(prefix, p.channelID, defaultSamplingConfig)
+
+    // 3. Verify the block is currently warm in the vLLM block manager.
+    warm, err := p.client.IsBlockWarm(ctx, hash)
+    if err != nil {
+        // VLLMClient unreachable.
+        return "", engine.ErrKVProviderUnavailable
+    }
+    if !warm {
+        // Block was computed but has been evicted.
+        return "", engine.ErrKVBlockEvicted
+    }
+
+    return engine.BlockHash(hash), nil
 }
 ```
+
+### VLLMClient extension for block warm-check
+
+The `VLLMClient` interface gains one method to support `ParentKVBlockHash`:
+
+```go
+// IsBlockWarm returns true if the block identified by blockHash is currently
+// resident in the vLLM block manager. Returns false (not an error) if the
+// block has been evicted; returns an error only on transport/runtime failure.
+IsBlockWarm(ctx context.Context, blockHash string) (bool, error)
+```
+
+`MockVLLMClient` implements this with a configurable warm-set for unit tests.
+
+### Registration in the provider registry
+
+The vLLM provider registers `KVCacheProvider` as a `KVBlockHashProvider` during
+channel init:
+
+```go
+// In internal/providers/vllm/provider_vllm.go, during channel registration:
+registry.RegisterKVBlockHashProvider(p.cache) // p.cache is *KVCacheProvider
+```
+
+The fork handler calls `registry.LookupKVBlockHashProvider()` at fork time. If the
+vLLM channel has not been initialized, the lookup returns `nil, false` and the fork
+handler degrades to cold start as specified in RFC-0005.
 
 The vLLM `VLLMClient` (cgo binding or Python sidecar) provides the block hash by
 querying `vllm.core.block_manager` for the block covering the given message's token
