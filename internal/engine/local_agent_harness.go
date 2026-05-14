@@ -48,6 +48,40 @@ var harnessToolScopes = map[string][]string{
 		"cog_emit_event",
 		engineRespondToolName, // Piece 3a: respond tool in consolidation scope
 	},
+	// consolidation_with_respond is identical to consolidation but named
+	// explicitly so callers can request it by scope name. The autonomic
+	// cycle uses this scope only when pending user messages are present;
+	// for purely autonomic ticks it uses consolidation_no_respond instead.
+	"consolidation_with_respond": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_read_cogdoc",
+		"cog_query_field",
+		"cog_check_coherence",
+		"cog_get_state",
+		"cog_get_trust",
+		"cog_get_nucleus",
+		"cog_get_index",
+		"cog_assemble_context",
+		"cog_emit_event",
+		engineRespondToolName,
+	},
+	// consolidation_no_respond is the autonomic-only scope: identical to
+	// consolidation except the respond tool is absent. The model cannot
+	// publish to bus_dashboard_response during a pure autonomic cycle.
+	"consolidation_no_respond": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_read_cogdoc",
+		"cog_query_field",
+		"cog_check_coherence",
+		"cog_get_state",
+		"cog_get_trust",
+		"cog_get_nucleus",
+		"cog_get_index",
+		"cog_assemble_context",
+		"cog_emit_event",
+	},
 	"audit": {
 		"cog_resolve_uri",
 		"cog_search_memory",
@@ -139,6 +173,10 @@ type LocalHarnessController struct {
 	toolRegistry    *KernelToolRegistry
 	dispatchTools   *KernelToolRegistry
 	backgroundTools *KernelToolRegistry
+	// backgroundToolsNoRespond is the tool set for purely autonomic cycles
+	// (no pending user messages). It is identical to backgroundTools but
+	// with the respond tool removed — Gate A enforcement.
+	backgroundToolsNoRespond *KernelToolRegistry
 
 	agentID  string
 	started  time.Time
@@ -217,7 +255,7 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 	}
 	toolNames, ok := harnessToolScopes[scopeName]
 	if !ok {
-		return nil, fmt.Errorf("unknown harness scope %q (known: consolidation, audit)", scopeName)
+		return nil, fmt.Errorf("unknown harness scope %q (known: consolidation, consolidation_with_respond, consolidation_no_respond, audit)", scopeName)
 	}
 	registry := NewKernelToolRegistry(mcpSrv)
 	// Piece 3b: inject the respond native tool into the full registry before
@@ -229,22 +267,31 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		return nil, err
 	}
 
+	// Gate A: build a respond-free tool set for purely autonomic cycles.
+	// When runCycle drains an empty pending queue, it uses this registry so
+	// the model cannot see (and therefore cannot invoke) the respond tool.
+	noRespondTools, err := registry.Scoped(harnessToolScopes["consolidation_no_respond"])
+	if err != nil {
+		return nil, fmt.Errorf("build no-respond tool scope: %w", err)
+	}
+
 	interval := time.Minute
 	if cfg != nil && cfg.HeartbeatInterval > 0 {
 		interval = time.Duration(cfg.HeartbeatInterval) * time.Second
 	}
 
 	return &LocalHarnessController{
-		cfg:                  cfg,
-		nucleus:              nucleus,
-		process:              process,
-		toolRegistry:         registry,
-		dispatchTools:        dispatchTools,
-		backgroundTools:      dispatchTools,
-		agentID:              DefaultAgentID,
-		started:              time.Now().UTC(),
-		interval:             interval,
-		localProviderTimeout: resolveLocalProviderTimeout(cfg),
+		cfg:                      cfg,
+		nucleus:                  nucleus,
+		process:                  process,
+		toolRegistry:             registry,
+		dispatchTools:            dispatchTools,
+		backgroundTools:          dispatchTools,
+		backgroundToolsNoRespond: noRespondTools,
+		agentID:                  DefaultAgentID,
+		started:                  time.Now().UTC(),
+		interval:                 interval,
+		localProviderTimeout:     resolveLocalProviderTimeout(cfg),
 	}, nil
 }
 
@@ -438,6 +485,28 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	if c.dashboardBus != nil {
 		pendingMsgs = DrainEnginePendingUserMessages()
 	}
+
+	// Gate A — select cycle-appropriate tool set.
+	//
+	// When there are no pending user messages this cycle is purely autonomic
+	// (health-check, memory consolidation, etc.). In that case, strip the
+	// respond tool from the model's visible tool set so it cannot publish to
+	// bus_dashboard_response. The model literally cannot see the tool; there
+	// is no text-based instruction that could override this.
+	//
+	// When pending messages are present, use the full background tool set
+	// (which includes respond) and reset the per-turn invocation counter so
+	// Gate B starts fresh for this turn.
+	cycleTools := c.backgroundTools
+	if len(pendingMsgs) == 0 {
+		if c.backgroundToolsNoRespond != nil {
+			cycleTools = c.backgroundToolsNoRespond
+		}
+	} else {
+		// Gate B: reset per-turn counter before each new user-turn execute phase.
+		ResetEngineRespondPerTurnCount()
+	}
+
 	// Snapshot the respond counter BEFORE the execute phase so we can detect
 	// whether the agent called it during this turn.
 	respondSnapshot := EngineRespondInvokeSnapshot()
@@ -525,7 +594,7 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	}
 
 	if assessment.Action != "sleep" {
-		result, err := c.executeCycleTask(ctx, provider, assessment, outcome.record.Observation, c.backgroundTools)
+		result, err := c.executeCycleTask(ctx, provider, assessment, outcome.record.Observation, cycleTools)
 		if err != nil {
 			outcome.record.Action = "error"
 			outcome.record.Reason = err.Error()
