@@ -192,6 +192,92 @@ a custom retention at fork time.
 **Cross-workspace forks**: deferred to constellation federation work. v1 is
 intra-workspace only. Cross-workspace fork requests return `501 Not Implemented`.
 
+### Parent-reference coupling and lifetime semantics
+
+This section specifies precisely what holds a reference to a parent session and when a
+parent becomes GC-eligible. The defaults are intentionally conservative to minimize
+surprise; the explicit-disown escape hatch handles the case where early release is
+desired.
+
+**What holds a parent reference:**
+
+1. **Child sessions (direct)**: every active child session holds a strong reference to
+   its parent via the `ParentSessionID` field in `SessionForkBody`. While any child
+   session's `session.fork` CogBlock is within its retention window (i.e.
+   `child_fork_expiry > now`), the parent session's ledger state is pinned and
+   GC-ineligible. Children are the primary reference holders.
+
+2. **Message handlers (transitive)**: if a child session's message handler is
+   currently executing (i.e. the child session has an inflight MCP call or HTTP
+   request in-flight), the handler holds a transitive reference to the parent via the
+   child's `ParentSessionID`. This prevents the parent from being GC'd during an
+   active cross-session lineage walk. The transitive reference is released when the
+   handler returns.
+
+3. **`PinnedUntil` timestamp (explicit)**: a fork with a non-nil `PinnedUntil` in its
+   `SessionForkBody` holds a reference until that timestamp, regardless of child
+   activity. This is the mechanism for long-running or deliberately-preserved fork
+   points.
+
+**When a parent becomes GC-eligible:**
+
+A parent session's ledger state becomes GC-eligible when ALL of the following are true:
+
+- No child session's `session.fork` CogBlock has `child_fork_expiry > now` (i.e. all
+  children have expired or been explicitly disowned).
+- No message handler is executing with a transitive reference to the parent.
+- No active `PinnedUntil` timestamp on any child's `SessionForkBody` extends beyond now.
+- The parent's own session retention window has elapsed (separate from child coupling;
+  the parent is a session record in its own right with its own retention policy).
+
+The parent-reference coupling adds an additional floor on top of the parent's own
+retention: the parent cannot be GC'd before its last child's expiry even if the
+parent's own retention window is shorter.
+
+**Default: parent persists while any child is active**
+
+The defensive default is: **a parent session persists in the ledger for as long as any
+child fork is within its retention window**. This means:
+
+- Forking is always safe to do on long-lived parents; the parent will not disappear
+  while a child is using it.
+- `ForkAncestors` walks always succeed for live forks.
+- The cost is that long-lived children extend parent retention. This is intentional
+  and correct: a fork over a long-lived parent's KV state is only coherent if the
+  parent's ledger is intact.
+
+**Explicit disown: `cog_fork_disown`**
+
+When a child session is known-complete but its retention window has not yet elapsed,
+the caller may release the parent reference early by calling `cog_fork_disown`:
+
+```go
+// forkDisownInput releases a child's reference to its parent,
+// making the parent immediately GC-eligible (subject to other references).
+// Does not delete the child session; only releases the parent reference hold.
+type forkDisownInput struct {
+    ChildSessionID string `json:"child_session_id"`
+}
+```
+
+`cog_fork_disown` is a voluntary compact: the caller asserts it will no longer use
+the parent-child lineage for this child. The fork registry removes the child's GC root
+on the parent. If no other child holds a reference and no `PinnedUntil` is active, the
+parent becomes immediately GC-eligible.
+
+`cog_fork_disown` does NOT retroactively expire the child's `session.fork` CogBlock;
+it is not a delete. The ledger entry remains readable until its own retention window
+expires. Only the live GC root is released.
+
+**Summary table:**
+
+| Reference holder          | Holds parent until                          | Release mechanism              |
+|---------------------------|---------------------------------------------|--------------------------------|
+| Child session (active)    | `child_fork_expiry > now`                   | Expiry or `cog_fork_disown`    |
+| In-flight message handler | Handler returns                             | Automatic (handler completion) |
+| `PinnedUntil` timestamp   | `PinnedUntil > now`                         | Expiry or explicit update      |
+| Parent's own retention    | Parent's own session retention window       | Expiry                         |
+
 ## MCP tool: `cog_fork_session`
 
 ```go
