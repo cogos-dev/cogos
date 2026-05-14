@@ -117,6 +117,12 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// override via the exported fields if they want an isolated fixture.
 	s.busSessions = NewBusSessionManager(cfg.WorkspaceRoot)
 	s.spanEmitter = &serverSpanEmitter{bus: s.busSessions}
+
+	// Piece 1: install the dashboard chat inlet handler on the engine's bus
+	// manager so events on bus_dashboard_chat enqueue to enginePendingMsgs.
+	// Called unconditionally — the handler is a no-op until the first event
+	// arrives, and the bus dirs are created idempotently.
+	InstallEngineDashboardInlet(s.busSessions)
 	s.busBroker = NewBusEventBroker()
 	s.busConsumers = NewConsumerRegistry(
 		// Match root's persistence path: .cog/run/bus/{bus_id}.cursors.jsonl
@@ -240,10 +246,18 @@ func (s *Server) SetServiceSupervisor(sup ServiceSupervisor) {
 // root-package serveServer) can build the controller and pass it here.
 // Safe to call post-construction: the MCP tool registry resolves the
 // controller at call time.
+//
+// When ctrl is a *LocalHarnessController, also wires the dashboard chat bridge
+// (Piece 2+3) by calling SetDashboardBus with the server's bus session manager.
 func (s *Server) SetAgentController(ctrl AgentController) {
 	s.agentController = ctrl
 	if s.mcpServer != nil {
 		s.mcpServer.SetAgentController(ctrl)
+	}
+	// Piece 2+3: wire dashboard bus into the harness so runCycle drains
+	// pending messages and the respond tool has a publish target.
+	if lhc, ok := ctrl.(*LocalHarnessController); ok && s.busSessions != nil {
+		lhc.SetDashboardBus(s.busSessions)
 	}
 }
 
