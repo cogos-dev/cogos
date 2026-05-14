@@ -329,6 +329,13 @@ func (e errDashboardNotReady) Error() string { return string(e) }
 // the auto-fallback should fire.
 var engineRespondInvokeCount uint64
 
+// engineRespondPerTurnCount is the per-turn invocation counter for Gate B.
+// It is reset to 0 at the start of each user-turn execute phase (by
+// ResetEngineRespondPerTurnCount in runCycle) and incremented on each
+// successful respond dispatch. When > 0 at entry, engineRespondExecutor
+// rejects the call and returns a structured error to the model.
+var engineRespondPerTurnCount uint64
+
 // EngineRespondInvokeSnapshot returns the current respond-call counter.
 func EngineRespondInvokeSnapshot() uint64 {
 	return atomic.LoadUint64(&engineRespondInvokeCount)
@@ -339,6 +346,12 @@ func EngineRespondInvokedSince(snapshot uint64) bool {
 	return atomic.LoadUint64(&engineRespondInvokeCount) > snapshot
 }
 
+// ResetEngineRespondPerTurnCount zeroes the per-turn counter. Called by
+// runCycle at the start of each user-turn execute phase (Gate B reset).
+func ResetEngineRespondPerTurnCount() {
+	atomic.StoreUint64(&engineRespondPerTurnCount, 0)
+}
+
 // engineRespondPublish is the seam for the respond executor. Tests swap this
 // to capture output without a live bus manager.
 var engineRespondPublish = enginePublishDashboardResponse
@@ -346,7 +359,22 @@ var engineRespondPublish = enginePublishDashboardResponse
 // engineRespondExecutor is the toolExecutor for the `respond` tool.
 // It fans out across all session IDs in ctx (set by runCycle after draining
 // the pending queue) and publishes one reply per unique session.
+//
+// Gate B: at most one successful respond invocation is allowed per user turn.
+// If the per-turn counter is already > 0 this function returns a structured
+// error to the model and does NOT publish to bus_dashboard_response. The
+// counter is reset by ResetEngineRespondPerTurnCount at the start of each
+// user-turn execute phase.
 func engineRespondExecutor(ctx context.Context, arguments string) (string, error) {
+	// Gate B: reject 2nd+ invocations within the same user turn.
+	if atomic.LoadUint64(&engineRespondPerTurnCount) > 0 {
+		result, _ := json.Marshal(map[string]interface{}{
+			"ok":    false,
+			"error": "respond already invoked this turn (1 reply per turn)",
+		})
+		return string(result), nil
+	}
+
 	var p struct {
 		Text      string `json:"text"`
 		Reasoning string `json:"reasoning"`
@@ -397,8 +425,11 @@ func engineRespondExecutor(ctx context.Context, arguments string) (string, error
 		return string(errResult), nil
 	}
 
-	// Bump exactly once per tool invocation (N fan-out publishes = 1 call).
+	// Bump both counters exactly once per tool invocation (N fan-out publishes = 1 call).
+	// engineRespondInvokeCount: used by the auto-fallback dedupe (EngineRespondInvokedSince).
+	// engineRespondPerTurnCount: used by Gate B to reject 2nd+ invocations this turn.
 	atomic.AddUint64(&engineRespondInvokeCount, 1)
+	atomic.AddUint64(&engineRespondPerTurnCount, 1)
 
 	result, _ := json.Marshal(map[string]interface{}{
 		"ok":         true,
