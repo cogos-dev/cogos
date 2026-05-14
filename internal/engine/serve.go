@@ -124,6 +124,22 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// arrives, and the bus dirs are created idempotently.
 	InstallEngineDashboardInlet(s.busSessions)
 	s.busBroker = NewBusEventBroker()
+
+	// Wire BusSessionManager → BusEventBroker so that any direct AppendEvent
+	// call (e.g. enginePublishDashboardResponse from the respond tool) notifies
+	// live SSE subscribers on /v1/bus/{id}/stream.  Without this hook, events
+	// written via AppendEvent bypass the broker and never reach mod3's response
+	// bridge subscriber.  handleBusSend already calls busBroker.Publish after
+	// the AppendEvent write, so the handler below is intentionally idempotent
+	// (the broker uses non-blocking channel sends and tolerates double-notify).
+	// Capture the broker pointer so the closure doesn't race on s.busBroker.
+	{
+		broker := s.busBroker
+		s.busSessions.AddEventHandler("sse-broker-notify", func(busID string, block *BusBlock) {
+			broker.Publish(busID, block)
+		})
+	}
+
 	s.busConsumers = NewConsumerRegistry(
 		// Match root's persistence path: .cog/run/bus/{bus_id}.cursors.jsonl
 		filepath.Join(cfg.WorkspaceRoot, ".cog", "run", "bus"),
