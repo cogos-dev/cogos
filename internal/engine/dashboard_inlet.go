@@ -191,11 +191,16 @@ func ensureEngineDashboardBuses(mgr *BusSessionManager) {
 
 // handleEngineDashboardChatEvent is the bus handler registered on the engine's
 // BusSessionManager. It filters non-target buses, extracts the user message
-// text, and enqueues it onto the pending FIFO.
+// text and session_id, and enqueues them onto the pending FIFO.
 //
-// Expected Mod³ payload shape:
+// Two payload shapes are accepted:
 //
-//	{"type": "user_message", "text": "hello agent", "session_id": "...", "ts": "..."}
+//  1. Direct shape (e.g. from tests or direct bus appends):
+//     {"type":"user_message","text":"hello","session_id":"...","ts":"..."}
+//
+//  2. Wrapped shape from Mod³ /v1/bus/send (handleBusSend wraps the event JSON
+//     into the "content" field of the stored payload):
+//     {"content":"{\"type\":\"user_message\",\"text\":\"hello\",\"session_id\":\"...\"}"}
 func handleEngineDashboardChatEvent(busID string, block *BusBlock) {
 	if busID != engineDashboardChatBusID || block == nil {
 		return
@@ -205,7 +210,17 @@ func handleEngineDashboardChatEvent(busID string, block *BusBlock) {
 		return
 	}
 
-	text := extractEngineDashboardText(block)
+	// Unwrap: if the payload has a "content" field containing JSON (the
+	// handleBusSend shape), parse it to recover the inner event fields.
+	payload := block.Payload
+	if content, ok := payload["content"].(string); ok && len(content) > 0 && content[0] == '{' {
+		var inner map[string]interface{}
+		if err := json.Unmarshal([]byte(content), &inner); err == nil {
+			payload = inner
+		}
+	}
+
+	text := extractPayloadText(payload)
 	if text == "" {
 		slog.Debug("dashboard-inlet: drop: no text in block",
 			"seq", block.Seq, "from", block.From, "type", block.Type)
@@ -219,7 +234,7 @@ func handleEngineDashboardChatEvent(busID string, block *BusBlock) {
 		}
 	}
 	sessionID := ""
-	if v, ok := block.Payload["session_id"].(string); ok {
+	if v, ok := payload["session_id"].(string); ok {
 		sessionID = v
 	}
 
@@ -244,16 +259,18 @@ func handleEngineDashboardChatEvent(busID string, block *BusBlock) {
 	}
 }
 
-// extractEngineDashboardText pulls message body from a BusBlock payload.
-// Accepts either "text" or "content" keys.
-func extractEngineDashboardText(block *BusBlock) string {
-	if block == nil || block.Payload == nil {
+// extractPayloadText pulls message body from a payload map.
+// Accepts either "text" or "content" keys. When content looks like a JSON
+// object (starts with "{"), it is NOT used as the message text — that case is
+// handled by the caller's unwrap logic.
+func extractPayloadText(payload map[string]interface{}) string {
+	if payload == nil {
 		return ""
 	}
-	if v, ok := block.Payload["text"].(string); ok && v != "" {
+	if v, ok := payload["text"].(string); ok && v != "" {
 		return v
 	}
-	if v, ok := block.Payload["content"].(string); ok && v != "" {
+	if v, ok := payload["content"].(string); ok && v != "" && (len(v) == 0 || v[0] != '{') {
 		return v
 	}
 	return ""
