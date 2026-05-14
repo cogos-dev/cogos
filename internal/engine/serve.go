@@ -219,6 +219,9 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.registerServiceRoutes(mux)
 	s.registerServiceMutationRoutes(mux)
 
+	// ACP-client surface: list/browse Claude Code projects+sessions, spawn subprocess.
+	s.registerClaudeCodeRoutes(mux)
+
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
 	// either way; this just warms the read path.
