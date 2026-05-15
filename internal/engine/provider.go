@@ -189,11 +189,12 @@ type ProviderSalienceEntry struct {
 
 // CompletionResponse is what a Provider returns from Complete().
 type CompletionResponse struct {
-	Content      string       `json:"content"`
-	ToolCalls    []ToolCall   `json:"tool_calls,omitempty"`
-	StopReason   string       `json:"stop_reason"` // "end_turn" | "max_tokens" | "tool_use"
-	Usage        TokenUsage   `json:"usage"`
-	ProviderMeta ProviderMeta `json:"provider_meta"`
+	Content          string       `json:"content"`
+	ReasoningContent string       `json:"reasoning_content,omitempty"` // populated by reasoning models (LM Studio, Anthropic extended-thinking)
+	ToolCalls        []ToolCall   `json:"tool_calls,omitempty"`
+	StopReason       string       `json:"stop_reason"` // "end_turn" | "max_tokens" | "tool_use"
+	Usage            TokenUsage   `json:"usage"`
+	ProviderMeta     ProviderMeta `json:"provider_meta"`
 }
 
 // StreamChunk is one piece of a streaming response.

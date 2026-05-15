@@ -1094,7 +1094,9 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 
 	resp, err := provider.Complete(ctx, req)
 	pt.promptEvalEnd = time.Now()
-	pt.answerStart = pt.promptEvalEnd
+	// answerStart/End are derived after we inspect the response payload so we
+	// can split the round-trip duration proportionally when reasoning content
+	// is present. They are set below, after the tool loop.
 	if err != nil {
 		slog.Warn("chat: complete error", "err", err)
 		if turn != nil {
@@ -1221,7 +1223,32 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 		}
 	}
 
-	pt.answerEnd = time.Now()
+	// Derive per-phase timings from the response payload.
+	//
+	// In non-streaming mode the full HTTP round-trip is captured in
+	// promptEvalStart→promptEvalEnd; we cannot separately time thinking vs
+	// answer generation. Instead we split the round-trip duration
+	// proportionally by rune count — the same heuristic streamChat uses on
+	// the drain window — so that per-phase durations add up to the full
+	// latency rather than being zero.
+	//
+	// Token counts (the more actionable metric) come directly from the
+	// provider's usage fields and resp.ReasoningContent length.
+	roundTripDur := pt.promptEvalEnd.Sub(pt.promptEvalStart)
+	thinkRunes := utf8.RuneCountInString(resp.ReasoningContent)
+	ansRunes := utf8.RuneCountInString(resp.Content)
+	totalRunes := thinkRunes + ansRunes
+	if thinkRunes > 0 && totalRunes > 0 {
+		thinkFrac := float64(thinkRunes) / float64(totalRunes)
+		thinkDur := time.Duration(float64(roundTripDur) * thinkFrac)
+		pt.thinkingStart = pt.promptEvalStart
+		pt.thinkingEnd = pt.promptEvalStart.Add(thinkDur)
+		pt.answerStart = pt.thinkingEnd
+		pt.tokensThink = thinkRunes // rune-count proxy; no tokenizer in the hot path
+	} else {
+		pt.answerStart = pt.promptEvalStart
+	}
+	pt.answerEnd = pt.promptEvalEnd
 	pt.tokensAnswer = resp.Usage.OutputTokens
 
 	msg := &oaiMessage{Role: "assistant", Content: mustMarshalString(resp.Content)}
