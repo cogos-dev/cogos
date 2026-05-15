@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -151,6 +152,53 @@ func turnSidecarPath(workspaceRoot, sessionID string) string {
 // rewrites by downstream consumers).
 func turnSidecarRelPath(sessionID string) string {
 	return filepath.Join(".cog", "run", "turns", sessionID+".jsonl")
+}
+
+// extractTextFromToolCalls scans a slice of ToolCallRecords for text-bearing
+// tool calls (speak, send_text, output) and concatenates their text payloads
+// with a double-newline separator. Returns "" when no text-bearing calls exist.
+//
+// This is the fix for the audit-fidelity gap: when the model replies purely
+// via tool calls (e.g. speak({text:"..."})), resp.Content is empty and
+// turn.Response would otherwise persist as "". Callers apply this after
+// setting turn.Response = resp.Content:
+//
+//	if turn.Response == "" {
+//	    turn.Response = extractTextFromToolCalls(turn.ToolCalls)
+//	}
+func extractTextFromToolCalls(calls []ToolCallRecord) string {
+	var parts []string
+	for _, tc := range calls {
+		if tc.Arguments == "" {
+			continue
+		}
+		var args map[string]any
+		if err := json.Unmarshal([]byte(tc.Arguments), &args); err != nil {
+			continue
+		}
+		var text string
+		switch tc.Name {
+		case "speak", "output":
+			if v, ok := args["text"]; ok {
+				text, _ = v.(string)
+			}
+		case "send_text":
+			// send_text uses "content" as its text field.
+			if v, ok := args["content"]; ok {
+				text, _ = v.(string)
+			}
+			// Fallback: some callers pass "text" even on send_text.
+			if text == "" {
+				if v, ok := args["text"]; ok {
+					text, _ = v.(string)
+				}
+			}
+		}
+		if text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // truncateUTF8Bytes returns a prefix of s containing at most capBytes bytes,

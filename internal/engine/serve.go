@@ -1221,6 +1221,12 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 				})
 			}
 		}
+		// Audit-fidelity fix: when the model replies via speak/send_text/output
+		// tool calls, resp.Content is empty. Extract the text payload from the
+		// tool-call arguments so turn.Response captures what was actually said.
+		if turn.Response == "" {
+			turn.Response = extractTextFromToolCalls(turn.ToolCalls)
+		}
 	}
 
 	// Derive per-phase timings from the response payload.
@@ -1717,6 +1723,13 @@ func (s *Server) flushStreamHop(buf *streamHopBuffer, externalCalls []ToolCall,
 				OutputTokens: buf.usage.OutputTokens,
 				TotalTokens:  buf.usage.InputTokens + buf.usage.OutputTokens,
 			}
+		}
+		// Audit-fidelity fix: when the model replies via speak/send_text/output
+		// tool calls, the streaming buffer text content is empty. Extract the
+		// text payload from tool-call arguments so the turn record captures what
+		// was actually said.
+		if turn.Response == "" {
+			turn.Response = extractTextFromToolCalls(turn.ToolCalls)
 		}
 	}
 
