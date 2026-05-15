@@ -37,6 +37,7 @@
 //   - mod3_register_session     — kernel-minted session registration  (via kernel)
 //   - mod3_deregister_session   — session deregister                  (via kernel)
 //   - mod3_list_sessions        — merged kernel+mod3 session roster   (via kernel)
+//   - mod3_tail_logs            — tail chat-flow events from ring buffer (direct to mod3)
 package engine
 
 import (
@@ -194,6 +195,19 @@ func (m *MCPServer) registerMod3Tools() {
 			"block: kernel identity records + mod3's live per-channel state " +
 			"(voice_pool, voice_holders, serializer policy).",
 	}), withToolObserver(m, "mod3_list_sessions", m.toolMod3ListSessions))
+
+	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+		Name: "mod3_tail_logs",
+		Description: "Tail recent structured chat-flow events from mod3's " +
+			"in-memory ring buffer (up to 5000 events, DEBUG-level). " +
+			"Each event has: ts, event_type, session_id, message_id, " +
+			"from_seat, to_seats, content_hash, content_preview, direction. " +
+			"Optional: session_id (filter to one session), " +
+			"event_type (comma-separated, e.g. chat.message_received,chat.fan_out), " +
+			"since (ISO timestamp or relative like 5m), " +
+			"limit (default 50, max 500). " +
+			"Fallback: curl 'http://localhost:7860/v1/logs/chat-flow?limit=20'",
+	}), withToolObserver(m, "mod3_tail_logs", m.toolMod3TailLogs))
 }
 
 // ─── input / output types ────────────────────────────────────────────────────
@@ -224,6 +238,20 @@ type mod3VoicesInput struct {
 }
 
 type mod3StatusInput struct{}
+
+// mod3TailLogsInput controls the chat-flow log query parameters for mod3_tail_logs.
+type mod3TailLogsInput struct {
+	// SessionID filters to a single mod3 session (optional).
+	SessionID string `json:"session_id,omitempty"`
+	// EventType is a comma-separated list of event types to include, e.g.
+	// "chat.message_received,chat.fan_out". Empty means all types.
+	EventType string `json:"event_type,omitempty"`
+	// Since is an ISO 8601 timestamp or a relative duration like "5m" or "30s".
+	// Only events at or after this time are returned.
+	Since string `json:"since,omitempty"`
+	// Limit caps the number of events returned (default 50, max 500).
+	Limit int `json:"limit,omitempty"`
+}
 
 type mod3RegisterSessionInput struct {
 	SessionID             string `json:"session_id,omitempty"`
@@ -560,6 +588,57 @@ func (m *MCPServer) toolMod3Voices(ctx context.Context, req *mcp.CallToolRequest
 
 func (m *MCPServer) toolMod3Status(ctx context.Context, req *mcp.CallToolRequest, in mod3StatusInput) (*mcp.CallToolResult, any, error) {
 	return m.proxyMod3JSONAsMCP(ctx, http.MethodGet, "/health", nil)
+}
+
+// toolMod3TailLogs queries mod3's /v1/logs/chat-flow endpoint and returns
+// the structured event array. Supports the same filter params as the HTTP
+// endpoint: session_id, event_type, since, limit.
+//
+// Relative "since" values like "5m" or "30s" are resolved against the current
+// time before forwarding so mod3 receives a well-formed ISO timestamp.
+func (m *MCPServer) toolMod3TailLogs(ctx context.Context, req *mcp.CallToolRequest, in mod3TailLogsInput) (*mcp.CallToolResult, any, error) {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	q := url.Values{}
+	if in.SessionID != "" {
+		q.Set("session_id", in.SessionID)
+	}
+	if in.EventType != "" {
+		q.Set("event_type", in.EventType)
+	}
+	if in.Since != "" {
+		resolved := resolveSince(in.Since)
+		q.Set("since", resolved)
+	}
+	q.Set("limit", strconv.Itoa(limit))
+
+	path := "/v1/logs/chat-flow?" + q.Encode()
+	return m.proxyMod3JSONAsMCP(ctx, http.MethodGet, path, nil)
+}
+
+// resolveSince converts a relative duration string ("5m", "30s", "1h") to an
+// ISO 8601 UTC timestamp. If the input is already an ISO timestamp (contains
+// 'T' or '-') it is returned unchanged. Unrecognised formats pass through.
+func resolveSince(s string) string {
+	if s == "" {
+		return s
+	}
+	// If it looks like an ISO timestamp already, return as-is.
+	if strings.Contains(s, "T") || (len(s) > 4 && s[4] == '-') {
+		return s
+	}
+	// Try to parse as a Go duration (e.g. "5m", "30s", "1h").
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return s // pass through unmodified
+	}
+	return time.Now().UTC().Add(-d).Format(time.RFC3339)
 }
 
 // toolMod3RegisterSession routes through the kernel's shared
