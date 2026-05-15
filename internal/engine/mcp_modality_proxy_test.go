@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,13 +35,14 @@ type fakeMod3Proxy struct {
 	captured []capturedProxyRequest
 
 	// Overrides for per-endpoint behavior.
-	synthesizeHandler  http.HandlerFunc
-	stopHandler        http.HandlerFunc
-	voicesHandler      http.HandlerFunc
-	healthHandler      http.HandlerFunc
-	regHandler         http.HandlerFunc
-	deregHandler       http.HandlerFunc
-	listSessionHandler http.HandlerFunc
+	synthesizeHandler   http.HandlerFunc
+	stopHandler         http.HandlerFunc
+	voicesHandler       http.HandlerFunc
+	healthHandler       http.HandlerFunc
+	regHandler          http.HandlerFunc
+	deregHandler        http.HandlerFunc
+	listSessionHandler  http.HandlerFunc
+	chatFlowLogHandler  http.HandlerFunc
 }
 
 type capturedProxyRequest struct {
@@ -159,6 +161,30 @@ func newFakeMod3Proxy(t *testing.T) *fakeMod3Proxy {
 		writeFakeJSON(w, http.StatusOK, map[string]any{
 			"sessions":   []any{},
 			"voice_pool": []string{"bm_lewis", "af_bella"},
+		})
+	})
+
+	mux.HandleFunc("GET /v1/logs/chat-flow", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.chatFlowLogHandler != nil {
+			fm.chatFlowLogHandler(w, r)
+			return
+		}
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"events": []map[string]any{
+				{
+					"ts":              "2026-05-15T00:00:00Z",
+					"event_type":      "chat.message_received",
+					"session_id":      r.URL.Query().Get("session_id"),
+					"message_id":      "test-msg",
+					"from_seat":       "http",
+					"to_seats":        []string{},
+					"content_hash":    "b94d27b9",
+					"content_preview": "hello world",
+					"direction":       "inbound",
+				},
+			},
+			"count": 1,
 		})
 	})
 
@@ -1319,6 +1345,148 @@ func TestCheckSessionSubscriber_Mod3UnreachableReturnsError(t *testing.T) {
 	}
 	if subscribed {
 		t.Fatal("expected subscribed=false on error")
+	}
+}
+
+// ─── mod3_tail_logs ──────────────────────────────────────────────────────────
+
+// TestMod3TailLogs_BasicQuery verifies that mod3_tail_logs forwards filter
+// params to /v1/logs/chat-flow and returns parseable event structs.
+func TestMod3TailLogs_BasicQuery(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := &MCPServer{cfg: &Config{Mod3URL: fm.srv.URL}}
+
+	result, _, err := m.toolMod3TailLogs(context.Background(), nil, mod3TailLogsInput{
+		SessionID: "cs-abc123",
+		EventType: "chat.message_received",
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("toolMod3TailLogs: %v", err)
+	}
+	if result == nil {
+		t.Fatal("nil result")
+	}
+	if result.IsError {
+		t.Fatalf("tool returned IsError=true: %v", result.Content)
+	}
+
+	// Verify the HTTP layer received the expected query params.
+	last := fm.last()
+	if last.Path != "/v1/logs/chat-flow" {
+		t.Errorf("path = %q; want /v1/logs/chat-flow", last.Path)
+	}
+	if !strings.Contains(last.Query, "session_id=cs-abc123") {
+		t.Errorf("query %q missing session_id", last.Query)
+	}
+	if !strings.Contains(last.Query, "event_type=chat.message_received") {
+		t.Errorf("query %q missing event_type", last.Query)
+	}
+	if !strings.Contains(last.Query, "limit=10") {
+		t.Errorf("query %q missing limit", last.Query)
+	}
+
+	// Verify the result is parseable JSON with the expected "events" field.
+	if len(result.Content) == 0 {
+		t.Fatal("empty content")
+	}
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content[0] is %T, want *mcp.TextContent", result.Content[0])
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(tc.Text), &parsed); err != nil {
+		t.Fatalf("parse result JSON: %v (raw=%q)", err, tc.Text)
+	}
+	events, ok := parsed["events"].([]any)
+	if !ok {
+		t.Fatalf("events field missing or wrong type: %T", parsed["events"])
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	ev, ok := events[0].(map[string]any)
+	if !ok {
+		t.Fatalf("event is %T, want map", events[0])
+	}
+	if got := ev["event_type"]; got != "chat.message_received" {
+		t.Errorf("event_type = %q; want chat.message_received", got)
+	}
+}
+
+// TestMod3TailLogs_DefaultLimit verifies that the default limit (50) is sent
+// when the caller supplies 0.
+func TestMod3TailLogs_DefaultLimit(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := &MCPServer{cfg: &Config{Mod3URL: fm.srv.URL}}
+
+	_, _, err := m.toolMod3TailLogs(context.Background(), nil, mod3TailLogsInput{})
+	if err != nil {
+		t.Fatalf("toolMod3TailLogs: %v", err)
+	}
+	last := fm.last()
+	if !strings.Contains(last.Query, "limit=50") {
+		t.Errorf("query %q: want default limit=50", last.Query)
+	}
+}
+
+// TestMod3TailLogs_LimitCap verifies that limit is capped at 500.
+func TestMod3TailLogs_LimitCap(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := &MCPServer{cfg: &Config{Mod3URL: fm.srv.URL}}
+
+	_, _, err := m.toolMod3TailLogs(context.Background(), nil, mod3TailLogsInput{Limit: 9999})
+	if err != nil {
+		t.Fatalf("toolMod3TailLogs: %v", err)
+	}
+	last := fm.last()
+	if !strings.Contains(last.Query, "limit=500") {
+		t.Errorf("query %q: want capped limit=500", last.Query)
+	}
+}
+
+// TestMod3TailLogs_RelativeSince verifies that a relative "since" string like
+// "5m" is resolved to an ISO timestamp before forwarding to mod3.
+func TestMod3TailLogs_RelativeSince(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := &MCPServer{cfg: &Config{Mod3URL: fm.srv.URL}}
+
+	before := time.Now().UTC().Add(-6 * time.Minute)
+	after := time.Now().UTC().Add(-4 * time.Minute)
+
+	_, _, err := m.toolMod3TailLogs(context.Background(), nil, mod3TailLogsInput{Since: "5m"})
+	if err != nil {
+		t.Fatalf("toolMod3TailLogs: %v", err)
+	}
+	last := fm.last()
+	// since= must be present and be a parseable ISO time in the expected window.
+	for _, kv := range strings.Split(last.Query, "&") {
+		if !strings.HasPrefix(kv, "since=") {
+			continue
+		}
+		raw, _ := url.QueryUnescape(strings.TrimPrefix(kv, "since="))
+		ts, parseErr := time.Parse(time.RFC3339, raw)
+		if parseErr != nil {
+			t.Fatalf("since= value %q is not valid RFC3339: %v", raw, parseErr)
+		}
+		if ts.Before(before) || ts.After(after) {
+			t.Errorf("since=%v not in expected window [%v, %v]", ts, before, after)
+		}
+		return
+	}
+	t.Errorf("since= not found in query: %q", last.Query)
+}
+
+// TestMod3TailLogs_Unreachable verifies that an unreachable mod3 returns an
+// IsError=true result (not a Go error) so the caller sees a tool-level error.
+func TestMod3TailLogs_Unreachable(t *testing.T) {
+	m := &MCPServer{cfg: &Config{Mod3URL: "http://127.0.0.1:1"}} // port 1: always ECONNREFUSED
+	result, _, err := m.toolMod3TailLogs(context.Background(), nil, mod3TailLogsInput{})
+	if err != nil {
+		t.Fatalf("unexpected Go error (want IsError result): %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Error("expected IsError=true when mod3 is unreachable")
 	}
 }
 
