@@ -268,14 +268,14 @@ func decodeToolText(t *testing.T, res *mcp.CallToolResult) map[string]any {
 
 // ─── mod3_speak — MCP queue path ─────────────────────────────────────────────
 
-// newMCPSpeakFn builds a deterministic mcpSpeakFn stub. Each call returns a
+// newSpeakFn builds a deterministic speakFn stub. Each call returns a
 // "queued" response whose queue_position increments per call (starting at 1
 // for the first call that arrives while something is "playing"). The first
 // invocation returns a "speaking" response (queue_position 0); subsequent
 // ones simulate the queue growing.
 //
 // capturedArgs is populated with the args map each call receives, in order.
-func newMCPSpeakFn(capturedArgs *[]map[string]any) func(ctx context.Context, in mod3SpeakInput) (map[string]any, error) {
+func newSpeakFn(capturedArgs *[]map[string]any) func(ctx context.Context, in mod3SpeakInput) (map[string]any, error) {
 	var mu sync.Mutex
 	callCount := 0
 	return func(ctx context.Context, in mod3SpeakInput) (map[string]any, error) {
@@ -329,13 +329,15 @@ func newMCPSpeakFn(capturedArgs *[]map[string]any) func(ctx context.Context, in 
 	}
 }
 
-// TestMod3Speak_MCPSuccessPath — the primary happy path: mcpSpeakFn returns a
-// "speaking" response; the result must contain job_id + queue_position + no
-// playback_status field (mod3 owns playback, not the kernel).
+// TestMod3Speak_MCPSuccessPath — the primary happy path: speakFn returns a
+// "speaking" response; the result must contain job_id + queue_position.
+// With the REST transport replacing the old MCP transport, the kernel handles
+// playback locally. disablePlayback=true is set by newProxyMCP so the test
+// asserts playback_status="disabled" rather than "spawned"/"played".
 func TestMod3Speak_MCPSuccessPath(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
-	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(nil)
+	m.mod3Proxy.speakFn = newSpeakFn(nil)
 
 	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
 		Text: "hello world",
@@ -364,13 +366,11 @@ func TestMod3Speak_MCPSuccessPath(t *testing.T) {
 	if _, ok := out["estimated_wait_sec"]; !ok {
 		t.Fatal("expected estimated_wait_sec in result")
 	}
-	// The kernel must NOT be spawning afplay — no playback_status field.
-	if _, present := out["playback_status"]; present {
-		t.Fatalf("expected no playback_status on MCP path, got %v", out["playback_status"])
-	}
-	// No bytes/metrics fields on the MCP path.
-	if _, present := out["bytes"]; present {
-		t.Fatalf("unexpected bytes field on MCP path")
+	// playback_status is present; "disabled" because disablePlayback=true in
+	// newProxyMCP. The speakFn stub returns no _audio_bytes so the playback
+	// short-circuits at "disabled" (disablePlayback gate runs first).
+	if ps, _ := out["playback_status"].(string); ps != "disabled" {
+		t.Fatalf("expected playback_status=disabled (disablePlayback=true), got %v", out["playback_status"])
 	}
 }
 
@@ -379,8 +379,8 @@ func TestMod3Speak_MCPSuccessPath(t *testing.T) {
 func TestMod3Speak_MCPQueued(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
-	speakFn := newMCPSpeakFn(nil)
-	m.mod3Proxy.mcpSpeakFn = speakFn
+	speakFn := newSpeakFn(nil)
+	m.mod3Proxy.speakFn = speakFn
 
 	// First call — starts immediately.
 	_, _, _ = m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "first"})
@@ -412,13 +412,13 @@ func TestMod3Speak_MCPQueued(t *testing.T) {
 	}
 }
 
-// TestMod3Speak_MCPForwardsArgs — mcpSpeakFn receives all call-site arguments
+// TestMod3Speak_MCPForwardsArgs — speakFn receives all call-site arguments
 // (text, voice, speed, session_id) correctly.
 func TestMod3Speak_MCPForwardsArgs(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
 	var captured []map[string]any
-	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(&captured)
+	m.mod3Proxy.speakFn = newSpeakFn(&captured)
 
 	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
 		Text:      "hello",
@@ -430,7 +430,7 @@ func TestMod3Speak_MCPForwardsArgs(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(captured) == 0 {
-		t.Fatal("mcpSpeakFn not called")
+		t.Fatal("speakFn not called")
 	}
 	args := captured[0]
 	if args["text"] != "hello" {
@@ -448,19 +448,19 @@ func TestMod3Speak_MCPForwardsArgs(t *testing.T) {
 }
 
 // TestMod3Speak_MCPOmitsSessionIDWhenAbsent — no session_id on the call site
-// must not produce a session_id key in the args forwarded to mcpSpeakFn.
+// must not produce a session_id key in the args forwarded to speakFn.
 func TestMod3Speak_MCPOmitsSessionIDWhenAbsent(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
 	var captured []map[string]any
-	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(&captured)
+	m.mod3Proxy.speakFn = newSpeakFn(&captured)
 
 	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "plain"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(captured) == 0 {
-		t.Fatal("mcpSpeakFn not called")
+		t.Fatal("speakFn not called")
 	}
 	if _, present := captured[0]["session_id"]; present {
 		t.Fatalf("expected no session_id key forwarded, got %v", captured[0]["session_id"])
@@ -474,7 +474,7 @@ func TestMod3Speak_MCPOmitsSessionIDWhenAbsent(t *testing.T) {
 func TestMod3Speak_ConcurrentCallsSequenced(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
-	m.mod3Proxy.mcpSpeakFn = newMCPSpeakFn(nil)
+	m.mod3Proxy.speakFn = newSpeakFn(nil)
 
 	const n = 3
 	type result struct {
@@ -551,10 +551,11 @@ func TestMod3Speak_EmptyTextRejects(t *testing.T) {
 	}
 }
 
-// TestMod3Speak_BothPathsDownReturnsCleanError — when BOTH mod3's MCP
-// endpoint AND its HTTP /v1/synthesize are unreachable, the handler must
-// return IsError=true with a composite "mcp: ... http: ..." message.
-func TestMod3Speak_BothPathsDownReturnsCleanError(t *testing.T) {
+// TestMod3Speak_Mod3UnreachableReturnsCleanError — when mod3's /v1/synthesize
+// REST endpoint is unreachable, the handler must return IsError=true with an
+// "unreachable" message. (The old MCP-transport approach produced a composite
+// "mcp: ... http: ..." error; with the REST transport the error is simpler.)
+func TestMod3Speak_Mod3UnreachableReturnsCleanError(t *testing.T) {
 	// Port that refuses connections.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -575,45 +576,69 @@ func TestMod3Speak_BothPathsDownReturnsCleanError(t *testing.T) {
 		t.Fatal("expected IsError=true when mod3 is unreachable")
 	}
 	tc := res.Content[0].(*mcp.TextContent)
-	// Error message must mention both failure paths.
 	lower := strings.ToLower(tc.Text)
-	if !strings.Contains(lower, "mcp") || !strings.Contains(lower, "http") {
-		t.Fatalf("expected composite error mentioning 'mcp' and 'http', got %q", tc.Text)
+	if !strings.Contains(lower, "unreachable") {
+		t.Fatalf("expected 'unreachable' in error text, got %q", tc.Text)
 	}
 }
 
-// TestMod3Speak_MCPDownFallsBackToSynthesize — when MCP is unreachable but
-// /v1/synthesize is up, the kernel falls back to local playback. The result
-// carries fallback_reason to surface the MCP failure to the caller.
-func TestMod3Speak_MCPDownFallsBackToSynthesize(t *testing.T) {
+// TestMod3Speak_RESTPathNoSpeakFnInjection — verifies the primary REST path
+// works when no speakFn is injected. The kernel posts to the fake mod3's
+// /v1/synthesize, receives WAV bytes + X-Mod3-Job-Id header, and synthesizes
+// a queue-state response. disablePlayback=true means playback_status=disabled.
+func TestMod3Speak_RESTPathNoSpeakFnInjection(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
-	// No mcpSpeakFn injected — the fake server has no /mcp route so the
-	// StreamableClientTransport dial will fail, triggering the fallback.
+	// No speakFn injected — kernel uses the real REST path against the fake server.
 
 	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
-		Text: "fallback test",
+		Text: "rest path test",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("expected success (fallback path), got IsError=true: %v", res.Content)
+		t.Fatalf("expected success (REST path), got IsError=true: %v", res.Content)
 	}
 	out := decodeToolText(t, res)
-	if ok, _ := out["ok"].(bool); !ok {
-		t.Fatalf("expected ok=true in fallback response, got %v", out["ok"])
+
+	// Verify the queue-state response shape from REST headers.
+	if status, _ := out["status"].(string); status != "completed" {
+		t.Fatalf("expected status=completed from REST path, got %v", out["status"])
 	}
-	if reason, _ := out["fallback_reason"].(string); reason == "" {
-		t.Fatal("expected fallback_reason to document why MCP path was skipped")
+	if jobID, _ := out["job_id"].(string); jobID != "job-test-0001" {
+		t.Fatalf("expected job_id=job-test-0001 from X-Mod3-Job-Id header, got %v", out["job_id"])
+	}
+	if _, ok := out["queue_position"]; !ok {
+		t.Fatal("expected queue_position in REST response")
+	}
+	if _, ok := out["metrics"]; !ok {
+		t.Fatal("expected metrics block in REST response")
+	}
+	// _audio_bytes must NOT appear in the returned JSON (it's an internal field).
+	if _, present := out["_audio_bytes"]; present {
+		t.Fatal("_audio_bytes internal field must be stripped from tool response")
 	}
 	if got, _ := out["playback_status"].(string); got != "disabled" {
 		t.Fatalf("expected playback_status=disabled (disablePlayback=true), got %v", out["playback_status"])
 	}
+
+	// Verify the fake server received the POST to /v1/synthesize.
+	last := fm.last()
+	if last.Path != "/v1/synthesize" || last.Method != "POST" {
+		t.Fatalf("expected POST /v1/synthesize, got %s %s", last.Method, last.Path)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(last.Body, &body); err != nil {
+		t.Fatalf("decode forwarded body: %v", err)
+	}
+	if body["text"] != "rest path test" {
+		t.Fatalf("expected text forwarded, got %v", body["text"])
+	}
 }
 
-// TestMod3Speak_FallbackPreservesMod3ErrorBody — when the fallback path hits
-// /v1/synthesize and gets a non-2xx, the mod3 error body is preserved intact.
+// TestMod3Speak_FallbackPreservesMod3ErrorBody — when /v1/synthesize returns
+// a non-2xx, the mod3 error body is preserved intact in the tool error.
 func TestMod3Speak_FallbackPreservesMod3ErrorBody(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	fm.synthesizeHandler = func(w http.ResponseWriter, r *http.Request) {
@@ -621,7 +646,7 @@ func TestMod3Speak_FallbackPreservesMod3ErrorBody(t *testing.T) {
 		_, _ = w.Write([]byte(`{"detail":"text must not be empty"}`))
 	}
 	m := newProxyMCP(t, fm)
-	// No mcpSpeakFn — will fall through to /v1/synthesize which returns 422.
+	// No speakFn — REST path hits /v1/synthesize which returns 422.
 
 	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "bad"})
 	if err != nil {
@@ -640,15 +665,12 @@ func TestMod3Speak_FallbackPreservesMod3ErrorBody(t *testing.T) {
 }
 
 // ─── mod3_speak — legacy test names for backward-compat with existing CI ─────
-// These exercise the fallback path (fake httptest server has no /mcp).
 
 func TestMod3Speak_SuccessPath(t *testing.T) {
-	// Delegates to the canonical MCP-path test.
 	TestMod3Speak_MCPSuccessPath(t)
 }
 
 func TestMod3Speak_ForwardsSessionID(t *testing.T) {
-	// Verify session_id is forwarded on the MCP path.
 	TestMod3Speak_MCPForwardsArgs(t)
 }
 
@@ -657,7 +679,7 @@ func TestMod3Speak_OmitsSessionIDWhenAbsent(t *testing.T) {
 }
 
 func TestMod3Speak_Mod3DownReturnsCleanError(t *testing.T) {
-	TestMod3Speak_BothPathsDownReturnsCleanError(t)
+	TestMod3Speak_Mod3UnreachableReturnsCleanError(t)
 }
 
 func TestMod3Speak_PreservesMod3ErrorBody(t *testing.T) {
