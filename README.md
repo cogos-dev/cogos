@@ -136,7 +136,8 @@ The model sees a pre-focused window instead of everything-or-nothing. Zone order
 
 ### Coordination
 
-- **Reconcilers.** A generic plan/apply control loop (in `pkg/reconcile`) runs registered providers: agent, component, discord, eval, mcp-tools, and service. Each provider implements `Reconcilable` (seven methods: Type, LoadConfig, FetchLive, ComputePlan, ApplyPlan, BuildState, Health). The orchestrator handles plan, apply, drift detection, topological ordering (Kahn's sort), and three-axis status (Sync, Health, Operation) for all providers.
+- **Reconcilers.** A generic plan/apply control loop (in `pkg/reconcile`) runs registered providers: agent, component, discord, eval, mcp-tools, service, and cogdoc-review. Each provider implements `Reconcilable` (seven methods: Type, LoadConfig, FetchLive, ComputePlan, ApplyPlan, BuildState, Health). The orchestrator handles plan, apply, drift detection, topological ordering (Kahn's sort), and three-axis status (Sync, Health, Operation) for all providers.
+- **Cogdoc Review Reconciler.** Layer A deterministic prior-art gate for cogdoc authoring: deduplication check before any LLM write, with LLM-generated abstract synthesis for the observatory ingest path.
 - **Kernel-native session management.** `SessionRegistry` + `HandoffRegistry` with atomic-claim semantics: first-wins enforced at the bus boundary, not just in the in-memory cache. Bus stays ground truth; the registries are derived views rebuilt from seq-sorted replay on startup.
 - **Native agent harness.** A homeostatic assessment loop runs as a goroutine inside the kernel. Calls a local model via Ollama with six kernel-native tools. Adaptive interval (5m-30m) based on assessment urgency, with panic recovery.
 - **MCP Streamable HTTP.** Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Always-on (no build tag). 30 tools spanning observability, agent control, config, memory, sessions, handoffs, and voice.
@@ -224,6 +225,8 @@ Six kernel-native tools are available to the agent itself:
 | `POST /v1/handoffs/{id}/claim` | Atomic first-wins claim under registry lock; bus append before in-memory commit |
 | `POST /v1/handoffs/{id}/complete` | Complete a claimed handoff; optional `next_handoff_id` links recursive relays |
 | `GET /v1/handoffs` | List handoffs; filter by `state` (open, claimed, complete) and `for_session` |
+| `GET /v1/hud/state` | Claude Code HUD state snapshot (identity, session, context pressure) |
+| `GET /v1/claude-code/sessions` · `POST /v1/claude-code/sessions` | ACP-client session endpoints for Claude Code integration |
 | `GET /v1/bus/:id/events/stream` | SSE stream of broker events |
 | `GET /health` | Liveness probe (identity, state, trust) |
 | `GET /dashboard` | Embedded web dashboard |
@@ -231,7 +234,7 @@ Six kernel-native tools are available to the agent itself:
 
 All endpoints serve on port **6931** by default. `--bind <addr>` (or `bind_addr` in YAML) overrides; CORS is strict on loopback and relaxed on non-loopback binds.
 
-### MCP tools (30 total)
+### MCP tools (33 total)
 
 The always-on MCP server groups tools by surface. The `mcpserver` build tag was removed in #9. MCP ships in every binary.
 
@@ -255,6 +258,7 @@ The always-on MCP server groups tools by surface. The `mcpserver` build tag was 
 | | `cog_heartbeat_session` | Emit a heartbeat; rejected with 409 on ended sessions (no side effects) |
 | | `cog_end_session` | Graceful shutdown marker; optional `handoff_id` links the chain |
 | | `cog_list_sessions` | Aggregated roster with active-within-window flag |
+| | `cog_fork_session` | Substrate-native session fork (RFC-0005); vLLM PagedAttention-aware KV hand-off |
 | **Handoffs** | `cog_offer_handoff` | Mint an offer with kernel-side id; payload validated, TTL enforced |
 | | `cog_claim_handoff` | Atomic first-wins claim under registry lock; bus append before in-memory commit |
 | | `cog_complete_handoff` | Complete a claimed handoff; `next_handoff_id` links recursive relays |
@@ -264,12 +268,13 @@ The always-on MCP server groups tools by surface. The `mcpserver` build tag was 
 | | `cogos_memory_write` | Write or update a memory document |
 | | `cogos_coherence_check` | Drift detection across the workspace |
 | **Voice (Mod3 bridge)** | `mod3_speak` · `mod3_stop` · `mod3_voices` · `mod3_status` | TTS and voice channel control |
+| | `mod3_tail_logs` | Tail chat-flow events from the mod3 ring buffer |
 
 Sessions are created on `initialize` and expire after 30 minutes of inactivity.
 
 ### Providers
 
-Ships with adapters for Anthropic, Ollama, Claude Code, and Codex. New providers implement [six methods](docs/writing-a-provider.md).
+Ships with adapters for Anthropic, Ollama, Claude Code, Codex, and vLLM (PagedAttention scaffolding). New providers implement [six methods](docs/writing-a-provider.md). Providers support `default_options` in config for per-provider request shaping (e.g. foveal vs peripheral inference profiles).
 
 ---
 
@@ -396,7 +401,7 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 - Config mutation API (MCP + REST, merge-patch, atomic write, rollback)
 - Agent state and loop control over MCP and REST (singular routes preserved)
 - Multi-provider routing (Ollama, Anthropic, Claude Code, Codex)
-- Always-on MCP Streamable HTTP server (30 tools, sessions, JSON-RPC 2.0)
+- Always-on MCP Streamable HTTP server (33 tools, sessions, JSON-RPC 2.0)
 - Kernel-native session management with atomic handoff claim (bus-level first-wins via append-before-apply; seq-sorted replay on startup)
 - Anthropic Messages API proxy with streaming SSE
 - Native Go agent harness with adaptive interval and 6 kernel tools
@@ -433,7 +438,7 @@ CogOS is one piece of a larger system. Each component is its own repo with indep
 | **[cogos](https://github.com/myrgic/cogos)** | The daemon (this repo) | Active |
 | [constellation](https://github.com/myrgic/constellation) | L1 trust-node protocol for the Constellation substrate. Git-backed hash-chained ledger, ECDSA P-256 identity, EMA-weighted peer trust. Consumed via the kernel's `ConstellationBridge` seam. | Active |
 | [mod3](https://github.com/myrgic/mod3) | Modality bus: voice I/O, TTS, channel multiplexing | Active |
-| [skills](https://github.com/myrgic/skills) | Agent skill library (Claude Code compatible) | Active |
+| [plugins](https://github.com/myrgic/plugins) | Agent skill and plugin library (Claude Code compatible) | Active |
 | [charts](https://github.com/myrgic/charts) | Helm charts and Docker Compose for deployment | Active |
 
 ---
