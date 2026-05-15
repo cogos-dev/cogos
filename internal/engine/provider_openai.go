@@ -204,11 +204,12 @@ type openaiChatRequest struct {
 }
 
 type openaiMessage struct {
-	Role       string           `json:"role"`
-	Content    string           `json:"content"`
-	Name       string           `json:"name,omitempty"`
-	ToolCallID string           `json:"tool_call_id,omitempty"`
-	ToolCalls  []openaiToolCall `json:"tool_calls,omitempty"`
+	Role             string           `json:"role"`
+	Content          string           `json:"content"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"` // LM Studio / reasoning models (non-streaming)
+	Name             string           `json:"name,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+	ToolCalls        []openaiToolCall `json:"tool_calls,omitempty"`
 }
 
 type openaiTool struct {
@@ -422,6 +423,7 @@ func parseOpenAIResponse(or *openaiChatResponse, model, providerName string, lat
 	if len(or.Choices) > 0 {
 		choice := or.Choices[0]
 		cr.Content = choice.Message.Content
+		cr.ReasoningContent = choice.Message.ReasoningContent
 		cr.StopReason = mapOpenAIFinishReason(choice.FinishReason)
 
 		// Extract tool calls.
