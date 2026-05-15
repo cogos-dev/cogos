@@ -55,6 +55,16 @@ type TurnRecord struct {
 	Status     string           `json:"status,omitempty"`       // "ok" | "error"
 	Error      string           `json:"error,omitempty"`        // on status="error"
 	LedgerHash string           `json:"ledger_hash,omitempty"`  // turn.completed hash, filled after append
+
+	// Speculative-output fields — populated when barge-in interrupted playback
+	// mid-utterance (Slice 4). Response contains what was actually delivered to
+	// the user; ResponseSpeculative is the suffix that was generated but never
+	// played. BargeinPositionMs is the wall-time position into the utterance
+	// where playback stopped; BargeinPositionTextOffset is the character offset
+	// in Response (full text) marking the solidified/speculative boundary.
+	ResponseSpeculative         string  `json:"response_speculative,omitempty"`
+	BargeinPositionMs           float64 `json:"bargein_position_ms,omitempty"`
+	BargeinPositionTextOffset   int     `json:"bargein_position_text_offset,omitempty"`
 }
 
 // TurnUsage is a minimal (provider-neutral) token tally for a turn.
@@ -145,6 +155,93 @@ func readSidecarMaxTurnIndex(workspaceRoot, sessionID string) int {
 // turnSidecarPath returns the sidecar path for a session's turn JSONL.
 func turnSidecarPath(workspaceRoot, sessionID string) string {
 	return filepath.Join(workspaceRoot, ".cog", "run", "turns", sessionID+".jsonl")
+}
+
+// ReadLastTurn reads the most-recent TurnRecord from the session sidecar.
+// Returns nil, nil when the sidecar does not exist or is empty. Errors only
+// for genuine I/O failures (permissions, truncated JSON on last line).
+func ReadLastTurn(workspaceRoot, sessionID string) (*TurnRecord, error) {
+	path := turnSidecarPath(workspaceRoot, sessionID)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open sidecar: %w", err)
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+	var last *TurnRecord
+	for dec.More() {
+		var row TurnRecord
+		if err := dec.Decode(&row); err != nil {
+			break // ignore trailing partial line
+		}
+		copy := row
+		last = &copy
+	}
+	return last, nil
+}
+
+// PatchTurnSpeculative rewrites the most-recent TurnRecord in the session
+// sidecar to include speculative-output fields. It reads all rows, updates
+// the last one, and atomically replaces the file. This is intentionally
+// O(N) in sidecar size — sidecars are bounded (one session) and patching
+// is a rare post-turn path, not the hot inference path.
+func PatchTurnSpeculative(workspaceRoot, sessionID string, turnID string, specText string, bargeinMs float64, textOffset int) error {
+	path := turnSidecarPath(workspaceRoot, sessionID)
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open sidecar: %w", err)
+	}
+
+	dec := json.NewDecoder(f)
+	var rows []TurnRecord
+	for dec.More() {
+		var row TurnRecord
+		if err := dec.Decode(&row); err != nil {
+			break
+		}
+		rows = append(rows, row)
+	}
+	f.Close()
+
+	// Find and patch the target turn.
+	patched := false
+	for i := range rows {
+		if rows[i].TurnID == turnID {
+			rows[i].ResponseSpeculative = specText
+			rows[i].BargeinPositionMs = bargeinMs
+			rows[i].BargeinPositionTextOffset = textOffset
+			patched = true
+			break
+		}
+	}
+	if !patched {
+		return fmt.Errorf("turn %s not found in sidecar", turnID)
+	}
+
+	// Atomic rewrite: write to .tmp then rename.
+	tmp := path + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("create tmp sidecar: %w", err)
+	}
+	enc := json.NewEncoder(out)
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
+			out.Close()
+			os.Remove(tmp)
+			return fmt.Errorf("encode sidecar row: %w", err)
+		}
+	}
+	out.Close()
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename sidecar: %w", err)
+	}
+	return nil
 }
 
 // turnSidecarRelPath returns the workspace-relative sidecar path used in

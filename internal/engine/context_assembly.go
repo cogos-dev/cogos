@@ -73,6 +73,13 @@ type ContextPackage struct {
 	// + conversation history) after eviction. Equal to the original flex
 	// budget minus whatever remained unspent.
 	FlexBudgetUsed int
+
+	// PreviousTurnSpeculative is the barge-in-truncated suffix from the
+	// previous turn — text the model generated but that was never played to
+	// the user. Non-empty only when the previous turn was interrupted.
+	// Injected into the system prompt as an agent-private block so the model
+	// knows what it "almost said" without the user having heard it.
+	PreviousTurnSpeculative string
 }
 
 // FovealDoc is a single CogDoc selected for context injection.
@@ -183,17 +190,18 @@ func (p *Process) AssembleContext(query string, messages []ProviderMessage, budg
 	for _, o := range opts {
 		o(&ao)
 	}
-	return p.assembleContextInnerWithOpts(ao.ctx, ao.convID, query, messages, budget, ao.manifestMode, ao.iris)
+	return p.assembleContextInnerWithOpts(ao.ctx, ao.convID, query, messages, budget, ao.manifestMode, ao.iris, ao.previousTurnSpeculative)
 }
 
 // AssembleOption configures optional AssembleContext parameters.
 type AssembleOption func(*assembleOpts)
 
 type assembleOpts struct {
-	ctx          context.Context
-	convID       string
-	iris         irisSignal
-	manifestMode bool
+	ctx                     context.Context
+	convID                  string
+	iris                    irisSignal
+	manifestMode            bool
+	previousTurnSpeculative string
 }
 
 func assembleDefaults() assembleOpts {
@@ -222,7 +230,14 @@ func WithManifestMode(enabled bool) AssembleOption {
 	return func(o *assembleOpts) { o.manifestMode = enabled }
 }
 
-func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool, iris irisSignal) (*ContextPackage, error) {
+// WithPreviousTurnSpeculative injects the barge-in-truncated suffix from the
+// previous turn as an agent-private block in the assembled system prompt.
+// Pass "" to omit the block (no barge-in on the previous turn).
+func WithPreviousTurnSpeculative(text string) AssembleOption {
+	return func(o *assembleOpts) { o.previousTurnSpeculative = text }
+}
+
+func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool, iris irisSignal, previousTurnSpeculative string) (*ContextPackage, error) {
 	if budget <= 0 {
 		budget = p.cfg.EffectiveBudget()
 	}
@@ -241,7 +256,11 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 		outputReserve = 4096
 	}
 
-	pkg := &ContextPackage{OutputReserve: outputReserve, Budget: budget}
+	pkg := &ContextPackage{
+		OutputReserve:           outputReserve,
+		Budget:                  budget,
+		PreviousTurnSpeculative: previousTurnSpeculative,
+	}
 
 	// === Decompose client messages ===
 
@@ -281,9 +300,14 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 	if pkg.CurrentMessage != nil {
 		currentMsgTokens = estimateTokens(pkg.CurrentMessage.Content)
 	}
+	speculativeTokens := 0
+	if previousTurnSpeculative != "" {
+		// Approximate tokens for the injected speculative block (header + content).
+		speculativeTokens = estimateTokens("<previous-turn-speculative>\n" + previousTurnSpeculative + "\n</previous-turn-speculative>")
+	}
 
 	// Budget available for CogDocs + conversation history.
-	flexBudget := budget - outputReserve - nucleusTokens - clientSysTokens - currentMsgTokens
+	flexBudget := budget - outputReserve - nucleusTokens - clientSysTokens - currentMsgTokens - speculativeTokens
 	if flexBudget < 0 {
 		flexBudget = 0
 	}
@@ -476,6 +500,21 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 				sb.WriteString("\n\n")
 			}
 		}
+	}
+
+	// Inject speculative-output block as agent-private context (Slice 4).
+	// This block is visible only to the model — it is NOT shown to the user.
+	// It carries the suffix of the previous response that was generated but
+	// never delivered because the user barged in. The model can use it to
+	// decide whether to repeat, continue, or drop the unsaid content.
+	if pkg.PreviousTurnSpeculative != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n---\n")
+		}
+		sb.WriteString("<previous-turn-speculative>\n")
+		sb.WriteString("The following text was generated in your previous response but was NOT delivered to the user (they interrupted before it could be spoken). You may choose to naturally resume, re-state, or drop this content based on their new message.\n\n")
+		sb.WriteString(pkg.PreviousTurnSpeculative)
+		sb.WriteString("\n</previous-turn-speculative>")
 	}
 
 	systemPrompt := sb.String()
