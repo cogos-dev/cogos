@@ -2,23 +2,20 @@
 //
 // Wave 3 of the mod3-kernel integration (ADR-082 + channel-provider RFC),
 // consolidated in Wave 3.5 with Wave 2's session-ID authority.
-// The kernel becomes the MCP front door for mod3; the previous OpenClaw
-// gateway pattern in the installed binary read metrics but discarded audio
-// bytes. This proxy fixes that: it forwards speech requests to mod3's
-// /v1/synthesize REST endpoint and returns a queue-state-shaped response
-// derived from the response headers.
+// Wave 4.4 (this file) switches the primary speak path from the blocking
+// /v1/synthesize endpoint to the queue-aware /v1/speak endpoint, so mod3's
+// drain thread owns all audio scheduling and the kernel never spawns a local
+// afplay/aplay process.
 //
 // Design locks:
 //
-//  1. REST transport = direct POST to mod3's /v1/synthesize. Mod3 does not
-//     expose an /mcp endpoint; the prior StreamableClientTransport approach
-//     always failed with "unable to connect". The /v1/synthesize endpoint is
-//     blocking (waits for synthesis) and serializes concurrent calls
-//     server-side, so the kernel's local afplay/aplay handles playback.
-//     A synthesized queue-state response (status, job_id, metrics) is built
-//     from the X-Mod3-* response headers. The local player path and all
-//     fallback/subscriber-routing logic (Wave 4.3) are preserved unchanged.
-//     Other synthesis/control tool handlers (/v1/stop, /v1/voices, /health)
+//  1. REST transport = direct POST to mod3's /v1/speak (primary) or
+//     /v1/synthesize (skip_playback=true, raw bytes). Mod3 does not expose
+//     an /mcp endpoint; the prior StreamableClientTransport approach always
+//     failed with "unable to connect". /v1/speak is non-blocking — it enqueues
+//     and returns {job_id, queue_position, status} immediately. Mod3's drain
+//     thread handles all audio; the kernel never spawns afplay/aplay for the
+//     primary path. Other control handlers (/v1/stop, /v1/voices, /health)
 //     continue to POST/GET against cfg.Mod3URL + "/v1/*" as before.
 //  2. Session authority = kernel-owned (Wave 3.5). The session-family tools
 //     (register/deregister/list) do NOT call mod3 directly — they call the
@@ -27,9 +24,9 @@
 //     and forward to mod3. Session ID minting happens in exactly one place.
 //  3. SkipPlayback = callers that need raw bytes (dashboard WS, file write,
 //     etc.) still use the /v1/synthesize HTTP path, which returns audio/wav.
-//     The subscriber-routing path (Wave 4.3) also remains: when a session
-//     has a live dashboard WebSocket subscriber, mod3 routes WAV there
-//     independently; the kernel skips the local player.
+//     The subscriber-routing path (Wave 4.3) also remains for skip_playback:
+//     when a session has a live dashboard WebSocket subscriber, mod3 routes
+//     WAV there independently; the kernel skips the local player.
 //
 // Tools registered (prefix `mod3_` to namespace against cog_* kernel tools):
 //
@@ -136,15 +133,15 @@ func (m *MCPServer) getModalityProxy() *modalityProxy {
 func (m *MCPServer) registerMod3Tools() {
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_speak",
-		Description: "Synthesize text to speech via mod3's queue-aware speak() " +
-			"MCP tool. Required: text. Optional: session_id, voice, speed, " +
+		Description: "Synthesize text to speech via mod3's queue-aware /v1/speak " +
+			"endpoint. Required: text. Optional: session_id, voice, speed, " +
 			"emotion, skip_playback (return raw base64 bytes without queuing). " +
-			"Returns mod3's queue state: status (speaking|queued|held), job_id, " +
-			"queue_position (0=playing immediately, N=queued at position N), " +
-			"currently_playing, estimated_wait_sec, and an actions hint. " +
-			"Concurrent calls are serialized by mod3 — no overlapping audio. " +
-			"Fallback: curl -X POST http://localhost:7860/v1/synthesize " +
-			"-d '{\"text\":\"...\"}' -o out.wav && afplay out.wav",
+			"Returns mod3's queue state: status (speaking|queued), job_id, " +
+			"queue_position (0=playing immediately, N=queued at position N). " +
+			"Concurrent calls are serialized by mod3's drain thread — no " +
+			"overlapping audio, no local afplay spawned by the kernel. " +
+			"Fallback: curl -X POST http://localhost:7860/v1/speak " +
+			"-H 'Content-Type: application/json' -d '{\"text\":\"...\"}'",
 	}), withToolObserver(m, "mod3_speak", m.toolMod3Speak))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
@@ -293,65 +290,18 @@ func (m *MCPServer) toolMod3Speak(ctx context.Context, req *mcp.CallToolRequest,
 		return m.toolMod3SpeakRawBytes(ctx, in)
 	}
 
-	// Primary path: POST to mod3's /v1/synthesize REST endpoint (blocking).
-	// callMod3SpeakTool handles the HTTP round-trip and synthesises a
-	// queue-state response map from the X-Mod3-* response headers.
-	// Playback is handled locally below (mod3 synthesizes audio and returns
-	// bytes; it does not play audio server-side).
-	synthesisResult, synthesisErr := m.callMod3SpeakTool(ctx, in)
-	if synthesisErr != nil {
-		// Synthesis failed — surface a clean error; no audio to play.
-		return mod3ErrorResult(fmt.Sprintf("mod3 unreachable: %v", synthesisErr))
+	// Primary path: POST to mod3's /v1/speak REST endpoint (non-blocking,
+	// queue-aware). callMod3SpeakTool handles the HTTP round-trip and returns
+	// the JSON response {job_id, queue_position, status}. Mod3's drain thread
+	// owns all audio playback — the kernel never spawns afplay/aplay here.
+	speakResult, speakErr := m.callMod3SpeakTool(ctx, in)
+	if speakErr != nil {
+		return mod3ErrorResult(fmt.Sprintf("mod3 unreachable: %v", speakErr))
 	}
 
-	// Happy path — synthesis succeeded.  Add session_id echo for
-	// observability consistency, then handle local playback.
-	synthesisResult["session_id"] = in.SessionID
-
-	// Retrieve and strip the internal _audio_bytes transport field before
-	// any return path so the MCP response never exposes raw bytes here.
-	// (SkipPlayback callers use toolMod3SpeakRawBytes which returns base64.)
-	audioBytes, _ := synthesisResult["_audio_bytes"].([]byte)
-	delete(synthesisResult, "_audio_bytes")
-
-	p := m.getModalityProxy()
-	if p.disablePlayback {
-		synthesisResult["playback_status"] = "disabled"
-		return marshalResult(synthesisResult)
-	}
-
-	// Wave 4.3 subscriber-routing: when a session has a live dashboard
-	// WebSocket subscriber, mod3 routes WAV there independently; the kernel
-	// skips the local player.
-	if in.SessionID != "" {
-		subscribed, checkErr := m.checkSessionSubscriber(ctx, in.SessionID)
-		if checkErr != nil {
-			slog.Debug("mod3 proxy: subscriber check failed",
-				"session_id", in.SessionID, "err", checkErr)
-			synthesisResult["subscriber_check_error"] = checkErr.Error()
-		}
-		if subscribed {
-			synthesisResult["playback_status"] = "routed_ws"
-			return marshalResult(synthesisResult)
-		}
-	}
-
-	if len(audioBytes) == 0 {
-		synthesisResult["playback_status"] = "no_audio"
-		return marshalResult(synthesisResult)
-	}
-
-	playErr := p.playAudio(audioBytes, in.Blocking)
-	switch {
-	case playErr == nil && in.Blocking:
-		synthesisResult["playback_status"] = "played"
-	case playErr == nil:
-		synthesisResult["playback_status"] = "spawned"
-	default:
-		synthesisResult["playback_status"] = "error"
-		synthesisResult["playback_error"] = playErr.Error()
-	}
-	return marshalResult(synthesisResult)
+	// Echo session_id for observability consistency.
+	speakResult["session_id"] = in.SessionID
+	return marshalResult(speakResult)
 }
 
 // toolMod3SpeakRawBytes handles mod3_speak with skip_playback=true.
@@ -451,15 +401,10 @@ func (m *MCPServer) toolMod3SpeakLocalFallback(ctx context.Context, in mod3Speak
 	return marshalResult(result)
 }
 
-// callMod3SpeakTool POSTs to mod3's /v1/synthesize REST endpoint (blocking)
-// and returns a queue-state-shaped response map synthesised from the
-// X-Mod3-* response headers. The audio bytes are stashed under the internal
-// key "_audio_bytes" so toolMod3Speak can hand them to the local player
-// without re-reading.
-//
-// Mod3 does not expose an /mcp endpoint; the previous StreamableClientTransport
-// approach always failed. /v1/synthesize serialises concurrent calls server-side
-// so no additional queue-management is needed on the kernel side.
+// callMod3SpeakTool POSTs to mod3's /v1/speak REST endpoint (non-blocking,
+// queue-aware) and returns the parsed JSON response {job_id, queue_position,
+// status}. Mod3's drain thread owns all audio playback — the kernel never
+// spawns afplay/aplay for this path.
 //
 // Injectable via modalityProxy.speakFn for tests that want deterministic
 // queue-state responses without hitting a real HTTP server.
@@ -477,45 +422,47 @@ func (m *MCPServer) callMod3SpeakTool(ctx context.Context, in mod3SpeakInput) (m
 		return nil, errors.New("Mod3URL not configured")
 	}
 
-	body := buildSynthesizeBody(in)
+	body := buildSpeakBody(in)
 	raw, _ := json.Marshal(body)
 
-	audio, headers, status, err := m.proxyMod3Bytes(ctx, http.MethodPost,
-		"/v1/synthesize", bytes.NewReader(raw), "application/json")
+	respBytes, _, status, err := m.proxyMod3Bytes(ctx, http.MethodPost,
+		"/v1/speak", bytes.NewReader(raw), "application/json")
 	if err != nil {
-		return nil, fmt.Errorf("mod3 /v1/synthesize: %w", err)
+		return nil, fmt.Errorf("mod3 /v1/speak: %w", err)
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("mod3 returned %d: %s", status, truncate(string(audio), 400))
+		return nil, fmt.Errorf("mod3 returned %d: %s", status, truncate(string(respBytes), 400))
 	}
 
-	metrics := extractMod3Metrics(headers)
-
-	// Extract the job_id from the X-Mod3-Job-Id header so callers get a
-	// stable correlation handle even when the queue-position concept is N/A
-	// (synthesize is blocking; by the time we return, the job is done).
-	jobID := headers.Get("X-Mod3-Job-Id")
-	if jobID == "" {
-		jobID = "inline"
-	}
-
-	result := map[string]any{
-		"status":              "completed",
-		"job_id":              jobID,
-		"queue_position":      float64(0),
-		"estimated_wait_sec":  float64(0),
-		"metrics":             metrics,
-		// _audio_bytes is an internal transport field stripped before the
-		// MCP response is sent; it lets toolMod3Speak hand raw bytes to the
-		// local player without a second HTTP round-trip.
-		"_audio_bytes": audio,
+	// Parse the JSON response — {job_id, queue_position, status}.
+	var result map[string]any
+	if jsonErr := json.Unmarshal(respBytes, &result); jsonErr != nil {
+		return nil, fmt.Errorf("mod3 /v1/speak: decode response: %w (raw=%s)", jsonErr, truncate(string(respBytes), 200))
 	}
 	return result, nil
 }
 
+// buildSpeakBody constructs the JSON body for a /v1/speak request.
+// Used by callMod3SpeakTool for the primary queue-aware speak path.
+func buildSpeakBody(in mod3SpeakInput) map[string]any {
+	body := map[string]any{"text": in.Text}
+	if in.Voice != "" {
+		body["voice"] = in.Voice
+	}
+	if in.Speed > 0 {
+		body["speed"] = in.Speed
+	}
+	if in.Emotion > 0 {
+		body["emotion"] = in.Emotion
+	}
+	if in.SessionID != "" {
+		body["session_id"] = in.SessionID
+	}
+	return body
+}
+
 // buildSynthesizeBody constructs the JSON body for a /v1/synthesize request
-// from a mod3SpeakInput. Shared between the raw-bytes path and the local
-// fallback.
+// from a mod3SpeakInput. Used only by the raw-bytes path (skip_playback=true).
 func buildSynthesizeBody(in mod3SpeakInput) map[string]any {
 	body := map[string]any{"text": in.Text}
 	if in.Voice != "" {
