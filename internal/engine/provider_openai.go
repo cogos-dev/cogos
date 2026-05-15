@@ -33,13 +33,14 @@ const (
 
 // OpenAICompatProvider implements Provider against any OpenAI-compatible server.
 type OpenAICompatProvider struct {
-	name      string
-	endpoint  string // e.g. "http://<inference-host>:<port>" (local or remote)
-	apiKey    string // optional; some local servers don't require auth
-	model     string
-	maxTokens int
-	timeout   time.Duration
-	client    *http.Client
+	name           string
+	endpoint       string // e.g. "http://<inference-host>:<port>" (local or remote)
+	apiKey         string // optional; some local servers don't require auth
+	model          string
+	maxTokens      int
+	timeout        time.Duration
+	client         *http.Client
+	defaultOptions map[string]interface{} // extra fields merged into every request body
 }
 
 // NewOpenAICompatProvider creates an OpenAICompatProvider from a ProviderConfig.
@@ -61,14 +62,35 @@ func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvi
 	if cfg.APIKeyEnv != "" {
 		apiKey = os.Getenv(cfg.APIKeyEnv)
 	}
+
+	// Extract default_options from the provider's Options map. These key/value
+	// pairs are merged into every request body verbatim, allowing per-provider
+	// request shaping without new struct fields.
+	//
+	// Example: set `reasoning_effort: "none"` on a foveal/conversational provider
+	// to suppress Eclipse 26b A4B thinking tokens (empirically verified 2026-05-15:
+	// `reasoning_effort: "none"` removes reasoning_content entirely; "minimal" does
+	// not). The peripheral/deliberation variant omits this option so thinking runs.
+	//
+	// Future direction (Option B): a separate `lmstudio-eclipse-peripheral` provider
+	// entry pointing at the same endpoint+model but without default_options, so the
+	// kernel can route deliberation work to the thinking-enabled variant explicitly.
+	var defaultOpts map[string]interface{}
+	if raw, ok := cfg.Options["default_options"]; ok {
+		if m, ok := raw.(map[string]interface{}); ok && len(m) > 0 {
+			defaultOpts = m
+		}
+	}
+
 	return &OpenAICompatProvider{
-		name:      name,
-		endpoint:  normalizeLocalLLMEndpoint(endpoint),
-		apiKey:    apiKey,
-		model:     cfg.Model,
-		maxTokens: maxTokens,
-		timeout:   timeout,
-		client:    &http.Client{Timeout: timeout},
+		name:           name,
+		endpoint:       normalizeLocalLLMEndpoint(endpoint),
+		apiKey:         apiKey,
+		model:          cfg.Model,
+		maxTokens:      maxTokens,
+		timeout:        timeout,
+		client:         &http.Client{Timeout: timeout},
+		defaultOptions: defaultOpts,
 	}
 }
 
@@ -370,6 +392,34 @@ func buildOpenAIRequest(model string, req *CompletionRequest, stream bool, maxTo
 	return or
 }
 
+// marshalRequest serializes an openaiChatRequest and merges in any
+// provider-level defaultOptions. The merge happens after struct serialization
+// so per-request fields always win over provider defaults when both are set.
+// Returns an error if either serialization step fails.
+func (p *OpenAICompatProvider) marshalRequest(payload *openaiChatRequest) ([]byte, error) {
+	if len(p.defaultOptions) == 0 {
+		return json.Marshal(payload)
+	}
+	// Serialize the struct, unmarshal into a generic map, inject defaults,
+	// then re-serialize. This keeps all struct fields intact while allowing
+	// arbitrary extra keys (e.g. reasoning_effort) without new typed fields.
+	structBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]interface{}
+	if err := json.Unmarshal(structBytes, &merged); err != nil {
+		return nil, err
+	}
+	for k, v := range p.defaultOptions {
+		// Only inject if the struct didn't set this key (struct fields win).
+		if _, exists := merged[k]; !exists {
+			merged[k] = v
+		}
+	}
+	return json.Marshal(merged)
+}
+
 // ── Complete ─────────────────────────────────────────────────────────────────
 
 // Complete sends a non-streaming request and returns the full response.
@@ -378,7 +428,7 @@ func (p *OpenAICompatProvider) Complete(ctx context.Context, req *CompletionRequ
 	model := p.effectiveModel(req)
 
 	payload := buildOpenAIRequest(model, req, false, p.maxTokens)
-	body, err := json.Marshal(payload)
+	body, err := p.marshalRequest(payload)
 	if err != nil {
 		return nil, fmt.Errorf("openai-compat: marshal request: %w", err)
 	}
@@ -471,7 +521,7 @@ func mapOpenAIFinishReason(reason string) string {
 func (p *OpenAICompatProvider) Stream(ctx context.Context, req *CompletionRequest) (<-chan StreamChunk, error) {
 	model := p.effectiveModel(req)
 	payload := buildOpenAIRequest(model, req, true, p.maxTokens)
-	body, err := json.Marshal(payload)
+	body, err := p.marshalRequest(payload)
 	if err != nil {
 		return nil, fmt.Errorf("openai-compat: marshal stream request: %w", err)
 	}

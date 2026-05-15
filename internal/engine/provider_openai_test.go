@@ -915,3 +915,139 @@ func TestNewOpenAICompatProviderNormalizesTrailingV1(t *testing.T) {
 		t.Fatalf("endpoint = %q; want http://localhost:1234", p.endpoint)
 	}
 }
+
+// ── marshalRequest / default_options ─────────────────────────────────────────
+
+// TestMarshalRequestNoDefaultOptions verifies that marshalRequest without any
+// defaultOptions produces the same JSON as a plain json.Marshal.
+func TestMarshalRequestNoDefaultOptions(t *testing.T) {
+	t.Parallel()
+	p := NewOpenAICompatProvider("openai-compat", ProviderConfig{Model: "m"})
+	payload := buildOpenAIRequest("m", &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	}, false, 4096)
+	got, err := p.marshalRequest(payload)
+	if err != nil {
+		t.Fatalf("marshalRequest: %v", err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, hasExtra := raw["reasoning_effort"]; hasExtra {
+		t.Error("reasoning_effort should not be present when no defaultOptions configured")
+	}
+}
+
+// TestMarshalRequestDefaultOptionsInjected verifies that defaultOptions keys are
+// merged into the wire body when configured.
+func TestMarshalRequestDefaultOptionsInjected(t *testing.T) {
+	t.Parallel()
+	p := NewOpenAICompatProvider("openai-compat", ProviderConfig{
+		Model: "m",
+		Options: map[string]interface{}{
+			"default_options": map[string]interface{}{
+				"reasoning_effort": "none",
+			},
+		},
+	})
+	payload := buildOpenAIRequest("m", &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	}, false, 4096)
+	got, err := p.marshalRequest(payload)
+	if err != nil {
+		t.Fatalf("marshalRequest: %v", err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if raw["reasoning_effort"] != "none" {
+		t.Errorf("reasoning_effort = %v; want none", raw["reasoning_effort"])
+	}
+	// Standard fields must still be present.
+	if _, ok := raw["model"]; !ok {
+		t.Error("model field missing from wire body")
+	}
+	if _, ok := raw["messages"]; !ok {
+		t.Error("messages field missing from wire body")
+	}
+}
+
+// TestMarshalRequestStructFieldsWinOverDefaults verifies that per-request struct
+// fields take precedence over defaultOptions when both address the same key.
+func TestMarshalRequestStructFieldsWinOverDefaults(t *testing.T) {
+	t.Parallel()
+	// Simulate a case where a future struct field might overlap with a default option.
+	// Use "stream" as the overlap field (struct sets it to false; we try to
+	// inject true via defaultOptions — struct must win).
+	p := NewOpenAICompatProvider("openai-compat", ProviderConfig{
+		Model: "m",
+		Options: map[string]interface{}{
+			"default_options": map[string]interface{}{
+				"reasoning_effort": "none",
+				"stream":           true, // attempt to override the struct's stream=false
+			},
+		},
+	})
+	payload := buildOpenAIRequest("m", &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	}, false /* stream=false */, 4096)
+	got, err := p.marshalRequest(payload)
+	if err != nil {
+		t.Fatalf("marshalRequest: %v", err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(got, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// struct value (false) must win over defaultOptions value (true).
+	if stream, _ := raw["stream"].(bool); stream != false {
+		t.Errorf("stream = %v; want false (struct field must win over default_options)", raw["stream"])
+	}
+	// Non-conflicting default must still be injected.
+	if raw["reasoning_effort"] != "none" {
+		t.Errorf("reasoning_effort = %v; want none", raw["reasoning_effort"])
+	}
+}
+
+// TestNewOpenAICompatProviderLoadsDefaultOptions verifies that ProviderConfig
+// Options["default_options"] is correctly parsed into the provider's defaultOptions map.
+func TestNewOpenAICompatProviderLoadsDefaultOptions(t *testing.T) {
+	t.Parallel()
+	p := NewOpenAICompatProvider("lmstudio-eclipse", ProviderConfig{
+		Endpoint: "http://192.168.10.191:1234",
+		Model:    "google/gemma-4-26b-a4b",
+		Options: map[string]interface{}{
+			"is_local":    true,
+			"health_path": "/v1/models",
+			"default_options": map[string]interface{}{
+				"reasoning_effort": "none",
+			},
+		},
+	})
+	if p.defaultOptions == nil {
+		t.Fatal("defaultOptions should not be nil when default_options is present in Options")
+	}
+	if p.defaultOptions["reasoning_effort"] != "none" {
+		t.Errorf("defaultOptions[reasoning_effort] = %v; want none", p.defaultOptions["reasoning_effort"])
+	}
+}
+
+// TestNewOpenAICompatProviderNoDefaultOptions verifies that a provider with no
+// default_options entry leaves defaultOptions nil (zero-cost path: no map alloc,
+// marshalRequest falls through to plain json.Marshal).
+func TestNewOpenAICompatProviderNoDefaultOptions(t *testing.T) {
+	t.Parallel()
+	p := NewOpenAICompatProvider("lmstudio-eclipse", ProviderConfig{
+		Endpoint: "http://192.168.10.191:1234",
+		Model:    "google/gemma-4-26b-a4b",
+		Options: map[string]interface{}{
+			"is_local":    true,
+			"health_path": "/v1/models",
+		},
+	})
+	if p.defaultOptions != nil {
+		t.Errorf("defaultOptions should be nil when not configured; got %v", p.defaultOptions)
+	}
+}
