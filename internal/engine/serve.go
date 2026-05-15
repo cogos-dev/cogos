@@ -859,6 +859,29 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Fetch the most-recent barge-in event from mod3 for this session.
+	// Used two ways: (a) inject previous-turn speculative text into context,
+	// (b) backfill the previous turn's sidecar row after RecordTurn.
+	// Best-effort: a nil event means no barge-in occurred or mod3 is down.
+	var bargeinEv *mod3BargeinEvent
+	if s.cfg != nil && s.cfg.Mod3URL != "" {
+		bargeinEv = fetchRecentBargeinEvent(r.Context(), s.cfg.Mod3URL, block.SessionID)
+	}
+	previousSpeculative := ""
+	if bargeinEv != nil {
+		previousSpeculative = bargeinEv.TextSpeculative
+	}
+
+	// Read the previous turn's TurnID now (before RecordTurn writes the new
+	// row) so we can backfill speculative fields after inference completes.
+	// best-effort: nil means first turn or sidecar unreadable.
+	var previousTurnID string
+	if bargeinEv != nil {
+		if prev, err := ReadLastTurn(s.cfg.WorkspaceRoot, block.SessionID); err == nil && prev != nil {
+			previousTurnID = prev.TurnID
+		}
+	}
+
 	// Allow per-request budget override via the X-Cogos-Context-Budget header.
 	// A value of 0 (absent or unparseable) defers to the kernel's configured
 	// default_budget (or the package-level DefaultBudget fallback).
@@ -873,6 +896,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		WithContext(r.Context()),
 		WithConversationID(creq.Metadata.RequestID),
 		WithManifestMode(true),
+		WithPreviousTurnSpeculative(previousSpeculative),
 	); err != nil {
 		slog.Warn("chat: context assembly failed", "err", err)
 		// Fallback: preserve any client-supplied role=system messages as the
@@ -1044,6 +1068,28 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	turn.DurationMs = time.Since(inferStart).Milliseconds()
 	if err := s.process.RecordTurn(turn); err != nil {
 		slog.Warn("chat: RecordTurn failed", "err", err, "session", turn.SessionID)
+	}
+
+	// Backfill the previous turn's sidecar row with barge-in position data.
+	// This is the speculative-output bookkeeping (Slice 4): the previous turn
+	// was interrupted, so we patch its ResponseSpeculative/BargeinPositionMs/
+	// BargeinPositionTextOffset fields now that we know them. Done after the
+	// current turn is persisted to avoid ordering hazards.
+	if bargeinEv != nil && previousTurnID != "" {
+		if err := PatchTurnSpeculative(
+			s.cfg.WorkspaceRoot,
+			block.SessionID,
+			previousTurnID,
+			bargeinEv.TextSpeculative,
+			bargeinEv.BargeinPositionMs,
+			bargeinEv.BargeinPositionTextOffset,
+		); err != nil {
+			slog.Debug("chat: PatchTurnSpeculative failed (best-effort)",
+				"err", err,
+				"prev_turn_id", previousTurnID,
+				"session", block.SessionID,
+			)
+		}
 	}
 
 	// Capture debug snapshot (best-effort, non-blocking).
