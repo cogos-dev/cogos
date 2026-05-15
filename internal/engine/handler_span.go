@@ -116,6 +116,77 @@ func (e *serverSpanEmitter) emitSpan(span KernelHandlerSpan) {
 	}
 }
 
+// ChatSubSpan carries timing and token data for one phase of a chat turn.
+// Emitted to bus_traces as "kernel.chat.subspan.v1" events so operators can
+// reconstruct per-phase latency (prompt_eval, thinking_generation,
+// answer_generation, tool_call_resolution) from the bus without a Jaeger
+// collector.  All durations are wall-clock milliseconds.
+//
+// To export to Jaeger, set OTEL_EXPORTER_OTLP_ENDPOINT and run:
+//   docker run -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one
+// The OTel SDK in telemetry.go will pick it up automatically.
+type ChatSubSpan struct {
+	SpanName      string    `json:"span_name"`      // e.g. "chat.answer_generation"
+	ParentSpanID  string    `json:"parent_span_id"` // outer chat.request handler span
+	TraceID       string    `json:"trace_id"`       // W3C trace-id (hex, 32 chars) if available
+	StartedAt     time.Time `json:"started_at"`
+	DurationMS    int64     `json:"duration_ms"`
+	TokensThink   int       `json:"tokens_think,omitempty"`  // reasoning token count (est.)
+	TokensAnswer  int       `json:"tokens_answer,omitempty"` // answer token count (est.)
+	TokensTotal   int       `json:"tokens_total,omitempty"`  // total completion tokens
+	ToolCallCount int       `json:"tool_calls,omitempty"`
+	Model         string    `json:"model,omitempty"`
+	SessionID     string    `json:"session_id,omitempty"`
+}
+
+// emitChatSubSpan writes a ChatSubSpan to bus_traces. It is a no-op if bus
+// is nil. Errors are logged at WARN level and never returned — telemetry must
+// not disrupt the hot path.
+func emitChatSubSpan(bus *BusSessionManager, sub ChatSubSpan) {
+	if bus == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"span_name":    sub.SpanName,
+		"started_at":   sub.StartedAt.UTC().Format(time.RFC3339Nano),
+		"duration_ms":  sub.DurationMS,
+	}
+	if sub.ParentSpanID != "" {
+		payload["parent_span_id"] = sub.ParentSpanID
+	}
+	if sub.TraceID != "" {
+		payload["trace_id"] = sub.TraceID
+	}
+	if sub.TokensThink > 0 {
+		payload["tokens_think"] = sub.TokensThink
+	}
+	if sub.TokensAnswer > 0 {
+		payload["tokens_answer"] = sub.TokensAnswer
+	}
+	if sub.TokensTotal > 0 {
+		payload["tokens_total"] = sub.TokensTotal
+	}
+	if sub.ToolCallCount > 0 {
+		payload["tool_calls"] = sub.ToolCallCount
+	}
+	if sub.Model != "" {
+		payload["model"] = sub.Model
+	}
+	if sub.SessionID != "" {
+		payload["session_id"] = sub.SessionID
+	}
+	if err := bus.EnsureBus(BusTraces); err != nil {
+		slog.Warn("chat_subspan: ensure bus_traces failed", "err", err)
+		return
+	}
+	if err := bus.RegisterBus(BusTraces, "kernel", "kernel"); err != nil {
+		slog.Warn("chat_subspan: register bus_traces failed", "err", err)
+	}
+	if _, err := bus.AppendEvent(BusTraces, "kernel.chat.subspan.v1", "kernel", payload); err != nil {
+		slog.Warn("chat_subspan: AppendEvent failed", "err", err, "span", sub.SpanName)
+	}
+}
+
 // capturingResponseWriter wraps http.ResponseWriter to intercept the status
 // code and count the bytes written to the response body. It implements
 // http.Flusher so SSE handlers keep working: if the underlying writer is a

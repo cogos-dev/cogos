@@ -266,9 +266,10 @@ type openaiStreamChoice struct {
 }
 
 type openaiStreamDelta struct {
-	Role      string                    `json:"role,omitempty"`
-	Content   string                    `json:"content,omitempty"`
-	ToolCalls []openaiStreamToolCall    `json:"tool_calls,omitempty"`
+	Role             string                 `json:"role,omitempty"`
+	Content          string                 `json:"content,omitempty"`
+	ReasoningContent string                 `json:"reasoning_content,omitempty"` // LM Studio / reasoning models
+	ToolCalls        []openaiStreamToolCall `json:"tool_calls,omitempty"`
 }
 
 // openaiStreamToolCall is the streaming variant of a tool call delta.
@@ -547,6 +548,15 @@ func parseOpenAISSE(ctx context.Context, r io.Reader, ch chan<- StreamChunk, mod
 		}
 
 		for _, choice := range chunk.Choices {
+			// Reasoning/thinking content delta (LM Studio reasoning models,
+			// e.g. Eclipse 26b A4B). Tagged with IsReasoning so the handler
+			// can measure the thinking phase separately from answer generation.
+			if choice.Delta.ReasoningContent != "" {
+				if !send(StreamChunk{Delta: choice.Delta.ReasoningContent, IsReasoning: true}) {
+					return
+				}
+			}
+
 			// Text content delta.
 			if choice.Delta.Content != "" {
 				if !send(StreamChunk{Delta: choice.Delta.Content}) {
