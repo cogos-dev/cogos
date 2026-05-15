@@ -1014,14 +1014,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// correlation key instead and let the operator join on session_id+ts.
 	sessionID := block.SessionID
 
+	// Extract the W3C trace-id from the incoming traceparent header so the
+	// sub-span events can share the same trace_id as the mod3 phase events that
+	// injected it (CogOSProvider._make_traceparent). This lets the trace panel
+	// join mod3 phase events with kernel sub-spans by trace_id.
+	// Format: "00-<trace_id_32hex>-<parent_id_16hex>-<flags>"
+	var subSpanTraceID string
+	if tp := r.Header.Get("traceparent"); tp != "" {
+		if parts := strings.SplitN(tp, "-", 4); len(parts) == 4 && len(parts[1]) == 32 {
+			subSpanTraceID = parts[1]
+		}
+	}
+
 	// chat.prompt_eval — covers context assembly + upstream connection setup.
 	if !pt.promptEvalStart.IsZero() && !pt.promptEvalEnd.IsZero() {
 		emitChatSubSpan(s.busSessions, ChatSubSpan{
-			SpanName:  "chat.prompt_eval",
-			StartedAt: pt.promptEvalStart,
+			SpanName:   "chat.prompt_eval",
+			TraceID:    subSpanTraceID,
+			StartedAt:  pt.promptEvalStart,
 			DurationMS: pt.promptEvalEnd.Sub(pt.promptEvalStart).Milliseconds(),
-			Model:     model,
-			SessionID: sessionID,
+			Model:      model,
+			SessionID:  sessionID,
 		})
 	}
 
@@ -1029,6 +1042,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if !pt.thinkingStart.IsZero() {
 		emitChatSubSpan(s.busSessions, ChatSubSpan{
 			SpanName:    "chat.thinking_generation",
+			TraceID:     subSpanTraceID,
 			StartedAt:   pt.thinkingStart,
 			DurationMS:  pt.thinkingEnd.Sub(pt.thinkingStart).Milliseconds(),
 			TokensThink: pt.tokensThink,
@@ -1042,6 +1056,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		totalToks := pt.tokensThink + pt.tokensAnswer
 		emitChatSubSpan(s.busSessions, ChatSubSpan{
 			SpanName:     "chat.answer_generation",
+			TraceID:      subSpanTraceID,
 			StartedAt:    pt.answerStart,
 			DurationMS:   pt.answerEnd.Sub(pt.answerStart).Milliseconds(),
 			TokensAnswer: pt.tokensAnswer,
@@ -1055,6 +1070,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if !pt.toolCallStart.IsZero() {
 		emitChatSubSpan(s.busSessions, ChatSubSpan{
 			SpanName:      "chat.tool_call_resolution",
+			TraceID:       subSpanTraceID,
 			StartedAt:     pt.toolCallStart,
 			DurationMS:    pt.toolCallEnd.Sub(pt.toolCallStart).Milliseconds(),
 			ToolCallCount: pt.toolCallCount,
