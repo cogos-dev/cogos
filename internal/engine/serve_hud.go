@@ -100,22 +100,42 @@ func (s *Server) handleHUDState(w http.ResponseWriter, r *http.Request) {
 	trust := s.process.TrustSnapshot()
 	identity.TrustScore = trust.LocalScore
 
-	// Active foveated-context sessions.
-	sessionSnap := s.sessions.Snapshot()
-	sessions := make([]HUDSession, 0, len(sessionSnap))
-	for _, st := range sessionSnap {
-		sessions = append(sessions, HUDSession{
+	// Active sessions: merge SessionContextStore (foveated chat sessions) with
+	// ChannelSessionRegistry (mod3 channel sessions). The channel registry
+	// contains live mod3 dashboard sessions; the context store contains sessions
+	// that have made /v1/chat/completions requests to the kernel. Both are
+	// populated from separate code paths — include both so the HUD shows all
+	// active sessions regardless of which path each session took.
+	sessionSet := make(map[string]HUDSession)
+	for _, st := range s.sessions.Snapshot() {
+		sessionSet[st.SessionID] = HUDSession{
 			SessionID:     st.SessionID,
 			Profile:       st.Profile,
 			TurnNumber:    st.TurnNumber,
 			IrisPressure:  st.IrisPressure,
 			TotalTokens:   st.TotalTokens,
 			LastRequestAt: st.LastRequestAt,
-		})
+		}
+	}
+	// Layer channel-session records on top (or as additions).
+	for _, rec := range s.channelSessionRegistry.Snapshot() {
+		if _, exists := sessionSet[rec.SessionID]; !exists {
+			sessionSet[rec.SessionID] = HUDSession{
+				SessionID:     rec.SessionID,
+				Profile:       rec.ParticipantType,
+				LastRequestAt: rec.LastSeen,
+			}
+		}
+	}
+	sessions := make([]HUDSession, 0, len(sessionSet))
+	for _, s := range sessionSet {
+		sessions = append(sessions, s)
 	}
 
 	// Recent URIs from the attentional field fovea (top 10).
-	foveaEntries := s.process.Field().Fovea(10)
+	// Use BaseFovea (no inbox-raw boost) so chatgpt-archive inbox entries
+	// don't dominate the list — same as the chat-read view in context_blocks.go.
+	foveaEntries := s.process.Field().BaseFovea(10)
 	recentURIs := make([]HUDURI, 0, len(foveaEntries))
 	for _, fs := range foveaEntries {
 		recentURIs = append(recentURIs, HUDURI{
@@ -125,8 +145,14 @@ func (s *Server) handleHUDState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Node health summary.
+	// If no probe has fired yet (empty map), trigger one on-demand so the HUD
+	// reports the same data as /health. This is safe: Probe() is designed for
+	// concurrent goroutine use and the 2s per-probe timeout is bounded.
 	var nodeHealth map[string]string
 	if nh := s.process.NodeHealth(); nh != nil {
+		if nm := s.process.NodeManifest(); nm != nil && len(nh.Summary()) == 0 {
+			nh.Probe(nm, s.cfg.Port)
+		}
 		nodeHealth = nh.Summary()
 	}
 	if nodeHealth == nil {
