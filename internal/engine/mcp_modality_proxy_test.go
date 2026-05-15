@@ -35,6 +35,7 @@ type fakeMod3Proxy struct {
 	captured []capturedProxyRequest
 
 	// Overrides for per-endpoint behavior.
+	speakHandler        http.HandlerFunc
 	synthesizeHandler   http.HandlerFunc
 	stopHandler         http.HandlerFunc
 	voicesHandler       http.HandlerFunc
@@ -65,6 +66,22 @@ func newFakeMod3Proxy(t *testing.T) *fakeMod3Proxy {
 	fm := &fakeMod3Proxy{t: t}
 	mux := http.NewServeMux()
 
+	// POST /v1/speak — primary queue-aware speak endpoint (non-blocking, JSON).
+	mux.HandleFunc("POST /v1/speak", func(w http.ResponseWriter, r *http.Request) {
+		fm.capture(r)
+		if fm.speakHandler != nil {
+			fm.speakHandler(w, r)
+			return
+		}
+		// Default: return a "speaking" response (queue_position=0, first call).
+		writeFakeJSON(w, http.StatusOK, map[string]any{
+			"job_id":         "job-speak-0001",
+			"queue_position": 0,
+			"status":         "speaking",
+		})
+	})
+
+	// POST /v1/synthesize — raw-bytes path (skip_playback=true or legacy).
 	mux.HandleFunc("POST /v1/synthesize", func(w http.ResponseWriter, r *http.Request) {
 		fm.capture(r)
 		if fm.synthesizeHandler != nil {
@@ -331,9 +348,8 @@ func newSpeakFn(capturedArgs *[]map[string]any) func(ctx context.Context, in mod
 
 // TestMod3Speak_MCPSuccessPath — the primary happy path: speakFn returns a
 // "speaking" response; the result must contain job_id + queue_position.
-// With the REST transport replacing the old MCP transport, the kernel handles
-// playback locally. disablePlayback=true is set by newProxyMCP so the test
-// asserts playback_status="disabled" rather than "spawned"/"played".
+// With the queue-aware /v1/speak endpoint, mod3 owns playback — the kernel
+// returns the JSON queue state directly without setting playback_status.
 func TestMod3Speak_MCPSuccessPath(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
@@ -366,11 +382,10 @@ func TestMod3Speak_MCPSuccessPath(t *testing.T) {
 	if _, ok := out["estimated_wait_sec"]; !ok {
 		t.Fatal("expected estimated_wait_sec in result")
 	}
-	// playback_status is present; "disabled" because disablePlayback=true in
-	// newProxyMCP. The speakFn stub returns no _audio_bytes so the playback
-	// short-circuits at "disabled" (disablePlayback gate runs first).
-	if ps, _ := out["playback_status"].(string); ps != "disabled" {
-		t.Fatalf("expected playback_status=disabled (disablePlayback=true), got %v", out["playback_status"])
+	// playback_status is NOT set by the primary path — mod3's drain thread
+	// owns all audio scheduling; the kernel no longer reports local player status.
+	if _, present := out["playback_status"]; present {
+		t.Fatalf("playback_status must not appear in primary /v1/speak response, got %v", out["playback_status"])
 	}
 }
 
@@ -584,8 +599,8 @@ func TestMod3Speak_Mod3UnreachableReturnsCleanError(t *testing.T) {
 
 // TestMod3Speak_RESTPathNoSpeakFnInjection — verifies the primary REST path
 // works when no speakFn is injected. The kernel posts to the fake mod3's
-// /v1/synthesize, receives WAV bytes + X-Mod3-Job-Id header, and synthesizes
-// a queue-state response. disablePlayback=true means playback_status=disabled.
+// /v1/speak (queue-aware) and receives a JSON {job_id, queue_position, status}
+// response. Mod3 owns playback — no playback_status set by the kernel.
 func TestMod3Speak_RESTPathNoSpeakFnInjection(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
@@ -602,31 +617,31 @@ func TestMod3Speak_RESTPathNoSpeakFnInjection(t *testing.T) {
 	}
 	out := decodeToolText(t, res)
 
-	// Verify the queue-state response shape from REST headers.
-	if status, _ := out["status"].(string); status != "completed" {
-		t.Fatalf("expected status=completed from REST path, got %v", out["status"])
+	// Verify the queue-state response shape from /v1/speak JSON body.
+	if status, _ := out["status"].(string); status != "speaking" {
+		t.Fatalf("expected status=speaking from /v1/speak, got %v", out["status"])
 	}
-	if jobID, _ := out["job_id"].(string); jobID != "job-test-0001" {
-		t.Fatalf("expected job_id=job-test-0001 from X-Mod3-Job-Id header, got %v", out["job_id"])
+	if jobID, _ := out["job_id"].(string); jobID != "job-speak-0001" {
+		t.Fatalf("expected job_id=job-speak-0001 from /v1/speak, got %v", out["job_id"])
 	}
-	if _, ok := out["queue_position"]; !ok {
-		t.Fatal("expected queue_position in REST response")
+	if qp, ok := out["queue_position"]; !ok {
+		t.Fatal("expected queue_position in /v1/speak response")
+	} else if qp.(float64) != 0 {
+		t.Fatalf("expected queue_position=0, got %v", qp)
 	}
-	if _, ok := out["metrics"]; !ok {
-		t.Fatal("expected metrics block in REST response")
-	}
-	// _audio_bytes must NOT appear in the returned JSON (it's an internal field).
+	// _audio_bytes must NOT appear — /v1/speak returns JSON not WAV bytes.
 	if _, present := out["_audio_bytes"]; present {
-		t.Fatal("_audio_bytes internal field must be stripped from tool response")
+		t.Fatal("_audio_bytes must not appear in /v1/speak response")
 	}
-	if got, _ := out["playback_status"].(string); got != "disabled" {
-		t.Fatalf("expected playback_status=disabled (disablePlayback=true), got %v", out["playback_status"])
+	// playback_status is NOT set by the primary path — mod3's drain thread owns audio.
+	if _, present := out["playback_status"]; present {
+		t.Fatalf("playback_status must not appear in primary /v1/speak response, got %v", out["playback_status"])
 	}
 
-	// Verify the fake server received the POST to /v1/synthesize.
+	// Verify the fake server received POST to /v1/speak (not /v1/synthesize).
 	last := fm.last()
-	if last.Path != "/v1/synthesize" || last.Method != "POST" {
-		t.Fatalf("expected POST /v1/synthesize, got %s %s", last.Method, last.Path)
+	if last.Path != "/v1/speak" || last.Method != "POST" {
+		t.Fatalf("expected POST /v1/speak, got %s %s", last.Method, last.Path)
 	}
 	var body map[string]any
 	if err := json.Unmarshal(last.Body, &body); err != nil {
@@ -637,16 +652,16 @@ func TestMod3Speak_RESTPathNoSpeakFnInjection(t *testing.T) {
 	}
 }
 
-// TestMod3Speak_FallbackPreservesMod3ErrorBody — when /v1/synthesize returns
-// a non-2xx, the mod3 error body is preserved intact in the tool error.
-func TestMod3Speak_FallbackPreservesMod3ErrorBody(t *testing.T) {
+// TestMod3Speak_PreservesErrorBody — when /v1/speak returns a non-2xx,
+// the mod3 error body is preserved intact in the tool error.
+func TestMod3Speak_PreservesErrorBody(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
-	fm.synthesizeHandler = func(w http.ResponseWriter, r *http.Request) {
+	fm.speakHandler = func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		_, _ = w.Write([]byte(`{"detail":"text must not be empty"}`))
 	}
 	m := newProxyMCP(t, fm)
-	// No speakFn — REST path hits /v1/synthesize which returns 422.
+	// No speakFn — REST path hits /v1/speak which returns 422.
 
 	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{Text: "bad"})
 	if err != nil {
@@ -682,8 +697,8 @@ func TestMod3Speak_Mod3DownReturnsCleanError(t *testing.T) {
 	TestMod3Speak_Mod3UnreachableReturnsCleanError(t)
 }
 
-func TestMod3Speak_PreservesMod3ErrorBody(t *testing.T) {
-	TestMod3Speak_FallbackPreservesMod3ErrorBody(t)
+func TestMod3Speak_FallbackPreservesMod3ErrorBody(t *testing.T) {
+	TestMod3Speak_PreservesErrorBody(t)
 }
 
 func TestMod3Speak_SkipPlaybackReturnsBase64(t *testing.T) {
@@ -1159,22 +1174,27 @@ sleep 5
 	}
 }
 
-// ─── Wave 4.3 — subscriber-check / afplay skip ───────────────────────────────
+// ─── Wave 4.3 — subscriber-check / afplay skip (local-fallback path) ────────
+//
+// These tests exercise toolMod3SpeakLocalFallback, which is the preserved
+// legacy code path for when a caller explicitly needs the kernel to manage
+// local audio playback (e.g. testing the audio plumbing independently from
+// the primary /v1/speak queue path). The primary toolMod3Speak now routes
+// through /v1/speak and mod3's drain thread owns all audio.
 
-// TestMod3Speak_NoSessionAlwaysSpawnsPlayer — session_id="" bypasses the
-// subscriber check entirely so CLI invocations of mod3_speak still play
-// audio through afplay as they always did.
-func TestMod3Speak_NoSessionAlwaysSpawnsPlayer(t *testing.T) {
+// TestMod3Speak_LocalFallback_NoSessionSpawnsPlayer — session_id="" in
+// the local-fallback path bypasses the subscriber check and spawns the player.
+func TestMod3Speak_LocalFallback_NoSessionSpawnsPlayer(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
 
 	stubPath, count := writeStubPlayer(t)
 	m.mod3Proxy = &modalityProxy{player: stubPath}
 
-	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+	res, _, err := m.toolMod3SpeakLocalFallback(context.Background(), mod3SpeakInput{
 		Text:     "no session",
-		Blocking: true, // wait for stub to finish so the test can assert invocation count
-	})
+		Blocking: true,
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1190,10 +1210,9 @@ func TestMod3Speak_NoSessionAlwaysSpawnsPlayer(t *testing.T) {
 	}
 }
 
-// TestMod3Speak_SessionWithSubscriberSkipsPlayer — when the injected
-// subscriber-check returns true, the kernel skips afplay entirely and
-// returns playback_status=routed_ws. The stub player must NOT be invoked.
-func TestMod3Speak_SessionWithSubscriberSkipsPlayer(t *testing.T) {
+// TestMod3Speak_LocalFallback_SessionWithSubscriberSkipsPlayer — subscriber-
+// check returns true: the local-fallback path skips the player (routed_ws).
+func TestMod3Speak_LocalFallback_SessionWithSubscriberSkipsPlayer(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
 
@@ -1208,11 +1227,11 @@ func TestMod3Speak_SessionWithSubscriberSkipsPlayer(t *testing.T) {
 		},
 	}
 
-	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+	res, _, err := m.toolMod3SpeakLocalFallback(context.Background(), mod3SpeakInput{
 		Text:      "skip me",
 		SessionID: "cs-with-sub",
 		Blocking:  true,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1230,10 +1249,9 @@ func TestMod3Speak_SessionWithSubscriberSkipsPlayer(t *testing.T) {
 	}
 }
 
-// TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer — subscriber-check
-// returns false: kernel falls back to the normal afplay path and the stub
-// player IS invoked.
-func TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer(t *testing.T) {
+// TestMod3Speak_LocalFallback_NoSubscriberSpawnsPlayer — subscriber-check
+// returns false: kernel falls back to the player path.
+func TestMod3Speak_LocalFallback_NoSubscriberSpawnsPlayer(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
 
@@ -1245,11 +1263,11 @@ func TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer(t *testing.T) {
 		},
 	}
 
-	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+	res, _, err := m.toolMod3SpeakLocalFallback(context.Background(), mod3SpeakInput{
 		Text:      "no subscriber",
 		SessionID: "cs-no-sub",
 		Blocking:  true,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1265,11 +1283,9 @@ func TestMod3Speak_SessionWithoutSubscriberSpawnsPlayer(t *testing.T) {
 	}
 }
 
-// TestMod3Speak_SubscriberCheckErrorFallsBackToPlayer — transient
-// check error (mod3 flaky, timeout, etc.) must not orphan the audio.
-// The kernel logs the error, records subscriber_check_error in the result,
-// and still spawns the player so the user hears the reply.
-func TestMod3Speak_SubscriberCheckErrorFallsBackToPlayer(t *testing.T) {
+// TestMod3Speak_LocalFallback_SubscriberCheckErrorFallsBack — transient check
+// error must not orphan the audio; the local-fallback path still spawns the player.
+func TestMod3Speak_LocalFallback_SubscriberCheckErrorFallsBack(t *testing.T) {
 	fm := newFakeMod3Proxy(t)
 	m := newProxyMCP(t, fm)
 
@@ -1281,11 +1297,11 @@ func TestMod3Speak_SubscriberCheckErrorFallsBackToPlayer(t *testing.T) {
 		},
 	}
 
-	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+	res, _, err := m.toolMod3SpeakLocalFallback(context.Background(), mod3SpeakInput{
 		Text:      "check failed",
 		SessionID: "cs-flaky",
 		Blocking:  true,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
