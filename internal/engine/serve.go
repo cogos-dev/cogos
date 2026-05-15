@@ -49,6 +49,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/myrgic/cogos/ui/canvas"
 	"github.com/myrgic/cogos/ui/dashboard"
@@ -968,16 +969,74 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inferStart := time.Now()
+	var pt chatPhaseTimings
 	if req.Stream {
-		s.streamChat(w, r.Context(), creq, provider, respID, model, req.StreamOptions, turn)
+		pt = s.streamChat(w, r.Context(), creq, provider, respID, model, req.StreamOptions, turn)
 	} else {
-		s.completeChat(w, r.Context(), creq, provider, respID, model, turn)
+		pt = s.completeChat(w, r.Context(), creq, provider, respID, model, turn)
 	}
 
 	inferMs := float64(time.Since(inferStart).Milliseconds())
 	span.SetAttributes(attribute.Float64("cogos.inference.latency_ms", inferMs))
 	if instruments.InferenceLatency != nil {
 		instruments.InferenceLatency.Record(ctx, inferMs)
+	}
+
+	// Emit per-phase sub-spans to bus_traces so operators can reconstruct
+	// the turn timeline without a Jaeger collector. Each event carries a
+	// parent_span_id that matches the outer handler span's span_id (emitted
+	// by withSpan). The outer span fires after handleChat returns so the
+	// parent_span_id is not yet known here; we use a stable request-ID as a
+	// correlation key instead and let the operator join on session_id+ts.
+	sessionID := block.SessionID
+
+	// chat.prompt_eval — covers context assembly + upstream connection setup.
+	if !pt.promptEvalStart.IsZero() && !pt.promptEvalEnd.IsZero() {
+		emitChatSubSpan(s.busSessions, ChatSubSpan{
+			SpanName:  "chat.prompt_eval",
+			StartedAt: pt.promptEvalStart,
+			DurationMS: pt.promptEvalEnd.Sub(pt.promptEvalStart).Milliseconds(),
+			Model:     model,
+			SessionID: sessionID,
+		})
+	}
+
+	// chat.thinking_generation — only emitted when reasoning_content arrived.
+	if !pt.thinkingStart.IsZero() {
+		emitChatSubSpan(s.busSessions, ChatSubSpan{
+			SpanName:    "chat.thinking_generation",
+			StartedAt:   pt.thinkingStart,
+			DurationMS:  pt.thinkingEnd.Sub(pt.thinkingStart).Milliseconds(),
+			TokensThink: pt.tokensThink,
+			Model:       model,
+			SessionID:   sessionID,
+		})
+	}
+
+	// chat.answer_generation — always emitted when answer content arrived.
+	if !pt.answerStart.IsZero() {
+		totalToks := pt.tokensThink + pt.tokensAnswer
+		emitChatSubSpan(s.busSessions, ChatSubSpan{
+			SpanName:     "chat.answer_generation",
+			StartedAt:    pt.answerStart,
+			DurationMS:   pt.answerEnd.Sub(pt.answerStart).Milliseconds(),
+			TokensAnswer: pt.tokensAnswer,
+			TokensTotal:  totalToks,
+			Model:        model,
+			SessionID:    sessionID,
+		})
+	}
+
+	// chat.tool_call_resolution — only emitted when kernel-internal tools ran.
+	if !pt.toolCallStart.IsZero() {
+		emitChatSubSpan(s.busSessions, ChatSubSpan{
+			SpanName:      "chat.tool_call_resolution",
+			StartedAt:     pt.toolCallStart,
+			DurationMS:    pt.toolCallEnd.Sub(pt.toolCallStart).Milliseconds(),
+			ToolCallCount: pt.toolCallCount,
+			Model:         model,
+			SessionID:     sessionID,
+		})
 	}
 
 	// Persist the turn (ledger event + sidecar). Closes cogos#20 by
@@ -1003,13 +1062,39 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// chatPhaseTimings carries per-phase wall-clock timing from a single chat turn.
+// Both streamChat and completeChat populate this so handleChat can emit sub-spans
+// to bus_traces without modifying the hot streaming path.
+type chatPhaseTimings struct {
+	promptEvalStart time.Time // when the provider call was initiated (≈ inferStart)
+	promptEvalEnd   time.Time // when the first byte / response arrived
+
+	thinkingStart time.Time // first reasoning_content chunk (zero if none)
+	thinkingEnd   time.Time // last reasoning_content chunk before answer starts
+
+	answerStart time.Time // first answer-content chunk (or response returned)
+	answerEnd   time.Time // stream/response complete
+
+	toolCallStart time.Time // tool-call resolution start (zero if no tools)
+	toolCallEnd   time.Time // tool-call resolution end
+
+	tokensThink   int // approximate: len(reasoningContent) rune count (no tokenizer available)
+	tokensAnswer  int // approximate: len(content) rune count
+	toolCallCount int
+}
+
 // completeChat handles non-streaming chat completions.
 // The optional turn record is populated with the response text, usage, and
 // any tool-call traces so the caller can persist the full turn via RecordTurn.
 func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string, turn *TurnRecord) {
+	provider Provider, respID, model string, turn *TurnRecord) chatPhaseTimings {
+
+	var pt chatPhaseTimings
+	pt.promptEvalStart = time.Now()
 
 	resp, err := provider.Complete(ctx, req)
+	pt.promptEvalEnd = time.Now()
+	pt.answerStart = pt.promptEvalEnd
 	if err != nil {
 		slog.Warn("chat: complete error", "err", err)
 		if turn != nil {
@@ -1026,7 +1111,7 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 				"code":    nil,
 			},
 		})
-		return
+		return pt
 	}
 
 	// Server-side execution of MCP-internal tools (cog_*, mod3_*, ...).
@@ -1049,6 +1134,9 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			// turn we still service the internal ones, but keep the external
 			// ones queued for the response so the client gets them.
 			req.Messages = appendToolHopMessages(req.Messages, resp, internal)
+			if pt.toolCallStart.IsZero() {
+				pt.toolCallStart = time.Now()
+			}
 			for _, tc := range internal {
 				s.executeInternalToolCall(ctx, provider.Name(), tc)
 				resultText, isErr, callErr := s.mcpServer.CallTool(ctx, tc.Name, []byte(tc.Arguments))
@@ -1067,6 +1155,7 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 					Name:       tc.Name,
 					ToolCallID: tc.ID,
 				})
+				pt.toolCallCount++
 				if turn != nil {
 					rec := ToolCallRecord{
 						ID:        tc.ID,
@@ -1098,7 +1187,7 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 						"type":    "server_error",
 					},
 				})
-				return
+				return pt
 			}
 			// If the prior turn carried external tool_use events alongside
 			// the internal ones, surface them by merging into next.ToolCalls
@@ -1108,6 +1197,9 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			}
 			resp = next
 		}
+	}
+	if !pt.toolCallStart.IsZero() {
+		pt.toolCallEnd = time.Now()
 	}
 	if turn != nil {
 		turn.Response = resp.Content
@@ -1128,6 +1220,9 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			}
 		}
 	}
+
+	pt.answerEnd = time.Now()
+	pt.tokensAnswer = resp.Usage.OutputTokens
 
 	msg := &oaiMessage{Role: "assistant", Content: mustMarshalString(resp.Content)}
 	finishReason := mapStopReasonToOpenAI(resp.StopReason)
@@ -1188,6 +1283,7 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(oai)
+	return pt
 }
 
 // streamChat handles streaming chat completions via SSE.
@@ -1211,7 +1307,7 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 // from the final chunk) so the caller can persist the full turn via
 // RecordTurn.
 func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
-	provider Provider, respID, model string, streamOpts *oaiStreamOpts, turn *TurnRecord) {
+	provider Provider, respID, model string, streamOpts *oaiStreamOpts, turn *TurnRecord) chatPhaseTimings {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1261,6 +1357,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 	//   firstStream      — channel from the very first provider.Stream call,
 	//     opened upfront so a Stream() error returns the conventional 500.
 	//     Subsequent hops re-open the stream from inside the loop.
+	var pt chatPhaseTimings
+	pt.promptEvalStart = time.Now()
+
 	var carriedExternal []ToolCall
 
 	firstStream, err := provider.Stream(ctx, req)
@@ -1287,12 +1386,40 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 				"code":    nil,
 			},
 		})
-		return
+		return pt
 	}
 
 	chunks := firstStream
+	isFirstHop := true
 	for hop := 0; hop < maxStreamHops; hop++ {
+		drainStart := time.Now()
 		hopBuf, hopErr := drainStreamHop(chunks)
+		drainEnd := time.Now()
+
+		// On the first (and usually only) hop, derive per-phase timings from
+		// the buffer contents.  Reasoning deltas precede answer deltas in the
+		// stream; we split the drain wall-time proportionally by rune count.
+		if isFirstHop {
+			isFirstHop = false
+			pt.promptEvalEnd = drainStart // drain start ≈ first upstream byte
+			thinkRunes := utf8.RuneCountInString(hopBuf.reasoningContent.String())
+			ansRunes := utf8.RuneCountInString(hopBuf.content.String())
+			totalRunes := thinkRunes + ansRunes
+			drainDur := drainEnd.Sub(drainStart)
+			if totalRunes > 0 && thinkRunes > 0 {
+				thinkFrac := float64(thinkRunes) / float64(totalRunes)
+				thinkDur := time.Duration(float64(drainDur) * thinkFrac)
+				pt.thinkingStart = drainStart
+				pt.thinkingEnd = drainStart.Add(thinkDur)
+				pt.answerStart = pt.thinkingEnd
+			} else {
+				pt.answerStart = drainStart
+			}
+			pt.answerEnd = drainEnd
+			pt.tokensThink = thinkRunes // proxy: chars ≈ fractional tokens
+			pt.tokensAnswer = ansRunes
+		}
+
 		if hopErr != nil {
 			writeStreamErr(hopErr)
 			break
@@ -1327,6 +1454,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 			ToolCalls:  toolCalls,
 			StopReason: hopBuf.stopReason,
 		}, internal)
+		if pt.toolCallStart.IsZero() {
+			pt.toolCallStart = time.Now()
+		}
 		for _, tc := range internal {
 			s.executeInternalToolCall(ctx, provider.Name(), tc)
 			resultText, isErr, callErr := s.mcpServer.CallTool(ctx, tc.Name, []byte(tc.Arguments))
@@ -1345,6 +1475,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 				Name:       tc.Name,
 				ToolCallID: tc.ID,
 			})
+			pt.toolCallCount++
 			if turn != nil {
 				rec := ToolCallRecord{
 					ID:        tc.ID,
@@ -1358,6 +1489,9 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 				}
 				turn.ToolCalls = append(turn.ToolCalls, rec)
 			}
+		}
+		if !pt.toolCallStart.IsZero() {
+			pt.toolCallEnd = time.Now()
 		}
 
 		// Hop overflow guard: if the next hop would exceed the cap, surface
@@ -1377,6 +1511,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 
 	_, _ = fmt.Fprint(bw, "data: [DONE]\n\n")
 	flush()
+	return pt
 }
 
 // streamHopBuffer collects everything one upstream stream emitted on a
@@ -1387,10 +1522,12 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 // to SSE (terminal hop) or feed it back into the conversation as a
 // tool_use turn (intermediate hop).
 type streamHopBuffer struct {
-	deltas     []string
-	content    strings.Builder
-	stopReason string
-	usage      *TokenUsage
+	deltas           []string
+	content          strings.Builder
+	reasoningDeltas  []string       // reasoning/thinking chunks (IsReasoning=true)
+	reasoningContent strings.Builder
+	stopReason       string
+	usage            *TokenUsage
 	// toolCalls maps streaming index → assembled call. Provider-side the
 	// index is stable across deltas for the same call; the ID typically
 	// arrives on the first delta and arguments accumulate after.
@@ -1454,8 +1591,13 @@ func drainStreamHop(chunks <-chan StreamChunk) (*streamHopBuffer, error) {
 			continue
 		}
 		if sc.Delta != "" {
-			buf.deltas = append(buf.deltas, sc.Delta)
-			buf.content.WriteString(sc.Delta)
+			if sc.IsReasoning {
+				buf.reasoningDeltas = append(buf.reasoningDeltas, sc.Delta)
+				buf.reasoningContent.WriteString(sc.Delta)
+			} else {
+				buf.deltas = append(buf.deltas, sc.Delta)
+				buf.content.WriteString(sc.Delta)
+			}
 		}
 	}
 	// Channel closed without an explicit Done — treat as benign EOF.
