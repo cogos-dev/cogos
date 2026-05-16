@@ -634,9 +634,12 @@ func (w *ProjectionWatcher) runPolling(ctx context.Context) {
 //
 // This is the D5 entry point. Each instance is keyed by its Type() string,
 // e.g., "lineage-projection-bibliography".
+//
+// Uses UpsertProvider (not RegisterProvider) so it is safe to call multiple
+// times — e.g., after a reconcile.ResetProviders() call in tests.
 func RegisterProjectionProviders() {
 	for _, kind := range AllProjectionKinds {
-		reconcile.RegisterProvider(
+		reconcile.UpsertProvider(
 			"lineage-projection-"+string(kind),
 			NewProjectionReconciler(kind),
 		)

@@ -298,14 +298,16 @@ func TestProjectionWatcher_TriggerOnWrite(t *testing.T) {
 }
 
 func TestProjectionReconciler_Registration(t *testing.T) {
-	// Reset registry state (this test verifies that RegisterProjectionProviders
-	// registers exactly 6 providers with the correct names).
-	// We cannot reset the global registry here without the test helper,
-	// but we can verify the providers exist after init() runs.
+	// Explicitly call RegisterProjectionProviders to ensure providers are present
+	// even if another test called reconcile.ResetProviders() earlier in the run.
+	// RegisterProjectionProviders uses UpsertProvider, so it is safe to call
+	// multiple times.
+	RegisterProjectionProviders()
+
 	for _, kind := range AllProjectionKinds {
 		providerName := "lineage-projection-" + string(kind)
 		if !reconcile.HasProvider(providerName) {
-			t.Errorf("provider %q not registered (init should have called RegisterProjectionProviders)", providerName)
+			t.Errorf("provider %q not registered after RegisterProjectionProviders()", providerName)
 		}
 	}
 }
