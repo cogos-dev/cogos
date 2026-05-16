@@ -46,13 +46,24 @@ func makeTestWorkspace(t *testing.T, nodeFiles map[string]string) (root string, 
 	return root, func() { os.RemoveAll(root) }
 }
 
+// titleCase converts "foo-bar-baz" to "Foo Bar Baz" without using strings.Title (deprecated).
+func titleCase(s string) string {
+	words := strings.Fields(strings.ReplaceAll(s, "-", " "))
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
+}
+
 // sampleNode returns a minimal valid lineage node cogdoc.
 func sampleNode(id, tier, exposure string) string {
 	return `---
 id: ` + id + `
 kind: lineage-node
 tier: ` + tier + `
-title: "` + strings.Title(strings.ReplaceAll(id, "-", " ")) + `"
+title: "` + titleCase(id) + `"
 public_exposure_risk: ` + exposure + `
 demotion_template: "Test demotion template for ` + id + `."
 corpus_depth: medium
@@ -64,7 +75,7 @@ created: 2026-05-16T00:00:00Z
 updated: 2026-05-16T00:00:00Z
 ---
 
-# ` + strings.Title(strings.ReplaceAll(id, "-", " ")) + `
+# ` + titleCase(id) + `
 
 Test node body.
 `

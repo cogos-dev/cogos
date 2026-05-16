@@ -837,7 +837,7 @@ func generateOutreachStatus(nodes []LineageNode) string {
 		if len(matching) == 0 {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("## Risk: %s\n\n", strings.Title(risk)))
+		b.WriteString(fmt.Sprintf("## Risk: %s\n\n", strings.ToUpper(risk[:1])+risk[1:]))
 		for _, n := range matching {
 			b.WriteString(fmt.Sprintf("### %s (Tier %d)\n\n", n.Frontmatter.Title, n.Frontmatter.Tier))
 			if n.Frontmatter.DemotionTemplate != "" {
