@@ -1,0 +1,440 @@
+// reconcile_daemon.go — daemon-resident continuous reconcile loop driver.
+//
+// ReconcileDaemon closes ADR-092 §2 step 4: "Reconcile loop start — periodic /
+// on-demand reconciliation begins." It periodically iterates all registered
+// Reconcilables and drives the full per-provider cycle:
+//
+//	LoadConfig → FetchLive → ComputePlan → ApplyPlan → BuildState → WriteState
+//
+// Each provider's cycle is error-isolated: a panic or error in one provider
+// does not block or terminate the cycles of other providers (ADR-092 §3).
+//
+// Per-provider error isolation is non-negotiable per ADR-092 §3 at-least-once
+// semantics: one bad Reconcilable must not block others.
+//
+// ADR-091 Layer: Kernel (requires a running process; consumes Substrate
+// primitives pkg/reconcile.Reconcilable + process-local registry).
+// ADR-095: this file implements the contract specified therein.
+package engine
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/myrgic/cogos/pkg/reconcile"
+)
+
+// ReconcileDaemonState represents the lifecycle state of the daemon.
+type ReconcileDaemonState string
+
+const (
+	// ReconcileDaemonStarting is the initial state before the goroutine starts.
+	ReconcileDaemonStarting ReconcileDaemonState = "Starting"
+	// ReconcileDaemonLive means the goroutine is running; last tick had no errors.
+	ReconcileDaemonLive ReconcileDaemonState = "Live"
+	// ReconcileDaemonStalled means running but last tick had provider errors.
+	// The daemon continues ticking.
+	ReconcileDaemonStalled ReconcileDaemonState = "Stalled"
+	// ReconcileDaemonShutdown means context was cancelled; goroutine has exited.
+	ReconcileDaemonShutdown ReconcileDaemonState = "Shutdown"
+)
+
+// ReconcileDaemonConfig holds configuration for the ReconcileDaemon.
+type ReconcileDaemonConfig struct {
+	// WorkspaceRoot is the workspace root path, passed to LoadConfig and
+	// reconcile.LoadState / reconcile.WriteState.
+	WorkspaceRoot string
+
+	// PollInterval is how often all registered providers are iterated.
+	// Default: 30 seconds.
+	PollInterval time.Duration
+
+	// MaxConcurrent is the maximum number of providers reconciled concurrently
+	// within a single tick. Default: 1 (serial) per ADR-095 §5 rationale:
+	// serializes all providers to avoid ADR-092 §1 ledger chain-break risk until
+	// the per-session mutex is added to pkg/cogblock.AppendEvent.
+	MaxConcurrent int
+
+	// ShutdownGracePeriod is how long the daemon waits for in-flight cycles to
+	// complete after context cancel before returning. Default: 5 seconds.
+	ShutdownGracePeriod time.Duration
+}
+
+func (c *ReconcileDaemonConfig) withDefaults() ReconcileDaemonConfig {
+	cfg := *c
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 30 * time.Second
+	}
+	if cfg.MaxConcurrent <= 0 {
+		cfg.MaxConcurrent = 1
+	}
+	if cfg.ShutdownGracePeriod <= 0 {
+		cfg.ShutdownGracePeriod = 5 * time.Second
+	}
+	return cfg
+}
+
+// ReconcileDaemon is the daemon-resident goroutine that drives the full
+// reconcile cycle for all registered Reconcilables on each periodic tick.
+//
+// Start the daemon with Start(ctx). Stop it by cancelling the context.
+// Use Trigger to queue an early (out-of-band) reconcile for a specific provider.
+type ReconcileDaemon struct {
+	cfg ReconcileDaemonConfig
+
+	mu    sync.Mutex
+	state ReconcileDaemonState
+
+	// triggerCh is a non-blocking channel for early trigger requests.
+	// Keys are provider type strings. The map is drained at the start of
+	// each tick and after each regular tick.
+	triggerMu sync.Mutex
+	triggered map[string]struct{}
+	triggerCh chan struct{} // notifies the loop that triggers are queued
+}
+
+// NewReconcileDaemon creates a ReconcileDaemon with the given config.
+// Call Start(ctx) to begin the loop.
+func NewReconcileDaemon(cfg ReconcileDaemonConfig) *ReconcileDaemon {
+	return &ReconcileDaemon{
+		cfg:       cfg.withDefaults(),
+		state:     ReconcileDaemonStarting,
+		triggered: make(map[string]struct{}),
+		triggerCh: make(chan struct{}, 1),
+	}
+}
+
+// State returns the current lifecycle state of the daemon.
+func (d *ReconcileDaemon) State() ReconcileDaemonState {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.state
+}
+
+// Trigger queues an immediate (out-of-band) reconcile for the named provider
+// type. Non-blocking: if the provider is already queued, this is a no-op.
+// If the provider is not registered, the trigger is silently dropped.
+//
+// This is the integration point for watch-based early-trigger mechanisms
+// (e.g., ProjectionWatcher). See ADR-095 §4.
+func (d *ReconcileDaemon) Trigger(providerType string) {
+	if !reconcile.HasProvider(providerType) {
+		return
+	}
+	d.triggerMu.Lock()
+	d.triggered[providerType] = struct{}{}
+	d.triggerMu.Unlock()
+
+	// Non-blocking notify: if the channel already has a notification queued,
+	// the loop will drain triggers when it wakes. No need to send again.
+	select {
+	case d.triggerCh <- struct{}{}:
+	default:
+	}
+}
+
+// Start begins the reconcile loop in a background goroutine. The goroutine
+// exits when ctx is cancelled. Start is safe to call only once.
+func (d *ReconcileDaemon) Start(ctx context.Context) {
+	d.mu.Lock()
+	d.state = ReconcileDaemonLive
+	d.mu.Unlock()
+
+	slog.Info("reconcile-daemon: starting",
+		"poll_interval", d.cfg.PollInterval,
+		"max_concurrent", d.cfg.MaxConcurrent,
+		"workspace", d.cfg.WorkspaceRoot,
+	)
+
+	go d.run(ctx)
+}
+
+// run is the main goroutine body. It runs until ctx is cancelled.
+func (d *ReconcileDaemon) run(ctx context.Context) {
+	ticker := time.NewTicker(d.cfg.PollInterval)
+	defer ticker.Stop()
+
+	defer func() {
+		d.mu.Lock()
+		d.state = ReconcileDaemonShutdown
+		d.mu.Unlock()
+		slog.Info("reconcile-daemon: stopped")
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Drain any queued triggers with the grace period.
+			d.drainTriggersOnShutdown(ctx)
+			return
+
+		case <-d.triggerCh:
+			// Early trigger from a watcher or external caller.
+			d.runTriggered(ctx)
+
+		case <-ticker.C:
+			// Periodic tick: reconcile all registered providers.
+			d.runTick(ctx)
+		}
+	}
+}
+
+// runTick iterates all registered providers and runs their reconcile cycle.
+// Also drains any pending triggers before iterating (so a trigger that fired
+// between ticks is absorbed into this tick rather than generating a double run).
+func (d *ReconcileDaemon) runTick(ctx context.Context) {
+	// Absorb any outstanding triggers into this tick (they'll be covered by
+	// the full provider scan).
+	d.triggerMu.Lock()
+	d.triggered = make(map[string]struct{})
+	d.triggerMu.Unlock()
+
+	providers := reconcile.ListProviders()
+	if len(providers) == 0 {
+		return
+	}
+
+	slog.Debug("reconcile-daemon: tick", "provider_count", len(providers))
+
+	errCount := d.runProviders(ctx, providers)
+
+	d.mu.Lock()
+	if errCount > 0 {
+		d.state = ReconcileDaemonStalled
+	} else {
+		d.state = ReconcileDaemonLive
+	}
+	d.mu.Unlock()
+}
+
+// runTriggered drains the pending trigger set and runs cycles for only the
+// queued providers. Used for early (out-of-band) reconcile requests.
+func (d *ReconcileDaemon) runTriggered(ctx context.Context) {
+	d.triggerMu.Lock()
+	queued := d.triggered
+	d.triggered = make(map[string]struct{})
+	d.triggerMu.Unlock()
+
+	if len(queued) == 0 {
+		return
+	}
+
+	types := make([]string, 0, len(queued))
+	for t := range queued {
+		types = append(types, t)
+	}
+	slog.Debug("reconcile-daemon: triggered", "providers", types)
+	d.runProviders(ctx, types)
+}
+
+// drainTriggersOnShutdown runs any pending triggers within the shutdown grace period.
+func (d *ReconcileDaemon) drainTriggersOnShutdown(ctx context.Context) {
+	d.triggerMu.Lock()
+	queued := d.triggered
+	d.triggered = make(map[string]struct{})
+	d.triggerMu.Unlock()
+
+	if len(queued) == 0 {
+		return
+	}
+
+	graceCtx, cancel := context.WithTimeout(context.Background(), d.cfg.ShutdownGracePeriod)
+	defer cancel()
+
+	types := make([]string, 0, len(queued))
+	for t := range queued {
+		types = append(types, t)
+	}
+	slog.Info("reconcile-daemon: draining triggers on shutdown", "providers", types)
+	d.runProviders(graceCtx, types)
+}
+
+// runProviders runs the reconcile cycle for each named provider type.
+// Providers are run with MaxConcurrent parallelism (default 1 = serial).
+// Per-provider error isolation: panics and errors are recovered and logged;
+// other providers in the same batch continue unaffected.
+// Returns the number of providers that errored.
+func (d *ReconcileDaemon) runProviders(ctx context.Context, providerTypes []string) int {
+	if d.cfg.MaxConcurrent <= 1 {
+		// Serial path: simple loop, no goroutines needed.
+		errCount := 0
+		for _, pt := range providerTypes {
+			if err := d.runOneCycle(ctx, pt); err != nil {
+				errCount++
+			}
+			// Bail early if context is done.
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		return errCount
+	}
+
+	// Concurrent path: semaphore-bounded goroutines.
+	sem := make(chan struct{}, d.cfg.MaxConcurrent)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errCount := 0
+
+	for _, pt := range providerTypes {
+		if ctx.Err() != nil {
+			break
+		}
+		pt := pt
+		sem <- struct{}{} // acquire
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }() // release
+			if err := d.runOneCycle(ctx, pt); err != nil {
+				mu.Lock()
+				errCount++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return errCount
+}
+
+// runOneCycle runs the full reconcile cycle for a single provider type.
+// The cycle is:
+//
+//	LoadConfig → FetchLive → ComputePlan → ApplyPlan → BuildState → WriteState
+//
+// Panics are recovered and returned as errors to preserve error isolation.
+// Conforms to ADR-092 §4 Reconcilable contract order.
+func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) (retErr error) {
+	// Recover from panics so one misbehaving provider can't take down the loop.
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("panic in provider %s: %v", providerType, r)
+			slog.Error("reconcile-daemon: provider panicked",
+				"provider", providerType,
+				"panic", r,
+			)
+		}
+	}()
+
+	tracer := otel.Tracer("cogos.reconcile-daemon")
+	spanCtx, span := tracer.Start(ctx, "reconcile.daemon.cycle")
+	span.SetAttributes(attribute.String("provider.type", providerType))
+	defer span.End()
+
+	start := time.Now()
+
+	provider, err := reconcile.GetProvider(providerType)
+	if err != nil {
+		slog.Warn("reconcile-daemon: provider not found", "provider", providerType, "err", err)
+		return err
+	}
+
+	// Step 1: LoadConfig — read-only disk operation.
+	config, err := provider.LoadConfig(d.cfg.WorkspaceRoot)
+	if err != nil {
+		slog.Warn("reconcile-daemon: LoadConfig failed",
+			"provider", providerType, "err", err)
+		return fmt.Errorf("LoadConfig %s: %w", providerType, err)
+	}
+
+	// Step 2: FetchLive — read-only observation of world state.
+	live, err := provider.FetchLive(spanCtx, config)
+	if err != nil {
+		slog.Warn("reconcile-daemon: FetchLive failed",
+			"provider", providerType, "err", err)
+		return fmt.Errorf("FetchLive %s: %w", providerType, err)
+	}
+
+	// Step 3: Load persisted state.
+	state, _ := reconcile.LoadState(d.cfg.WorkspaceRoot, providerType)
+
+	// Step 4: ComputePlan — pure function, deterministic.
+	plan, err := provider.ComputePlan(config, live, state)
+	if err != nil {
+		slog.Warn("reconcile-daemon: ComputePlan failed",
+			"provider", providerType, "err", err)
+		return fmt.Errorf("ComputePlan %s: %w", providerType, err)
+	}
+
+	span.SetAttributes(
+		attribute.Int("plan.creates", plan.Summary.Creates),
+		attribute.Int("plan.updates", plan.Summary.Updates),
+		attribute.Int("plan.deletes", plan.Summary.Deletes),
+		attribute.Int("plan.skipped", plan.Summary.Skipped),
+	)
+
+	if !plan.Summary.HasChanges() {
+		// No drift — log at debug level and exit early; no write needed.
+		dur := time.Since(start)
+		span.SetAttributes(attribute.Int64("cycle.duration_ms", dur.Milliseconds()))
+		slog.Debug("reconcile-daemon: provider in sync",
+			"provider", providerType,
+			"skipped", plan.Summary.Skipped,
+			"duration_ms", dur.Milliseconds(),
+		)
+		return nil
+	}
+
+	// Step 5: ApplyPlan — idempotent per ADR-092 §3.
+	results, err := provider.ApplyPlan(spanCtx, plan)
+	if err != nil {
+		slog.Warn("reconcile-daemon: ApplyPlan failed",
+			"provider", providerType, "err", err)
+		return fmt.Errorf("ApplyPlan %s: %w", providerType, err)
+	}
+
+	// Count apply failures.
+	applyFailed := 0
+	for _, r := range results {
+		if r.Status == reconcile.ApplyFailed {
+			applyFailed++
+			slog.Warn("reconcile-daemon: action failed",
+				"provider", providerType,
+				"action", r.Action,
+				"name", r.Name,
+				"err", r.Error,
+			)
+		}
+	}
+
+	// Step 6: BuildState — pure function.
+	newState, buildErr := provider.BuildState(config, live, state)
+	if buildErr == nil && newState != nil {
+		// Step 7: WriteState — atomic tmp+rename.
+		if writeErr := reconcile.WriteState(d.cfg.WorkspaceRoot, providerType, newState); writeErr != nil {
+			slog.Warn("reconcile-daemon: WriteState failed",
+				"provider", providerType, "err", writeErr)
+		}
+	} else if buildErr != nil {
+		slog.Warn("reconcile-daemon: BuildState failed",
+			"provider", providerType, "err", buildErr)
+	}
+
+	dur := time.Since(start)
+	span.SetAttributes(attribute.Int64("cycle.duration_ms", dur.Milliseconds()))
+
+	logLevel := slog.LevelInfo
+	if applyFailed > 0 {
+		logLevel = slog.LevelWarn
+	}
+	slog.Log(ctx, logLevel, "reconcile-daemon: cycle complete",
+		"provider", providerType,
+		"creates", plan.Summary.Creates,
+		"updates", plan.Summary.Updates,
+		"deletes", plan.Summary.Deletes,
+		"skipped", plan.Summary.Skipped,
+		"apply_failed", applyFailed,
+		"duration_ms", dur.Milliseconds(),
+	)
+
+	if applyFailed > 0 {
+		return fmt.Errorf("provider %s: %d action(s) failed during apply", providerType, applyFailed)
+	}
+	return nil
+}
