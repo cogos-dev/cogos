@@ -261,3 +261,87 @@ func ReconcileWithSpan(ctx context.Context, r *ProjectionReconciler, workspaceRo
 
 	return nil
 }
+
+// ─── H4: ReconcileDaemon span wiring ─────────────────────────────────────────
+//
+// H4 wires the three-level span hierarchy into the ReconcileDaemon tick loop.
+//
+// The ReconcileDaemon (internal/engine/reconcile_daemon.go, landed in commit
+// e6bdb04 on feat/otel-gen-ai-attrs-and-projection-watcher) drives periodic
+// reconcile cycles over all registered providers. H4 wraps each daemon tick
+// with StartTurnSpan and each ProjectionReconciler call with ReconcileWithSpan.
+//
+// Wiring contract (for ReconcileDaemon.runLoop or equivalent):
+//
+//   // --- daemon session startup ---
+//   sessionID := computeSessionID(cfg.WorkspaceRoot)
+//   sessionCtx, sessionDone := StartConversationSpan(ctx, sessionID, cfg.WorkspaceRoot)
+//   defer sessionDone(nil)
+//
+//   // --- each periodic tick ---
+//   for {
+//     select {
+//     case <-ticker.C:
+//       tickCtx, tickDone := StartTurnSpan(sessionCtx, sessionID, len(providers))
+//       for _, provider := range projectionProviders {
+//         if pr, ok := provider.(*ProjectionReconciler); ok {
+//           if err := ReconcileWithSpan(tickCtx, pr, cfg.WorkspaceRoot); err != nil {
+//             // log, continue — error isolation per ADR-092 §3
+//           }
+//         }
+//       }
+//       tickDone(nil)
+//     case <-ctx.Done():
+//       return
+//     }
+//   }
+//
+// DaemonSessionID derives a stable identifier from the workspace root so
+// all spans from the same daemon session share a session_id dimension.
+
+// DaemonSessionID computes a short, stable identifier for a daemon session
+// from the workspace root. Used as the CogosSessionID on conversation/turn spans.
+func DaemonSessionID(workspaceRoot string) string {
+	// Use a simple hash of the workspace root for brevity.
+	// Not cryptographically sensitive — this is an observability label.
+	h := 0
+	for _, c := range workspaceRoot {
+		h = h*31 + int(c)
+		if h < 0 {
+			h = -h
+		}
+	}
+	return fmt.Sprintf("daemon-%08x", h)
+}
+
+// ProjectionReconcilerTick wraps one daemon tick over all projection kinds with
+// a "turn" span and per-provider "service" spans. Suitable for embedding in a
+// ReconcileDaemon's tick handler once the daemon is available.
+//
+// providers is the list of reconcile.Reconcilable instances registered for
+// projection types. Only *ProjectionReconciler instances are spanned; other
+// types are skipped (they are not managed by this wiring).
+//
+// This function is H4's executable interface: the daemon calls it once per tick
+// with sessionCtx (a context carrying the conversation span) as parent.
+func ProjectionReconcilerTick(
+	sessionCtx context.Context,
+	sessionID string,
+	providers []interface{ Type() string },
+	workspaceRoot string,
+) error {
+	turnCtx, turnDone := StartTurnSpan(sessionCtx, sessionID, len(providers))
+	var tickErr error
+	for _, p := range providers {
+		pr, ok := p.(*ProjectionReconciler)
+		if !ok {
+			continue
+		}
+		if err := ReconcileWithSpan(turnCtx, pr, workspaceRoot); err != nil {
+			// Record but continue — error isolation per ADR-092 §3.
+			tickErr = err
+		}
+	}
+	turnDone(tickErr)
+	return tickErr
+}
