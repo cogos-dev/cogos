@@ -264,6 +264,39 @@ func runServe(workspace string, port int, bindAddr string) {
 		}
 	}
 
+	// ADR-092 §2 step 4: Reconcile loop start.
+	// ReconcileDaemon drives the full reconcile cycle for all registered
+	// Reconcilables on each periodic tick. ADR-095 specifies the contract.
+	reconcileDaemon := NewReconcileDaemon(ReconcileDaemonConfig{
+		WorkspaceRoot: cfg.WorkspaceRoot,
+	})
+	reconcileDaemon.Start(ctx)
+
+	// Wire ProjectionWatcher as an early-trigger source into the daemon.
+	// Each lineage-projection-<kind> Reconcilable gets a watcher that fires
+	// daemon.Trigger on file-system changes to the nodes/ directory.
+	// ADR-095 §4: watchers are specific early-trigger instances; the daemon
+	// driver is the general mechanism.
+	// The watcher is created with a nil-safe best-effort approach: if the
+	// nodes/ directory does not exist (workspace not yet initialized), the
+	// watcher Start call fails gracefully and no watch loop runs. Reconciliation
+	// still occurs on each periodic daemon tick.
+	for _, kind := range AllProjectionKinds {
+		kind := kind
+		nodesDir := cfg.WorkspaceRoot + "/.cog/mem/semantic/lineage/nodes"
+		providerType := "lineage-projection-" + string(kind)
+		watcher := NewProjectionWatcher(nodesDir, func(watchCtx context.Context) error {
+			reconcileDaemon.Trigger(providerType)
+			return nil
+		}, 0)
+		if err := watcher.Start(ctx); err != nil {
+			slog.Debug("projection watcher skipped (nodes dir not present)",
+				"kind", kind, "err", err)
+		} else {
+			slog.Info("projection watcher started", "kind", kind, "nodes_dir", nodesDir)
+		}
+	}
+
 	// Start process goroutine.
 	processDone := make(chan error, 1)
 	go func() {
