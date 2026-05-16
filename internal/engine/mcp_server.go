@@ -228,8 +228,13 @@ func (m *MCPServer) registerTools() {
 	}), withToolObserver(m, "cog_assemble_context", m.toolAssembleContext))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
-		Name:        "cog_emit_event",
-		Description: "Emit a typed event to the workspace ledger. Events: attention.boost (uri + weight), session.marker (label), insight.captured (summary), decision.made (decision + rationale). Fallback: events are JSONL in .cog/ledger/",
+		Name: "cog_emit_event",
+		Description: "Emit a typed event to the workspace ledger. " +
+			"Events: attention.boost (uri + weight), session.marker (label), " +
+			"insight.captured (summary), decision.made (decision + rationale), " +
+			"peer.utterance (from + to + content + turn; both sessions must be registered). " +
+			"Optional from_session: records the emitting session as event source; required for peer.utterance and must match payload.from. " +
+			"Fallback: events are JSONL in .cog/ledger/",
 	}), withToolObserver(m, "cog_emit_event", m.toolEmitEvent))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
@@ -660,8 +665,9 @@ type memoryIndexResult struct {
 }
 
 type emitEventInput struct {
-	Type    string         `json:"type" jsonschema:"Event type: attention.boost, session.marker, insight.captured, decision.made"`
-	Payload map[string]any `json:"payload,omitempty" jsonschema:"Event payload. attention.boost: {uri, weight}. session.marker: {label}. insight.captured: {summary, tags}. decision.made: {decision, rationale}."`
+	Type        string         `json:"type" jsonschema:"Event type: attention.boost, session.marker, insight.captured, decision.made, peer.utterance"`
+	Payload     map[string]any `json:"payload,omitempty" jsonschema:"Event payload. attention.boost: {uri, weight}. session.marker: {label}. insight.captured: {summary, tags}. decision.made: {decision, rationale}. peer.utterance: {from, to, content, turn, in_reply_to (optional)}."`
+	FromSession string         `json:"from_session,omitempty" jsonschema:"Optional sender session_id. If provided, must be a registered session; recorded as event source. Required for peer.utterance events and must match payload.from."`
 }
 
 type readLedgerInput struct {
@@ -1338,12 +1344,72 @@ func WriteCogDoc(workspaceRoot string, path string, opts CogDocWriteOpts) (strin
 	return uri, nil
 }
 
+// allowedEventTypes is the closed set of event types accepted by toolEmitEvent.
+// Extend this list when new peer or substrate event types are ratified.
+var allowedEventTypes = map[string]bool{
+	"attention.boost":  true,
+	"session.marker":   true,
+	"insight.captured": true,
+	"decision.made":    true,
+	"peer.utterance":   true,
+}
+
 func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest, input emitEventInput) (*mcp.CallToolResult, any, error) {
 	if input.Type == "" {
-		return textResult("event type is required. Valid types: attention.boost, session.marker, insight.captured, decision.made")
+		return textResult("event type is required. Valid types: attention.boost, session.marker, insight.captured, decision.made, peer.utterance")
+	}
+	if !allowedEventTypes[input.Type] {
+		return textResult(fmt.Sprintf("unknown event type %q. Valid types: attention.boost, session.marker, insight.captured, decision.made, peer.utterance", input.Type))
 	}
 	if m.process == nil {
 		return fallbackResult("process not initialized", "echo '{\"type\":\"...\"}' >> .cog/ledger/<session_id>/events.jsonl")
+	}
+
+	// Validate from_session if provided: must be a registered session.
+	if input.FromSession != "" {
+		if err := ValidateSessionID(input.FromSession); err != nil {
+			return textResult("from_session: " + err.Error())
+		}
+		if m.sessionRegistry != nil {
+			if _, ok := m.sessionRegistry.Get(input.FromSession); !ok {
+				return textResult(fmt.Sprintf("from_session %q is not a registered session", input.FromSession))
+			}
+		}
+	}
+
+	// Validate peer.utterance payload fields.
+	if input.Type == "peer.utterance" {
+		if input.FromSession == "" {
+			return textResult("peer.utterance requires from_session (must match payload.from)")
+		}
+		fromPayload, _ := input.Payload["from"].(string)
+		if fromPayload == "" {
+			return textResult("peer.utterance payload requires 'from' field")
+		}
+		if fromPayload != input.FromSession {
+			return textResult(fmt.Sprintf("peer.utterance: from_session %q must match payload.from %q", input.FromSession, fromPayload))
+		}
+		toPayload, _ := input.Payload["to"].(string)
+		if toPayload == "" {
+			return textResult("peer.utterance payload requires 'to' field")
+		}
+		if m.sessionRegistry != nil {
+			if _, ok := m.sessionRegistry.Get(toPayload); !ok {
+				return textResult(fmt.Sprintf("peer.utterance payload.to %q is not a registered session", toPayload))
+			}
+		}
+		contentPayload, _ := input.Payload["content"].(string)
+		if contentPayload == "" {
+			return textResult("peer.utterance payload requires non-empty 'content' field")
+		}
+		turnPayload, hasTurn := input.Payload["turn"]
+		if !hasTurn {
+			return textResult("peer.utterance payload requires 'turn' field (positive integer, 1-indexed)")
+		}
+		turnNum, ok := turnPayload.(float64) // JSON numbers unmarshal as float64.
+		if !ok || turnNum < 1 || turnNum != float64(int(turnNum)) {
+			return textResult("peer.utterance payload.turn must be a positive integer")
+		}
 	}
 
 	// Build the event data. Legacy shape exposed payload under a separate
@@ -1353,6 +1419,12 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 	data := map[string]any{}
 	if input.Payload != nil {
 		data["payload"] = input.Payload
+	}
+
+	// Record from_session as the attributed source in event data so
+	// downstream consumers see consistent sender attribution.
+	if input.FromSession != "" {
+		data["from_session"] = input.FromSession
 	}
 
 	// Handle attention.boost: resolve URI to field key, then boost. Side
@@ -1374,16 +1446,24 @@ func (m *MCPServer) toolEmitEvent(ctx context.Context, req *mcp.CallToolRequest,
 	// Route every emission through AppendEvent (hash chain + broker fan-out).
 	// Fixes the cogos#10 orphan-file bug: pre-refactor writes landed in a
 	// flat .cog/ledger/events.jsonl bypassing both the chain and the bus.
-	if err := m.process.EmitEvent(input.Type, data, "mcp-client"); err != nil {
+	source := "mcp-client"
+	if input.FromSession != "" {
+		source = "mcp-client:" + input.FromSession
+	}
+	if err := m.process.EmitEvent(input.Type, data, source); err != nil {
 		return fallbackResult(fmt.Sprintf("emit failed: %v", err),
 			"echo '{\"type\":\"...\"}' >> .cog/ledger/<session_id>/events.jsonl")
 	}
 
-	return marshalResult(map[string]any{
+	result := map[string]any{
 		"emitted":    true,
 		"type":       input.Type,
 		"session_id": m.process.SessionID(),
-	})
+	}
+	if input.FromSession != "" {
+		result["from_session"] = input.FromSession
+	}
+	return marshalResult(result)
 }
 
 func (m *MCPServer) toolReadLedger(ctx context.Context, req *mcp.CallToolRequest, input readLedgerInput) (*mcp.CallToolResult, any, error) {
