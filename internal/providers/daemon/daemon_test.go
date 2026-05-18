@@ -1,9 +1,9 @@
-// daemon_test.go — verifies that importing this package registers all 10
+// daemon_test.go — verifies that importing this package registers all 12
 // expected Reconcilable providers with pkg/reconcile.
 //
 // This is the canonical test for verification gate 3: "after the
 // engine.Main-equivalent boot path runs, reconcile.ListProviders() returns
-// the 10 expected names."
+// the 12 expected names (including identity — Wave 6b, and mlx-inference)."
 //
 // We don't start a server or invoke engine.Main() — we only confirm that
 // the package's init() side-effect wired the providers. This is sufficient
@@ -31,6 +31,7 @@ var expectedProviders = []string{
 	"component",
 	"discord",
 	"eval",
+	"identity",
 	"mlx-inference",
 	"mcp-tools",
 	"openclaw-agents",
@@ -40,7 +41,7 @@ var expectedProviders = []string{
 	"service",
 }
 
-func TestDaemonInit_RegistersAll10Providers(t *testing.T) {
+func TestDaemonInit_RegistersAll12Providers(t *testing.T) {
 	got := reconcile.ListProviders()
 	sort.Strings(got)
 

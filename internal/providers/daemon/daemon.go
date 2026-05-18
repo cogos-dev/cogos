@@ -1,7 +1,7 @@
 // Package daemon registers all Reconcilable providers that the kernel daemon
 // (cmd/cogos) needs to surface in proprioception health blocks.
 //
-// Background: The 8 production providers (agent, component, discord,
+// Background: The production providers (agent, component, discord, identity,
 // mcp-tools, openclaw-agents, openclaw-cron, openclaw-gateway, service) were
 // originally defined in the workspace-root package main of the cog CLI.
 // Because package main cannot be imported, the daemon binary (built from
@@ -25,7 +25,9 @@
 // internal/providers/component and is wired here via blank import.
 // The pin provider (internal/providers/pin) is fully extracted and registered
 // here directly — its Health() delegates to the extracted package.
-// The other seven are implemented as minimal structs below.
+// The identity provider (Wave 6b) is registered here as a stub; the full
+// plan/apply wiring lives in the workspace-root identity_wiring.go.
+// The other eight are implemented as minimal structs below.
 //
 // cmd/cogos/providers_wire.go imports this package (triggering init()) and
 // wires both engine.RegisterProviders and engine.SetProvidersWorkspace so
@@ -157,6 +159,7 @@ func init() {
 	reconcile.RegisterProvider("agent", &agentProvider{})
 	reconcile.RegisterProvider("discord", &discordProvider{})
 	reconcile.RegisterProvider("eval", &evalProvider{})
+	reconcile.RegisterProvider("identity", &identityProvider{stubMethods: stubMethods{name: "identity"}})
 	reconcile.RegisterProvider("mcp-tools", &mcpToolsProvider{})
 	reconcile.RegisterProvider("openclaw-agents", &openclawAgentsProvider{})
 	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{})
@@ -438,6 +441,61 @@ func (p *evalProvider) Health() reconcile.ResourceStatus {
 			Operation: reconcile.OperationIdle,
 			Message:   fmt.Sprintf("%d pinned baseline(s); full plan/apply via cog CLI", pinnedCount),
 		}
+	}
+}
+
+// ─── identity ────────────────────────────────────────────────────────────────
+
+// identityProvider surfaces identity CRD health for the daemon's proprioception
+// block. Health() checks for the presence of the identity config directory
+// (.cog/config/identities/) and counts declared CRDs.
+//
+// Full plan/apply lives in the workspace-root CLI binary (identity_wiring.go);
+// the daemon only needs Health() to contribute to the foveated context block.
+//
+// Wave 6b: stub-only. Wave 6c will wire the real IdentityProvider once the
+// Constellation DB layer is extractable from the workspace-root package.
+type identityProvider struct{ stubMethods }
+
+func (p *identityProvider) Type() string { return "identity" }
+
+func (p *identityProvider) Health() reconcile.ResourceStatus {
+	root, bad := resolveRoot()
+	if bad != nil {
+		return *bad
+	}
+	identitiesDir := filepath.Join(root, ".cog", "config", "identities")
+	entries, err := os.ReadDir(identitiesDir)
+	if err != nil {
+		// No identities directory — treat as healthy (no identities declared).
+		// Presence of the directory is optional; the provider operates on an
+		// empty set if it does not exist.
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusSynced,
+			Health:    reconcile.HealthHealthy,
+			Operation: reconcile.OperationIdle,
+			Message:   "no identities directory — no identities declared",
+		}
+	}
+	count := 0
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".yaml" {
+			count++
+		}
+	}
+	if count == 0 {
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusSynced,
+			Health:    reconcile.HealthHealthy,
+			Operation: reconcile.OperationIdle,
+			Message:   "identities directory present, no CRDs declared",
+		}
+	}
+	return reconcile.ResourceStatus{
+		Sync:      reconcile.SyncStatusUnknown,
+		Health:    reconcile.HealthHealthy,
+		Operation: reconcile.OperationIdle,
+		Message:   fmt.Sprintf("%d identity CRD(s) declared; runtime status requires CLI", count),
 	}
 }
 

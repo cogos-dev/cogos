@@ -2,9 +2,14 @@
 // context, and MCP tool extensions into the kernel daemon at boot.
 //
 // A named import of internal/providers/daemon triggers that package's init(),
-// which registers all 9 production providers ("agent", "component", "discord",
-// "eval", "mcp-tools", "openclaw-agents", "openclaw-cron", "openclaw-gateway",
-// "service") with pkg/reconcile before engine.Main() starts the HTTP server.
+// which registers all 10 production providers ("agent", "component", "discord",
+// "eval", "identity", "mcp-tools", "openclaw-agents", "openclaw-cron",
+// "openclaw-gateway", "service") with pkg/reconcile before engine.Main()
+// starts the HTTP server.
+//
+// The identity provider (Wave 6b) registers a daemon-side stub via
+// internal/providers/daemon. The full plan/apply implementation lives in
+// workspace-root identity_wiring.go (cog CLI binary).
 //
 // engine.RegisterProviders is set here so the registration call happens inside
 // runServe() (after the logger is up) rather than in a file-level init() that
@@ -165,9 +170,9 @@ func init() {
 
 	// The named import of internal/providers/daemon above already triggered
 	// daemon.init() (and component.init() via daemon's blank import), which
-	// called reconcile.RegisterProvider for all 9 providers. engine.RegisterProviders
-	// is set to a no-op rather than left nil so runServe() logs "providers
-	// registered" when it calls the hook.
+	// called reconcile.RegisterProvider for all 10 providers (including the
+	// Wave 6b identity stub). engine.RegisterProviders is set to a no-op rather
+	// than left nil so runServe() logs "providers registered" when it calls the hook.
 	engine.RegisterProviders = func() {
 		// providers already registered by internal/providers/daemon init()
 	}
