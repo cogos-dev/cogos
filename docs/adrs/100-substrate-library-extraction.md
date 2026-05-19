@@ -7,7 +7,7 @@ cog:
 
 title: "ADR-100: Substrate Library Extraction From Current Package Structure"
 created: 2026-05-19
-status: proposed
+status: accepted
 tags: [adr, substrate, kernel, library-extraction, decomposition, supersedes-085]
 author: chaz
 refs:
@@ -66,12 +66,18 @@ refs:
 
 ## Status
 
-**Proposed — 2026-05-19.**
+**Accepted — 2026-05-19. Steps 1, 2a, and 2b merged.**
 
 Supersedes ADR-085 as the prerequisite decomposition ADR for RFC-034 Phase 2.
 ADR-085 is marked `superseded` (see body note added 2026-05-15); its
 prescribed per-provider layout diverged in implementation. This ADR takes the
 current codebase as its starting point rather than the ADR-085 plan.
+
+Implementation progress:
+- Step 1 (scaffold `pkg/substrate/` module) — merged #283
+- Step 2a (`pkg/reconcile` re-export via `pkg/substrate/reconcile`) — merged #283
+- Step 2b (`pkg/uri`, `pkg/cogfield`, `pkg/bep` re-exports) — merged #294
+- Steps 3–6 pending
 
 ---
 

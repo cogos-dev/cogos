@@ -7,7 +7,7 @@ cog:
 
 title: "ADR-101: testkernel — In-Process Boot Harness for Daemon-Level Integration Testing"
 created: 2026-05-19
-status: proposed
+status: accepted
 tags: [adr, kernel, testing, testkernel, reconcile, mcp, integration-testing]
 author: chaz
 refs:
@@ -45,7 +45,12 @@ refs:
 
 ## Status
 
-**Proposed — 2026-05-19.**
+**Accepted — 2026-05-19. Phases 1 and 2 merged.**
+
+Implementation progress:
+- Phase 1 (`engine.Boot` factored out of `runServe`; `internal/testkernel` scaffold) — merged #289
+- Phase 2 (`WithIsolatedRegistry` for provider injection in testkernel) — merged #295
+- Phase 3 (downstream cross-module testkernel adoption) pending
 
 ---
 
