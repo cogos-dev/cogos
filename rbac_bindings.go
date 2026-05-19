@@ -212,97 +212,234 @@ type RBACBindingSet struct {
 // LoadRBACBindings reads all structural binding YAML files from the
 // .cog/config/rbac/bindings/ hierarchy. Missing directories are not errors;
 // a fresh workspace has no bindings yet.
-func LoadRBACBindings(root string) (*RBACBindingSet, error) {
+//
+// Two error categories are distinguished:
+//   - Fatal I/O errors (unreadable directory, unreadable file) cause an
+//     immediate return with nil set and a non-nil error.
+//   - Schema errors (YAML parse failures, missing required fields) are
+//     accumulated into schemaErrors and the valid files are still returned.
+//     This allows partial-load: a single bad file does not block the rest.
+//
+// Callers that need to surface schema errors in health reporting should
+// capture the schemaErrors slice (e.g. into RBACProvider.schemaErrors).
+func LoadRBACBindings(root string) (set *RBACBindingSet, schemaErrors []string, err error) {
 	base := rbacBindingsDir(root)
-	set := &RBACBindingSet{}
+	set = &RBACBindingSet{}
 
-	var err error
-
-	set.RoleBindings, err = loadRoleBindings(filepath.Join(base, "rolebinding"))
+	var roleErrs []string
+	set.RoleBindings, roleErrs, err = loadRoleBindings(filepath.Join(base, "rolebinding"))
 	if err != nil {
-		return nil, fmt.Errorf("rbac: load rolebindings: %w", err)
+		return nil, nil, fmt.Errorf("rbac: load rolebindings: %w", err)
 	}
+	schemaErrors = append(schemaErrors, roleErrs...)
 
-	set.AccountBindings, err = loadAccountBindings(filepath.Join(base, "accountbinding"))
+	var acctErrs []string
+	set.AccountBindings, acctErrs, err = loadAccountBindings(filepath.Join(base, "accountbinding"))
 	if err != nil {
-		return nil, fmt.Errorf("rbac: load accountbindings: %w", err)
+		return nil, nil, fmt.Errorf("rbac: load accountbindings: %w", err)
 	}
+	schemaErrors = append(schemaErrors, acctErrs...)
 
-	set.NodeBindings, err = loadNodeBindings(filepath.Join(base, "nodebinding"))
+	var nodeErrs []string
+	set.NodeBindings, nodeErrs, err = loadNodeBindings(filepath.Join(base, "nodebinding"))
 	if err != nil {
-		return nil, fmt.Errorf("rbac: load nodebindings: %w", err)
+		return nil, nil, fmt.Errorf("rbac: load nodebindings: %w", err)
 	}
+	schemaErrors = append(schemaErrors, nodeErrs...)
 
-	set.WorkspaceBindings, err = loadWorkspaceBindings(filepath.Join(base, "workspacebinding"))
+	var wsErrs []string
+	set.WorkspaceBindings, wsErrs, err = loadWorkspaceBindings(filepath.Join(base, "workspacebinding"))
 	if err != nil {
-		return nil, fmt.Errorf("rbac: load workspacebindings: %w", err)
+		return nil, nil, fmt.Errorf("rbac: load workspacebindings: %w", err)
 	}
+	schemaErrors = append(schemaErrors, wsErrs...)
 
-	return set, nil
+	return set, schemaErrors, nil
 }
 
-func loadRoleBindings(dir string) ([]*RoleBindingCRD, error) {
+// loadRoleBindings reads all RoleBindingCRD files from dir. Returns valid
+// bindings, any schema errors encountered, and a fatal I/O error if one occurs.
+func loadRoleBindings(dir string) ([]*RoleBindingCRD, []string, error) {
 	files, err := yamlFilesIn(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]*RoleBindingCRD, 0, len(files))
+	var errs []string
 	for _, f := range files {
 		var crd RoleBindingCRD
 		if err := decodeYAMLFile(f, &crd); err != nil {
-			return nil, fmt.Errorf("%s: %w", f, err)
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
+		}
+		if err := validateRoleBinding(&crd); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
 		}
 		out = append(out, &crd)
 	}
-	return out, nil
+	return out, errs, nil
 }
 
-func loadAccountBindings(dir string) ([]*AccountBindingCRD, error) {
+// loadAccountBindings reads all AccountBindingCRD files from dir. Returns valid
+// bindings, any schema errors encountered, and a fatal I/O error if one occurs.
+func loadAccountBindings(dir string) ([]*AccountBindingCRD, []string, error) {
 	files, err := yamlFilesIn(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]*AccountBindingCRD, 0, len(files))
+	var errs []string
 	for _, f := range files {
 		var crd AccountBindingCRD
 		if err := decodeYAMLFile(f, &crd); err != nil {
-			return nil, fmt.Errorf("%s: %w", f, err)
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
+		}
+		if err := validateAccountBinding(&crd); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
 		}
 		out = append(out, &crd)
 	}
-	return out, nil
+	return out, errs, nil
 }
 
-func loadNodeBindings(dir string) ([]*NodeBindingCRD, error) {
+// loadNodeBindings reads all NodeBindingCRD files from dir. Returns valid
+// bindings, any schema errors encountered, and a fatal I/O error if one occurs.
+func loadNodeBindings(dir string) ([]*NodeBindingCRD, []string, error) {
 	files, err := yamlFilesIn(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]*NodeBindingCRD, 0, len(files))
+	var errs []string
 	for _, f := range files {
 		var crd NodeBindingCRD
 		if err := decodeYAMLFile(f, &crd); err != nil {
-			return nil, fmt.Errorf("%s: %w", f, err)
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
+		}
+		if err := validateNodeBinding(&crd); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
 		}
 		out = append(out, &crd)
 	}
-	return out, nil
+	return out, errs, nil
 }
 
-func loadWorkspaceBindings(dir string) ([]*WorkspaceBindingCRD, error) {
+// loadWorkspaceBindings reads all WorkspaceBindingCRD files from dir. Returns
+// valid bindings, any schema errors encountered, and a fatal I/O error if one occurs.
+func loadWorkspaceBindings(dir string) ([]*WorkspaceBindingCRD, []string, error) {
 	files, err := yamlFilesIn(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]*WorkspaceBindingCRD, 0, len(files))
+	var errs []string
 	for _, f := range files {
 		var crd WorkspaceBindingCRD
 		if err := decodeYAMLFile(f, &crd); err != nil {
-			return nil, fmt.Errorf("%s: %w", f, err)
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
+		}
+		if err := validateWorkspaceBinding(&crd); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+			continue
 		}
 		out = append(out, &crd)
 	}
-	return out, nil
+	return out, errs, nil
+}
+
+// ─── Validators ─────────────────────────────────────────────────────────────
+
+// validateRoleBinding checks that required fields are present.
+// Returns a descriptive error if any required field is empty.
+func validateRoleBinding(crd *RoleBindingCRD) error {
+	if crd.Metadata.Name == "" {
+		return fmt.Errorf("binding: metadata.name is required")
+	}
+	if crd.Spec.Subject == "" {
+		return fmt.Errorf("binding %q: spec.subject is required", crd.Metadata.Name)
+	}
+	if crd.Spec.RoleRef == "" {
+		return fmt.Errorf("binding %q: spec.role_ref is required", crd.Metadata.Name)
+	}
+	return nil
+}
+
+// validateAccountBinding checks that required fields are present.
+func validateAccountBinding(crd *AccountBindingCRD) error {
+	if crd.Metadata.Name == "" {
+		return fmt.Errorf("binding: metadata.name is required")
+	}
+	if crd.Spec.Subject == "" {
+		return fmt.Errorf("binding %q: spec.subject is required", crd.Metadata.Name)
+	}
+	if crd.Spec.Node == "" {
+		return fmt.Errorf("binding %q: spec.node is required", crd.Metadata.Name)
+	}
+	if crd.Spec.Account == "" {
+		return fmt.Errorf("binding %q: spec.account is required", crd.Metadata.Name)
+	}
+	return nil
+}
+
+// validateNodeBinding checks that required fields are present.
+func validateNodeBinding(crd *NodeBindingCRD) error {
+	if crd.Metadata.Name == "" {
+		return fmt.Errorf("binding: metadata.name is required")
+	}
+	if crd.Spec.Subject == "" {
+		return fmt.Errorf("binding %q: spec.subject is required", crd.Metadata.Name)
+	}
+	if crd.Spec.Node == "" {
+		return fmt.Errorf("binding %q: spec.node is required", crd.Metadata.Name)
+	}
+	if crd.Spec.Relation == "" {
+		return fmt.Errorf("binding %q: spec.relation is required", crd.Metadata.Name)
+	}
+	return nil
+}
+
+// validateWorkspaceBinding checks that required fields are present.
+func validateWorkspaceBinding(crd *WorkspaceBindingCRD) error {
+	if crd.Metadata.Name == "" {
+		return fmt.Errorf("binding: metadata.name is required")
+	}
+	if crd.Spec.Subject == "" {
+		return fmt.Errorf("binding %q: spec.subject is required", crd.Metadata.Name)
+	}
+	if crd.Spec.WorkspaceURI == "" {
+		return fmt.Errorf("binding %q: spec.workspace_uri is required", crd.Metadata.Name)
+	}
+	if crd.Spec.Access == "" {
+		return fmt.Errorf("binding %q: spec.access is required", crd.Metadata.Name)
+	}
+	return nil
+}
+
+// validateHarnessBinding checks that required fields are present.
+// Used by callers that construct HarnessBindingCRDs at runtime (AttachHarness).
+func validateHarnessBinding(crd *HarnessBindingCRD) error {
+	if crd.Metadata.Name == "" {
+		return fmt.Errorf("binding: metadata.name is required")
+	}
+	if crd.Spec.SessionID == "" {
+		return fmt.Errorf("binding %q: spec.session_id is required", crd.Metadata.Name)
+	}
+	if crd.Spec.Subject == "" {
+		return fmt.Errorf("binding %q: spec.subject is required", crd.Metadata.Name)
+	}
+	if crd.Spec.Type == "" {
+		return fmt.Errorf("binding %q: spec.type is required", crd.Metadata.Name)
+	}
+	if crd.Spec.HarnessType == "" {
+		return fmt.Errorf("binding %q: spec.harness_type is required", crd.Metadata.Name)
+	}
+	return nil
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
