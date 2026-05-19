@@ -32,6 +32,19 @@ import (
 // ─── Types ──────────────────────────────────────────────────────────────────────
 
 // NodeIdentity represents ~/.cog/node/identity.yaml.
+//
+// This is the Layer 3 machine-registration record — hostname, OS, capability
+// flags. It is NOT a cryptographic identity and does NOT contain key material.
+//
+// Three-layer node identity taxonomy (ADR-099):
+//
+//	L1: Constellation mesh identity — ECDSA P-256, NodeID = hex(sha256(DER(pubkey)))
+//	    Repo: github.com/myrgic/constellation — peer heartbeat signing, ledger events
+//	L2: Workspace operational identity — Ed25519, stored in .cog/identity.json
+//	    Scope: cog workspace CLI (cog/.cog/ package main), NOT the cogos kernel
+//	    Deprecated-pending-migration; see ADR-099 for retirement preconditions
+//	L3: Node machine-registration record (this type) — no keys, YAML
+//	    Scope: cogos kernel, multi-node deployment (ADR-062, ADR-063)
 type NodeIdentity struct {
 	Version string           `yaml:"version"`
 	Node    NodeInfo         `yaml:"node"`
