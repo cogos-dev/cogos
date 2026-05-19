@@ -1,0 +1,252 @@
+// boot.go — engine.Boot: in-process kernel boot, factored out of runServe.
+//
+// ADR-101 Phase 1: factor the boot sequence from runServe into a function
+// that accepts a context and returns a *Kernel handle. runServe becomes a
+// thin wrapper that handles daemon-lifecycle concerns (planServeState,
+// saveDaemonState, signal context) and then calls Boot.
+//
+// Boot does NOT:
+//   - Install OS signal handlers (caller's responsibility).
+//   - Write or clean up the daemon state file.
+//   - Call os.Exit on error (returns error instead).
+//   - Call RegisterProviders or SetProvidersWorkspace (already done by runServe
+//     before Boot is called; these are intentionally nil in test paths).
+//
+// Boot DOES:
+//   - Load the nucleus.
+//   - Build Process, Router, Server, ReconcileDaemon.
+//   - Wire telemetry (no-op if no collector).
+//   - Wire LocalHarnessController if an MCP server is present.
+//   - Start all long-lived goroutines (process loop, HTTP server, reconcile daemon,
+//     projection watchers).
+//   - Block until the HTTP server is ready (listening) before returning.
+//   - Return a *Kernel handle that gives callers Endpoint(), WorkspaceRoot(), and Stop().
+//
+// Phase 2 options (WithIsolatedRegistry, etc.) are not implemented here;
+// the BootOption type and option-application pattern are established so the
+// surface is stable for incremental addition.
+package engine
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"time"
+)
+
+// BootOption is a functional option passed to Boot.
+//
+// Phase 1 defines no options with observable effect; the type exists so
+// that Boot's signature is stable. Phase 2 will add WithIsolatedRegistry,
+// WithPollInterval, etc. without changing callers.
+type BootOption func(*bootConfig)
+
+// bootConfig holds the resolved configuration derived from BootOptions.
+// All fields are optional; zero values mean "use the kernel default".
+type bootConfig struct {
+	// pollInterval overrides the ReconcileDaemon tick interval.
+	// 0 means use the ReconcileDaemon default (30 s).
+	pollInterval time.Duration
+
+	// Phase 2: isolated provider list (nil = use global registry).
+	// providers []reconcile.Reconcilable
+}
+
+func applyBootOptions(opts []BootOption) bootConfig {
+	cfg := bootConfig{}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return cfg
+}
+
+// Kernel is an opaque handle to a running in-process kernel instance.
+// Obtain via Boot; release via Stop.
+type Kernel struct {
+	cfg             *Config
+	server          *Server
+	process         *Process
+	reconcileDaemon *ReconcileDaemon
+	cancel          context.CancelFunc
+	httpEndpoint    string // resolved actual addr, e.g. "http://127.0.0.1:54321"
+	serverDone      chan error
+	processDone     chan error
+	shutdownTelemetry func(context.Context)
+}
+
+// Endpoint returns the base URL of the kernel's HTTP server,
+// e.g. "http://127.0.0.1:54321".
+func (k *Kernel) Endpoint() string {
+	return k.httpEndpoint
+}
+
+// WorkspaceRoot returns the workspace root path in use.
+func (k *Kernel) WorkspaceRoot() string {
+	return k.cfg.WorkspaceRoot
+}
+
+// Stop cancels the kernel's context and waits for all goroutines to exit
+// within a 10-second deadline. Safe to call multiple times (idempotent after
+// first call; subsequent calls return nil immediately).
+func (k *Kernel) Stop() error {
+	k.cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	if err := k.server.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("kernel stop: server shutdown error", "err", err)
+	}
+
+	// Wait for the process goroutine.
+	select {
+	case <-k.processDone:
+	case <-shutdownCtx.Done():
+		slog.Warn("kernel stop: process did not stop in time")
+	}
+
+	if k.shutdownTelemetry != nil {
+		k.shutdownTelemetry(context.Background())
+	}
+
+	return nil
+}
+
+// Boot starts a kernel in-process. It loads the nucleus, builds all kernel
+// subsystems, starts the HTTP server on a pre-allocated listener, and returns
+// a *Kernel handle once the server is accepting connections.
+//
+// The kernel runs until ctx is cancelled or Stop is called.
+//
+// cfg must be a fully resolved *Config (LoadConfig + any flag overrides already
+// applied by the caller). Boot does not call os.Exit; any failure returns error.
+//
+// RegisterProviders / SetProvidersWorkspace are expected to have been called
+// (or intentionally left nil) by the caller before Boot.
+func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error) {
+	_ = applyBootOptions(opts) // Phase 2 will read these fields.
+
+	// Load nucleus (identity core).
+	nucleus, err := LoadNucleus(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("boot: nucleus load failed: %w", err)
+	}
+	slog.Info("nucleus loaded", "summary", nucleus.Summary())
+
+	// Build the continuous process.
+	process := NewProcess(cfg, nucleus)
+
+	// Load TRM model and embedding index (optional — graceful degradation).
+	if trm, embIdx := loadTRMAtStartup(cfg); trm != nil && embIdx != nil {
+		process.SetTRM(trm, embIdx)
+		slog.Info("trm: wired into context assembly pipeline")
+	}
+
+	// Build the inference router.
+	router, err := BuildRouter(cfg)
+	if err != nil {
+		slog.Warn("router build failed; inference disabled", "err", err)
+	}
+
+	// Build the HTTP server.
+	server := NewServer(cfg, nucleus, process)
+	server.SetRouter(router)
+
+	// Wire the session-activity publisher.
+	if server.busSessions != nil {
+		process.SetSessionActivityPublisher(server.busSessions.AppendEvent)
+	}
+
+	// Initialize telemetry (traces + metrics). No-op if no collector is available.
+	shutdownTelemetry := initTelemetry(ctx)
+
+	// Derived context the kernel owns; caller's ctx cancellation also stops it.
+	kernelCtx, cancel := context.WithCancel(ctx)
+
+	// Wire LocalHarnessController if an MCP server is present.
+	if server.mcpServer != nil {
+		ctrl, err := NewLocalHarnessController(cfg, nucleus, process, server.mcpServer)
+		if err != nil {
+			slog.Warn("local harness disabled", "err", err)
+		} else {
+			ctrl.SetBusSessionManager(server.busSessions)
+			server.SetAgentController(ctrl)
+			ctrl.Start(kernelCtx)
+			slog.Info("local harness started", "agent_id", DefaultAgentID, "interval", ctrl.interval.String())
+		}
+	}
+
+	// ADR-092 §2 step 4: Reconcile loop start.
+	reconcileDaemon := NewReconcileDaemon(ReconcileDaemonConfig{
+		WorkspaceRoot: cfg.WorkspaceRoot,
+	})
+	reconcileDaemon.Start(kernelCtx)
+
+	// Wire ProjectionWatcher as an early-trigger source.
+	for _, kind := range AllProjectionKinds {
+		kind := kind
+		nodesDir := cfg.WorkspaceRoot + "/.cog/mem/semantic/lineage/nodes"
+		providerType := "lineage-projection-" + string(kind)
+		watcher := NewProjectionWatcher(nodesDir, func(watchCtx context.Context) error {
+			reconcileDaemon.Trigger(providerType)
+			return nil
+		}, 0)
+		if err := watcher.Start(kernelCtx); err != nil {
+			slog.Debug("projection watcher skipped (nodes dir not present)",
+				"kind", kind, "err", err)
+		} else {
+			slog.Info("projection watcher started", "kind", kind, "nodes_dir", nodesDir)
+		}
+	}
+
+	// Pre-allocate the listener so we know the actual port before Start returns.
+	// This is necessary when cfg.Port == 0 (OS-assigned ephemeral port) so
+	// that Endpoint() can return a valid URL immediately after Boot.
+	listenAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.Port)
+	if cfg.BindAddr == "" {
+		listenAddr = fmt.Sprintf("127.0.0.1:%d", cfg.Port)
+	}
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("boot: listen %s: %w", listenAddr, err)
+	}
+
+	// Derive the actual endpoint URL from the listener.
+	actualAddr := ln.Addr().(*net.TCPAddr)
+	bindHost := cfg.BindAddr
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	httpEndpoint := fmt.Sprintf("http://%s:%d", bindHost, actualAddr.Port)
+
+	// Start process goroutine.
+	processDone := make(chan error, 1)
+	go func() {
+		processDone <- process.Run(kernelCtx)
+	}()
+
+	// Start HTTP server goroutine using the pre-allocated listener.
+	serverDone := make(chan error, 1)
+	go func() {
+		if err := server.srv.Serve(ln); err != nil {
+			serverDone <- err
+		}
+	}()
+
+	k := &Kernel{
+		cfg:               cfg,
+		server:            server,
+		process:           process,
+		reconcileDaemon:   reconcileDaemon,
+		cancel:            cancel,
+		httpEndpoint:      httpEndpoint,
+		serverDone:        serverDone,
+		processDone:       processDone,
+		shutdownTelemetry: shutdownTelemetry,
+	}
+
+	slog.Info("kernel booted", "endpoint", httpEndpoint, "workspace", cfg.WorkspaceRoot)
+	return k, nil
+}
