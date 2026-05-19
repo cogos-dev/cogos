@@ -83,6 +83,11 @@ type IdentityProjection struct {
 	// first) expression so callers can resolve the identity's home URI without
 	// iterating the full expression list.
 	WorkspaceRoot string               `json:"workspace_root,omitempty"`
+	// VoiceProfile carries the voice_profile from the primary (catch-all or
+	// first) expression so callers can resolve the identity's voice config
+	// without iterating the full expression list. Both generative (TTS) and
+	// discriminative (speaker recognition) heads are carried when present.
+	VoiceProfile *VoiceProfile `json:"voice_profile,omitempty"`
 }
 
 // ParticipantRow matches the kernel's existing `participants` table schema
@@ -608,13 +613,16 @@ func (p *IdentityProvider) applyUpsert(ctx context.Context, root string, crd *Id
 	projectionPath := filepath.Join(".cog", "id", sub+".cog.md")
 	absProjection := filepath.Join(root, projectionPath)
 
-	// Pull WorkspaceRoot from the primary expression so callers don't need to
-	// iterate expressions to find the home URI.
+	// Pull WorkspaceRoot and VoiceProfile from the primary expression so callers
+	// don't need to iterate expressions to find the home URI or voice config.
 	var workspaceRoot string
+	var voiceProfile *VoiceProfile
 	if exp := crd.Spec.ExpressionFor("*"); exp != nil {
 		workspaceRoot = exp.WorkspaceRoot
+		voiceProfile = exp.VoiceProfile
 	} else if len(crd.Spec.Expressions) > 0 {
 		workspaceRoot = crd.Spec.Expressions[0].WorkspaceRoot
+		voiceProfile = crd.Spec.Expressions[0].VoiceProfile
 	}
 
 	proj := IdentityProjection{
@@ -626,6 +634,7 @@ func (p *IdentityProvider) applyUpsert(ctx context.Context, root string, crd *Id
 		Expressions:   append([]IdentityExpression(nil), crd.Spec.Expressions...),
 		ContentPath:   projectionPath,
 		WorkspaceRoot: workspaceRoot,
+		VoiceProfile:  voiceProfile,
 	}
 
 	// Write projection cogdoc first — if it fails we haven't touched the DB.
@@ -853,8 +862,15 @@ func writeIdentityProjectionCogDoc(absPath string, crd *IdentityCRD, specHash st
 		if exp.Role != "" {
 			fmt.Fprintf(&buf, "**Role:** %s\n\n", exp.Role)
 		}
-		if exp.Voice != "" {
-			fmt.Fprintf(&buf, "**Voice:** %s\n\n", exp.Voice)
+		if vp := exp.VoiceProfile; vp != nil {
+			if vp.Generative != nil {
+				fmt.Fprintf(&buf, "**Voice (generative):** engine=%s ref=%s\n\n",
+					vp.Generative.Engine, vp.Generative.ConditionalsRef)
+			}
+			if vp.Discriminative != nil {
+				fmt.Fprintf(&buf, "**Voice (discriminative):** model=%s ref=%s\n\n",
+					vp.Discriminative.Model, vp.Discriminative.EmbeddingRef)
+			}
 		}
 		if len(exp.Skills) > 0 {
 			buf.WriteString("**Skills:**\n")

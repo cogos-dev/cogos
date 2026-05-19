@@ -142,6 +142,40 @@ type AuthFactorEntry struct {
 	Claims map[string]any `yaml:"claims,omitempty"`
 }
 
+// VoiceProfile separates the generative TTS head from the discriminative
+// speaker-recognition head. Both are URI-addressed substrate records so
+// their file locations are projections, not the binding. This makes voice
+// assets substrate-addressable via cog://voices/* — the same pattern used
+// for skills (cog://skills/*) and memory (cog://mem/*).
+type VoiceProfile struct {
+	// Generative is the TTS conditioning head (Chatterbox-Turbo or compatible).
+	// When non-nil, the identity can speak via mod3 using these conditionals.
+	Generative *VoiceGenerativeHead `yaml:"generative,omitempty"`
+	// Discriminative is the speaker-recognition head (ECAPA-TDNN or compatible).
+	// When non-nil, the pipeline can identify this speaker from raw audio.
+	// Schema only in this wave — no live ECAPA integration yet.
+	Discriminative *VoiceDiscriminativeHead `yaml:"discriminative,omitempty"`
+}
+
+// VoiceGenerativeHead holds TTS conditioning parameters for one engine.
+// ConditionalsRef is a cog://voices/<name> URI that resolves to the
+// safetensors file containing the Chatterbox speaker conditionals.
+type VoiceGenerativeHead struct {
+	Engine          string `yaml:"engine"`                    // e.g. "chatterbox-turbo"
+	ConditionalsRef string `yaml:"conditionals_ref"`           // cog://voices/<name>
+	EnrolledAt      string `yaml:"enrolled_at,omitempty"`      // RFC3339; set by enrollment
+}
+
+// VoiceDiscriminativeHead holds speaker-recognition parameters.
+// EmbeddingRef is a cog://voices/<name>/ecapa-embedding URI that
+// resolves to the ECAPA-TDNN speaker embedding vector.
+// Schema only in this wave — ECAPA integration is a follow-up.
+type VoiceDiscriminativeHead struct {
+	Model        string `yaml:"model"`                  // e.g. "speechbrain/spkrec-ecapa-voxceleb"
+	EmbeddingRef string `yaml:"embedding_ref"`           // cog://voices/<name>/ecapa-embedding
+	EnrolledAt   string `yaml:"enrolled_at,omitempty"`   // RFC3339
+}
+
 // IdentityExpression is one projection of an identity into a specific audience.
 // At least one expression per Identity. The reconciler matches by `aud`:
 //
@@ -154,8 +188,13 @@ type IdentityExpression struct {
 	DisplayName string   `yaml:"display_name,omitempty"`
 	Role        string   `yaml:"role,omitempty"`
 	Skills      []string `yaml:"skills,omitempty"`
-	Voice       string   `yaml:"voice,omitempty"`
-	Sudo        bool     `yaml:"sudo,omitempty"`
+	// VoiceProfile holds structured voice configuration for this expression.
+	// Replaces the former Voice string field (removed in Wave 6c, 2026-05-19).
+	// Generative head: TTS conditioning via cog://voices/* URIs.
+	// Discriminative head: speaker-recognition embedding (schema only; no live
+	// ECAPA integration in this wave).
+	VoiceProfile *VoiceProfile `yaml:"voice_profile,omitempty"`
+	Sudo         bool          `yaml:"sudo,omitempty"`
 	// MemoryNamespace optionally scopes this expression's memory reads/writes
 	// (e.g., "cog://" for root, "cog://agents/sandy/" for a scoped agent).
 	MemoryNamespace string `yaml:"memory_namespace,omitempty"`

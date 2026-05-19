@@ -991,3 +991,114 @@ func TestIdentityProvider_WorkspaceRoot_AbsentIsEmpty(t *testing.T) {
 		t.Errorf("WorkspaceRoot = %q, want empty string when unset", proj.WorkspaceRoot)
 	}
 }
+
+// ─── VoiceProfile projection (Primitive 3) ──────────────────────────────────────
+
+// writeIdentityCRDWithVoiceProfile writes a CRD that includes a full
+// voice_profile (both generative and discriminative heads) in its catch-all
+// expression.
+func writeIdentityCRDWithVoiceProfile(t *testing.T, root, sub string) {
+	t.Helper()
+	dir := identityCRDDir(root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	body := fmt.Sprintf(`apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: %s
+spec:
+  iss: cogos-dev
+  sub: %s
+  type: agent
+  expressions:
+    - aud: "*"
+      display_name: %q
+      voice_profile:
+        generative:
+          engine: chatterbox-turbo
+          conditionals_ref: "cog://voices/%s"
+        discriminative:
+          model: "speechbrain/spkrec-ecapa-voxceleb"
+          embedding_ref: "cog://voices/%s/ecapa-embedding"
+`, sub, sub, sub, sub, sub)
+	path := filepath.Join(dir, sub+".yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// TestIdentityProvider_VoiceProfile_ProjectionPopulated verifies that after a
+// full reconcile cycle, IdentityProjection.VoiceProfile carries the generative
+// and discriminative heads declared in the CRD's catch-all expression.
+func TestIdentityProvider_VoiceProfile_ProjectionPopulated(t *testing.T) {
+	fx := setupProvider(t)
+	writeIdentityCRDWithVoiceProfile(t, fx.root, "cog")
+
+	cfg, _ := fx.prov.LoadConfig(fx.root)
+	live, _ := fx.prov.FetchLive(context.Background(), cfg)
+	plan, _ := fx.prov.ComputePlan(cfg, live, nil)
+	results, err := fx.prov.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != ApplySucceeded {
+		t.Fatalf("results = %+v, want 1 succeeded", results)
+	}
+
+	proj, err := fx.db.GetProjection(context.Background(), "cog")
+	if err != nil {
+		t.Fatalf("GetProjection: %v", err)
+	}
+	if proj == nil {
+		t.Fatal("projection is nil")
+	}
+	if proj.VoiceProfile == nil {
+		t.Fatal("VoiceProfile is nil; expected populated")
+	}
+	if proj.VoiceProfile.Generative == nil {
+		t.Fatal("VoiceProfile.Generative is nil")
+	}
+	if proj.VoiceProfile.Generative.Engine != "chatterbox-turbo" {
+		t.Errorf("Engine = %q, want chatterbox-turbo", proj.VoiceProfile.Generative.Engine)
+	}
+	if proj.VoiceProfile.Generative.ConditionalsRef != "cog://voices/cog" {
+		t.Errorf("ConditionalsRef = %q, want cog://voices/cog", proj.VoiceProfile.Generative.ConditionalsRef)
+	}
+	if proj.VoiceProfile.Discriminative == nil {
+		t.Fatal("VoiceProfile.Discriminative is nil")
+	}
+	if proj.VoiceProfile.Discriminative.EmbeddingRef != "cog://voices/cog/ecapa-embedding" {
+		t.Errorf("EmbeddingRef = %q, want cog://voices/cog/ecapa-embedding",
+			proj.VoiceProfile.Discriminative.EmbeddingRef)
+	}
+}
+
+// TestIdentityProvider_VoiceProfile_AbsentIsNil verifies that reconciling an
+// identity with no voice_profile yields VoiceProfile == nil on the projection.
+func TestIdentityProvider_VoiceProfile_AbsentIsNil(t *testing.T) {
+	fx := setupProvider(t)
+	writeIdentityCRD(t, fx.root, "cog", "cogos-dev", "Cog", "")
+
+	cfg, _ := fx.prov.LoadConfig(fx.root)
+	live, _ := fx.prov.FetchLive(context.Background(), cfg)
+	plan, _ := fx.prov.ComputePlan(cfg, live, nil)
+	results, err := fx.prov.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != ApplySucceeded {
+		t.Fatalf("results = %+v, want 1 succeeded", results)
+	}
+
+	proj, err := fx.db.GetProjection(context.Background(), "cog")
+	if err != nil {
+		t.Fatalf("GetProjection: %v", err)
+	}
+	if proj == nil {
+		t.Fatal("projection is nil")
+	}
+	if proj.VoiceProfile != nil {
+		t.Errorf("VoiceProfile should be nil when absent, got %+v", proj.VoiceProfile)
+	}
+}
