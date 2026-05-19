@@ -64,6 +64,14 @@ type ReconcileDaemonConfig struct {
 	// ShutdownGracePeriod is how long the daemon waits for in-flight cycles to
 	// complete after context cancel before returning. Default: 5 seconds.
 	ShutdownGracePeriod time.Duration
+
+	// Providers, when non-nil, is an explicit list of Reconcilables the daemon
+	// iterates instead of the global registry. This is the ADR-101 Phase 2
+	// registry-isolation mechanism: integration tests inject real providers here
+	// without touching the global registry (which may contain daemon-binary stub
+	// providers). When nil, the daemon uses reconcile.ListProviders() as before.
+	// Production code leaves this nil; only testkernel sets it.
+	Providers []reconcile.Reconcilable
 }
 
 func (c *ReconcileDaemonConfig) withDefaults() ReconcileDaemonConfig {
@@ -117,14 +125,61 @@ func (d *ReconcileDaemon) State() ReconcileDaemonState {
 	return d.state
 }
 
+// ─── Isolated-registry helpers ───────────────────────────────────────────────
+//
+// When cfg.Providers is nil these helpers delegate to the global registry,
+// preserving all pre-Phase-2 behaviour exactly. When cfg.Providers is set
+// (testkernel isolation path) they operate solely on that list.
+
+// hasProvider reports whether providerType is available in the active provider
+// source (injected list or global registry).
+func (d *ReconcileDaemon) hasProvider(pt string) bool {
+	if d.cfg.Providers != nil {
+		for _, p := range d.cfg.Providers {
+			if p.Type() == pt {
+				return true
+			}
+		}
+		return false
+	}
+	return reconcile.HasProvider(pt)
+}
+
+// listProviderTypes returns the ordered type strings for all active providers.
+func (d *ReconcileDaemon) listProviderTypes() []string {
+	if d.cfg.Providers != nil {
+		names := make([]string, len(d.cfg.Providers))
+		for i, p := range d.cfg.Providers {
+			names[i] = p.Type()
+		}
+		return names
+	}
+	return reconcile.ListProviders()
+}
+
+// getProvider returns the Reconcilable for the given type from the active
+// provider source (injected list or global registry).
+func (d *ReconcileDaemon) getProvider(pt string) (reconcile.Reconcilable, error) {
+	if d.cfg.Providers != nil {
+		for _, p := range d.cfg.Providers {
+			if p.Type() == pt {
+				return p, nil
+			}
+		}
+		return nil, fmt.Errorf("provider %q not in injected list", pt)
+	}
+	return reconcile.GetProvider(pt)
+}
+
 // Trigger queues an immediate (out-of-band) reconcile for the named provider
 // type. Non-blocking: if the provider is already queued, this is a no-op.
-// If the provider is not registered, the trigger is silently dropped.
+// If the provider is not registered (or not in the injected list when one is
+// set), the trigger is silently dropped.
 //
 // This is the integration point for watch-based early-trigger mechanisms
 // (e.g., ProjectionWatcher). See ADR-095 §4.
 func (d *ReconcileDaemon) Trigger(providerType string) {
-	if !reconcile.HasProvider(providerType) {
+	if !d.hasProvider(providerType) {
 		return
 	}
 	d.triggerMu.Lock()
@@ -185,9 +240,11 @@ func (d *ReconcileDaemon) run(ctx context.Context) {
 	}
 }
 
-// runTick iterates all registered providers and runs their reconcile cycle.
-// Also drains any pending triggers before iterating (so a trigger that fired
-// between ticks is absorbed into this tick rather than generating a double run).
+// runTick iterates all providers and runs their reconcile cycle.
+// When cfg.Providers is set, iterates the injected list; otherwise uses the
+// global registry. Also drains any pending triggers before iterating (so a
+// trigger that fired between ticks is absorbed into this tick rather than
+// generating a double run).
 func (d *ReconcileDaemon) runTick(ctx context.Context) {
 	// Absorb any outstanding triggers into this tick (they'll be covered by
 	// the full provider scan).
@@ -195,7 +252,7 @@ func (d *ReconcileDaemon) runTick(ctx context.Context) {
 	d.triggered = make(map[string]struct{})
 	d.triggerMu.Unlock()
 
-	providers := reconcile.ListProviders()
+	providers := d.listProviderTypes()
 	if len(providers) == 0 {
 		return
 	}
@@ -329,7 +386,7 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 
 	start := time.Now()
 
-	provider, err := reconcile.GetProvider(providerType)
+	provider, err := d.getProvider(providerType)
 	if err != nil {
 		slog.Warn("reconcile-daemon: provider not found", "provider", providerType, "err", err)
 		return err

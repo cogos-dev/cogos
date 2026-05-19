@@ -22,9 +22,9 @@
 //   - Block until the HTTP server is ready (listening) before returning.
 //   - Return a *Kernel handle that gives callers Endpoint(), WorkspaceRoot(), and Stop().
 //
-// Phase 2 options (WithIsolatedRegistry, etc.) are not implemented here;
-// the BootOption type and option-application pattern are established so the
-// surface is stable for incremental addition.
+// Phase 2 adds WithIsolatedRegistry: callers can inject an explicit provider
+// list so the ReconcileDaemon bypasses the global registry. This is the
+// integration-test isolation mechanism (ADR-101 Decision 3).
 package engine
 
 import (
@@ -33,6 +33,8 @@ import (
 	"log/slog"
 	"net"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/reconcile"
 )
 
 // BootOption is a functional option passed to Boot.
@@ -49,8 +51,10 @@ type bootConfig struct {
 	// 0 means use the ReconcileDaemon default (30 s).
 	pollInterval time.Duration
 
-	// Phase 2: isolated provider list (nil = use global registry).
-	// providers []reconcile.Reconcilable
+	// providers, when non-nil, is passed to ReconcileDaemonConfig.Providers so
+	// the daemon iterates this list instead of the global registry.
+	// Set via WithIsolatedRegistry. nil = use global registry (default).
+	providers []reconcile.Reconcilable
 }
 
 func applyBootOptions(opts []BootOption) bootConfig {
@@ -59,6 +63,23 @@ func applyBootOptions(opts []BootOption) bootConfig {
 		o(&cfg)
 	}
 	return cfg
+}
+
+// WithIsolatedRegistry returns a BootOption that injects an explicit provider
+// list into the ReconcileDaemon, bypassing the global registry.
+//
+// When this option is set the daemon iterates only the supplied providers;
+// the global registry (which in daemon-binary code paths contains stub
+// providers) is never consulted. This is the ADR-101 Phase 2 mechanism for
+// writing integration tests that exercise real plan/apply without stub
+// interference.
+//
+// Production callers should not use this option; pass nil or omit it to
+// preserve the default global-registry behaviour.
+func WithIsolatedRegistry(providers ...reconcile.Reconcilable) BootOption {
+	return func(c *bootConfig) {
+		c.providers = providers
+	}
 }
 
 // Kernel is an opaque handle to a running in-process kernel instance.
@@ -84,6 +105,13 @@ func (k *Kernel) Endpoint() string {
 // WorkspaceRoot returns the workspace root path in use.
 func (k *Kernel) WorkspaceRoot() string {
 	return k.cfg.WorkspaceRoot
+}
+
+// ReconcileDaemon returns the kernel's ReconcileDaemon, exposing Trigger and
+// State for integration tests that need to drive or observe reconcile cycles.
+// The daemon is already running when Boot returns.
+func (k *Kernel) ReconcileDaemon() *ReconcileDaemon {
+	return k.reconcileDaemon
 }
 
 // Stop cancels the kernel's context and waits for all goroutines to exit
@@ -125,7 +153,7 @@ func (k *Kernel) Stop() error {
 // RegisterProviders / SetProvidersWorkspace are expected to have been called
 // (or intentionally left nil) by the caller before Boot.
 func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error) {
-	_ = applyBootOptions(opts) // Phase 2 will read these fields.
+	bootCfg := applyBootOptions(opts)
 
 	// Load nucleus (identity core).
 	nucleus, err := LoadNucleus(cfg)
@@ -178,8 +206,11 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	}
 
 	// ADR-092 §2 step 4: Reconcile loop start.
+	// When WithIsolatedRegistry was passed (testkernel path), bootCfg.providers
+	// is non-nil and the daemon bypasses the global registry.
 	reconcileDaemon := NewReconcileDaemon(ReconcileDaemonConfig{
 		WorkspaceRoot: cfg.WorkspaceRoot,
+		Providers:     bootCfg.providers,
 	})
 	reconcileDaemon.Start(kernelCtx)
 
