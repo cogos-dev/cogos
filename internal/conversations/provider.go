@@ -575,14 +575,25 @@ func expandHome(path string) string {
 }
 
 // isDrift returns true when the indexed meta is stale compared to f.
-// Uses mtime AND size as a cheap two-field change detector.
+// Primary signal: size change (definitive — any content change changes size).
+// Secondary signal: mtime difference > 1s (guards against same-size rewrites).
+//
+// mtime is compared with 2-second tolerance to guard against filesystem mtime
+// resolution differences between `os.ReadDir` calls on fast-write filesystems
+// (e.g. Linux tmpfs in CI runners). A 1-byte change always changes size, so
+// the 2s tolerance only matters for truly same-size content changes (rare in
+// practice for session JSONLs, which grow monotonically).
 func isDrift(meta SessionMeta, f sourceFileInfo) bool {
-	// Size change is the fast path.
+	// Size change is the definitive fast path.
 	if meta.SourceSize != f.Size {
 		return true
 	}
-	// mtime with 1s resolution (filesystem granularity).
-	return meta.SourceMtime.Truncate(time.Second) != f.Mtime.Truncate(time.Second)
+	// mtime with 2s tolerance for filesystem-level mtime granularity jitter.
+	diff := meta.SourceMtime.Sub(f.Mtime)
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff > 2*time.Second
 }
 
 // indexSession opens sourcePath, streams turns, and returns the resulting
