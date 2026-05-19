@@ -20,9 +20,10 @@
 //   WorkspaceBindingCRD is the AUTHORITATIVE BINDING RECORD — it declares
 //   which identity owns which workspace URI with what access level.
 //   IdentityExpression.WorkspaceRoot (Primitive 1) is the SPEC HINT — a
-//   declaration of intent on the identity spec. The RBACProvider's reconciler
-//   converges the binding record toward the spec hint. They are NOT redundant;
-//   they live at different layers (spec vs authoritative binding state).
+//   declaration of intent on the identity spec. A future WorkspaceReconciler
+//   will converge (Wave 6c) the binding record toward the spec hint. They are
+//   NOT redundant; they live at different layers (spec vs authoritative binding
+//   state).
 //
 // Storage paths:
 //   .cog/config/rbac/bindings/rolebinding/<name>.yaml
