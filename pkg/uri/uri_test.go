@@ -382,6 +382,50 @@ func TestParseBothFormsRoundTrip(t *testing.T) {
 	}
 }
 
+// ── cog://voices/* namespace (Primitive 3 — VoiceProfile) ──────────────────────
+
+// TestParseVoicesNamespace verifies that cog://voices/* URIs are accepted by
+// the parser now that "voices" is registered in the Namespaces map (Wave 6c).
+func TestParseVoicesNamespace(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		raw      string
+		wantNS   string
+		wantPath string
+	}{
+		{"cog:voices/cog", "voices", "cog"},
+		{"cog://voices/cog", "voices", "cog"},
+		{"cog:voices/cog/ecapa-embedding", "voices", "cog/ecapa-embedding"},
+		{"cog:voices/bm_lewis", "voices", "bm_lewis"},
+		{"cog:voices/eng_uk_m_davids", "voices", "eng_uk_m_davids"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Parallel()
+			u, err := Parse(tc.raw)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.raw, err)
+			}
+			if u.Namespace != tc.wantNS {
+				t.Errorf("Namespace = %q; want %q", u.Namespace, tc.wantNS)
+			}
+			if u.Path != tc.wantPath {
+				t.Errorf("Path = %q; want %q", u.Path, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestIsValidNamespace_Voices asserts that "voices" is recognized as a valid
+// cog: namespace after the Wave 6c registration.
+func TestIsValidNamespace_Voices(t *testing.T) {
+	t.Parallel()
+	if !IsValidNamespace("voices") {
+		t.Error("IsValidNamespace(\"voices\") = false; want true")
+	}
+}
+
 // ── Fragment-before-query rejection in canonical parser (issue #171 follow-up) ──
 
 // TestParseFragmentBeforeQuery_Rejected verifies that pkg/uri.Parse rejects a URI

@@ -746,3 +746,117 @@ spec:
 		})
 	}
 }
+
+// ─── VoiceProfile (Primitive 3) ─────────────────────────────────────────────────
+
+// TestLoadIdentityCRD_VoiceProfile_GenerativeOnly asserts that a YAML with
+// only a generative head parses correctly and discriminative is nil.
+func TestLoadIdentityCRD_VoiceProfile_GenerativeOnly(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "cog.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: cog
+spec:
+  iss: cogos-dev
+  sub: cog
+  type: agent
+  expressions:
+    - aud: "*"
+      display_name: Cog
+      voice_profile:
+        generative:
+          engine: chatterbox-turbo
+          conditionals_ref: "cog://voices/cog"
+          enrolled_at: "2026-05-19T00:00:00Z"
+`)
+	crd, err := LoadIdentityCRD(dir, "cog")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	exp := crd.Spec.Expressions[0]
+	if exp.VoiceProfile == nil {
+		t.Fatal("VoiceProfile is nil; expected populated")
+	}
+	if exp.VoiceProfile.Generative == nil {
+		t.Fatal("VoiceProfile.Generative is nil; expected populated")
+	}
+	if exp.VoiceProfile.Generative.Engine != "chatterbox-turbo" {
+		t.Errorf("Engine = %q, want %q", exp.VoiceProfile.Generative.Engine, "chatterbox-turbo")
+	}
+	if exp.VoiceProfile.Generative.ConditionalsRef != "cog://voices/cog" {
+		t.Errorf("ConditionalsRef = %q, want %q", exp.VoiceProfile.Generative.ConditionalsRef, "cog://voices/cog")
+	}
+	if exp.VoiceProfile.Discriminative != nil {
+		t.Errorf("Discriminative should be nil, got %+v", exp.VoiceProfile.Discriminative)
+	}
+}
+
+// TestLoadIdentityCRD_VoiceProfile_BothHeads asserts that a YAML with both
+// generative and discriminative heads round-trips all fields correctly.
+func TestLoadIdentityCRD_VoiceProfile_BothHeads(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "cog.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: cog
+spec:
+  iss: cogos-dev
+  sub: cog
+  type: agent
+  expressions:
+    - aud: "*"
+      display_name: Cog
+      voice_profile:
+        generative:
+          engine: chatterbox-turbo
+          conditionals_ref: "cog://voices/cog"
+        discriminative:
+          model: "speechbrain/spkrec-ecapa-voxceleb"
+          embedding_ref: "cog://voices/cog/ecapa-embedding"
+          enrolled_at: "2026-05-19T00:00:00Z"
+`)
+	crd, err := LoadIdentityCRD(dir, "cog")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	exp := crd.Spec.Expressions[0]
+	if exp.VoiceProfile == nil {
+		t.Fatal("VoiceProfile is nil")
+	}
+	if exp.VoiceProfile.Generative == nil {
+		t.Fatal("Generative is nil")
+	}
+	if exp.VoiceProfile.Discriminative == nil {
+		t.Fatal("Discriminative is nil")
+	}
+	if exp.VoiceProfile.Discriminative.Model != "speechbrain/spkrec-ecapa-voxceleb" {
+		t.Errorf("Model = %q", exp.VoiceProfile.Discriminative.Model)
+	}
+	if exp.VoiceProfile.Discriminative.EmbeddingRef != "cog://voices/cog/ecapa-embedding" {
+		t.Errorf("EmbeddingRef = %q", exp.VoiceProfile.Discriminative.EmbeddingRef)
+	}
+}
+
+// TestLoadIdentityCRD_VoiceProfile_Absent asserts that an identity without
+// voice_profile has VoiceProfile == nil and loads without error.
+func TestLoadIdentityCRD_VoiceProfile_Absent(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "cog.yaml", minimalValidIdentityYAML)
+	crd, err := LoadIdentityCRD(dir, "cog")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	exp := crd.Spec.Expressions[0]
+	if exp.VoiceProfile != nil {
+		t.Errorf("expected VoiceProfile nil when absent, got %+v", exp.VoiceProfile)
+	}
+}
