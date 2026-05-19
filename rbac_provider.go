@@ -127,15 +127,25 @@ func (p *RBACProvider) Type() string { return "rbac-bindings" }
 // LoadConfig reads all structural binding YAML files from
 // .cog/config/rbac/bindings/. HarnessBindings are NOT loaded here —
 // they are populated at runtime via ApplyPlan when session events arrive.
+//
+// Schema errors (YAML parse failures, missing required fields) are stored in
+// p.schemaErrors so that Health() can report them. Valid files are still loaded;
+// schema errors do not abort the load. Fatal I/O errors cause LoadConfig to
+// return a non-nil error.
 func (p *RBACProvider) LoadConfig(root string) (any, error) {
 	p.mu.Lock()
 	p.root = root
 	p.mu.Unlock()
 
-	bindings, err := LoadRBACBindings(root)
+	bindings, schemaErrs, err := LoadRBACBindings(root)
 	if err != nil {
 		return nil, fmt.Errorf("rbac provider: load config: %w", err)
 	}
+
+	p.mu.Lock()
+	p.schemaErrors = schemaErrs
+	p.mu.Unlock()
+
 	return &rbacConfig{Root: root, Bindings: bindings}, nil
 }
 
@@ -364,7 +374,11 @@ func (p *RBACProvider) ApplyPlan(ctx context.Context, plan *ReconcilePlan) ([]Re
 	}()
 
 	// Reload specs so we have the full YAML for creates.
-	bindings, err := LoadRBACBindings(root)
+	// Schema errors from this reload are intentionally not re-stored in
+	// p.schemaErrors here — LoadConfig is the authoritative load path for
+	// health tracking. ApplyPlan uses the reload only to fetch CRD structs
+	// for creates; any new schema errors will surface on the next LoadConfig.
+	bindings, _, err := LoadRBACBindings(root)
 	if err != nil {
 		return nil, fmt.Errorf("rbac provider: reload specs for apply: %w", err)
 	}
