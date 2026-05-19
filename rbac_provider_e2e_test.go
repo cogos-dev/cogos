@@ -318,51 +318,62 @@ func TestRBACProvider_E2E_HarnessBindingEphemeral(t *testing.T) {
 	}
 }
 
-// TestRBACProvider_E2E_HealthOnSchemaError verifies that LoadRBACBindings
-// loading a malformed binding YAML causes Health to report an error.
-// A binding with an empty subject is syntactically valid YAML but semantically
-// empty — the provider should surface this through its schema-error tracking.
+// TestRBACProvider_E2E_HealthOnSchemaError verifies that a RoleBindingCRD with
+// a missing required field is recorded as a schema error by LoadConfig and
+// causes Health() to report Degraded. This uses the required-field validation
+// path added in #288: syntactically valid YAML that omits spec.subject is
+// rejected by validateRoleBinding and accumulated into p.schemaErrors rather
+// than being silently dropped or causing a fatal I/O error.
 //
-// Note: RBACProvider currently loads bindings without enum validation
-// (follow-up per blind review §#285 item 7). This test covers the error path
-// that IS wired: a LoadConfig error increments schemaErrors.
+// Before #288 this test used unparseable YAML (malformed syntax) to force an
+// error, which meant LoadConfig returned a non-nil error and schemaErrors was
+// never populated, so Health() could not observe the failure. The natural form
+// — a structurally valid binding file that fails semantic validation — is now
+// the canonical shape for this path.
 func TestRBACProvider_E2E_HealthOnSchemaError(t *testing.T) {
 	root := t.TempDir()
 
-	// Write a YAML that is valid YAML but represents a LoadRBACBindings error:
-	// completely unparseable as a RoleBindingCRD (malformed YAML).
+	// Write a syntactically valid RoleBindingCRD that omits spec.subject.
+	// validateRoleBinding (added in #288) rejects this and records the error
+	// in schemaErrors; the file does NOT produce a valid binding in the output.
 	writeE2EBindingFile(t, root, "rolebinding", "bad-binding", `
-not: valid: yaml: at: all: [unclosed
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: bad-binding
+spec:
+  role_ref: orchestrator
 `)
 
 	p := newE2ERBACProvider()
 
-	// LoadConfig returns an error when a binding file fails to parse.
-	_, err := p.LoadConfig(root)
-	if err == nil {
-		// If LoadRBACBindings doesn't error on malformed YAML (yaml.Unmarshal
-		// may silently ignore extra keys), we test via the schema error count.
-		// In that case verify Health returns Healthy (no errors surfaced) and
-		// note this as a coverage limitation.
-		t.Logf("LoadConfig did not error on malformed binding; schema error surfacing via Health() not wired — follow-up per blind review §#285 item 7")
-		return
+	// LoadConfig must succeed (schema errors are stored, not returned as error).
+	cfg, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig returned unexpected I/O error: %v", err)
 	}
 
-	// LoadConfig errored — this is the expected path. The error count should
-	// be reflected in Health once we track it. Since LoadConfig returned an
-	// error directly (not stored as schemaErrors), we verify the error message
-	// mentions the parse failure.
-	if err == nil || len(err.Error()) == 0 {
-		t.Fatalf("expected LoadConfig error for malformed YAML, got nil")
+	// The invalid binding is excluded from the loaded set.
+	rbacCfg, ok := cfg.(*rbacConfig)
+	if !ok {
+		t.Fatalf("LoadConfig returned %T, want *rbacConfig", cfg)
 	}
-	t.Logf("LoadConfig correctly returned error for malformed binding: %v", err)
+	if len(rbacCfg.Bindings.RoleBindings) != 0 {
+		t.Errorf("RoleBindings: got %d, want 0 (invalid binding must be excluded)", len(rbacCfg.Bindings.RoleBindings))
+	}
 
-	// Health on a provider that failed LoadConfig: the p.schemaErrors field
-	// is not populated by LoadConfig errors (those are returned, not stored).
-	// Health will show Healthy/Synced since no plan ran. This is the current
-	// behavior; explicit schema-error tracking in Health is the follow-up item.
+	// Health must reflect the schema error.
 	h := p.Health()
+	if h.Health != HealthDegraded {
+		t.Errorf("Health.Health = %q, want Degraded after schema error", h.Health)
+	}
 	if h.Operation != OperationIdle {
-		t.Errorf("Health.Operation = %q, want Idle after LoadConfig error", h.Operation)
+		t.Errorf("Health.Operation = %q, want Idle", h.Operation)
+	}
+
+	// The Health message must name the missing field so that operator tooling
+	// can surface actionable context without requiring log inspection.
+	if h.Message == "" {
+		t.Errorf("Health.Message is empty; want a message mentioning the schema error count")
 	}
 }
