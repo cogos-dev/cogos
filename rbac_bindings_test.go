@@ -1,11 +1,13 @@
 // rbac_bindings_test.go
-// Tests for RBAC binding CRD types: YAML round-trip for each CRD type.
+// Tests for RBAC binding CRD types: YAML round-trip for each CRD type,
+// required-field validation, and partial-load behavior.
 
 package main
 
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -394,9 +396,12 @@ spec:
 		}
 	}
 
-	set, err := LoadRBACBindings(root)
+	set, schemaErrs, err := LoadRBACBindings(root)
 	if err != nil {
 		t.Fatalf("LoadRBACBindings: %v", err)
+	}
+	if len(schemaErrs) != 0 {
+		t.Errorf("unexpected schema errors: %v", schemaErrs)
 	}
 
 	if len(set.RoleBindings) != 1 {
@@ -416,12 +421,251 @@ spec:
 func TestLoadRBACBindings_EmptyDir(t *testing.T) {
 	// A fresh workspace with no bindings directory is not an error.
 	root := t.TempDir()
-	set, err := LoadRBACBindings(root)
+	set, schemaErrs, err := LoadRBACBindings(root)
 	if err != nil {
 		t.Fatalf("LoadRBACBindings on empty workspace: %v", err)
+	}
+	if len(schemaErrs) != 0 {
+		t.Errorf("unexpected schema errors on empty workspace: %v", schemaErrs)
 	}
 	if len(set.RoleBindings) != 0 || len(set.AccountBindings) != 0 ||
 		len(set.NodeBindings) != 0 || len(set.WorkspaceBindings) != 0 {
 		t.Errorf("expected empty sets for fresh workspace")
+	}
+}
+
+// ─── Validation: required-field checks ───────────────────────────────────────
+
+func TestValidateRoleBinding_MissingSubject(t *testing.T) {
+	crd := &RoleBindingCRD{
+		APIVersion: "cog.os/v1alpha1",
+		Kind:       "RoleBinding",
+		Metadata:   RBACMeta{Name: "test-rb"},
+		Spec:       RoleBindingSpec{Subject: "", RoleRef: "orchestrator"},
+	}
+	err := validateRoleBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for missing subject, got nil")
+	}
+	if !strings.Contains(err.Error(), "spec.subject") {
+		t.Errorf("error should mention spec.subject, got: %v", err)
+	}
+}
+
+func TestValidateRoleBinding_MissingRoleRef(t *testing.T) {
+	crd := &RoleBindingCRD{
+		APIVersion: "cog.os/v1alpha1",
+		Kind:       "RoleBinding",
+		Metadata:   RBACMeta{Name: "test-rb"},
+		Spec:       RoleBindingSpec{Subject: "cog", RoleRef: ""},
+	}
+	err := validateRoleBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for missing role_ref, got nil")
+	}
+	if !strings.Contains(err.Error(), "spec.role_ref") {
+		t.Errorf("error should mention spec.role_ref, got: %v", err)
+	}
+}
+
+func TestValidateRoleBinding_MissingName(t *testing.T) {
+	crd := &RoleBindingCRD{
+		APIVersion: "cog.os/v1alpha1",
+		Kind:       "RoleBinding",
+		Metadata:   RBACMeta{Name: ""},
+		Spec:       RoleBindingSpec{Subject: "cog", RoleRef: "orchestrator"},
+	}
+	err := validateRoleBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for missing name, got nil")
+	}
+	if !strings.Contains(err.Error(), "metadata.name") {
+		t.Errorf("error should mention metadata.name, got: %v", err)
+	}
+}
+
+func TestValidateRoleBinding_Valid(t *testing.T) {
+	crd := &RoleBindingCRD{
+		APIVersion: "cog.os/v1alpha1",
+		Kind:       "RoleBinding",
+		Metadata:   RBACMeta{Name: "cog-orchestrator"},
+		Spec:       RoleBindingSpec{Subject: "cog", RoleRef: "orchestrator"},
+	}
+	if err := validateRoleBinding(crd); err != nil {
+		t.Errorf("expected nil error for valid binding, got: %v", err)
+	}
+}
+
+func TestValidateAccountBinding_MissingFields(t *testing.T) {
+	cases := []struct {
+		name string
+		crd  *AccountBindingCRD
+		want string
+	}{
+		{
+			name: "missing subject",
+			crd: &AccountBindingCRD{
+				Metadata: RBACMeta{Name: "ab"},
+				Spec:     AccountBindingSpec{Subject: "", Node: "darkstar", Account: "slowbro"},
+			},
+			want: "spec.subject",
+		},
+		{
+			name: "missing node",
+			crd: &AccountBindingCRD{
+				Metadata: RBACMeta{Name: "ab"},
+				Spec:     AccountBindingSpec{Subject: "cog", Node: "", Account: "slowbro"},
+			},
+			want: "spec.node",
+		},
+		{
+			name: "missing account",
+			crd: &AccountBindingCRD{
+				Metadata: RBACMeta{Name: "ab"},
+				Spec:     AccountBindingSpec{Subject: "cog", Node: "darkstar", Account: ""},
+			},
+			want: "spec.account",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAccountBinding(tc.crd)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error should mention %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestValidateNodeBinding_MissingRelation(t *testing.T) {
+	crd := &NodeBindingCRD{
+		Metadata: RBACMeta{Name: "nb"},
+		Spec:     NodeBindingSpec{Subject: "cog", Node: "darkstar", Relation: ""},
+	}
+	err := validateNodeBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for missing relation, got nil")
+	}
+	if !strings.Contains(err.Error(), "spec.relation") {
+		t.Errorf("error should mention spec.relation, got: %v", err)
+	}
+}
+
+func TestValidateWorkspaceBinding_MissingWorkspaceURI(t *testing.T) {
+	crd := &WorkspaceBindingCRD{
+		Metadata: RBACMeta{Name: "wb"},
+		Spec:     WorkspaceBindingSpec{Subject: "cog", WorkspaceURI: "", Access: "owner"},
+	}
+	err := validateWorkspaceBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for missing workspace_uri, got nil")
+	}
+	if !strings.Contains(err.Error(), "spec.workspace_uri") {
+		t.Errorf("error should mention spec.workspace_uri, got: %v", err)
+	}
+}
+
+func TestValidateHarnessBinding_MissingType(t *testing.T) {
+	crd := &HarnessBindingCRD{
+		Metadata: RBACMeta{Name: "hb"},
+		Spec:     HarnessBindingSpec{SessionID: "s1", Subject: "cog", Type: "", HarnessType: "claude-code"},
+	}
+	err := validateHarnessBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for missing type, got nil")
+	}
+	if !strings.Contains(err.Error(), "spec.type") {
+		t.Errorf("error should mention spec.type, got: %v", err)
+	}
+}
+
+// ─── Partial-load: valid + invalid in same directory ─────────────────────────
+
+// TestLoadRBACBindings_PartialLoad verifies that a directory containing one
+// valid and one invalid binding loads the valid one and returns the schema error
+// for the invalid one — without aborting the whole load.
+func TestLoadRBACBindings_PartialLoad(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, ".cog", "config", "rbac", "bindings", "rolebinding")
+	if err := os.MkdirAll(base, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Good binding: fully valid.
+	goodYAML := `
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: cog-orchestrator
+spec:
+  subject: cog
+  role_ref: orchestrator
+`
+	if err := os.WriteFile(filepath.Join(base, "good.yaml"), []byte(goodYAML), 0o640); err != nil {
+		t.Fatalf("write good: %v", err)
+	}
+
+	// Bad binding: missing required subject field.
+	badYAML := `
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: missing-subject
+spec:
+  role_ref: orchestrator
+`
+	if err := os.WriteFile(filepath.Join(base, "bad.yaml"), []byte(badYAML), 0o640); err != nil {
+		t.Fatalf("write bad: %v", err)
+	}
+
+	set, schemaErrs, err := LoadRBACBindings(root)
+	if err != nil {
+		t.Fatalf("LoadRBACBindings returned fatal error: %v", err)
+	}
+
+	// The valid binding should still load.
+	if len(set.RoleBindings) != 1 {
+		t.Errorf("RoleBindings: got %d, want 1 (only the valid binding)", len(set.RoleBindings))
+	}
+	if len(set.RoleBindings) == 1 && set.RoleBindings[0].Metadata.Name != "cog-orchestrator" {
+		t.Errorf("loaded wrong binding: got %q, want cog-orchestrator", set.RoleBindings[0].Metadata.Name)
+	}
+
+	// The invalid binding should produce exactly one schema error.
+	if len(schemaErrs) != 1 {
+		t.Errorf("schemaErrs: got %d, want 1; errors: %v", len(schemaErrs), schemaErrs)
+	}
+	if len(schemaErrs) > 0 && !strings.Contains(schemaErrs[0], "spec.subject") {
+		t.Errorf("schema error should mention spec.subject, got: %q", schemaErrs[0])
+	}
+}
+
+// TestLoadRBACBindings_UnparseableYAML verifies that a completely malformed
+// YAML file produces a schema error (not a fatal error) and skips the file.
+func TestLoadRBACBindings_UnparseableYAML(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, ".cog", "config", "rbac", "bindings", "rolebinding")
+	if err := os.MkdirAll(base, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Unparseable YAML.
+	if err := os.WriteFile(filepath.Join(base, "corrupt.yaml"),
+		[]byte("not: valid: yaml: at: all: [unclosed\n"), 0o640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	set, schemaErrs, err := LoadRBACBindings(root)
+	if err != nil {
+		t.Fatalf("LoadRBACBindings returned fatal error: %v", err)
+	}
+	if len(set.RoleBindings) != 0 {
+		t.Errorf("expected 0 valid bindings from corrupt file, got %d", len(set.RoleBindings))
+	}
+	if len(schemaErrs) == 0 {
+		t.Error("expected at least one schema error for unparseable YAML, got none")
 	}
 }

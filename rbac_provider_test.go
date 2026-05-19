@@ -509,3 +509,132 @@ func TestRBACProvider_BuildState_SerialIncrement(t *testing.T) {
 		t.Errorf("Lineage should be preserved across increments")
 	}
 }
+
+// ─── schemaErrors wiring + Health.Degraded ───────────────────────────────────
+
+// TestRBACProvider_LoadConfig_SchemaErrorsStored verifies that LoadConfig
+// populates p.schemaErrors when a binding file has a missing required field,
+// and that the valid bindings in the same directory are still loaded.
+func TestRBACProvider_LoadConfig_SchemaErrorsStored(t *testing.T) {
+	root := t.TempDir()
+
+	// One valid binding.
+	writeFixtureBinding(t, root, "rolebinding", "valid.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: cog-orchestrator
+spec:
+  subject: cog
+  role_ref: orchestrator
+`)
+	// One invalid binding: subject missing.
+	writeFixtureBinding(t, root, "rolebinding", "bad.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: missing-subject
+spec:
+  role_ref: orchestrator
+`)
+
+	p := newTestRBACProvider()
+	cfg, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig returned fatal error: %v", err)
+	}
+
+	// Valid bindings still present in returned config.
+	rbacCfg, ok := cfg.(*rbacConfig)
+	if !ok {
+		t.Fatalf("expected *rbacConfig, got %T", cfg)
+	}
+	if len(rbacCfg.Bindings.RoleBindings) != 1 {
+		t.Errorf("RoleBindings: got %d, want 1 (only valid binding)", len(rbacCfg.Bindings.RoleBindings))
+	}
+
+	// schemaErrors populated.
+	p.mu.Lock()
+	gotErrs := len(p.schemaErrors)
+	p.mu.Unlock()
+	if gotErrs != 1 {
+		t.Errorf("schemaErrors: got %d, want 1", gotErrs)
+	}
+}
+
+// TestRBACProvider_Health_DegradedOnSchemaError verifies that Health() reports
+// Degraded when LoadConfig stored at least one schema error. This closes the
+// dead-code path for p.schemaErrors that was identified in the PR #285 review.
+func TestRBACProvider_Health_DegradedOnSchemaError(t *testing.T) {
+	root := t.TempDir()
+
+	// Write a binding with a missing required field.
+	writeFixtureBinding(t, root, "rolebinding", "bad.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: missing-subject
+spec:
+  role_ref: orchestrator
+`)
+
+	p := newTestRBACProvider()
+	_, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig returned fatal error: %v", err)
+	}
+
+	h := p.Health()
+	if h.Health != HealthDegraded {
+		t.Errorf("Health.Health = %q, want Degraded after schema error", h.Health)
+	}
+	if h.Message == "" {
+		t.Error("Health.Message should be non-empty when Degraded")
+	}
+}
+
+// TestRBACProvider_Health_HealthyAfterCleanReload verifies that a subsequent
+// LoadConfig with valid files clears the schema errors and restores Healthy.
+// This confirms per-call accumulation semantics: each LoadConfig replaces
+// schemaErrors rather than appending cumulatively.
+func TestRBACProvider_Health_HealthyAfterCleanReload(t *testing.T) {
+	root := t.TempDir()
+
+	// First load: bad binding → Degraded.
+	writeFixtureBinding(t, root, "rolebinding", "bad.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: missing-subject
+spec:
+  role_ref: orchestrator
+`)
+
+	p := newTestRBACProvider()
+	if _, err := p.LoadConfig(root); err != nil {
+		t.Fatalf("first LoadConfig: %v", err)
+	}
+	if p.Health().Health != HealthDegraded {
+		t.Fatal("expected Degraded after first load with bad binding")
+	}
+
+	// Fix the bad binding in place.
+	writeFixtureBinding(t, root, "rolebinding", "bad.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: RoleBinding
+metadata:
+  name: now-valid
+spec:
+  subject: cog
+  role_ref: orchestrator
+`)
+
+	// Second load: all bindings valid → Healthy.
+	if _, err := p.LoadConfig(root); err != nil {
+		t.Fatalf("second LoadConfig: %v", err)
+	}
+	h := p.Health()
+	if h.Health != HealthHealthy {
+		t.Errorf("Health.Health = %q, want Healthy after clean reload", h.Health)
+	}
+}
