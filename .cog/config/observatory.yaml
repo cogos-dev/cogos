@@ -1,0 +1,49 @@
+# observatory.yaml — Conversations Observatory configuration
+#
+# This file configures the Conversations Observatory Reconcilable provider
+# (resource type: "conversations"). The observatory projects Claude Code
+# session JSONLs into a queryable substrate-native index, making operator
+# utterances, assistant responses, and tool calls accessible via:
+#
+#   cog_search_conversations    — full-text search over indexed turns
+#   cog_get_conversation_turn   — fetch one turn by session_id + turn_index
+#   cog_list_conversations      — list indexed sessions with metadata
+#
+# All fields are optional. Omitting a field uses the documented default.
+
+# source_dirs: list of directories to scan for Claude Code session JSONLs.
+# Each directory is scanned non-recursively for *.jsonl files whose names
+# are UUIDs (the Claude Code session ID format).
+#
+# Supports ~ expansion for the home directory.
+# Default: ["~/.claude/projects/-Users-slowbro"] when that directory exists.
+source_dirs:
+  - ~/.claude/projects/-Users-slowbro
+
+# include_patterns: glob patterns for files to index within each source_dir.
+# Default: ["*.jsonl"]
+include_patterns:
+  - "*.jsonl"
+
+# exclude_patterns: glob patterns for files to skip.
+# Useful for excluding specific known-large or irrelevant sessions.
+# Default: [] (nothing excluded)
+# exclude_patterns:
+#   - "00000000-*.jsonl"
+
+# max_turn_length: maximum characters stored per turn in the index.
+# Turns longer than this limit are stored truncated with a " [truncated]" suffix.
+# This affects the queryable text, not the source JSONL.
+# Default: 8192
+max_turn_length: 8192
+
+# max_sessions_to_index: cap on sessions indexed per ApplyPlan pass.
+# 0 means no limit — all pending sessions are indexed in one pass.
+# Useful for incremental rollout on large corpora.
+# Default: 0 (no limit)
+max_sessions_to_index: 0
+
+# default_identity: tag applied to sessions from this config when no
+# identity can be extracted from the JSONL records themselves.
+# Default: "" (no tag)
+default_identity: "slowbro"
