@@ -610,3 +610,139 @@ spec:
 		t.Fatal("expected error for empty factors list, got nil")
 	}
 }
+
+// ─── WorkspaceRoot field (Primitive 1) ─────────────────────────────────────────
+
+// TestLoadIdentityCRD_WorkspaceRoot_Set verifies that workspace_root survives
+// a YAML parse + validate round-trip when explicitly set.
+func TestLoadIdentityCRD_WorkspaceRoot_Set(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "cog.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: cog
+spec:
+  iss: cogos-dev
+  sub: cog
+  type: agent
+  expressions:
+    - aud: "*"
+      display_name: Cog
+      memory_namespace: "cog://"
+      workspace_root: "cog://workspaces/cog"
+`)
+	crd, err := LoadIdentityCRD(dir, "cog")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	if len(crd.Spec.Expressions) != 1 {
+		t.Fatalf("expressions len = %d, want 1", len(crd.Spec.Expressions))
+	}
+	got := crd.Spec.Expressions[0].WorkspaceRoot
+	if got != "cog://workspaces/cog" {
+		t.Errorf("WorkspaceRoot = %q, want %q", got, "cog://workspaces/cog")
+	}
+}
+
+// TestLoadIdentityCRD_WorkspaceRoot_Optional verifies that omitting
+// workspace_root does not cause a validation error (the field is optional).
+func TestLoadIdentityCRD_WorkspaceRoot_Optional(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	// minimalValidIdentityYAML has no workspace_root — reuse it.
+	writeTempCRD(t, idDir, "cog.yaml", minimalValidIdentityYAML)
+	crd, err := LoadIdentityCRD(dir, "cog")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	for _, exp := range crd.Spec.Expressions {
+		if exp.WorkspaceRoot != "" {
+			t.Errorf("WorkspaceRoot = %q, want empty string when unset", exp.WorkspaceRoot)
+		}
+	}
+}
+
+// TestLoadIdentityCRD_WorkspaceRoot_MultiExpression verifies that different
+// expressions can carry different workspace_root values (audience-scoped).
+func TestLoadIdentityCRD_WorkspaceRoot_MultiExpression(t *testing.T) {
+	dir := t.TempDir()
+	idDir := filepath.Join(dir, ".cog", "config", "identities")
+	_ = os.MkdirAll(idDir, 0o755)
+	writeTempCRD(t, idDir, "chaz.yaml", `
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: chaz
+spec:
+  iss: cogos-dev
+  sub: chaz
+  type: human
+  expressions:
+    - aud: "workspace:cog-workspace"
+      display_name: Chaz
+      workspace_root: "cog://workspaces/chaz"
+    - aud: "*"
+      display_name: Chaz
+`)
+	crd, err := LoadIdentityCRD(dir, "chaz")
+	if err != nil {
+		t.Fatalf("LoadIdentityCRD: %v", err)
+	}
+	exp := crd.Spec.ExpressionFor("workspace:cog-workspace")
+	if exp == nil {
+		t.Fatal("ExpressionFor returned nil")
+	}
+	if exp.WorkspaceRoot != "cog://workspaces/chaz" {
+		t.Errorf("WorkspaceRoot = %q, want %q", exp.WorkspaceRoot, "cog://workspaces/chaz")
+	}
+	// Catch-all expression has no workspace_root set.
+	wildcard := crd.Spec.ExpressionFor("channel:anything")
+	if wildcard == nil {
+		t.Fatal("wildcard ExpressionFor returned nil")
+	}
+	if wildcard.WorkspaceRoot != "" {
+		t.Errorf("wildcard WorkspaceRoot = %q, want empty", wildcard.WorkspaceRoot)
+	}
+}
+
+// TestLoadIdentityCRD_WorkspaceRoot_strings checks that workspace_root
+// preserves its value exactly including the cog:// scheme prefix.
+func TestLoadIdentityCRD_WorkspaceRoot_SchemePreserved(t *testing.T) {
+	cases := []string{
+		"cog://workspaces/cog",
+		"cog://workspaces/chaz",
+		"cog://workspaces/eclipse",
+	}
+	for _, want := range cases {
+		t.Run(want, func(t *testing.T) {
+			dir := t.TempDir()
+			idDir := filepath.Join(dir, ".cog", "config", "identities")
+			_ = os.MkdirAll(idDir, 0o755)
+			writeTempCRD(t, idDir, "x.yaml", fmt.Sprintf(`
+apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: x
+spec:
+  iss: cogos-dev
+  sub: x
+  type: agent
+  expressions:
+    - aud: "*"
+      workspace_root: %q
+`, want))
+			crd, err := LoadIdentityCRD(dir, "x")
+			if err != nil {
+				t.Fatalf("LoadIdentityCRD: %v", err)
+			}
+			got := crd.Spec.Expressions[0].WorkspaceRoot
+			if got != want {
+				t.Errorf("WorkspaceRoot = %q, want %q", got, want)
+			}
+		})
+	}
+}
