@@ -1,6 +1,7 @@
 package modality_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/myrgic/cogos/pkg/modality"
@@ -122,5 +123,98 @@ func TestChannelRegistry_ChannelsForSession(t *testing.T) {
 	chs := reg.ChannelsForSession("s1")
 	if len(chs) != 2 {
 		t.Errorf("ChannelsForSession returned %d, want 2", len(chs))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Primitive 4: Mode + Pipeline fields
+// ---------------------------------------------------------------------------
+
+func TestChannelDescriptor_AmbientModeRoundTrip(t *testing.T) {
+	// Construct a descriptor with Mode="ambient" and a Pipeline list.
+	desc := &modality.ChannelDescriptor{
+		ID:        "mic-ambient",
+		Transport: "http",
+		Mode:      "ambient",
+		Pipeline:  []string{"denoise", "vad", "diarize", "ecapa_match", "stt", "attribute", "mention_detect", "emit"},
+	}
+
+	data, err := json.Marshal(desc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	var got modality.ChannelDescriptor
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	if got.Mode != "ambient" {
+		t.Errorf("Mode = %q, want %q", got.Mode, "ambient")
+	}
+	if len(got.Pipeline) != len(desc.Pipeline) {
+		t.Fatalf("Pipeline len = %d, want %d", len(got.Pipeline), len(desc.Pipeline))
+	}
+	for i, stage := range desc.Pipeline {
+		if got.Pipeline[i] != stage {
+			t.Errorf("Pipeline[%d] = %q, want %q", i, got.Pipeline[i], stage)
+		}
+	}
+}
+
+func TestChannelDescriptor_IntentionalModeRoundTrip(t *testing.T) {
+	// Explicit intentional mode round-trips correctly.
+	desc := &modality.ChannelDescriptor{
+		ID:       "mic-intentional",
+		Mode:     "intentional",
+		Pipeline: []string{"denoise", "vad", "stt", "emit"},
+	}
+
+	data, err := json.Marshal(desc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	var got modality.ChannelDescriptor
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Mode != "intentional" {
+		t.Errorf("Mode = %q, want %q", got.Mode, "intentional")
+	}
+}
+
+func TestChannelDescriptor_DefaultModeIsEmpty(t *testing.T) {
+	// When Mode is not set, the JSON field is absent (omitempty) and the
+	// zero value round-trips as empty string. Resolution to "intentional"
+	// is the consumer's responsibility.
+	desc := &modality.ChannelDescriptor{
+		ID:        "default-mode",
+		Transport: "stdio",
+	}
+
+	data, err := json.Marshal(desc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	// "mode" key must not appear in the JSON when Mode is empty.
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal raw: %v", err)
+	}
+	if _, present := raw["mode"]; present {
+		t.Error("mode key should be absent from JSON when Mode is empty (omitempty)")
+	}
+
+	var got modality.ChannelDescriptor
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Mode != "" {
+		t.Errorf("Mode = %q, want empty string", got.Mode)
+	}
+	if len(got.Pipeline) != 0 {
+		t.Errorf("Pipeline = %v, want empty", got.Pipeline)
 	}
 }
