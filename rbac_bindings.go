@@ -98,6 +98,21 @@ type AccountBindingSpec struct {
 	Account string `yaml:"account"`
 }
 
+// ─── Enum constants ─────────────────────────────────────────────────────────
+
+// WorkspaceBinding.Spec.Access valid values.
+const (
+	WorkspaceBindingAccessOwner     = "owner"
+	WorkspaceBindingAccessRead      = "read"
+	WorkspaceBindingAccessReadWrite = "read-write"
+)
+
+// NodeBinding.Spec.Relation valid values.
+const (
+	NodeBindingRelationCanEmbody = "can-embody"
+	NodeBindingRelationPinnedTo  = "pinned-to"
+)
+
 // ─── NodeBinding ────────────────────────────────────────────────────────────
 
 // NodeBindingCRD asserts that a subject identity has a declared relationship
@@ -387,7 +402,8 @@ func validateAccountBinding(crd *AccountBindingCRD) error {
 	return nil
 }
 
-// validateNodeBinding checks that required fields are present.
+// validateNodeBinding checks that required fields are present and that
+// Spec.Relation is one of the defined enum values.
 func validateNodeBinding(crd *NodeBindingCRD) error {
 	if crd.Metadata.Name == "" {
 		return fmt.Errorf("binding: metadata.name is required")
@@ -401,10 +417,17 @@ func validateNodeBinding(crd *NodeBindingCRD) error {
 	if crd.Spec.Relation == "" {
 		return fmt.Errorf("binding %q: spec.relation is required", crd.Metadata.Name)
 	}
+	switch crd.Spec.Relation {
+	case NodeBindingRelationCanEmbody, NodeBindingRelationPinnedTo:
+		// valid
+	default:
+		return fmt.Errorf("binding %q: spec.relation value %q is not one of [can-embody, pinned-to]", crd.Metadata.Name, crd.Spec.Relation)
+	}
 	return nil
 }
 
-// validateWorkspaceBinding checks that required fields are present.
+// validateWorkspaceBinding checks that required fields are present and that
+// Spec.Access is one of the defined enum values.
 func validateWorkspaceBinding(crd *WorkspaceBindingCRD) error {
 	if crd.Metadata.Name == "" {
 		return fmt.Errorf("binding: metadata.name is required")
@@ -417,6 +440,12 @@ func validateWorkspaceBinding(crd *WorkspaceBindingCRD) error {
 	}
 	if crd.Spec.Access == "" {
 		return fmt.Errorf("binding %q: spec.access is required", crd.Metadata.Name)
+	}
+	switch crd.Spec.Access {
+	case WorkspaceBindingAccessOwner, WorkspaceBindingAccessRead, WorkspaceBindingAccessReadWrite:
+		// valid
+	default:
+		return fmt.Errorf("binding %q: spec.access value %q is not one of [owner, read, read-write]", crd.Metadata.Name, crd.Spec.Access)
 	}
 	return nil
 }
