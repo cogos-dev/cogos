@@ -10,6 +10,7 @@ use (
 	./pkg/coordination
 	./pkg/modality
 	./pkg/reconcile
+	./pkg/substrate
 	./pkg/uri
 	./sdk
 )
