@@ -669,3 +669,143 @@ func TestLoadRBACBindings_UnparseableYAML(t *testing.T) {
 		t.Error("expected at least one schema error for unparseable YAML, got none")
 	}
 }
+
+// ─── Enum validation: WorkspaceBinding.Access ────────────────────────────────
+
+// TestValidateWorkspaceBinding_InvalidAccess verifies that an unrecognised
+// access value is rejected by the validator.
+func TestValidateWorkspaceBinding_InvalidAccess(t *testing.T) {
+	crd := &WorkspaceBindingCRD{
+		Metadata: RBACMeta{Name: "wb-bad"},
+		Spec: WorkspaceBindingSpec{
+			Subject:      "cog",
+			WorkspaceURI: "cog://workspaces/cog",
+			Access:       "delete-everything",
+		},
+	}
+	err := validateWorkspaceBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for invalid access value, got nil")
+	}
+	if !strings.Contains(err.Error(), "spec.access") {
+		t.Errorf("error should mention spec.access, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "delete-everything") {
+		t.Errorf("error should quote the bad value, got: %v", err)
+	}
+}
+
+// TestValidateWorkspaceBinding_ValidAccess verifies that all three valid access
+// values pass validation.
+func TestValidateWorkspaceBinding_ValidAccess(t *testing.T) {
+	for _, access := range []string{
+		WorkspaceBindingAccessOwner,
+		WorkspaceBindingAccessRead,
+		WorkspaceBindingAccessReadWrite,
+	} {
+		crd := &WorkspaceBindingCRD{
+			Metadata: RBACMeta{Name: "wb-" + access},
+			Spec: WorkspaceBindingSpec{
+				Subject:      "cog",
+				WorkspaceURI: "cog://workspaces/cog",
+				Access:       access,
+			},
+		}
+		if err := validateWorkspaceBinding(crd); err != nil {
+			t.Errorf("access=%q: unexpected error: %v", access, err)
+		}
+	}
+}
+
+// ─── Enum validation: NodeBinding.Relation ───────────────────────────────────
+
+// TestValidateNodeBinding_InvalidRelation verifies that an unrecognised relation
+// value is rejected by the validator.
+func TestValidateNodeBinding_InvalidRelation(t *testing.T) {
+	crd := &NodeBindingCRD{
+		Metadata: RBACMeta{Name: "nb-bad"},
+		Spec: NodeBindingSpec{
+			Subject:  "cog",
+			Node:     "darkstar",
+			Relation: "wants-to-be-friends",
+		},
+	}
+	err := validateNodeBinding(crd)
+	if err == nil {
+		t.Fatal("expected error for invalid relation value, got nil")
+	}
+	if !strings.Contains(err.Error(), "spec.relation") {
+		t.Errorf("error should mention spec.relation, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "wants-to-be-friends") {
+		t.Errorf("error should quote the bad value, got: %v", err)
+	}
+}
+
+// TestValidateNodeBinding_ValidRelation verifies that both valid relation values
+// pass validation.
+func TestValidateNodeBinding_ValidRelation(t *testing.T) {
+	for _, rel := range []string{
+		NodeBindingRelationCanEmbody,
+		NodeBindingRelationPinnedTo,
+	} {
+		crd := &NodeBindingCRD{
+			Metadata: RBACMeta{Name: "nb-" + rel},
+			Spec: NodeBindingSpec{
+				Subject:  "cog",
+				Node:     "darkstar",
+				Relation: rel,
+			},
+		}
+		if err := validateNodeBinding(crd); err != nil {
+			t.Errorf("relation=%q: unexpected error: %v", rel, err)
+		}
+	}
+}
+
+// ─── Enum validation: LoadConfig surfaces enum error in schemaErrors ─────────
+
+// TestLoadRBACBindings_EnumErrorInSchemaErrors verifies that a binding with an
+// invalid enum value is rejected during LoadRBACBindings, surfaces the error in
+// schemaErrors, and causes Health() to report Degraded when wired through
+// RBACProvider.LoadConfig.
+func TestLoadRBACBindings_EnumErrorInSchemaErrors(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, ".cog", "config", "rbac", "bindings", "workspacebinding")
+	if err := os.MkdirAll(base, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Binding with an invalid access enum value.
+	badYAML := `
+apiVersion: cog.os/v1alpha1
+kind: WorkspaceBinding
+metadata:
+  name: wb-bad-access
+spec:
+  subject: cog
+  workspace_uri: cog://workspaces/cog
+  access: delete-everything
+`
+	if err := os.WriteFile(filepath.Join(base, "bad.yaml"), []byte(badYAML), 0o640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	set, schemaErrs, err := LoadRBACBindings(root)
+	if err != nil {
+		t.Fatalf("LoadRBACBindings returned fatal error: %v", err)
+	}
+
+	// The invalid binding should be excluded.
+	if len(set.WorkspaceBindings) != 0 {
+		t.Errorf("WorkspaceBindings: got %d, want 0 (invalid binding excluded)", len(set.WorkspaceBindings))
+	}
+
+	// The schema error should be present and mention the bad value.
+	if len(schemaErrs) == 0 {
+		t.Fatal("expected at least one schema error for invalid enum, got none")
+	}
+	if !strings.Contains(schemaErrs[0], "delete-everything") {
+		t.Errorf("schema error should mention the bad value, got: %q", schemaErrs[0])
+	}
+}
