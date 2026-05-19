@@ -12,13 +12,40 @@ import (
 )
 
 // ChannelDescriptor declares a channel's identity and capabilities.
+//
+// Mode controls pipeline composition:
+//
+//   - "intentional" (default): session-scoped, explicit participation. The
+//     user turns the mic on deliberately; the pipeline is mic → VAD → STT →
+//     emit. This is the current default for all Claude Code / MCP channels.
+//
+//   - "ambient": always-on mic, VAD-gated attention, continuous diarization.
+//     The pipeline is mic → VAD → diarize → ecapa_match → STT → attribute →
+//     mention_detect → emit. Cog stays silent unless mentioned or there is
+//     "appropriate silence." This is the multi-human-attendee mode (e.g. Chaz
+//     + Erin with a hot mic where Cog listens and chimes in when addressed).
+//
+// Pipeline overrides the ordered stage list derived from Mode. When empty,
+// the channel runtime uses DEFAULT_PIPELINES[Mode]. Each entry is a stage
+// name; the runtime resolves each name to a registered PipelineStage
+// implementation and skips (with a warning log) any name that is not yet
+// registered, so ambient mode is safe to declare even before all its stages
+// are implemented.
 type ChannelDescriptor struct {
 	ID         string         `json:"id"`                 // "discord-text", "claude-code", etc.
 	Transport  string         `json:"transport"`          // "openclaw-gateway", "mcp", "http", "stdio"
 	Input      []ModalityType `json:"input"`              // modalities this channel can receive
 	Output     []ModalityType `json:"output"`             // modalities this channel can deliver
 	SessionKey string         `json:"session_key"`        // pattern for session binding, e.g. "discord:{guild}:{channel}:{user}"
-	Metadata   map[string]any `json:"metadata,omitempty"` // transport-specific data (guild ID, thread ID, etc.)
+	// Mode governs pipeline composition. "intentional" = session-scoped,
+	// explicit participation (default). "ambient" = always-on, VAD-gated
+	// attention, continuous diarization. Empty string resolves to "intentional".
+	Mode string `json:"mode,omitempty"` // "intentional" | "ambient"
+	// Pipeline declares the ordered stage graph. Empty = use mode default.
+	// Each entry is a stage name; the channel runtime resolves each name to
+	// a registered PipelineStage implementation.
+	Pipeline []string       `json:"pipeline,omitempty"`
+	Metadata map[string]any `json:"metadata,omitempty"` // transport-specific data (guild ID, thread ID, etc.)
 }
 
 // SupportsOutput reports whether this channel can deliver the given modality.
