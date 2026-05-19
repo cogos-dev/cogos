@@ -186,6 +186,7 @@ func runServe(workspace string, port int, bindAddr string) {
 		slog.Info("providers workspace wired", "workspace", cfg.WorkspaceRoot)
 	}
 
+	// Daemon-already-running guard. Must stay in runServe, not Boot.
 	if reuse, msg, err := planServeState(cfg, checkDaemonHealth); err != nil {
 		slog.Error("daemon lifecycle failed", "err", err)
 		os.Exit(1)
@@ -194,6 +195,7 @@ func runServe(workspace string, port int, bindAddr string) {
 		return
 	}
 
+	// Daemon state file management. Must stay in runServe, not Boot.
 	state := buildDaemonState(cfg)
 	if err := saveDaemonState(state); err != nil {
 		slog.Error("daemon state write failed", "err", err)
@@ -205,141 +207,37 @@ func runServe(workspace string, port int, bindAddr string) {
 		}
 	}()
 
-	// Load nucleus (identity core).
-	nucleus, err := LoadNucleus(cfg)
-	if err != nil {
-		slog.Error("nucleus load failed", "err", err)
-		os.Exit(1)
-	}
-	slog.Info("nucleus loaded", "summary", nucleus.Summary())
-
-	// Build the continuous process.
-	process := NewProcess(cfg, nucleus)
-
-	// Load TRM model and embedding index (optional — graceful degradation).
-	if trm, embIdx := loadTRMAtStartup(cfg); trm != nil && embIdx != nil {
-		process.SetTRM(trm, embIdx)
-		slog.Info("trm: wired into context assembly pipeline")
-	}
-
-	// Build the inference router.
-	router, err := BuildRouter(cfg)
-	if err != nil {
-		slog.Warn("router build failed; inference disabled", "err", err)
-	}
-
-	// Build the HTTP server.
-	server := NewServer(cfg, nucleus, process)
-	server.SetRouter(router)
-
-	// Wire the session-activity publisher so handleTailerBlock can fan
-	// tailer blocks onto per-session bus channels (Phase 1A of the 4E
-	// cognitive-observer loop). server.busSessions is always non-nil by
-	// NewServer's contract; AppendEvent's signature matches
-	// SessionActivityPublisher by construction.
-	if server.busSessions != nil {
-		process.SetSessionActivityPublisher(server.busSessions.AppendEvent)
-	}
-
-	// Initialize telemetry (traces + metrics). No-op if no collector is available.
+	// Signal context for OS-level shutdown. Must stay in runServe, not Boot.
 	ctx0 := context.Background()
-	shutdownTelemetry := initTelemetry(ctx0)
-
-	// Root context cancelled on SIGINT / SIGTERM.
 	ctx, cancel := signal.NotifyContext(ctx0, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	defer shutdownTelemetry(ctx0)
 
-	if server.mcpServer != nil {
-		ctrl, err := NewLocalHarnessController(cfg, nucleus, process, server.mcpServer)
-		if err != nil {
-			slog.Warn("local harness disabled", "err", err)
-		} else {
-			// Wire the bus layer so each tick emits a KernelHealthSnapshot
-			// to bus_kernel_proprio. This is optional — nil is a safe no-op.
-			ctrl.SetBusSessionManager(server.busSessions)
-			server.SetAgentController(ctrl)
-			ctrl.Start(ctx)
-			slog.Info("local harness started", "agent_id", DefaultAgentID, "interval", ctrl.interval.String())
-		}
+	// Boot the kernel. All subsystem construction, goroutine start, and
+	// listener allocation happen inside Boot. Boot does not call os.Exit.
+	kernel, err := Boot(ctx, cfg)
+	if err != nil {
+		slog.Error("kernel boot failed", "err", err)
+		os.Exit(1)
 	}
 
-	// ADR-092 §2 step 4: Reconcile loop start.
-	// ReconcileDaemon drives the full reconcile cycle for all registered
-	// Reconcilables on each periodic tick. ADR-095 specifies the contract.
-	reconcileDaemon := NewReconcileDaemon(ReconcileDaemonConfig{
-		WorkspaceRoot: cfg.WorkspaceRoot,
-	})
-	reconcileDaemon.Start(ctx)
-
-	// Wire ProjectionWatcher as an early-trigger source into the daemon.
-	// Each lineage-projection-<kind> Reconcilable gets a watcher that fires
-	// daemon.Trigger on file-system changes to the nodes/ directory.
-	// ADR-095 §4: watchers are specific early-trigger instances; the daemon
-	// driver is the general mechanism.
-	// The watcher is created with a nil-safe best-effort approach: if the
-	// nodes/ directory does not exist (workspace not yet initialized), the
-	// watcher Start call fails gracefully and no watch loop runs. Reconciliation
-	// still occurs on each periodic daemon tick.
-	for _, kind := range AllProjectionKinds {
-		kind := kind
-		nodesDir := cfg.WorkspaceRoot + "/.cog/mem/semantic/lineage/nodes"
-		providerType := "lineage-projection-" + string(kind)
-		watcher := NewProjectionWatcher(nodesDir, func(watchCtx context.Context) error {
-			reconcileDaemon.Trigger(providerType)
-			return nil
-		}, 0)
-		if err := watcher.Start(ctx); err != nil {
-			slog.Debug("projection watcher skipped (nodes dir not present)",
-				"kind", kind, "err", err)
-		} else {
-			slog.Info("projection watcher started", "kind", kind, "nodes_dir", nodesDir)
-		}
-	}
-
-	// Start process goroutine.
-	processDone := make(chan error, 1)
-	go func() {
-		processDone <- process.Run(ctx)
-	}()
-
-	// Start HTTP server goroutine.
-	serverDone := make(chan error, 1)
-	go func() {
-		if err := server.Start(); err != nil {
-			serverDone <- err
-		}
-	}()
-
-	// Wait for shutdown signal or fatal error.
+	// Wait for shutdown signal or fatal goroutine error.
 	select {
 	case <-ctx.Done():
 		slog.Info("cogos: shutdown signal received")
-	case err := <-serverDone:
+	case err := <-kernel.serverDone:
 		if err != nil {
 			slog.Error("server error", "err", err)
 			cancel()
 		}
-	case err := <-processDone:
+	case err := <-kernel.processDone:
 		if err != nil {
 			slog.Error("process error", "err", err)
 			cancel()
 		}
 	}
 
-	// Graceful shutdown.
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		slog.Warn("server shutdown error", "err", err)
-	}
-
-	// Wait for process to finish.
-	select {
-	case <-processDone:
-	case <-shutdownCtx.Done():
-		slog.Warn("process did not stop in time")
+	if err := kernel.Stop(); err != nil {
+		slog.Warn("kernel stop error", "err", err)
 	}
 
 	slog.Info("cogos: stopped")
