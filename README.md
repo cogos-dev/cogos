@@ -96,7 +96,7 @@ When you submit a prompt in Claude Code, the `UserPromptSubmit` hook fires and c
 
 The context engine:
 
-1. Scores all workspace documents using a 2.3M-parameter Mamba SSM trained as a context retrieval model, combined with git-derived salience
+1. Scores all workspace documents using a ~1.7M-parameter Mamba SSM trained as a context retrieval model, combined with git-derived salience
 2. Ranks by a composite signal (edit recency, semantic match, structural importance)
 3. Assembles a context window organized into stability zones:
 
@@ -140,7 +140,7 @@ The model sees a pre-focused window instead of everything-or-nothing. Zone order
 - **Cogdoc Review Reconciler.** Layer A deterministic prior-art gate for cogdoc authoring: deduplication check before any LLM write, with LLM-generated abstract synthesis for the observatory ingest path.
 - **Kernel-native session management.** `SessionRegistry` + `HandoffRegistry` with atomic-claim semantics: first-wins enforced at the bus boundary, not just in the in-memory cache. Bus stays ground truth; the registries are derived views rebuilt from seq-sorted replay on startup.
 - **Native agent harness.** A homeostatic assessment loop runs as a goroutine inside the kernel. Calls a local model via Ollama with six kernel-native tools. Adaptive interval (5m-30m) based on assessment urgency, with panic recovery.
-- **MCP Streamable HTTP.** Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Always-on (no build tag). 30 tools spanning observability, agent control, config, memory, sessions, handoffs, and voice.
+- **MCP Streamable HTTP.** Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Always-on (no build tag). 54 tools spanning observability, agent control, config, memory, sessions, handoffs, voice, and conversation search.
 - **Config mutation API.** `cog_read_config` / `cog_write_config` / `cog_rollback_config` MCP tools and matching REST surface. RFC 7396 merge-patch semantics with atomic writes and rotating backups.
 
 For endpoint and tool counts, see the HTTP API and MCP tools tables below.
@@ -157,13 +157,13 @@ Three non-overlapping observability lanes, each with an MCP tool, HTTP endpoint,
 | **Traces** | Client metabolites, attention, proprioceptive state, internal requests | `cog_search_traces` | `GET /v1/traces` (legacy `/v1/proprioceptive` preserved) | Trace files |
 | **Kernel slog** | Structured runtime logs via `teeHandler` | `cog_tail_kernel_log` | `GET /v1/kernel-log` | stderr + `.cog/run/kernel.log.jsonl` |
 
-The live event bus is a fourth surface for real-time subscribers: SSE at `/v1/bus/:id/events/stream`, plus `cog_tail_events` and `cog_query_events` MCP tools. All `AppendEvent` writes fan through the broker.
+The live event bus is a fourth surface for real-time subscribers: SSE at `/v1/bus/:id/events/stream`, plus `cog_tail_events` and `cog_read_events` MCP tools. All `AppendEvent` writes fan through the broker.
 
 ---
 
 ## Library packages (pkg/)
 
-Seven importable Go packages extracted into a `go.work` multi-module workspace. Each has its own `go.mod` and can be imported independently of the kernel. Six are stdlib-only; `pkg/bep` requires `google.golang.org/protobuf`.
+Eight importable Go packages extracted into a `go.work` multi-module workspace. Each has its own `go.mod` and can be imported independently of the kernel. Six are stdlib-only; `pkg/bep` requires `google.golang.org/protobuf`.
 
 | Package | What it provides |
 |---------|-----------------|
@@ -174,6 +174,7 @@ Seven importable Go packages extracted into a `go.work` multi-module workspace. 
 | `pkg/modality` | Module interface, Bus, wire protocol (D2), events, salience tracker, channels, ProcessSupervisor |
 | `pkg/cogfield` | Node/Edge/Graph types, Block, BlockAdapter interface, conditions, signals, sessions, documents |
 | `pkg/uri` | URI struct, Parse/Format, 35 namespaces, ExtractInlineRefs, error types |
+| `pkg/substrate` | Umbrella re-export module for substrate-shaped packages (uri, cogfield, bep); ADR-100 extraction target |
 
 ---
 
@@ -234,7 +235,7 @@ Six kernel-native tools are available to the agent itself:
 
 All endpoints serve on port **6931** by default. `--bind <addr>` (or `bind_addr` in YAML) overrides; CORS is strict on loopback and relaxed on non-loopback binds.
 
-### MCP tools (33 total)
+### MCP tools (54 total)
 
 The always-on MCP server groups tools by surface. The `mcpserver` build tag was removed in #9. MCP ships in every binary.
 
@@ -244,13 +245,14 @@ The always-on MCP server groups tools by surface. The `mcpserver` build tag was 
 | | `cog_search_traces` | Query client metabolites + attention + proprioceptive + internal-request traces |
 | | `cog_tail_kernel_log` | Stream the structured kernel slog |
 | | `cog_tail_events` | Tail the live event bus |
-| | `cog_query_events` | Filter event bus records by predicate |
+| | `cog_read_events` | Filter event bus records by predicate |
 | **Conversation / tool calls** | `cog_read_conversation` | Read turn sidecars with full prompt/response text |
 | | `cog_read_tool_calls` | Read tool-call records + correlation state |
 | | `cog_tail_tool_calls` | Live stream of tool-call activity |
 | **Agent control** | `cog_list_agents` | Enumerate running agents |
 | | `cog_get_agent_state` | State snapshot for an agent |
 | | `cog_trigger_agent_loop` | Manually trigger an assessment cycle |
+| | `cog_dispatch_to_harness` | Dispatch a prompt directly to the agent harness |
 | **Config** | `cog_read_config` | Read the live config |
 | | `cog_write_config` | RFC 7396 merge-patch (atomic write, rotating backups, `requires_restart=true` in v1) |
 | | `cog_rollback_config` | Restore a prior atomic backup |
@@ -263,12 +265,31 @@ The always-on MCP server groups tools by surface. The `mcpserver` build tag was 
 | | `cog_claim_handoff` | Atomic first-wins claim under registry lock; bus append before in-memory commit |
 | | `cog_complete_handoff` | Complete a claimed handoff; `next_handoff_id` links recursive relays |
 | | `cog_list_handoffs` | List handoffs by `state` (open, claimed, complete) and `for_session` |
-| **Memory** | `cogos_memory_search` | Search CogDocs |
-| | `cogos_memory_read` | Read a memory document |
-| | `cogos_memory_write` | Write or update a memory document |
-| | `cogos_coherence_check` | Drift detection across the workspace |
+| **Memory** | `cog_search_memory` | Search CogDocs by query |
+| | `cog_read_cogdoc` | Read a memory document |
+| | `cog_write_cogdoc` | Write or update a memory document |
+| | `cog_patch_frontmatter` | Patch frontmatter fields on an existing cogdoc |
+| | `cog_check_coherence` | Drift detection across the workspace |
+| | `cog_memory_toc` | Table of contents for workspace memory |
+| | `cog_memory_index` | Index or re-index workspace memory |
+| **Context and ingestion** | `cog_assemble_context` | Assemble a foveated context window |
+| | `cog_ingest` | Ingest external material (URLs, documents, conversations) |
+| | `cog_query_field` | Query the cogfield graph |
+| | `cog_get_state` | Get the current kernel state snapshot |
+| | `cog_emit_event` | Emit an event to the CogBus |
+| | `cog_read_file` | Read a file from the workspace |
+| | `cog_grep_files` | Grep files in the workspace |
+| | `cog_render_peer_awareness_packet` | Render a peer-awareness context packet |
+| **Conversations Observatory** | `cog_search_conversations` | Full-text search across indexed conversation turns |
+| | `cog_get_conversation_turn` | Retrieve a specific turn from a conversation |
+| | `cog_list_conversations` | List indexed conversation sessions |
+| **Eval / experiments** | `cog_run_experiment` | Run a registered evaluation experiment |
+| | `cog_list_experiments` | List available experiments |
+| | `cog_get_experiment_status` | Get the status of a running experiment |
+| | `cog_pin_baseline` | Pin the current workspace state as a baseline for future comparison |
 | **Voice (Mod3 bridge)** | `mod3_speak` · `mod3_stop` · `mod3_voices` · `mod3_status` | TTS and voice channel control |
 | | `mod3_tail_logs` | Tail chat-flow events from the mod3 ring buffer |
+| | `mod3_register_session` · `mod3_deregister_session` · `mod3_list_sessions` | Mod3 channel session management |
 
 Sessions are created on `initialize` and expire after 30 minutes of inactivity.
 
@@ -378,6 +399,7 @@ pkg/                    Importable library packages (go.work multi-module)
   modality/             Modality bus and channel types
   cogfield/             Field graph types
   uri/                  URI parsing and namespaces
+  substrate/            Umbrella re-export module (ADR-100)
 sdk/                    Go SDK for CogOS clients
 docs/                   Specs, architecture docs, provider guide
 scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
@@ -392,7 +414,7 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 ### Working
 
 - Continuous process daemon with four-state FSM
-- Foveated context assembly with a 2.3M-parameter Mamba SSM context retrieval model
+- Foveated context assembly with a ~1.7M-parameter Mamba SSM context retrieval model
 - Hash-chained append-only ledger with optional chain verification
 - Three-lane observability: ledger, traces, kernel slog
 - Live event bus with in-process broker and SSE streaming
@@ -401,13 +423,13 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 - Config mutation API (MCP + REST, merge-patch, atomic write, rollback)
 - Agent state and loop control over MCP and REST (singular routes preserved)
 - Multi-provider routing (Ollama, Anthropic, Claude Code, Codex)
-- Always-on MCP Streamable HTTP server (33 tools, sessions, JSON-RPC 2.0)
+- Always-on MCP Streamable HTTP server (54 tools, sessions, JSON-RPC 2.0)
 - Kernel-native session management with atomic handoff claim (bus-level first-wins via append-before-apply; seq-sorted replay on startup)
 - Anthropic Messages API proxy with streaming SSE
 - Native Go agent harness with adaptive interval and 6 kernel tools
 - Embedded web dashboard with agent status, cycle history, and decomposition panel
 - Foveated decomposition pipeline (`cog decompose`) with 4-tier output, workbench TUI, embeddings, and bus events
-- Library extraction: 7 packages in pkg/
+- Library extraction: 8 packages in pkg/ (ADR-100; pkg/substrate added)
 - Content-addressed blob store
 - Git-derived salience scoring
 - Tool-call hallucination gate (activated by `NormalizeMCPRequest` path in #25)
