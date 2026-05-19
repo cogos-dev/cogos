@@ -42,7 +42,25 @@ type CogBlock struct {
 
 	// Artifacts produced from processing this block.
 	Artifacts []BlockArtifact `json:"artifacts,omitempty"`
+
+	// CanonForm identifies the canonicalization algorithm used to hash this block.
+	// RFC-0003 Refinement 4 — canonicalization algorithm versioning.
+	//
+	// New blocks default to "rfc8785-v1". Existing blocks without CanonForm are
+	// treated as "rfc8785-v1" at read time (no hash change; the algorithm has not
+	// changed). A future "rfc8785-v2" would be declared here when a
+	// canonicalization edge case is fixed; blocks with different CanonForm values
+	// coexist in the ledger and are hashed independently under their declared
+	// algorithm. See docs/rfcs/0003-cogblock-topology-refinements.md §Refinement 4.
+	CanonForm string `json:"canon_form,omitempty"`
 }
+
+// CanonFormRFC8785V1 is the default canonicalization algorithm for CogBlock.
+// It corresponds to RFC 8785 (JSON Canonicalization Scheme) with the
+// initial implementation in pkg/cogblock/ledger.go. Declared as a named
+// constant so callers can reference it without embedding a string literal.
+// RFC-0003 Refinement 4.
+const CanonFormRFC8785V1 = "rfc8785-v1"
 
 // CogBlockKind identifies the type of interaction a CogBlock represents.
 type CogBlockKind string

@@ -44,6 +44,20 @@ type EventPayload struct {
 
 	// Data contains type-specific payload (optional).
 	Data map[string]interface{} `json:"data,omitempty"`
+
+	// CanonForm identifies the canonicalization algorithm used to produce the
+	// canonical bytes that are hashed for this event. RFC-0003 Refinement 4.
+	//
+	// New events default to CanonFormRFC8785V1 ("rfc8785-v1"). Existing events
+	// without this field are treated as "rfc8785-v1" at read time — CanonForm
+	// is omitempty so the wire format is unchanged for legacy events.
+	//
+	// When a future "rfc8785-v2" is introduced (e.g., to fix a Unicode
+	// normalization edge case), events emitted under the new algorithm declare
+	// "rfc8785-v2" here; old and new events coexist in the same ledger without
+	// ambiguity. The CanonForm value is itself included in the canonical bytes,
+	// so the declared algorithm is part of the hash commitment.
+	CanonForm string `json:"canon_form,omitempty"`
 }
 
 // EventMetadata contains information NOT included in the hash.
@@ -68,6 +82,13 @@ type EventMetadata struct {
 //   - No insignificant whitespace
 //   - Unicode normalized (NFC)
 //   - Numbers in canonical form (no leading zeros, etc.)
+//
+// RFC-0003 Refinement 4: if payload.CanonForm is set (non-empty), it is
+// included in the canonical map under the key "canon_form". This commits the
+// declared canonicalization algorithm into the hash, making the hash dependent
+// on which algorithm was used. For new events this is always "rfc8785-v1".
+// Legacy events without CanonForm omit the field from the map (backward
+// compatible — their hashes are unchanged).
 func CanonicalizeEvent(payload *EventPayload) ([]byte, error) {
 	// Convert to map for canonical JSON encoding
 	data := map[string]interface{}{
@@ -82,6 +103,12 @@ func CanonicalizeEvent(payload *EventPayload) ([]byte, error) {
 	}
 	if len(payload.Data) > 0 {
 		data["data"] = payload.Data
+	}
+
+	// RFC-0003 R4: include canon_form in hash when declared. Absent on legacy
+	// events (omitempty) — their canonical bytes and hashes are unchanged.
+	if payload.CanonForm != "" {
+		data["canon_form"] = payload.CanonForm
 	}
 
 	return canonicalJSON(data)
@@ -383,6 +410,9 @@ func VerifyLedger(workspaceRoot, sessionID string) error {
 // === CONVENIENCE CONSTRUCTORS ===
 
 // NewEventEnvelope creates a new event envelope with current timestamp.
+// The CanonForm field defaults to CanonFormRFC8785V1 ("rfc8785-v1") per
+// RFC-0003 Refinement 4 — all new events declare their canonicalization
+// algorithm so future algorithm migrations are unambiguous.
 func NewEventEnvelope(eventType, sessionID string) *EventEnvelope {
 	return &EventEnvelope{
 		HashedPayload: EventPayload{
@@ -390,6 +420,7 @@ func NewEventEnvelope(eventType, sessionID string) *EventEnvelope {
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 			SessionID: sessionID,
 			Data:      make(map[string]interface{}),
+			CanonForm: CanonFormRFC8785V1,
 		},
 		Metadata: EventMetadata{},
 	}

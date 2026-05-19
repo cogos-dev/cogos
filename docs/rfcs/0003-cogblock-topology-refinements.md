@@ -2,7 +2,7 @@
 
 | Field         | Value                                                          |
 |---------------|----------------------------------------------------------------|
-| Status        | Draft                                                          |
+| Status        | Partially Implemented (R4 merged; R1, R2, R3, R5 pending)    |
 | Author        | @chazmaniandinkle                                             |
 | Tracking      | [#204](https://github.com/myrgic/cogos/issues/204), [#205](https://github.com/myrgic/cogos/issues/205), [#206](https://github.com/myrgic/cogos/issues/206), [#207](https://github.com/myrgic/cogos/issues/207), [#208](https://github.com/myrgic/cogos/issues/208) |
 | Target        | `v0.6.0`                                                       |
@@ -144,6 +144,17 @@ Migration: existing blocks without CanonForm are read as `"rfc8785-v1"` (no hash
 - `CanonicalizeEvent` includes CanonForm in canonical input.
 - Existing blocks read as `"rfc8785-v1"` on unmarshal.
 - Migration plan sketched in documentation: how `"rfc8785-v2"` would be introduced and how blocks with different CanonForm values are handled at read time.
+
+### Implementation notes (2026-05-19)
+
+- `CanonFormRFC8785V1 = "rfc8785-v1"` constant added to `pkg/cogblock/block.go`.
+- `CanonForm string` added to both `CogBlock` and `EventPayload` (omitempty).
+- `NewEventEnvelope` defaults `CanonForm` to `CanonFormRFC8785V1`.
+- `CanonicalizeEvent` includes `canon_form` in the canonical map when non-empty.
+- Migration path: new events produced after this PR carry `"rfc8785-v1"`. Legacy
+  events (empty CanonForm) hash as before — the field is absent from their
+  canonical map. When `"rfc8785-v2"` is introduced, old and new events coexist
+  unambiguously; a verifier reads `CanonForm` to select the correct algorithm.
 
 ### References
 

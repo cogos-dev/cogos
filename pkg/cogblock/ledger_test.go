@@ -336,3 +336,245 @@ func splitNonEmpty(s string) []string {
 	}
 	return lines
 }
+
+// === RFC-0003 REFINEMENT 4: CANON FORM TESTS ===
+
+// TestCanonicalizeEvent_CanonForm_IncludedInHash verifies that when CanonForm is
+// set, it appears in the canonical bytes and therefore changes the hash.
+func TestCanonicalizeEvent_CanonForm_IncludedInHash(t *testing.T) {
+	base := &EventPayload{
+		Type:      "test.event",
+		SessionID: "session-r4",
+		Timestamp: "2026-05-19T10:00:00Z",
+	}
+
+	withCanonForm := &EventPayload{
+		Type:      "test.event",
+		SessionID: "session-r4",
+		Timestamp: "2026-05-19T10:00:00Z",
+		CanonForm: CanonFormRFC8785V1,
+	}
+
+	bytesBase, err := CanonicalizeEvent(base)
+	if err != nil {
+		t.Fatalf("CanonicalizeEvent(base): %v", err)
+	}
+
+	bytesWithCanon, err := CanonicalizeEvent(withCanonForm)
+	if err != nil {
+		t.Fatalf("CanonicalizeEvent(withCanonForm): %v", err)
+	}
+
+	// The canonical bytes must differ because canon_form is included.
+	if string(bytesBase) == string(bytesWithCanon) {
+		t.Errorf("Expected canonical bytes to differ when CanonForm is set, but they are identical:\n%s", bytesBase)
+	}
+
+	// The canon_form key must appear in the output.
+	if !strings.Contains(string(bytesWithCanon), `"canon_form"`) {
+		t.Errorf("canon_form not found in canonical bytes: %s", bytesWithCanon)
+	}
+	if !strings.Contains(string(bytesWithCanon), CanonFormRFC8785V1) {
+		t.Errorf("canon_form value %q not found in canonical bytes: %s", CanonFormRFC8785V1, bytesWithCanon)
+	}
+}
+
+// TestCanonicalizeEvent_CanonForm_AbsentOnLegacy verifies that EventPayload with
+// empty CanonForm produces canonical bytes without the canon_form key — the
+// backward-compatibility guarantee for pre-R4 ledger events.
+func TestCanonicalizeEvent_CanonForm_AbsentOnLegacy(t *testing.T) {
+	legacy := &EventPayload{
+		Type:      "test.event",
+		SessionID: "session-legacy",
+		Timestamp: "2026-05-19T10:00:00Z",
+	}
+
+	bytes, err := CanonicalizeEvent(legacy)
+	if err != nil {
+		t.Fatalf("CanonicalizeEvent: %v", err)
+	}
+
+	if strings.Contains(string(bytes), "canon_form") {
+		t.Errorf("canon_form must not appear in canonical bytes for legacy event (empty CanonForm): %s", bytes)
+	}
+}
+
+// TestCanonicalizeEvent_CanonForm_ExactBytes verifies the exact canonical form
+// of a new event with CanonForm set. This pins the expected output so that any
+// future canonicalization change is immediately visible.
+func TestCanonicalizeEvent_CanonForm_ExactBytes(t *testing.T) {
+	event := &EventPayload{
+		Type:      "test.event",
+		SessionID: "session-r4",
+		Timestamp: "2026-05-19T10:00:00Z",
+		CanonForm: CanonFormRFC8785V1,
+	}
+
+	bytes, err := CanonicalizeEvent(event)
+	if err != nil {
+		t.Fatalf("CanonicalizeEvent: %v", err)
+	}
+
+	// Keys must be lexicographically sorted: canon_form < session_id < timestamp < type
+	expected := `{"canon_form":"rfc8785-v1","session_id":"session-r4","timestamp":"2026-05-19T10:00:00Z","type":"test.event"}`
+	if string(bytes) != expected {
+		t.Errorf("Unexpected canonical form:\nGot:  %s\nWant: %s", bytes, expected)
+	}
+}
+
+// TestNewEventEnvelope_DefaultsCanonForm verifies that NewEventEnvelope sets
+// CanonForm to CanonFormRFC8785V1 on all new events.
+func TestNewEventEnvelope_DefaultsCanonForm(t *testing.T) {
+	env := NewEventEnvelope("test.event", "session-42")
+
+	if env.HashedPayload.CanonForm != CanonFormRFC8785V1 {
+		t.Errorf("CanonForm = %q; want %q", env.HashedPayload.CanonForm, CanonFormRFC8785V1)
+	}
+}
+
+// TestCanonForm_NewEventHashesDifferFromLegacy verifies that a new event
+// (CanonForm set) produces a different hash from a logically equivalent legacy
+// event (CanonForm empty). This is intentional — the declared algorithm is part
+// of the hash commitment.
+func TestCanonForm_NewEventHashesDifferFromLegacy(t *testing.T) {
+	newEvent := &EventPayload{
+		Type:      "test.event",
+		SessionID: "session-test",
+		Timestamp: "2026-05-19T10:00:00Z",
+		CanonForm: CanonFormRFC8785V1,
+	}
+
+	legacyEvent := &EventPayload{
+		Type:      "test.event",
+		SessionID: "session-test",
+		Timestamp: "2026-05-19T10:00:00Z",
+		// CanonForm intentionally empty — simulates a pre-R4 ledger event.
+	}
+
+	newBytes, err := CanonicalizeEvent(newEvent)
+	if err != nil {
+		t.Fatalf("CanonicalizeEvent(new): %v", err)
+	}
+
+	legacyBytes, err := CanonicalizeEvent(legacyEvent)
+	if err != nil {
+		t.Fatalf("CanonicalizeEvent(legacy): %v", err)
+	}
+
+	newHash, _ := HashEvent(newBytes, "sha256")
+	legacyHash, _ := HashEvent(legacyBytes, "sha256")
+
+	if newHash == legacyHash {
+		t.Errorf("Expected new-event hash to differ from legacy-event hash (CanonForm is part of commitment)")
+	}
+}
+
+// TestAppendEvent_CanonFormPersistedAndVerifiable verifies that a full
+// ledger round-trip with the new default CanonForm passes VerifyLedger.
+func TestAppendEvent_CanonFormPersistedAndVerifiable(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionID := "test-session-r4"
+
+	// Genesis event sets hash algorithm.
+	genesis := NewEventEnvelope("workspace.genesis", sessionID)
+	genesis.WithData("hash_algorithm", "sha256")
+	if err := AppendEvent(tmpDir, sessionID, genesis); err != nil {
+		t.Fatalf("AppendEvent genesis: %v", err)
+	}
+
+	// Subsequent events with CanonForm set by default.
+	for i := 1; i <= 3; i++ {
+		event := NewEventEnvelope("test.event", sessionID)
+		event.WithData("index", i)
+		if err := AppendEvent(tmpDir, sessionID, event); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+	}
+
+	// All events must have CanonForm in their payload.
+	eventsFile := filepath.Join(tmpDir, ".cog", "ledger", sessionID, "events.jsonl")
+	data, err := os.ReadFile(eventsFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	lines := splitNonEmpty(string(data))
+	for i, line := range lines {
+		var env EventEnvelope
+		if err := json.Unmarshal([]byte(line), &env); err != nil {
+			t.Fatalf("Unmarshal line %d: %v", i, err)
+		}
+		if env.HashedPayload.CanonForm != CanonFormRFC8785V1 {
+			t.Errorf("line %d: CanonForm = %q; want %q", i, env.HashedPayload.CanonForm, CanonFormRFC8785V1)
+		}
+	}
+
+	// VerifyLedger must pass — hash chain must be intact with CanonForm included.
+	if err := VerifyLedger(tmpDir, sessionID); err != nil {
+		t.Errorf("VerifyLedger: %v", err)
+	}
+}
+
+// TestCogBlock_CanonFormRoundTrip verifies that CanonForm survives JSON
+// marshal/unmarshal on CogBlock and that omitempty works correctly.
+func TestCogBlock_CanonFormRoundTrip(t *testing.T) {
+	t.Run("with CanonForm", func(t *testing.T) {
+		b := CogBlock{
+			ID:        "block-r4",
+			Kind:      BlockMessage,
+			CanonForm: CanonFormRFC8785V1,
+		}
+
+		data, err := json.Marshal(b)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+
+		if !strings.Contains(string(data), `"canon_form"`) {
+			t.Errorf("canon_form missing from JSON: %s", data)
+		}
+
+		var decoded CogBlock
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+
+		if decoded.CanonForm != CanonFormRFC8785V1 {
+			t.Errorf("CanonForm = %q; want %q", decoded.CanonForm, CanonFormRFC8785V1)
+		}
+	})
+
+	t.Run("without CanonForm (omitempty)", func(t *testing.T) {
+		b := CogBlock{
+			ID:   "block-legacy",
+			Kind: BlockMessage,
+			// CanonForm intentionally omitted
+		}
+
+		data, err := json.Marshal(b)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+
+		if strings.Contains(string(data), "canon_form") {
+			t.Errorf("canon_form should be omitted when empty: %s", data)
+		}
+
+		var decoded CogBlock
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+
+		if decoded.CanonForm != "" {
+			t.Errorf("CanonForm = %q; want empty string for legacy block", decoded.CanonForm)
+		}
+	})
+}
+
+// TestCanonFormRFC8785V1_ConstantValue pins the constant value so any
+// accidental rename or edit fails loudly.
+func TestCanonFormRFC8785V1_ConstantValue(t *testing.T) {
+	if CanonFormRFC8785V1 != "rfc8785-v1" {
+		t.Errorf("CanonFormRFC8785V1 = %q; want %q", CanonFormRFC8785V1, "rfc8785-v1")
+	}
+}
