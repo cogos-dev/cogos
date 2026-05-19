@@ -159,6 +159,11 @@ type IdentityExpression struct {
 	// MemoryNamespace optionally scopes this expression's memory reads/writes
 	// (e.g., "cog://" for root, "cog://agents/sandy/" for a scoped agent).
 	MemoryNamespace string `yaml:"memory_namespace,omitempty"`
+	// WorkspaceRoot is the canonical cog:// URI home for this identity
+	// in this audience context. Location-independent; path projection
+	// is resolved by the WorkspaceBinding reconciler (Wave 6c).
+	// Example: "cog://workspaces/cog", "cog://workspaces/chaz"
+	WorkspaceRoot string `yaml:"workspace_root,omitempty"`
 	// Claims is an OIDC-style free-form claim bag. The reconciler preserves
 	// unknown claims verbatim — future tooling can read them without the
 	// spec needing a schema bump.

@@ -64,6 +64,16 @@ func LoadSessionContext(workspaceRoot string, session *LifecycleSession) string 
 		b.WriteString("\n")
 	}
 
+	// Emit workspace_root when the CRD projection for the agent is present.
+	// The reconciler writes .cog/id/<sub>.cog.md with a workspace_root line
+	// in its body. Surface it here so the LLM receives its home URI at
+	// session start without requiring a full CRD parse.
+	if wsRoot := loadWorkspaceRootFromProjection(workspaceRoot, session.AgentName); wsRoot != "" {
+		b.WriteString("\n---\n\n**Workspace root:** ")
+		b.WriteString(wsRoot)
+		b.WriteString("\n")
+	}
+
 	b.WriteString("</session-context>")
 	return b.String()
 }
@@ -161,6 +171,37 @@ func loadIdentitySummary(root, agentName string) string {
 		summary += "\n\n*(Full card on disk)*"
 	}
 	return summary
+}
+
+// loadWorkspaceRootFromProjection reads the CRD projection cogdoc written by
+// IdentityProvider at .cog/id/<sub>.cog.md and extracts the workspace_root
+// from its body. Returns empty string when the file is absent or the field is
+// unset — workspace_root is always optional.
+func loadWorkspaceRootFromProjection(root, agentName string) string {
+	name := agentName
+	if name == "" {
+		name = "cog"
+	}
+	path := filepath.Join(root, ".cog", "id", name+".cog.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	// The cogdoc body contains a line like:
+	//   **Workspace root:** `cog://workspaces/cog`
+	// Extract the value between the backticks.
+	content := string(data)
+	const marker = "**Workspace root:** `"
+	idx := strings.Index(content, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := content[idx+len(marker):]
+	end := strings.IndexByte(rest, '`')
+	if end <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:end])
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────

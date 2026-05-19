@@ -39,13 +39,17 @@ type IdentityConfig struct {
 
 // IdentityFrontmatter represents the YAML frontmatter in an identity card
 type IdentityFrontmatter struct {
-	Name           string   `yaml:"name"`
-	Role           string   `yaml:"role"`
-	ContextPlugin  string   `yaml:"context_plugin"`
-	MemoryPath     string   `yaml:"memory_path"`
-	MemoryNamespace string  `yaml:"memory_namespace"`
-	DerivesFrom    string   `yaml:"derives_from"`
-	Dependencies   []string `yaml:"dependencies"`
+	Name            string   `yaml:"name"`
+	Role            string   `yaml:"role"`
+	ContextPlugin   string   `yaml:"context_plugin"`
+	MemoryPath      string   `yaml:"memory_path"`
+	MemoryNamespace string   `yaml:"memory_namespace"`
+	// WorkspaceRoot is the canonical cog:// URI home for this identity.
+	// Mirrors IdentityExpression.WorkspaceRoot — carried here so TAA
+	// context loading surfaces it without re-reading the CRD.
+	WorkspaceRoot   string   `yaml:"workspace_root"`
+	DerivesFrom     string   `yaml:"derives_from"`
+	Dependencies    []string `yaml:"dependencies"`
 }
 
 // LoadIdentityContext loads the current identity and returns formatted context.
@@ -104,6 +108,9 @@ func LoadIdentityContext(workspaceRoot string, maxTokens int) (string, error) {
 	result.WriteString(fmt.Sprintf("**Role:** %s\n", frontmatter.Role))
 	if frontmatter.MemoryNamespace != "" {
 		result.WriteString(fmt.Sprintf("**Memory Namespace:** %s\n", frontmatter.MemoryNamespace))
+	}
+	if frontmatter.WorkspaceRoot != "" {
+		result.WriteString(fmt.Sprintf("**Workspace Root:** %s\n", frontmatter.WorkspaceRoot))
 	}
 	result.WriteString("\n---\n\n")
 
