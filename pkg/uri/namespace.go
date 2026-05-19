@@ -45,6 +45,14 @@ var Namespaces = map[string]bool{
 	"skill":  true, // cog:skill/* → Skill definitions
 	"skills": true, // cog:skills/* → Skills (plural alias)
 
+	// ── Voice assets ──────────────────────────────────────────────────────────
+	// cog:voices/<name>                  → VoiceProfile record (generative + discriminative heads)
+	// cog:voices/<name>/ecapa-embedding  → ECAPA-TDNN speaker embedding vector
+	// Resolution: the kernel projects cog:voices/* to ~/.mod3/voices/<name>.{json,safetensors}.
+	// Pattern mirrors cog:skills/* and cog:mem/* — voice assets are
+	// substrate-addressable records, not hidden name lookups.
+	"voices": true, // cog:voices/* → Voice profile records
+
 	// ── Handoffs / artifacts ──────────────────────────────────────────────────
 	"handoff":   true, // cog:handoff/* → Handoff documents
 	"handoffs":  true, // cog:handoffs/* → Handoffs (plural alias)
