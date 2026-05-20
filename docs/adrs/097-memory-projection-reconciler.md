@@ -305,6 +305,8 @@ Files to add or modify:
 - `pkg/cogblock/kinds.go` — add `memory.projection.created`, `memory.projection.updated`, `memory.projection.conflict`, `memory.projection.conflict.resolved`, `memory.index.update` to the Kind registry (per ADR-090)
 - `docs/adrs/097-memory-projection-reconciler.md` — this file
 
+**Implementation guidance: sector mapping must be configuration, not code.** The `type:` → sector mapping table in §3 is the documented default, not a hardcoded rule. `MemoryProjectionConfig` MUST expose the mapping as loaded configuration (e.g., `.cog/config/memory-projection.yaml` or equivalent), with the §3 table shipped as the default. Per-memory `projection.target-path` frontmatter remains the per-document override. The substrate is the framework; sector taxonomy is operator-defined. An implementation that hardcodes the §3 table into Go source is non-conforming.
+
 ## Acceptance criteria
 
 A `MemoryProjectionReconciler` prototype MUST be able to classify each memory pair in the operator's corpus given an initially-empty ledger:
@@ -332,7 +334,9 @@ Integration test cases to add:
 
 ## Open questions
 
-1. **Pre-creation event ordering.** When Claude Code writes a new memory file, the substrate discovers it on the next fsnotify event or periodic tick. There is no guarantee that the substrate has received the write before the operator's next Claude Code session reads MEMORY.md. If the operator writes a memory and immediately starts a new session, the cogdoc projection may not exist yet. Whether the reconciler should register a kernel-side hook that runs synchronously on memory-write (e.g., a `PostToolUse` hook in Claude Code's settings) or whether the periodic-tick latency (default 30s) is acceptable is unresolved. The fsnotify-driven early trigger reduces this window but does not eliminate it.
+1. **Pre-creation event ordering.** When Claude Code writes a new memory file, the substrate discovers it on the next fsnotify event or periodic tick. There is no guarantee that the substrate has received the write before the operator's next Claude Code session reads MEMORY.md. If the operator writes a memory and immediately starts a new session, the cogdoc projection may not exist yet. The fsnotify-driven early trigger reduces this window but does not eliminate it.
+
+   *Resolution direction:* the trigger source is itself a configuration knob, not a binary choice. The reconciler accepts multiple trigger sources composably — fsnotify event, periodic tick, kernel-side hook (e.g., a `PostToolUse` Claude Code hook), explicit operator invocation — and ships sensible defaults (fsnotify + 30s tick per ADR-095 §5). Operators in latency-sensitive environments may add a synchronous hook; operators in batch-oriented environments may rely on the periodic tick alone. The choice is per-environment, not per-framework, and MUST be configurable without code changes.
 
 2. **MEMORY.md ownership and write races.** MEMORY.md is the Claude Code auto-memory index. It is written by Claude Code (when `/remember` runs) and by the reconciler (when adding projection entries). The current file format is append-friendly (one-line entries) but Claude Code may rewrite the entire file on memory update. If Claude Code's rewrite and the reconciler's addition race at the OS level, the last writer wins and may produce a file missing the other writer's entries. A durable solution requires either: (a) a locking protocol between the reconciler and Claude Code, which is not currently possible, or (b) accepting that MEMORY.md entries may occasionally need a reconciler re-add on the next tick. This open question affects the implementation of `ApplyPlan` for `create-claude-code-projection` actions.
 
