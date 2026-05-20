@@ -227,7 +227,7 @@ Six kernel-native tools are available to the agent itself:
 | `POST /v1/handoffs/{id}/complete` | Complete a claimed handoff; optional `next_handoff_id` links recursive relays |
 | `GET /v1/handoffs` | List handoffs; filter by `state` (open, claimed, complete) and `for_session` |
 | `GET /v1/hud/state` | Claude Code HUD state snapshot (identity, session, context pressure) |
-| `GET /v1/claude-code/sessions` · `POST /v1/claude-code/sessions` | ACP-client session endpoints for Claude Code integration |
+| `GET /v1/claude-code/projects` · `GET /v1/claude-code/projects/{project}/sessions` · `POST /v1/claude-code/spawn` | ACP-client surface: enumerate Claude Code projects, list sessions in a project, spawn or resume a Claude Code subprocess wired into mod3 via a generated temp `.mcp.json` |
 | `GET /v1/bus/:id/events/stream` | SSE stream of broker events |
 | `GET /health` | Liveness probe (identity, state, trust) |
 | `GET /dashboard` | Embedded web dashboard |
