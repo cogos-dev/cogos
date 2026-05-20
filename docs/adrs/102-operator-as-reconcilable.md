@@ -253,13 +253,13 @@ implementation begins.
 **What it is:** A Reconcilable that ingests the session JSONLs from
 `~/.claude/projects/-Users-slowbro/*.jsonl` (and analogous locations on other nodes),
 projects them as cogblocks/events on the substrate bus, and exposes them as queryable
-records via `cog_search_traces` and related MCP tools.
+records via `cog_search_conversations` and related MCP tools.
 
 **Why it is the highest-leverage operator-visibility primitive:** Every operator utterance,
 every tool call, every timestamp, every approval and rejection is already recorded in these
 files. They are the densest operator-coupling artifacts in existence. Today they are
 brute-force-grep only. Once the Observatory is live, every future operator-context retrieval
-becomes `cog_search_traces "<query>"` returning structured cogblocks rather than a
+becomes `cog_search_conversations "<query>"` returning structured cogblocks rather than a
 transcript-walking agent dispatch.
 
 **Reconcilable mapping:**
