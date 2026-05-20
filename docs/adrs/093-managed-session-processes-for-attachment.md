@@ -479,3 +479,192 @@ Test coverage requirements:
   within policy and seat re-registration
 - Pool test (when pool-on): Detach + New with matching opts acquires
   warm session rather than cold-starting
+
+## §10 — Empirical findings from the validation spike (2026-05-20)
+
+A focused ~480-LOC spike (PR #306, branch `spike/acp-bridge-claude-cli`)
+exercised the central wire-shape assumption end-to-end against the real
+`claude` binary before the ADR's four-commit implementation begins. The
+findings shift two design decisions and confirm the rest.
+
+### Setting
+
+The spike adds `internal/acp/` containing:
+
+- `streamjson.go` — typed frames for the `claude --output-format stream-json`
+  NDJSON wire (`system`, `assistant`, `stream_event`, `result`,
+  catch-all `unknown`), `PromptInput` constructors for
+  `--input-format stream-json`, and a `ParseLine` dispatcher
+- `claudecli.go` — `Subprocess` driver: `Spawn` / `Send` / `Events` /
+  `CloseInput` / `Wait`. Serialized stdin writer; 1 MB scanner buffer
+  for fat assistant frames; subprocess parented through
+  `exec.CommandContext` (no `ProcessManager` integration yet)
+- `spike_test.go` — one-prompt round-trip
+- `multiturn_test.go` — two-prompt context-retention proof, with a
+  fresh UUID per test run
+
+Both tests auto-skip when `claude` is not on `PATH`. They live in the
+spike branch and are not part of the migration plan in §8.
+
+### Finding 1 — stream-json input IS multi-message. (Design unblocked.)
+
+A prior research pass had concluded that `claude --print --input-format
+stream-json` reads one input object, processes one turn, and exits —
+i.e., that multi-turn over one subprocess was not supported. That would
+have forced ADR-093's `Send` to spawn a fresh `claude --resume`
+per call, with all the cold-start and credential-rebinding cost that
+implies.
+
+The spike refutes this directly. With one long-lived subprocess:
+
+```
+turn 1 result: "OK"        session=2550852d-c5df-19b7-d289-a13e09818a37
+turn 2 result: "GLOWWORM"  session=2550852d-c5df-19b7-d289-a13e09818a37
+```
+
+Turn 2 retrieved a secret word that was only present in turn 1's
+prompt. Both turns reported the same `session_id` on their `result`
+frames. The CLI is reading NDJSON from stdin as a streaming protocol —
+each object on stdin triggers a turn, the session JSONL appends, the
+subprocess stays alive until stdin closes.
+
+**This is the load-bearing claim of ADR-093.** `ManagedSession.Send`
+maps cleanly onto a single `Encode(promptInput)` against the
+subprocess's stdin pipe. No pool of `--resume` subprocesses-per-turn
+required. The §4 lifecycle (Starting → Live → Stalled →
+Detached/Crashed) is correct as drafted.
+
+### Finding 2 — required flag combination
+
+For `--print --input-format stream-json --output-format stream-json` to
+work, `--verbose` must also be passed. Without it the CLI rejects the
+combination. The spike's `claudecli.go` bakes this in:
+
+```go
+args := []string{
+    "--print",
+    "--verbose",
+    "--output-format", "stream-json",
+    "--input-format",  "stream-json",
+}
+```
+
+§2's `claude --resume <session_id> --model <m> --mcp-config <path>
+--strict-mcp-config` invocation in this ADR must add `--print
+--verbose --input-format stream-json --output-format stream-json` to
+be wire-compatible with the channel mechanism described.
+
+### Finding 3 — `--session-id` is create-only
+
+`claude --session-id <uuid>` pins a *new* session to a caller-chosen
+UUID. It refuses to bind to a session_id that already exists on disk
+(observed when the spike test re-ran with a hardcoded UUID; the
+subprocess exited silently and the event channel closed before any
+`result` frame). To resume an existing session use `--resume <id>`.
+The two flags are not interchangeable.
+
+`SpawnOpts.ResumeExisting bool` in the spike encodes this distinction.
+Implementation in §8 should mirror the same discriminator on
+`ManagedSession.New` vs `ManagedSession.Resume`.
+
+### Finding 4 — frame catalogue is wider than §3 suggests
+
+The stream-json output stream emits more frame types than the §3
+operation table implies. Observed during the two-test run:
+
+- `system` with `subtype` in {`init`, `hook_started`, `hook_response`}
+  — only `init` carries the canonical session_id; the hook frames are
+  emitted at startup before the operator-provided prompt is processed
+- `stream_event` — Anthropic SSE deltas pulled out of the streaming
+  API and re-emitted as NDJSON lines. Inner `event` carries content
+  block deltas, message stops, tool-use deltas, etc.
+- `assistant` — a complete assistant message at end-of-turn
+  (authoritative for the turn's text)
+- `result` — terminal frame for each turn; carries `result` text,
+  `duration_ms`, `num_turns`, `is_error`
+- `rate_limit_event` — periodic quota status; observed during the
+  one-prompt test
+
+The §3 channel contract is unchanged (`Receive` is still "stream of
+model output chunks, tool calls, state events"), but the translator
+that maps these onto ACP `session/update` notifications needs to
+handle each frame type. Estimated translator size revised from §8's
+implicit "small" to ~300 LOC — still bounded but worth budgeting.
+
+The spike's `streamjson.go` types are deliberately subset-minimal;
+they decode just enough to validate the wire. The implementation in
+§8 should expand the type set as new frame kinds are observed.
+
+### Finding 5 — initial implementation library decision
+
+ADR-093 §7 mandates that channel transport stay behind the
+`SessionChannel` interface, transport-agnostic. The spike validates
+that a 280-LOC Go-only implementation can drive the wire without any
+foreign-runtime dependency (no Node, no Python). The follow-up
+implementation in §8 will likely import `github.com/coder/acp-go-sdk`
+for ACP wire types and JSON-RPC 2.0 framing (~990 LOC eliminated from
+our maintenance burden, per the comparison in PR #306's body) — but
+that is a library choice for the boundary surface that mediates
+between `SessionChannel` and ACP clients, not for the
+`SessionChannel` ↔ claude-CLI wire itself. The claude-CLI driver
+stays as authored in the spike.
+
+The substrate explicitly does **not** vendor
+`@agentclientprotocol/claude-agent-acp` (the Node adapter Zed uses).
+That path was evaluated and rejected: it would have introduced a
+Node ≥20 runtime + npm supply chain into CogOS deploys, in exchange
+for ~200 LOC saved on the kernel side. The spike confirms that the
+Go-native path is small enough that the LOC saving does not justify
+the topological hole. (Cf.
+`feedback_topological_hole_sovereignty_diagnostic.md`.)
+
+### What the spike does NOT validate
+
+These remain unverified and need explicit follow-up commits:
+
+- Cancellation via SIGINT or stdin-close mid-turn (does claude stop
+  cleanly? do trailing frames arrive?)
+- Restart-on-crash policy (§4) — no failure-injection coverage
+- Heartbeat semantics — claude has no native heartbeat; the §4
+  Stalled detection has to come from elsewhere (output-frame
+  inactivity timer, or kernel-side health probe)
+- `--mcp-config` injection of substrate MCP servers (substrate tools
+  reachable from inside the spawned claude)
+- `--strict-mcp-config` interaction with the generated config
+- Tool-call surfaces inside `stream_event` payloads (claude calling
+  Bash / Read / mod3_speak) — observed shape not yet typed
+- ACP `session/update` translator (a separate concern from the
+  subprocess driver)
+- ProcessManager integration — the spike's `exec.CommandContext`
+  bypasses §1's "all substrate agent processes use managed
+  channel-mediated sessions" requirement
+- Concurrent multi-session safety — only one `Subprocess` per test;
+  no shared-state stress
+
+### Implication for §8 migration plan
+
+Commit 2 ("Introduce ManagedSession scaffolding") should adopt the
+spike's `internal/acp/` types where they fit, replacing rather than
+duplicating. Specifically:
+
+- `acp.Subprocess` is the concrete claude-CLI implementation of
+  `SessionChannel`'s kernel-side surface — keep it; wrap it.
+- `acp.Event` is a substrate-internal representation; the public
+  `SessionChannel.Receive` contract should emit a richer type that
+  the translator constructs from `acp.Event`.
+- `acp.SpawnOpts.{SessionID, ResumeExisting}` should appear on
+  `ManagedSession.New` / `.Resume` with the same semantics.
+
+Commit 3 (dashboard Resume + dispatch migration) is unblocked. The
+wire-shape risk that justified hedging the migration plan has been
+retired.
+
+### References
+
+- PR #306 — https://github.com/myrgic/cogos/pull/306 (draft)
+- Spike branch — `spike/acp-bridge-claude-cli` on `upstream`
+- Test logs reproducible via `go test -v ./internal/acp/ -timeout 180s`
+  (auto-skip when `claude` is not on `PATH`)
+- Companion finding files in operator memory:
+  `reference_claude_code_mcp_env_substitution.md` (related: env
+  substitution pitfalls from PR #103-#109 cascade)
