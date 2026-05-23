@@ -24,7 +24,7 @@ import (
 	"sync"
 
 	"github.com/myrgic/cogos/internal/workspace"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // --- Dependency-injection seams ----------------------------------------------

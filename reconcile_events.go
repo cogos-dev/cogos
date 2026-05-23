@@ -5,7 +5,7 @@
 
 package main
 
-import "github.com/myrgic/cogos/pkg/reconcile"
+import "github.com/myrgic/cogos/pkg/substrate/reconcile"
 
 // --- Re-exported event type aliases ---
 

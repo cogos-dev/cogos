@@ -34,7 +34,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // BootOption is a functional option passed to Boot.

@@ -14,7 +14,7 @@ package main
 
 import (
 	"github.com/myrgic/cogos/internal/conversations"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // conversationsProviderInstance is the singleton registered with the reconcile

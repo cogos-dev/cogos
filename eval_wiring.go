@@ -21,7 +21,7 @@ import (
 
 	"github.com/myrgic/cogos/internal/engine"
 	"github.com/myrgic/cogos/internal/eval"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // evalProviderInstance is the singleton EvalProvider registered with the

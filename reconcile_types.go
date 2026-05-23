@@ -4,7 +4,7 @@
 
 package main
 
-import "github.com/myrgic/cogos/pkg/reconcile"
+import "github.com/myrgic/cogos/pkg/substrate/reconcile"
 
 // --- Type aliases for backward compatibility ---
 

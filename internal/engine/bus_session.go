@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/myrgic/cogos/pkg/cogfield"
+	"github.com/myrgic/cogos/pkg/substrate/cogfield"
 )
 
 // eventsFileMaxBytes is the size threshold that triggers a size-based rotation

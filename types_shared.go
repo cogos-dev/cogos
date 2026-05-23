@@ -12,7 +12,7 @@
 package main
 
 import (
-	"github.com/myrgic/cogos/pkg/cogfield"
+	"github.com/myrgic/cogos/pkg/substrate/cogfield"
 )
 
 // CogBlock is the Messages API content block — the canonical wire format
