@@ -9,20 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/substrate/session"
 )
 
-// SessionTracking represents session tracking information
-type SessionTracking struct {
-	SessionID     string   `json:"sessionId"`
-	Branch        string   `json:"branch"`
-	StartedAt     string   `json:"startedAt"`
-	EndedAt       *string  `json:"endedAt,omitempty"`
-	Status        *string  `json:"status,omitempty"`
-	RootAgent     string   `json:"rootAgent"`
-	SpawnedAgents []string `json:"spawnedAgents"`
-	ActiveAgents  []string `json:"activeAgents"`
-	ReapedAgents  []string `json:"reapedAgents"`
-}
+// SessionTracking is a thin alias of session.Tracking. The canonical
+// schema lives in pkg/substrate/session per ADR-100 Step 3d. New code
+// should prefer the substrate import path directly.
+type SessionTracking = session.Tracking
 
 // getSessionFile returns the path to the session tracking file
 func getSessionFile(root string) string {
