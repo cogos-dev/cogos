@@ -19,7 +19,7 @@ package main
 import (
 	"github.com/myrgic/cogos/internal/conversations"
 	"github.com/myrgic/cogos/internal/engine"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 var daemonConversationsProvider = conversations.NewProvider()

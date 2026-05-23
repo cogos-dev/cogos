@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // ---------------------------------------------------------------------------

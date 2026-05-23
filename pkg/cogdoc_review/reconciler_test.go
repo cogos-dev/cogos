@@ -28,7 +28,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/myrgic/cogos/pkg/cogdoc_review"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // makeWorkspace creates a temp directory with a minimal workspace structure.

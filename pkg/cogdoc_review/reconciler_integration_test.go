@@ -31,7 +31,7 @@ import (
 	"time"
 
 	"github.com/myrgic/cogos/pkg/cogdoc_review"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // TestT09_RegressionADR052_WorkflowAsDAG is the T09 gate test.

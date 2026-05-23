@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/myrgic/cogos/internal/providers/pin"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // ─── Test helpers ────────────────────────────────────────────────────────────

@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	"github.com/myrgic/cogos/internal/providers/daemon"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 
 	// Blank import fires daemon.init(), registering all 10 providers; the named
 	// import above is for the new SetWorkspaceRoot regression test.

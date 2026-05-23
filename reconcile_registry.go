@@ -3,7 +3,7 @@
 
 package main
 
-import "github.com/myrgic/cogos/pkg/reconcile"
+import "github.com/myrgic/cogos/pkg/substrate/reconcile"
 
 // RegisterProvider adds a reconciliation provider to the global registry.
 func RegisterProvider(name string, provider Reconcilable) {

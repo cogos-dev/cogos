@@ -44,7 +44,7 @@ import (
 	"time"
 
 	"github.com/myrgic/cogos/internal/providers/pin"
-	"github.com/myrgic/cogos/pkg/reconcile"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 
 	// Trigger internal/providers/component's init() which registers "component".
 	_ "github.com/myrgic/cogos/internal/providers/component"
