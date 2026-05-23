@@ -16,6 +16,8 @@ package main
 
 import (
 	"time"
+
+	"github.com/myrgic/cogos/pkg/substrate/session"
 )
 
 // === THREAD PARSER TYPES ===
@@ -46,56 +48,33 @@ type ThreadMessage struct {
 }
 
 // === SESSION MANAGER TYPES ===
+//
+// Per ADR-100 Step 3d full untangle: the schema for session lifecycle moved
+// to pkg/substrate/session. The aliases below let existing kernel call sites
+// (session_manager.go, context_engine.go) compile unchanged. New code should
+// prefer the substrate import path.
 
 // SessionState tracks a CogOS-managed conversation across Claude CLI sessions.
-// CogOS sessions are independent of OpenClaw sessions — one CogOS conversation
-// may span multiple Claude CLI sessions via rotation.
-type SessionState struct {
-	ID              string            // CogOS session ID (stable across Claude rotations)
-	ThreadID        string            // OpenClaw thread this session belongs to
-	ClaudeSessionID string            // Current Claude CLI session (may rotate)
-	CreatedAt       time.Time
-	LastActiveAt    time.Time
-	TurnCount       int
-	TotalTokensSent int               // Running total for pressure tracking
-	WorkingMemory   *WorkingMemory
-	History         []SessionRotation // Past Claude sessions for this conversation
-}
+// Canonical home: pkg/substrate/session.State.
+type SessionState = session.State
 
 // SessionRotation records a retired Claude CLI session.
-type SessionRotation struct {
-	ClaudeSessionID string
-	StartedAt       time.Time
-	EndedAt         time.Time
-	Reason          string // "pressure", "drift", "explicit", "idle", "error"
-	TurnCount       int
-}
+// Canonical home: pkg/substrate/session.Rotation.
+type SessionRotation = session.Rotation
 
-// WorkingMemory persists across Claude session rotations.
-// This is the continuity layer — what survives when we start a fresh Claude session.
-type WorkingMemory struct {
-	ActiveTopics    []string          `json:"active_topics,omitempty"`
-	KeyDecisions    []string          `json:"key_decisions,omitempty"`
-	ActiveArtifacts []string          `json:"active_artifacts,omitempty"`
-	UserPreferences map[string]string `json:"user_preferences,omitempty"`
-	Summary         string            `json:"summary,omitempty"`
-	UpdatedAt       time.Time         `json:"updated_at"`
-}
+// WorkingMemory persists across Claude session rotations. This is the
+// continuity layer — what survives when starting a fresh Claude session.
+// Canonical home: pkg/substrate/session.WorkingMemory.
+type WorkingMemory = session.WorkingMemory
 
 // SessionManagerConfig holds tunable thresholds for session rotation.
-type SessionManagerConfig struct {
-	MaxTurnsBeforeRotation  int           // default: 50
-	MaxTokensBeforeRotation int           // default: 500_000 (cumulative)
-	IdleTimeout             time.Duration // default: 30min
-}
+// Canonical home: pkg/substrate/session.ManagerConfig.
+type SessionManagerConfig = session.ManagerConfig
 
 // DefaultSessionManagerConfig returns sensible defaults.
+// Delegates to pkg/substrate/session.DefaultManagerConfig.
 func DefaultSessionManagerConfig() SessionManagerConfig {
-	return SessionManagerConfig{
-		MaxTurnsBeforeRotation:  50,
-		MaxTokensBeforeRotation: 500_000,
-		IdleTimeout:             30 * time.Minute,
-	}
+	return session.DefaultManagerConfig()
 }
 
 // === CONTEXT COMPRESSOR TYPES ===
