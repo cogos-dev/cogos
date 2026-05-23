@@ -175,6 +175,12 @@ func init() {
 	// than left nil so runServe() logs "providers registered" when it calls the hook.
 	engine.RegisterProviders = func() {
 		// providers already registered by internal/providers/daemon init()
+
+		// ProjectionCompiler (ADR-projection-compiler-primitive, ratified 2026-05-22):
+		// depth-axis Reconcilable that compiles reflective cogdocs at
+		// cog://mem/reflective/ into structured events. Uses filesystem-backed
+		// defaults; idempotent — UpsertProvider semantics make repeated calls safe.
+		engine.RegisterProjectionCompiler()
 	}
 
 	// Wire workspace context into daemon-side providers. runServe() calls this
@@ -185,6 +191,15 @@ func init() {
 	engine.SetProvidersWorkspace = func(workspaceRoot string) {
 		daemon.SetWorkspaceRoot(workspaceRoot)
 		component.SetWorkspaceRoot(workspaceRoot)
+		// WorktreeReconciler (ADR-096, accepted 2026-05-22): the substrate-
+		// canonical Reconcilable for git worktree lifecycle. v0 registers one
+		// instance per workspace root using filesystem-backed ledger adapters.
+		// Multi-repo registration is ADR-096 Open Question 4 territory.
+		// UpsertProvider is idempotent — safe to call on every workspace
+		// resolution.
+		if workspaceRoot != "" {
+			engine.RegisterWorktreeReconciler(workspaceRoot, nil, nil, nil)
+		}
 		// Wire URIRegistry into the pin provider's WorkspaceLocator so FetchLive
 		// can consult the global workspace registry for target path resolution
 		// (two-step chain: registry → sibling-dir fallback). Safe to call every
