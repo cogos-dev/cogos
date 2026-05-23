@@ -95,6 +95,44 @@ const (
 	// content hash. Each block is registered in the Kind registry via
 	// engine.RegisterKindHandler in internal/engine/kinds_vllm.go.
 	KindCacheKVBlock CogBlockKind = "cache.kv_block"
+
+	// Worktree lifecycle types (ADR-096).
+	//
+	// These Kinds are emitted to the per-session ledger by SpawnWorktree and
+	// WorktreeReconciler.ApplyPlan. They bind every substrate-spawned worktree
+	// to a dispatch identity from its first byte, closing the orphan-by-design
+	// gap (ADR-096 §2). See pkg/cogblock/kinds.go for the canonical comment;
+	// the constant definitions live here alongside the rest of the Kind set.
+	//
+	// BlockWorktreeCreated is written by SpawnWorktree BEFORE the underlying
+	// `git worktree add` call (ADR-091 §5 ledger-first rule). Required payload
+	// fields: worktree_id, dispatch_id, repo_root, worktree_path, branch, base,
+	// created_at.
+	BlockWorktreeCreated CogBlockKind = "worktree.created"
+
+	// BlockWorktreeTerminal records that the dispatch bound to a worktree has
+	// reached a terminal state. Required payload fields: worktree_id,
+	// dispatch_id, reason (one of: "merged", "abandoned", "exited").
+	BlockWorktreeTerminal CogBlockKind = "worktree.terminal"
+
+	// BlockWorktreePruned is written by WorktreeReconciler.ApplyPlan after a
+	// successful `git worktree remove --force`. Required payload fields:
+	// worktree_id, worktree_path, pruned_at.
+	BlockWorktreePruned CogBlockKind = "worktree.pruned"
+
+	// BlockWorktreeAlarm is written by WorktreeReconciler.ApplyPlan when a
+	// worktree is classified `alarm-uncommitted-on-terminal-dispatch` or
+	// `alarm-unknown-binding`. The reconciler does NOT mutate the filesystem
+	// on alarm; operator intervention is required (ADR-096 §4). Required
+	// payload fields: worktree_path, classification; optional: dispatch_id,
+	// branch, diagnostic details.
+	BlockWorktreeAlarm CogBlockKind = "worktree.alarm"
+
+	// BlockWorktreeRebind extends the lifecycle of an existing worktree by
+	// associating it with a new dispatch identity (ADR-096 §4 Option C).
+	// Required payload fields: worktree_id, old_dispatch_id, new_dispatch_id,
+	// rebound_at.
+	BlockWorktreeRebind CogBlockKind = "worktree.rebind"
 )
 
 // BlockProvenance records the origin and ingestion metadata of a CogBlock.

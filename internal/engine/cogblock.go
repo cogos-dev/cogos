@@ -88,4 +88,11 @@ const (
 	BlockImport      = cogblock.BlockImport
 	BlockAttention   = cogblock.BlockAttention
 	BlockSystemEvent = cogblock.BlockSystemEvent
+
+	// Worktree lifecycle (ADR-096).
+	BlockWorktreeCreated  = cogblock.BlockWorktreeCreated
+	BlockWorktreeTerminal = cogblock.BlockWorktreeTerminal
+	BlockWorktreePruned   = cogblock.BlockWorktreePruned
+	BlockWorktreeAlarm    = cogblock.BlockWorktreeAlarm
+	BlockWorktreeRebind   = cogblock.BlockWorktreeRebind
 )
