@@ -36,9 +36,9 @@ type ParsedURI struct {
 }
 
 // Namespaces is the SDK-layer copy of the canonical namespace whitelist.
-// SINGLE SOURCE OF TRUTH: pkg/uri/namespace.go — keep in sync with that file.
-// The sdk module cannot import pkg/uri directly (separate Go modules); this
-// copy must be identical to pkg/uri.Namespaces.
+// SINGLE SOURCE OF TRUTH: pkg/substrate/uri/namespace.go — keep in sync with
+// that file. The sdk module cannot import pkg/substrate/uri directly (separate
+// Go modules); this copy must be identical to pkg/substrate/uri.Namespaces.
 var Namespaces = map[string]bool{
 	// ── Core memory / knowledge ────────────────────────────────────────────────
 	"mem":      true, // cog:mem/* → CogDocs memory corpus

@@ -25,7 +25,7 @@
 //   - Alias name must match ^[a-z][a-z0-9_-]{0,30}$
 //   - Target must be a literal workspace name (no alias-of-alias)
 //   - Target must not shadow a known projection name (enforced at load time;
-//     TODO: load projection set from pkg/uri/namespace.go after #166 merges)
+//     TODO: load projection set from pkg/substrate/uri/namespace.go after #166 merges)
 //   - Stale aliases (target not in global.yaml) are tolerated but flagged
 package alias
 
@@ -47,8 +47,8 @@ import (
 var aliasNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,30}$`)
 
 // reservedNames are the cog:// projection namespace names that alias names
-// must not shadow.  This list mirrors pkg/uri/namespace.Namespaces.
-// TODO: import pkg/uri/namespace.Namespaces directly once #166 lands and the
+// must not shadow.  This list mirrors pkg/substrate/uri/namespace.Namespaces.
+// TODO: import pkg/substrate/uri/namespace.Namespaces directly once #166 lands and the
 // namespace package stabilises — for now we hardcode to avoid a circular dep.
 var reservedNames = map[string]bool{
 	"mem": true, "signals": true, "context": true, "thread": true,

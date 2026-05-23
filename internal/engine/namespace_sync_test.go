@@ -1,18 +1,23 @@
 package engine_test
 
 // namespace_sync_test.go — CI guard that all manual namespace lists never drift
-// from the canonical pkg/uri.Namespaces table (issues #173, #183).
+// from the canonical pkg/substrate/uri.Namespaces table (issues #173, #183).
 //
 // Three manual copies of the namespace set must stay in sync:
 //
-//	pkg/uri/namespace.go              — canonical definition (Namespaces map)
+//	pkg/substrate/uri/namespace.go    — canonical definition (Namespaces map)
 //	sdk/uri.go                        — copy (sdk.Namespaces, lines tagged "SINGLE SOURCE")
 //	internal/engine/uri_registry.go   — isProjectionNamespace switch statement
 //
-// The sdk module cannot import pkg/uri directly (separate Go modules; importing
-// would create an import cycle via the main module). The engine package's
-// isProjectionNamespace predicate is likewise a manually maintained copy
-// pending #166 (direct namespace-registry import).
+// The sdk module cannot import pkg/substrate/uri directly (separate Go modules;
+// importing would create an import cycle via the main module). The engine
+// package's isProjectionNamespace predicate is likewise a manually maintained
+// copy pending #166 (direct namespace-registry import).
+//
+// Note: as of the ADR-100 canonical-vs-shim inversion (2026-05-23), the
+// canonical Namespaces map moved from pkg/uri/namespace.go to
+// pkg/substrate/uri/namespace.go. The legacy pkg/uri import path is now a
+// thin re-export shim aliasing the substrate canonical surface.
 //
 // This test parses all three source files with go/ast, extracts the namespace
 // keys from each, and asserts they are identical sets. It runs as part of
@@ -111,31 +116,31 @@ func repoRoot(t *testing.T) string {
 func TestNamespaces_SDKAndPkgURI_NeverDrift(t *testing.T) {
 	root := repoRoot(t)
 
-	pkgURIFile := filepath.Join(root, "pkg", "uri", "namespace.go")
+	pkgURIFile := filepath.Join(root, "pkg", "substrate", "uri", "namespace.go")
 	sdkFile := filepath.Join(root, "sdk", "uri.go")
 
 	pkgKeys := extractNamespaceKeys(t, pkgURIFile)
 	sdkKeys := extractNamespaceKeys(t, sdkFile)
 
-	// Check: every pkg/uri key must be in sdk.
+	// Check: every pkg/substrate/uri key must be in sdk.
 	for k := range pkgKeys {
 		if _, ok := sdkKeys[k]; !ok {
-			t.Errorf("namespace %q is in pkg/uri.Namespaces but missing from sdk.Namespaces\n"+
+			t.Errorf("namespace %q is in pkg/substrate/uri.Namespaces but missing from sdk.Namespaces\n"+
 				"  add it to sdk/uri.go Namespaces map", k)
 		}
 	}
 
-	// Check: every sdk key must be in pkg/uri.
+	// Check: every sdk key must be in pkg/substrate/uri.
 	for k := range sdkKeys {
 		if _, ok := pkgKeys[k]; !ok {
-			t.Errorf("namespace %q is in sdk.Namespaces but missing from pkg/uri.Namespaces\n"+
-				"  add it to pkg/uri/namespace.go Namespaces map", k)
+			t.Errorf("namespace %q is in sdk.Namespaces but missing from pkg/substrate/uri.Namespaces\n"+
+				"  add it to pkg/substrate/uri/namespace.go Namespaces map", k)
 		}
 	}
 
 	if t.Failed() {
-		t.Logf("pkg/uri keys (%d): %v", len(pkgKeys), sortedKeys(pkgKeys))
-		t.Logf("sdk keys    (%d): %v", len(sdkKeys), sortedKeys(sdkKeys))
+		t.Logf("pkg/substrate/uri keys (%d): %v", len(pkgKeys), sortedKeys(pkgKeys))
+		t.Logf("sdk keys              (%d): %v", len(sdkKeys), sortedKeys(sdkKeys))
 	}
 }
 
@@ -211,31 +216,31 @@ func extractProjectionNamespaceKeys(t *testing.T, srcPath string) map[string]str
 func TestNamespaces_IsProjectionNamespace_NeverDrift(t *testing.T) {
 	root := repoRoot(t)
 
-	pkgURIFile := filepath.Join(root, "pkg", "uri", "namespace.go")
+	pkgURIFile := filepath.Join(root, "pkg", "substrate", "uri", "namespace.go")
 	uriRegistryFile := filepath.Join(root, "internal", "engine", "uri_registry.go")
 
 	pkgKeys := extractNamespaceKeys(t, pkgURIFile)
 	switchKeys := extractProjectionNamespaceKeys(t, uriRegistryFile)
 
-	// Check: every pkg/uri key must be in isProjectionNamespace.
+	// Check: every pkg/substrate/uri key must be in isProjectionNamespace.
 	for k := range pkgKeys {
 		if _, ok := switchKeys[k]; !ok {
-			t.Errorf("namespace %q is in pkg/uri.Namespaces but missing from isProjectionNamespace in uri_registry.go\n"+
+			t.Errorf("namespace %q is in pkg/substrate/uri.Namespaces but missing from isProjectionNamespace in uri_registry.go\n"+
 				"  add it to the switch in internal/engine/uri_registry.go:isProjectionNamespace", k)
 		}
 	}
 
-	// Check: every isProjectionNamespace key must be in pkg/uri.
+	// Check: every isProjectionNamespace key must be in pkg/substrate/uri.
 	for k := range switchKeys {
 		if _, ok := pkgKeys[k]; !ok {
-			t.Errorf("namespace %q is in isProjectionNamespace but missing from pkg/uri.Namespaces\n"+
-				"  add it to pkg/uri/namespace.go Namespaces map", k)
+			t.Errorf("namespace %q is in isProjectionNamespace but missing from pkg/substrate/uri.Namespaces\n"+
+				"  add it to pkg/substrate/uri/namespace.go Namespaces map", k)
 		}
 	}
 
 	if t.Failed() {
-		t.Logf("pkg/uri keys          (%d): %v", len(pkgKeys), sortedKeys(pkgKeys))
-		t.Logf("isProjectionNamespace (%d): %v", len(switchKeys), sortedKeys(switchKeys))
+		t.Logf("pkg/substrate/uri keys (%d): %v", len(pkgKeys), sortedKeys(pkgKeys))
+		t.Logf("isProjectionNamespace  (%d): %v", len(switchKeys), sortedKeys(switchKeys))
 	}
 }
 

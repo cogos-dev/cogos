@@ -14,7 +14,7 @@
 //   - BuildState()  → snapshots the current review corpus state
 //   - Health()      → reports Healthy/Degraded/Missing based on Ollama reachability
 //
-// See also: pkg/reconcile/cogdoc_review_types.go (types)
+// See also: pkg/substrate/reconcile/cogdoc_review_types.go (types)
 // See also: pkg/cogdoc_review/similarity.go (search primitive)
 
 package cogdoc_review
