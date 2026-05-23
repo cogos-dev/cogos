@@ -19,7 +19,7 @@
 // file is intended to compile (go build ./internal/eval/...) and serve as the
 // structural contract before Phase C begins.
 //
-// Do NOT register this provider in pkg/reconcile/registry.go until Phase C
+// Do NOT register this provider in pkg/substrate/reconcile/registry.go until Phase C
 // is formally shipped. See constraint note at bottom of file.
 package eval
 
@@ -494,7 +494,7 @@ type EvalProviderState struct {
 // package or kernel boot path sets the exported function variables before the
 // first reconcile cycle.
 //
-// NOTE: Do NOT register this provider in pkg/reconcile/registry.go until
+// NOTE: Do NOT register this provider in pkg/substrate/reconcile/registry.go until
 // Phase C is formally shipped. The component_provider.go init() call
 // (line 91) is the pattern to follow when registration is ready.
 type EvalProvider struct {

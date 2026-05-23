@@ -322,8 +322,9 @@ func parseGlobalYAML(data []byte) (map[string]string, error) {
 
 // isProjectionNamespace reports whether s is a known cog:// projection
 // namespace.  These are resolved locally regardless of alias configuration.
-// This list mirrors pkg/uri/namespace.Namespaces and internal/engine/uri.go.
-// TODO: deduplicate once pkg/uri/namespace package is imported directly
+// This list mirrors pkg/substrate/uri/namespace.Namespaces and
+// internal/engine/uri.go.
+// TODO: deduplicate once pkg/substrate/uri/namespace is imported directly
 // (#166 lands and stabilises the namespace registry).
 func isProjectionNamespace(s string) bool {
 	switch s {
