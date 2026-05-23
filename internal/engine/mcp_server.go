@@ -356,6 +356,12 @@ func (m *MCPServer) registerTools() {
 	// installed binary's OpenClaw gateway which silently drops audio bytes.
 	m.registerMod3Tools()
 
+	// Architecture skill plugin tools (mcp_architecture.go). 8 cog_architecture_*
+	// tools that subprocess-exec the Python implementations at
+	// {WorkspaceRoot}/.cog/skills/architecture/tools/architecture_*.py per the
+	// architecture-memory-canonical-form-and-projection ADR.
+	m.registerArchitectureTools()
+
 	// Audit-scope read-only filesystem tools. Also registered as first-class
 	// MCP tools so they're callable directly from Claude Code sessions.
 	// In harness dispatches these are available only when scope="audit".
