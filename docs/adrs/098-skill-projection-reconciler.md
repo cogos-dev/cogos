@@ -2,7 +2,7 @@
 
 | Field       | Value                                                                          |
 |-------------|--------------------------------------------------------------------------------|
-| Status      | Proposed                                                                       |
+| Status      | Accepted                                                                       |
 | Author      | @chazmaniandinkle                                                              |
 | Created     | 2026-05-17                                                                     |
 | Layer       | Substrate + Kernel (per [ADR-091](091-substrate-as-named-architectural-layer.md) §2) |
