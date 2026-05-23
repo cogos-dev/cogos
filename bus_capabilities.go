@@ -1,32 +1,26 @@
-// bus_capabilities.go
-// Defines the bus block schema for agent capability advertisement.
-// Agents post an agent.capabilities block on startup (or when capabilities
-// change after reconciler apply) to announce their tools, MCP servers,
-// memory sectors, and bus subscriptions to the field.
+// bus_capabilities.go — Thin re-export shim. Canonical capability envelope
+// vocabulary lives in pkg/substrate/capability per ADR-100 Step 3.
+//
+// Type aliases below let existing kernel call sites (capability_cache.go,
+// capability_resolver.go, capability_advertiser.go, headless_agent_test.go,
+// bus_tool_router.go) compile unchanged. New code should prefer the
+// pkg/substrate/capability import path.
 
 package main
 
-import "time"
+import (
+	"github.com/myrgic/cogos/pkg/substrate/capability"
+)
 
-// Block type constant for capability advertisement.
-const BlockAgentCapabilities = "agent.capabilities"
+// BlockAgentCapabilities is the bus block type for capability advertisement.
+// Canonical home: pkg/substrate/capability.BlockAgentCapabilities.
+const BlockAgentCapabilities = capability.BlockAgentCapabilities
 
 // AgentCapabilitiesPayload is posted on the bus when an agent comes online
 // or when its capabilities change (e.g., after reconciler apply).
-type AgentCapabilitiesPayload struct {
-	AgentID          string    `json:"agentId"`
-	AgentType        string    `json:"agentType"`                  // "interactive", "declarative", "headless"
-	Endpoint         string    `json:"endpoint,omitempty"`         // bus endpoint
-	Tools            CapTools  `json:"tools"`
-	MCPServers       []string  `json:"mcpServers,omitempty"`
-	MemorySectors    []string  `json:"memorySectors,omitempty"`
-	BusSubscriptions []string  `json:"busSubscriptions,omitempty"`
-	TTL              string    `json:"ttl,omitempty"`              // e.g., "1h"
-	AdvertisedAt     time.Time `json:"advertisedAt"`
-}
+// Canonical home: pkg/substrate/capability.Payload.
+type AgentCapabilitiesPayload = capability.Payload
 
 // CapTools mirrors the allow/deny tool policy for bus advertisement.
-type CapTools struct {
-	Allow []string `json:"allow,omitempty"`
-	Deny  []string `json:"deny,omitempty"`
-}
+// Canonical home: pkg/substrate/capability.Tools.
+type CapTools = capability.Tools
