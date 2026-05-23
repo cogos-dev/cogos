@@ -11,6 +11,7 @@ use (
 	./pkg/modality
 	./pkg/reconcile
 	./pkg/substrate
+	./pkg/substrate/projection
 	./pkg/uri
 	./sdk
 )
