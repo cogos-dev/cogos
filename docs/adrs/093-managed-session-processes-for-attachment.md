@@ -2,11 +2,30 @@
 
 | Field       | Value                                                                          |
 |-------------|--------------------------------------------------------------------------------|
-| Status      | Proposed                                                                       |
+| Status      | Accepted                                                                       |
 | Author      | @chazmaniandinkle                                                              |
 | Created     | 2026-05-16                                                                     |
 | Layer       | Kernel (per [ADR-091](091-substrate-as-named-architectural-layer.md) §2)       |
 | Refs        | [ADR-091](091-substrate-as-named-architectural-layer.md) (substrate as named architectural layer), [ADR-092](092-substrate-contracts-and-concurrency.md) §3 (crash recovery + idempotency), §7 (substrate-to-Module boundary), ADR-082 (channel architecture, mod3), ADR-094 (lineage observatory, PR #265), `pkg/reconcile/`, `internal/engine/process_manager.go`, `internal/engine/provider_claudecode.go`, `internal/engine/serve_claude_code.go`, mod3 `clients/channel_client.py`, mod3 `seats.py` |
+
+> **Ratified 2026-05-24.** Accepted alongside cog ADR-062 (Recursive Node
+> Architecture), ratified the same day, as part of the conductor-lineage
+> ratification. The 2026-05-20 validation spike retired the wire-shape risk;
+> Commit 3 (dashboard Resume + dispatch migration) is unblocked.
+>
+> **Verification backlog** — acceptance conditions on the implementation
+> commits, not blockers to acceptance. The items under "What the spike does
+> NOT validate" (below) are the required follow-up commits: cancellation
+> mid-turn, restart-on-crash policy, heartbeat/Stalled detection,
+> `--mcp-config` substrate-MCP injection, tool-call surface typing, the ACP
+> `session/update` translator, ProcessManager integration (§1), and
+> concurrent multi-session safety.
+>
+> **Cross-restart durability** (open question 3) — resolved consistently with
+> ADR-062: on cogos restart, ManagedSessions adopt orphaned subprocesses if
+> still alive, otherwise rebuild from the ledger. The remaining open questions
+> (authorization, cost accounting, multi-kernel, channel-transport evolution,
+> pool policy) stay deferred as scoped.
 
 ## Context
 
