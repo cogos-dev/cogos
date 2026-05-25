@@ -157,6 +157,15 @@ type Config struct {
 
 	localModelConfigured bool
 
+	// IdentityNakedDefault controls per-session identity embedding at the
+	// inference gateway (G1). Default FALSE — full backward compatibility;
+	// today's nucleus-card + AssembleContext behavior applies to all requests.
+	// When TRUE, unbound requests and requests bound to a foreign subject
+	// receive clean transport (no nucleus card, AssembleContext skipped).
+	// Only requests bound to the nucleus's own subject keep full embodiment.
+	// Configurable via identity_naked_default: true in kernel.yaml.
+	IdentityNakedDefault bool
+
 	// CoreInference is the node's declared N-tier inference contract.
 	// Loaded from .cog/config/core-inference.yaml; falls back to
 	// inference.DefaultCoreInferenceConfig() if the file is absent.
@@ -183,6 +192,7 @@ type kernelConfigSection struct {
 	ToolCallValidation    *bool             `yaml:"tool_call_validation_enabled"`
 	EnableSkillExec       *bool             `yaml:"enable_skill_exec"`
 	EnableServiceControl  *bool             `yaml:"enable_service_control"`
+	IdentityNakedDefault  *bool             `yaml:"identity_naked_default,omitempty"`
 	LocalModel            string            `yaml:"local_model"`
 	DigestPaths           map[string]string `yaml:"digest_paths"`
 	KernelLogPath         string            `yaml:"kernel_log_path"`
@@ -322,6 +332,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.EnableServiceControl != nil {
 		cfg.EnableServiceControl = *s.EnableServiceControl
+	}
+	if s.IdentityNakedDefault != nil {
+		cfg.IdentityNakedDefault = *s.IdentityNakedDefault
 	}
 	if s.LocalModel != "" {
 		cfg.LocalModel = s.LocalModel

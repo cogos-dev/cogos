@@ -361,6 +361,48 @@ func mergeSystemPrompts(nucleus string, clientParts []string) string {
 	return strings.Join(parts, "\n\n---\n\n")
 }
 
+// BoundIdentity is the result of per-request identity resolution at the
+// inference gateway (G1). It is intentionally minimal — just enough to
+// drive ledger attribution and embodiment gating.
+//
+// Subject is the resolved principal name (e.g. "cog", "alice").
+// Bound is false when no client session id was present or no harness
+// binding was found for it; in that case Subject is empty.
+type BoundIdentity struct {
+	Subject string
+	Bound   bool
+}
+
+// resolveBoundIdentity extracts the inbound client session id from the
+// request (X-Cogos-Session-Id header, then req.User field as fallback),
+// then resolves a HarnessBindingCRD via harnessBackend.
+//
+// Returns an unbound BoundIdentity when:
+//   - No client session id is present in the request.
+//   - harnessBackend is nil (backend not wired).
+//   - No binding exists for the client session id.
+//
+// This helper is reusable across attribution sites; this increment wires
+// it into handleChat only. Other sites (serve_anthropic.go, process.go,
+// tool_observer.go, mcp_server.go) are deferred to a later increment.
+func (s *Server) resolveBoundIdentity(r *http.Request, reqUser string) BoundIdentity {
+	clientSessionID := r.Header.Get("X-Cogos-Session-Id")
+	if clientSessionID == "" {
+		clientSessionID = reqUser
+	}
+	if clientSessionID == "" {
+		return BoundIdentity{}
+	}
+	if s.harnessBackend == nil {
+		return BoundIdentity{}
+	}
+	binding, ok := s.harnessBackend.ResolveHarnessBinding(clientSessionID, "agent")
+	if !ok || binding == nil {
+		return BoundIdentity{}
+	}
+	return BoundIdentity{Subject: binding.Spec.Subject, Bound: true}
+}
+
 // handleHealth is the liveness/readiness probe.
 //
 //	200 → healthy
@@ -688,9 +730,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	block := NormalizeOpenAIRequest(&req, body, "http")
 	block.SessionID = s.process.SessionID()
-	if s.nucleus != nil {
+
+	// G1: resolve inbound client session → bound identity for attribution.
+	// resolveBoundIdentity is nil-safe on harnessBackend and returns an
+	// unbound identity when no session id or binding is present.
+	bound := s.resolveBoundIdentity(r, req.User)
+	if bound.Bound {
+		block.TargetIdentity = bound.Subject
+	} else if s.nucleus != nil {
 		block.TargetIdentity = s.nucleus.Name
 	}
+
 	block.WorkspaceID = filepath.Base(s.cfg.WorkspaceRoot)
 	s.process.RecordBlock(block)
 
@@ -909,18 +959,85 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if p, err := s.process.AssembleContext(query, clientMsgs, contextBudget,
-		WithContext(r.Context()),
-		WithConversationID(creq.Metadata.RequestID),
-		WithManifestMode(true),
-		WithPreviousTurnSpeculative(previousSpeculative),
-	); err != nil {
-		slog.Warn("chat: context assembly failed", "err", err)
-		// Fallback: preserve any client-supplied role=system messages as the
-		// provider SystemPrompt, stripping them from the Messages slice so
-		// Anthropic's API (which rejects role=system inside messages) still
-		// works. Without this, BrowserOS-style clients that include a system
-		// prompt see it silently dropped on the fallback path.
+	// G1: embodiment gating.
+	//
+	// When IdentityNakedDefault is false (default), behavior is exactly
+	// today's: run AssembleContext + nucleus card on every request. The ONLY
+	// observable difference from before G1 is that bound sessions carry their
+	// own subject in block.TargetIdentity (set above).
+	//
+	// When IdentityNakedDefault is true:
+	//   • nucleus-bound request (bound.Subject == nucleus.Name): full embodiment.
+	//   • foreign-bound or unbound: clean transport — skip AssembleContext,
+	//     forward client messages verbatim (including role:system), no nucleus card.
+	nucleusName := ""
+	if s.nucleus != nil {
+		nucleusName = s.nucleus.Name
+	}
+	useFullEmbodiment := !s.cfg.IdentityNakedDefault ||
+		(bound.Bound && bound.Subject == nucleusName)
+
+	if useFullEmbodiment {
+		if p, err := s.process.AssembleContext(query, clientMsgs, contextBudget,
+			WithContext(r.Context()),
+			WithConversationID(creq.Metadata.RequestID),
+			WithManifestMode(true),
+			WithPreviousTurnSpeculative(previousSpeculative),
+		); err != nil {
+			slog.Warn("chat: context assembly failed", "err", err)
+			// Fallback: preserve any client-supplied role=system messages as the
+			// provider SystemPrompt, stripping them from the Messages slice so
+			// Anthropic's API (which rejects role=system inside messages) still
+			// works. Without this, BrowserOS-style clients that include a system
+			// prompt see it silently dropped on the fallback path.
+			var clientSysParts []string
+			var nonSysMsgs []ProviderMessage
+			for _, m := range clientMsgs {
+				if m.Role == "system" {
+					if strings.TrimSpace(m.Content) != "" {
+						clientSysParts = append(clientSysParts, m.Content)
+					}
+					continue
+				}
+				nonSysMsgs = append(nonSysMsgs, m)
+			}
+			creq.Messages = nonSysMsgs
+			creq.SystemPrompt = mergeSystemPrompts(s.nucleusCard(), clientSysParts)
+		} else {
+			pkg = p
+			systemPrompt, managedMsgs := pkg.FormatForProvider()
+			creq.SystemPrompt = systemPrompt
+			creq.Messages = managedMsgs
+
+			// Record metrics + span attributes.
+			span.SetAttributes(
+				attribute.Int("cogos.context.total_tokens", pkg.TotalTokens),
+				attribute.Int("cogos.context.docs_injected", len(pkg.FovealDocs)),
+				attribute.Int("cogos.context.conv_turns_kept", len(pkg.Conversation)),
+				attribute.Int("cogos.context.conv_turns_in", conversationTurnsIn),
+			)
+			if instruments.ContextTokens != nil {
+				instruments.ContextTokens.Record(ctx, int64(pkg.TotalTokens))
+			}
+			if instruments.DocsInjected != nil {
+				instruments.DocsInjected.Record(ctx, int64(len(pkg.FovealDocs)))
+			}
+			evicted := conversationTurnsIn - len(pkg.Conversation)
+			if evicted > 0 && instruments.TurnsEvicted != nil {
+				instruments.TurnsEvicted.Add(ctx, int64(evicted))
+			}
+
+			if len(pkg.InjectedPaths) > 0 {
+				slog.Info("chat: context injected",
+					"docs", len(pkg.InjectedPaths),
+					"conv_turns", len(pkg.Conversation),
+					"tokens", pkg.TotalTokens,
+				)
+			}
+		}
+	} else {
+		// Clean transport path (IdentityNakedDefault=true, foreign or unbound).
+		// Forward client messages verbatim; no nucleus card; AssembleContext skipped.
 		var clientSysParts []string
 		var nonSysMsgs []ProviderMessage
 		for _, m := range clientMsgs {
@@ -933,38 +1050,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			nonSysMsgs = append(nonSysMsgs, m)
 		}
 		creq.Messages = nonSysMsgs
-		creq.SystemPrompt = mergeSystemPrompts(s.nucleusCard(), clientSysParts)
-	} else {
-		pkg = p
-		systemPrompt, managedMsgs := pkg.FormatForProvider()
-		creq.SystemPrompt = systemPrompt
-		creq.Messages = managedMsgs
-
-		// Record metrics + span attributes.
-		span.SetAttributes(
-			attribute.Int("cogos.context.total_tokens", pkg.TotalTokens),
-			attribute.Int("cogos.context.docs_injected", len(pkg.FovealDocs)),
-			attribute.Int("cogos.context.conv_turns_kept", len(pkg.Conversation)),
-			attribute.Int("cogos.context.conv_turns_in", conversationTurnsIn),
-		)
-		if instruments.ContextTokens != nil {
-			instruments.ContextTokens.Record(ctx, int64(pkg.TotalTokens))
-		}
-		if instruments.DocsInjected != nil {
-			instruments.DocsInjected.Record(ctx, int64(len(pkg.FovealDocs)))
-		}
-		evicted := conversationTurnsIn - len(pkg.Conversation)
-		if evicted > 0 && instruments.TurnsEvicted != nil {
-			instruments.TurnsEvicted.Add(ctx, int64(evicted))
-		}
-
-		if len(pkg.InjectedPaths) > 0 {
-			slog.Info("chat: context injected",
-				"docs", len(pkg.InjectedPaths),
-				"conv_turns", len(pkg.Conversation),
-				"tokens", pkg.TotalTokens,
-			)
-		}
+		creq.SystemPrompt = mergeSystemPrompts("", clientSysParts)
 	}
 
 	provider, _, err := s.router.Route(r.Context(), creq)
