@@ -52,6 +52,26 @@ func (r *CapabilityResolver) CanInvokeTool(agentID, tool string) bool {
 	return r.cache.HasTool(agentID, tool)
 }
 
+// CanInvoke satisfies the engine.capabilityGater interface.
+//
+// Permit-by-default semantics: when the subject has no capability envelope
+// in the cache (e.g. the agent never advertised its capabilities), the call
+// is permitted. Restriction requires an explicit deny entry or a non-empty
+// allow-list in the advertised Payload.
+//
+// This differs from CanInvokeTool (which returns false for unknown agents)
+// so that the engine gating contract — "no envelope → no restriction" — is
+// upheld without callers needing a separate nil-check.
+func (r *CapabilityResolver) CanInvoke(subject, toolName string) bool {
+	payload := r.cache.Get(subject)
+	if payload == nil {
+		// No envelope declared — open by default.
+		return true
+	}
+	// Envelope present: apply allow/deny policy from cache.HasTool.
+	return r.cache.HasTool(subject, toolName)
+}
+
 // ListAvailableAgents returns all agents currently registered in the cache
 // (non-expired). The map is keyed by agent ID.
 func (r *CapabilityResolver) ListAvailableAgents() map[string]capability.Payload {

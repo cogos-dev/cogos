@@ -80,3 +80,43 @@ func injectKernelAgentTools(creq *CompletionRequest, m *MCPServer) {
 		"external_count", len(creq.ExternalTools),
 	)
 }
+
+// filterToolsByCapability removes tools from creq.Tools and creq.ExternalTools
+// that the capabilityGater denies for subject. Called after injectKernelAgentTools
+// when IdentityNakedDefault=true and the request is bound to an identity.
+//
+// Permit-by-default: when the gater has no envelope for subject (CanInvoke
+// returns true for all tools), no filtering occurs and the injection is
+// unchanged. The function is idempotent: calling it multiple times is safe.
+func filterToolsByCapability(creq *CompletionRequest, subject string, gater capabilityGater) {
+	if creq == nil || gater == nil || subject == "" {
+		return
+	}
+
+	// Filter creq.Tools in-place (compact pattern).
+	out := creq.Tools[:0]
+	for _, t := range creq.Tools {
+		if gater.CanInvoke(subject, t.Name) {
+			out = append(out, t)
+		}
+	}
+	removed := len(creq.Tools) - len(out)
+	creq.Tools = out
+
+	// Filter creq.ExternalTools in-place.
+	extOut := creq.ExternalTools[:0]
+	for _, t := range creq.ExternalTools {
+		if gater.CanInvoke(subject, t.Name) {
+			extOut = append(extOut, t)
+		}
+	}
+	creq.ExternalTools = extOut
+
+	if removed > 0 {
+		slog.Info("chat: capability envelope filtered injected tools",
+			"subject", subject,
+			"removed", removed,
+			"remaining", len(creq.Tools),
+		)
+	}
+}

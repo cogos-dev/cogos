@@ -921,6 +921,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// wins, since BrowserOS-style flows manage their own surface.
 		if len(creq.Tools) == 0 && s.mcpServer != nil {
 			injectKernelAgentTools(creq, s.mcpServer)
+			// G2 PART C: when IdentityNakedDefault is true and the request is
+			// bound to an identity with a wired capResolver, filter the injected
+			// tools to those permitted by the envelope. This prevents the model
+			// from being told about (and attempting to call) tools the identity's
+			// envelope disallows. Permit-by-default: no envelope → no filtering.
+			if s.cfg.IdentityNakedDefault && bound.Bound && s.mcpServer.capResolver != nil {
+				filterToolsByCapability(creq, bound.Subject, s.mcpServer.capResolver)
+			}
 		}
 	default:
 		// First check: is req.Model a provider alias (exact name match)? If so,

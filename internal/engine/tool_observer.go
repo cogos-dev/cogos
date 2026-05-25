@@ -453,11 +453,20 @@ func withToolObserver[In any](
 		if m != nil && m.process != nil {
 			block := NormalizeMCPRequest(name, argsJSON)
 			block.SessionID = sessionID
-			// MCP-protocol session IDs (req.Session.ID()) are transport-level random
-			// tokens, not CogOS harness session IDs (registered via cog_register_session).
-			// There is no mapping from transport session to HarnessBindingCRD here,
-			// so the nucleus remains the correct attribution for MCP tool-call blocks.
-			if m.nucleus != nil {
+			// G2 PART B: resolve the bound subject for this transport session.
+			// m.resolveTransportSession looks up the correlation recorded by
+			// toolRegisterSession. When found, the subject is the correct
+			// attribution (the identity that registered this harness session).
+			// When not found (no register call, in-process test path where
+			// req is nil or Session.ID() is empty), fall back to nucleus.Name
+			// — same behaviour as pre-G2, so flag-off regression is impossible.
+			transportID := ""
+			if req != nil && req.Session != nil {
+				transportID = req.Session.ID()
+			}
+			if entry, ok := m.resolveTransportSession(transportID); ok && entry.Subject != "" {
+				block.TargetIdentity = entry.Subject
+			} else if m.nucleus != nil {
 				block.TargetIdentity = m.nucleus.Name
 			}
 			m.process.RecordBlock(block)
@@ -474,6 +483,37 @@ func withToolObserver[In any](
 				InteractionID: interactionID,
 				SessionID:     sessionID,
 			})
+		}
+
+		// G2 PART C: capability-envelope gating (behind IdentityNakedDefault).
+		//
+		// When IdentityNakedDefault is true AND the transport session resolves to
+		// a bound identity AND a capResolver is wired, check the identity's
+		// capability envelope before running the handler. If the envelope denies
+		// the tool, return an error result without executing the handler.
+		//
+		// When IdentityNakedDefault is false (default), capResolver is nil, or
+		// the transport session has no bound subject: skip enforcement entirely.
+		// This is byte-for-byte pre-G2 behaviour on the handler execution path.
+		//
+		// Permit-by-default: CanInvoke returns true when no envelope is declared
+		// for the subject, so agents that have not advertised capabilities are
+		// never blocked. Restriction requires an explicit deny entry or a
+		// non-empty allow-list in the advertised Payload.
+		if m != nil && m.cfg != nil && m.cfg.IdentityNakedDefault && m.capResolver != nil {
+			capTransportID := ""
+			if req != nil && req.Session != nil {
+				capTransportID = req.Session.ID()
+			}
+			if entry, ok := m.resolveTransportSession(capTransportID); ok && entry.Subject != "" {
+				if !m.capResolver.CanInvoke(entry.Subject, name) {
+					denied, _, _ := fallbackResult(
+						"capability envelope denied: subject "+entry.Subject+" is not permitted to invoke "+name,
+						"",
+					)
+					return denied, nil, nil
+				}
+			}
 		}
 
 		result, data, err := h(ctx, req, in)

@@ -97,6 +97,17 @@ type MCPServer struct {
 	// when not wired, session register proceeds without creating any binding
 	// (naked-by-default contract). Set via SetHarnessBackend (mcp_sessions_identity.go).
 	harnessBackend HarnessAttacher
+
+	// correlation is the transport↔harness session correlation store (G2 PART A).
+	// Populated by toolRegisterSession: transport_session_id → {harness_session_id,
+	// subject}. Read by withToolObserver and toolIngest for per-session attribution.
+	// sync.Map zero-value is ready-to-use; no initialisation needed.
+	correlation transportCorrelationStore
+
+	// capResolver gates tool calls against the bound identity's capability
+	// envelope when IdentityNakedDefault is true (G2 PART C). Nil when not
+	// wired — gates are skipped (permit-by-default). Set via SetCapabilityResolver.
+	capResolver capabilityGater
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
@@ -1694,11 +1705,19 @@ func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 	block := NormalizeIngestBlock(ingestReq, result)
 	block.WorkspaceID = filepath.Base(m.cfg.WorkspaceRoot)
-	// MCP-protocol session IDs (req.Session.ID()) are transport-level random
-	// tokens, not CogOS harness session IDs (registered via cog_register_session).
-	// There is no mapping from transport session to HarnessBindingCRD here,
-	// so the nucleus remains the correct attribution for ingest blocks.
-	if m.nucleus != nil {
+	// G2 PART B: resolve the bound subject for this transport session.
+	// m.resolveTransportSession looks up the correlation recorded at
+	// cog_register_session time. When found, the subject is the correct
+	// attribution. When not found (no register call, in-process test path
+	// where req is nil or Session.ID() is empty), fall back to nucleus.Name
+	// — same behaviour as pre-G2, so flag-off regression is impossible.
+	ingestTransportID := ""
+	if req != nil && req.Session != nil {
+		ingestTransportID = req.Session.ID()
+	}
+	if entry, ok := m.resolveTransportSession(ingestTransportID); ok && entry.Subject != "" {
+		block.TargetIdentity = entry.Subject
+	} else if m.nucleus != nil {
 		block.TargetIdentity = m.nucleus.Name
 	}
 	if m.process != nil {

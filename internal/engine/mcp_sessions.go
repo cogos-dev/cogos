@@ -232,6 +232,19 @@ func (m *MCPServer) toolRegisterSession(ctx context.Context, req *mcp.CallToolRe
 		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
 	}
 
+	// G2 PART A: record transport↔harness correlation.
+	// req.Session.ID() is the MCP-protocol transport session ID assigned by the
+	// SDK to this client connection. in.SessionID is the CogOS harness session
+	// ID chosen by the caller. Recording the mapping here gives tool-call
+	// attribution sites (withToolObserver, toolIngest) a way to resolve the
+	// bound subject from the transport session ID without inspecting the harness
+	// session ID explicitly. When req.Session is nil or req.Session.ID() is
+	// empty (e.g. in-process test calls via CallTool or direct handler calls),
+	// record is a no-op — attribution falls back to nucleus.Name unchanged.
+	if req != nil && req.Session != nil {
+		m.correlation.record(req.Session.ID(), in.SessionID, in.Subject)
+	}
+
 	// G0(b): optional identity binding. When subject is provided and a
 	// harnessBackend is wired, create a HarnessBindingCRD linking this
 	// session to the subject identity. When subject is absent (or no backend
