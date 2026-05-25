@@ -124,7 +124,23 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(card)
 }
 
-// handleModels returns an OpenAI-compatible model list.
+// handleModels returns an OpenAI-compatible model list (G2 both-menu).
+//
+// Menu order and fields:
+//  1. Intent aliases (owned_by "cogos"): foreground, deliberation, local.
+//     These are always present — they are software-defined names, not
+//     hardware-presence signals.
+//  2. Raw frontier model IDs (owned_by "anthropic"): claude-sonnet-4-6,
+//     claude-opus-4-7.
+//  3. eclipse-26b (owned_by "cogos", tier "lan-local") — ONLY when the
+//     eclipse provider is registered in the router. Gated on config presence;
+//     no live HTTP probe on every call.
+//
+// Extension fields `tier` and `description` are ignored by standard OpenAI
+// clients; cogos-aware clients use them for UI display / routing decisions.
+// The alias IDs here MUST match the intentAliases table in resolve.go so that
+// selecting any entry from this menu resolves correctly on both gateway and
+// dispatch.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	s.logCompatDeprecated(r)
 	type modelPermission struct {
@@ -136,11 +152,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		AllowView     bool   `json:"allow_view"`
 	}
 	type model struct {
-		ID         string            `json:"id"`
-		Object     string            `json:"object"`
-		Created    int64             `json:"created"`
-		OwnedBy    string            `json:"owned_by"`
-		Permission []modelPermission `json:"permission"`
+		ID          string            `json:"id"`
+		Object      string            `json:"object"`
+		Created     int64             `json:"created"`
+		OwnedBy     string            `json:"owned_by"`
+		Permission  []modelPermission `json:"permission"`
+		Tier        string            `json:"tier,omitempty"`
+		Description string            `json:"description,omitempty"`
 	}
 	type response struct {
 		Object string  `json:"object"`
@@ -148,9 +166,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().Unix()
-	mkModel := func(id, owner string) model {
+	mkModel := func(id, owner, tier, description string) model {
 		return model{
 			ID: id, Object: "model", Created: now, OwnedBy: owner,
+			Tier:        tier,
+			Description: description,
 			Permission: []modelPermission{{
 				ID:            "modelperm-" + id,
 				Object:        "model_permission",
@@ -161,15 +181,53 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			}},
 		}
 	}
+
+	// Determine whether the eclipse provider is configured. We check the live
+	// router (no I/O — ProviderForName / ProviderForModel are in-memory map
+	// lookups). eclipse-26b is only advertised when an eclipse or lmstudio
+	// provider is registered, so the menu stays accurate without probing.
+	eclipseConfigured := isEclipseConfigured(s.router)
+
+	data := []model{
+		// Intent aliases — always present.
+		mkModel("foreground", "cogos", "frontier-managed",
+			"interactive, full capability (managed Claude, Max sub)"),
+		mkModel("deliberation", "cogos", "frontier-managed",
+			"heavier reasoning (Opus)"),
+		mkModel("local", "cogos", "local-sovereign",
+			"private, no egress (E4B on this node)"),
+		// Raw frontier model IDs.
+		mkModel("claude-sonnet-4-6", "anthropic", "frontier-managed", ""),
+		mkModel("claude-opus-4-7", "anthropic", "frontier-managed", ""),
+	}
+	if eclipseConfigured {
+		data = append(data,
+			mkModel("eclipse-26b", "cogos", "lan-local",
+				"LAN-resident 26B model (Eclipse node)"),
+		)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response{
 		Object: "list",
-		Data: []model{
-			mkModel("claude-sonnet-4-6", "anthropic"),
-			mkModel("claude-opus-4-7", "anthropic"),
-			mkModel("local", "cogos"),
-		},
+		Data:   data,
 	})
+}
+
+// isEclipseConfigured returns true when the router has a registered provider
+// that serves the eclipse-26b LAN model. Checks by provider name ("eclipse",
+// "lmstudio") and by model string ("eclipse-26b"). Fast: in-memory lookups only.
+func isEclipseConfigured(router Router) bool {
+	if router == nil {
+		return false
+	}
+	for _, name := range []string{"eclipse", "lmstudio"} {
+		if _, ok := router.ProviderForName(name); ok {
+			return true
+		}
+	}
+	_, ok := router.ProviderForModel("eclipse-26b")
+	return ok
 }
 
 // ── Tier C: Operational stability ──────────────────────────────────────────────

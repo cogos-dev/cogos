@@ -21,18 +21,21 @@ const defaultHarnessScopeName = "consolidation"
 // Each scope is a named set of tool names the harness may use.
 //
 // "consolidation" — substrate-only tools: memory, observability, identity.
-//   This is the default scope (unchanged from the original tool set).
-//   The harness operates on cogdocs, the field, and coherence only.
+//
+//	This is the default scope (unchanged from the original tool set).
+//	The harness operates on cogdocs, the field, and coherence only.
 //
 // "audit" — consolidation tools PLUS read-only filesystem access.
-//   Use this scope when the harness needs to inspect source, configs,
-//   or workspace files without mutating anything.
+//
+//	Use this scope when the harness needs to inspect source, configs,
+//	or workspace files without mutating anything.
 //
 // Future scopes (add entries here when the underlying mechanisms land):
-//   "maintenance" — read+write filesystem tools gated behind per-dispatch
-//                   worktree isolation (see ADR-081 §8 worktree work).
-//   "introspection" — audit tools plus kernel state-dump tools for deep
-//                     diagnostic cycles.
+//
+//	"maintenance" — read+write filesystem tools gated behind per-dispatch
+//	                worktree isolation (see ADR-081 §8 worktree work).
+//	"introspection" — audit tools plus kernel state-dump tools for deep
+//	                  diagnostic cycles.
 var harnessToolScopes = map[string][]string{
 	"consolidation": {
 		"cog_resolve_uri",
@@ -1083,11 +1086,19 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		return nil, err
 	}
 
-	// Resolve the inference provider. Three paths, evaluated in order:
+	// Resolve the inference provider. Four paths, evaluated in order:
+	//   0. Model-string resolution (NEW, additive): when req.Provider is empty
+	//      and req.Model resolves via the shared alias table to a known managed
+	//      provider (e.g. "claude-opus-4-7", "deliberation", "foreground"),
+	//      dispatch there with the resolved model override. Explicit-model-wins
+	//      over process_state_routing, mirroring req.Provider's precedence over
+	//      state-routing. See resolve.go / ResolveModelRequest.
+	//      Preserves: "e4b"/"26b" fall through (not in alias table); "" falls
+	//      through; process_state_routing fires when no model is given.
 	//   1. Explicit named provider via req.Provider (RFC-0007 Layer 1):
 	//      look the name up in providers.yaml + providers.local.yaml, build
 	//      the matching Provider, and use its declared model.
-	//   2. Process-state routing (new): when req.Provider is empty and the
+	//   2. Process-state routing: when req.Provider is empty and the
 	//      controller has an associated process, consult process_state_routing
 	//      in providers config. If the current state maps to a configured
 	//      provider, dispatch there. This wires the autonomic loop and harness
@@ -1144,55 +1155,97 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		// routeUsed stays empty; ProviderUsed on each slot is the canonical
 		// signal that the named-provider path fired.
 	} else {
-		// Path 2: process-state routing — try before falling back to legacy.
-		// When the controller has a process with a known state, consult
-		// process_state_routing in providers config. If the state maps to a
-		// valid, enabled provider, dispatch there. Otherwise fall through to
-		// the legacy local-LLM probe (Path 3).
-		usedStateRoute := false
-		if stateProvider, stateOK := c.resolveProviderByProcessState(); stateOK {
-			pcfg, perr := loadProvidersConfig(c.cfg)
-			if perr == nil {
-				if pc, pok := pcfg.Providers[stateProvider]; pok && pc.IsEnabled() {
-					p, merr := makeProvider(stateProvider, pc, nil)
-					if merr != nil {
+		// Path 0: model-string resolution via shared alias table (ADDITIVE).
+		// When req.Model is a recognised intent alias or model id (e.g.
+		// "claude-opus-4-7", "deliberation", "foreground", "opus"), build the
+		// resolved managed provider directly. Uses ResolveModelRequest with a
+		// nil router so only the static alias table is consulted — no live probe,
+		// no I/O. Existing values "e4b", "26b", and "" are NOT in the alias
+		// table and fall through to Paths 2/3 unchanged.
+		//
+		// Precedence decision: explicit-named-model wins over process_state_routing,
+		// mirroring how explicit req.Provider wins over state routing. A caller
+		// that names "claude-opus-4-7" has expressed intent that is more specific
+		// than the autonomic loop's state-based preference.
+		usedModelRoute := false
+		if mres := ResolveModelRequest(nil, string(req.Model), ""); mres.PreferProvider != "" {
+			pcfg, merr := loadProvidersConfig(c.cfg)
+			if merr == nil {
+				if pc, pok := pcfg.Providers[mres.PreferProvider]; pok && pc.IsEnabled() {
+					p, perr := makeProvider(mres.PreferProvider, pc, nil)
+					if perr != nil {
 						return nil, &AgentControllerError{
 							Code:    "internal_error",
-							Message: fmt.Sprintf("state-routing: failed to construct provider %q: %v", stateProvider, merr),
+							Message: fmt.Sprintf("model-routing: failed to construct provider %q: %v", mres.PreferProvider, perr),
 						}
 					}
 					provider = p
-					model = pc.Model
-					// Populate req.Provider so dispatchSlot records the
-					// resolved provider name in ProviderUsed — otherwise it
-					// stays empty and the caller can't distinguish this path
-					// from the legacy Ollama path.
-					req.Provider = stateProvider
-					note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
-					usedStateRoute = true
+					// Use the resolved model override when present; fall back to
+					// the provider's configured model.
+					if mres.ModelOverride != "" {
+						model = mres.ModelOverride
+					} else {
+						model = pc.Model
+					}
+					req.Provider = mres.PreferProvider
+					note = fmt.Sprintf("model-routing: model=%s -> provider=%s override=%s", req.Model, mres.PreferProvider, mres.ModelOverride)
+					usedModelRoute = true
 				}
-				// If provider not found or disabled: fall through to legacy path silently.
+				// If provider not found or disabled in this node's config: fall
+				// through to process_state_routing / legacy path.
 			}
 		}
-		if !usedStateRoute {
-			// Path 3: legacy model-enum routing via local-LLM probe.
-			target, terr := detectLocalLLMTarget(ctx, "")
-			if terr != nil {
-				return nil, terr
+		if !usedModelRoute {
+			// Path 2: process-state routing — try before falling back to legacy.
+			// When the controller has a process with a known state, consult
+			// process_state_routing in providers config. If the state maps to a
+			// valid, enabled provider, dispatch there. Otherwise fall through to
+			// the legacy local-LLM probe (Path 3).
+			usedStateRoute := false
+			if stateProvider, stateOK := c.resolveProviderByProcessState(); stateOK {
+				pcfg, perr := loadProvidersConfig(c.cfg)
+				if perr == nil {
+					if pc, pok := pcfg.Providers[stateProvider]; pok && pc.IsEnabled() {
+						p, merr := makeProvider(stateProvider, pc, nil)
+						if merr != nil {
+							return nil, &AgentControllerError{
+								Code:    "internal_error",
+								Message: fmt.Sprintf("state-routing: failed to construct provider %q: %v", stateProvider, merr),
+							}
+						}
+						provider = p
+						model = pc.Model
+						// Populate req.Provider so dispatchSlot records the
+						// resolved provider name in ProviderUsed — otherwise it
+						// stays empty and the caller can't distinguish this path
+						// from the legacy Ollama path.
+						req.Provider = stateProvider
+						note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
+						usedStateRoute = true
+					}
+					// If provider not found or disabled: fall through to legacy path silently.
+				}
 			}
-			m, ru, n := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
-			if m == "" {
-				return nil, errors.New(n)
+			if !usedStateRoute {
+				// Path 3: legacy model-enum routing via local-LLM probe.
+				target, terr := detectLocalLLMTarget(ctx, "")
+				if terr != nil {
+					return nil, terr
+				}
+				m, ru, n := resolveDispatchLocalModel(target.Models, c.localModelHint(), req.Model)
+				if m == "" {
+					return nil, errors.New(n)
+				}
+				model, routeUsed = m, ru
+				// Downgrade warnings (e.g. "26b route unavailable, degraded to e4b")
+				// are per-slot: each slot's result must carry the warning so callers
+				// that inspect individual slots know the requested model wasn't honored.
+				// These are distinct from batch-level diagnostics (state-routing note)
+				// which go into batch.Notes via the outer `note` variable.
+				slotNote = n
+				provider = buildLocalProvider(target, model, c.localProviderTimeout)
 			}
-			model, routeUsed = m, ru
-			// Downgrade warnings (e.g. "26b route unavailable, degraded to e4b")
-			// are per-slot: each slot's result must carry the warning so callers
-			// that inspect individual slots know the requested model wasn't honored.
-			// These are distinct from batch-level diagnostics (state-routing note)
-			// which go into batch.Notes via the outer `note` variable.
-			slotNote = n
-			provider = buildLocalProvider(target, model, c.localProviderTimeout)
-		}
+		} // end if !usedModelRoute
 	}
 
 	// Resolve the named scope. Empty scope means the harness's own default

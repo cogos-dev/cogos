@@ -51,25 +51,25 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/myrgic/cogos/ui/canvas"
 	"github.com/myrgic/cogos/ui/dashboard"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 )
 
 // Server wraps the HTTP server and its dependencies.
 type Server struct {
-	cfg             *Config
-	nucleus         *Nucleus
-	process         *Process
-	router          Router // nil until SetRouter is called
+	cfg               *Config
+	nucleus           *Nucleus
+	process           *Process
+	router            Router            // nil until SetRouter is called
 	serviceSupervisor ServiceSupervisor // nil until SetServiceSupervisor; defaults to ObserverSupervisor
-	srv             *http.Server
-	debug           debugStore      // captures last request pipeline state
-	attentionLog    *attentionLog   // per-server log (avoids global write race)
-	agentController AgentController // nil until SetAgentController is called
-	mcpServer       *MCPServer      // so SetAgentController can propagate to tools
+	srv               *http.Server
+	debug             debugStore      // captures last request pipeline state
+	attentionLog      *attentionLog   // per-server log (avoids global write race)
+	agentController   AgentController // nil until SetAgentController is called
+	mcpServer         *MCPServer      // so SetAgentController can propagate to tools
 
 	// Track 5 Phase 3 surface — per-bus event store, SSE broker, and
 	// consumer cursor registry. Scoped to the server so tests can create
@@ -880,46 +880,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Map OpenClaw model names to provider routing.
-	// "claude", "codex", "ollama" are provider aliases, not model names.
-	switch req.Model {
-	case "":
-		// empty model: use default routing
-	case "local":
-		// Pin to a local provider explicitly. Prefer ollama (always-resident
-		// baseline), then any other provider with IsLocal=true. If no local
-		// provider is registered, fall through to default routing and warn so
-		// operators notice (silent cloud routing under a "local" alias is the
-		// bug this fixes; see myrgic/cogos#75).
-		if name, ok := s.router.ProviderForName("ollama"); ok {
-			creq.Metadata.PreferProvider = name
-		} else if name, ok := s.router.FirstLocalProvider(); ok {
-			creq.Metadata.PreferProvider = name
-		} else {
-			slog.Warn("chat: model=local requested but no local provider registered; falling back to default routing",
-				"request_id", creq.Metadata.RequestID,
-			)
-		}
-	case "claude":
-		creq.Metadata.PreferProvider = "claude-code"
-	case "codex":
-		creq.Metadata.PreferProvider = "codex"
-	case "ollama", "kernel-agent":
-		// "kernel-agent" is the canonical alias for "the same harness the
-		// dispatch tool uses" — currently Ollama with the default kernel-core
-		// model. Eventually this aliases the kernel-managed in-host harness;
+	// Map OpenClaw model names to provider routing via the shared resolver.
+	// ResolveModelRequest centralises all alias + router-probe logic so that
+	// the gateway and dispatch tool share a single source of truth. The
+	// InjectKernelTools flag is handled below (kernel-agent / ollama path).
+	{
+		mres := ResolveModelRequest(s.router, req.Model, creq.Metadata.RequestID)
+		creq.Metadata.PreferProvider = mres.PreferProvider
+		creq.ModelOverride = mres.ModelOverride
+		// kernel-agent / ollama: auto-inject the kernel's MCP tool registry when
+		// the client did not supply tools of its own. Closes myrgic/cogos#89.
+		// "kernel-agent" is the canonical alias for "the same harness the dispatch
+		// tool uses" — currently Ollama with the default kernel-core model.
+		// Eventually this aliases the kernel-managed in-host harness;
 		// see .cog/scratch/audit-inference-paths/REPORT.md.
-		creq.Metadata.PreferProvider = "ollama"
-		// Auto-inject the kernel's MCP tool registry when the client did not
-		// supply tools of its own. Closes myrgic/cogos#89: the dashboard's
-		// chat path constructs `{model, messages, stream}` with no `tools`
-		// array, so the model receives zero tool definitions and promises
-		// tool calls that never fire. Advertising the kernel surface lets
-		// the provider emit real tool_use events the kernel can route via
-		// MCP. We only inject when the client truly sent nothing — any
-		// explicit (even empty-but-present) tools array from the caller
-		// wins, since BrowserOS-style flows manage their own surface.
-		if len(creq.Tools) == 0 && s.mcpServer != nil {
+		if mres.InjectKernelTools && len(creq.Tools) == 0 && s.mcpServer != nil {
 			injectKernelAgentTools(creq, s.mcpServer)
 			// G2 PART C: when IdentityNakedDefault is true and the request is
 			// bound to an identity with a wired capResolver, filter the injected
@@ -928,27 +903,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			// envelope disallows. Permit-by-default: no envelope → no filtering.
 			if s.cfg.IdentityNakedDefault && bound.Bound && s.mcpServer.capResolver != nil {
 				filterToolsByCapability(creq, bound.Subject, s.mcpServer.capResolver)
-			}
-		}
-	default:
-		// First check: is req.Model a provider alias (exact name match)? If so,
-		// route to that provider with NO ModelOverride — the provider knows its
-		// own configured model and we shouldn't second-guess it. This is what
-		// makes `model: mlx-gemma` resolve to the mlx-gemma provider's
-		// preloaded path instead of forwarding "mlx-gemma" upstream as a model
-		// id (which mlx_lm.server would try to fetch from HuggingFace).
-		if name, byName := s.router.ProviderForName(req.Model); byName {
-			creq.Metadata.PreferProvider = name
-			// No ModelOverride; provider uses its configured model.
-		} else {
-			// Pass through as model override (e.g. "opus", "haiku", "gpt-5.4",
-			// or a full HF model id). If a provider's configured Model()
-			// matches, prefer it so the request lands at the provider serving
-			// that model rather than falling through to the process-state
-			// default.
-			creq.ModelOverride = req.Model
-			if name, ok := s.router.ProviderForModel(req.Model); ok {
-				creq.Metadata.PreferProvider = name
 			}
 		}
 	}
@@ -1784,7 +1738,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 type streamHopBuffer struct {
 	deltas           []string
 	content          strings.Builder
-	reasoningDeltas  []string       // reasoning/thinking chunks (IsReasoning=true)
+	reasoningDeltas  []string // reasoning/thinking chunks (IsReasoning=true)
 	reasoningContent strings.Builder
 	stopReason       string
 	usage            *TokenUsage
