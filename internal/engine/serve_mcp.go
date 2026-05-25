@@ -23,6 +23,12 @@ func (s *Server) registerMCPRoutes(mux *http.ServeMux) {
 	// happens in exactly one place (this Server). Handlers dispatching
 	// to mod3 directly was the Wave 3 divergence this removes.
 	mcpSrv.SetChannelSessionBackend(s)
+	// G0(b): wire the RBAC harness-binding layer so cog_register_session
+	// can create HarnessBindingCRDs for sessions that supply a "subject".
+	// Nil when SetHarnessBackend was not called (tests, standalone MCP).
+	if s.harnessBackend != nil {
+		mcpSrv.SetHarnessBackend(s.harnessBackend)
+	}
 	// Call any extension hook registered by workspace-root wiring (e.g.
 	// eval_wiring.go calling eval.RegisterEvalTools). Nil when not set.
 	if RegisterMCPExtensions != nil {

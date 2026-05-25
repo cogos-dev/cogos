@@ -48,6 +48,7 @@ import (
 	"github.com/myrgic/cogos/internal/providers/daemon"
 	_ "github.com/myrgic/cogos/internal/providers/site" // registers "site" with pkg/reconcile
 	"github.com/myrgic/cogos/internal/workspace"
+	subidentity "github.com/myrgic/cogos/pkg/substrate/identity"
 	"gopkg.in/yaml.v3"
 )
 
@@ -222,5 +223,17 @@ func init() {
 	// return a "not configured" error that still exercises the code path.
 	engine.RegisterMCPExtensions = func(srv *engine.MCPServer) {
 		eval.RegisterEvalTools(srv.Server(), daemonEvalProvider)
+	}
+
+	// G0(b): wire the RBAC harness-binding layer so cog_register_session can
+	// create HarnessBindingCRDs when a "subject" field is supplied.
+	// The daemon binary uses HarnessRegistry from pkg/substrate/identity —
+	// a minimal in-memory implementation of the HarnessAttacher interface.
+	// The full RBACProvider (with reconcile-cycle integration) lives in the
+	// CLI binary's root package; the daemon-side shim satisfies the same
+	// interface with a lighter footprint appropriate to the daemon's role.
+	daemonHarnessRegistry := subidentity.NewHarnessRegistry()
+	engine.WireHarnessBackend = func(s *engine.Server) {
+		s.SetHarnessBackend(daemonHarnessRegistry)
 	}
 }

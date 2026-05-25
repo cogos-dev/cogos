@@ -442,6 +442,22 @@ func (p *RBACProvider) AttachHarness(binding *HarnessBindingCRD) {
 	})
 }
 
+// ResolveHarnessBinding returns the in-memory HarnessBindingCRD for
+// (sessionID, bindingType), or (nil, false) when no binding exists.
+// Read-only; no mutation. Satisfies the engine.HarnessAttacher interface
+// so the MCP server can look up the binding after registration.
+func (p *RBACProvider) ResolveHarnessBinding(sessionID, bindingType string) (*HarnessBindingCRD, bool) {
+	key := harnessKey(sessionID, bindingType)
+	p.mu.Lock()
+	binding, ok := p.live.HarnessBindings[key]
+	p.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	cp := *binding
+	return &cp, true
+}
+
 // DetachHarness removes a HarnessBindingCRD from in-memory state and emits
 // rbac.harness.detached. Called when a session ends.
 func (p *RBACProvider) DetachHarness(sessionID, bindingType string) {

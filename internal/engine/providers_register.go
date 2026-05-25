@@ -38,3 +38,11 @@ var SetProvidersWorkspace func(workspaceRoot string)
 // mcp.AddTool on its internal server. Set by workspace-root wiring.
 // Nil means no extensions are registered.
 var RegisterMCPExtensions func(srv *MCPServer)
+
+// WireHarnessBackend is called once during Boot after NewServer, to wire the
+// RBAC harness-binding layer into the server so cog_register_session can
+// create HarnessBindingCRDs for sessions that supply a "subject" field.
+// Set by cmd/cogos/providers_wire.go with a concrete HarnessAttacher impl.
+// Nil means the session-register path proceeds without identity binding
+// (naked-by-default: safe, correct, no functional change for existing callers).
+var WireHarnessBackend func(s *Server)

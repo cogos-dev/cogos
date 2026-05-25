@@ -91,6 +91,12 @@ type MCPServer struct {
 	// that expose content-addressed KV blocks (RFC-0006 vLLM provider).
 	// Nil-safe — fork handler degrades to cold start when nil.
 	kvBlockHashProvider KVBlockHashProvider
+
+	// harnessBackend is the RBAC layer that creates/resolves HarnessBindingCRDs
+	// when cog_register_session receives an optional "subject" field. Nil-safe:
+	// when not wired, session register proceeds without creating any binding
+	// (naked-by-default contract). Set via SetHarnessBackend (mcp_sessions_identity.go).
+	harnessBackend HarnessAttacher
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP

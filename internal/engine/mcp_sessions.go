@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	subidentity "github.com/myrgic/cogos/pkg/substrate/identity"
 )
 
 // SetSessionsBackend wires the bus manager + registries so the kernel-side
@@ -48,7 +49,11 @@ func (m *MCPServer) registerSessionTools() {
 			"bus_sessions. Validates the session_id format " +
 			"(lowercase, hyphen-separated, 3-component required). Required: " +
 			"session_id, workspace, role. Optional: task, model, hostname, " +
-			"status, current_task, context_usage.",
+			"status, current_task, context_usage. Identity binding (G0b): " +
+			"when subject is provided a HarnessBindingCRD is created linking " +
+			"session_id → subject via the RBAC provider. Optional iss sets " +
+			"the OIDC issuer; binding_type defaults to \"agent\". When subject " +
+			"is absent no binding is created (naked-by-default).",
 	}), withToolObserver(m, "cog_register_session", m.toolRegisterSession))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
@@ -123,6 +128,13 @@ type registerSessionInput struct {
 	CurrentTask  string                 `json:"current_task,omitempty"`
 	ContextUsage float64                `json:"context_usage,omitempty"`
 	Extras       map[string]interface{} `json:"extras,omitempty"`
+
+	// Identity binding fields (G0b — all optional; naked-by-default).
+	// When Subject is non-empty and a harnessBackend is wired, a
+	// HarnessBindingCRD is created linking sessionID → Subject.
+	Subject     string `json:"subject,omitempty"`      // identity sub-slug (e.g. "chaz", "cog")
+	Iss         string `json:"iss,omitempty"`           // OIDC issuer hint (e.g. "anthropic.claude-code")
+	BindingType string `json:"binding_type,omitempty"` // "agent" (default) or "user"
 }
 
 type heartbeatSessionInput struct {
@@ -219,11 +231,47 @@ func (m *MCPServer) toolRegisterSession(ctx context.Context, req *mcp.CallToolRe
 	if err != nil {
 		return fallbackResult(fmt.Sprintf("bus append failed: %v", err), "")
 	}
-	return marshalResult(map[string]any{
+
+	// G0(b): optional identity binding. When subject is provided and a
+	// harnessBackend is wired, create a HarnessBindingCRD linking this
+	// session to the subject identity. When subject is absent (or no backend
+	// is wired), skip silently — naked-by-default contract.
+	var bindingCreated bool
+	if in.Subject != "" && m.harnessBackend != nil {
+		bindingType := in.BindingType
+		if bindingType == "" {
+			bindingType = "agent"
+		}
+		name := in.SessionID + "/" + bindingType
+		binding := &subidentity.HarnessBindingCRD{
+			APIVersion: "cog.os/v1alpha1",
+			Kind:       "HarnessBinding",
+			Metadata:   subidentity.RBACMeta{Name: name},
+			Spec: subidentity.HarnessBindingSpec{
+				SessionID:   in.SessionID,
+				Subject:     in.Subject,
+				Type:        bindingType,
+				HarnessType: in.Iss,
+			},
+		}
+		m.harnessBackend.AttachHarness(binding)
+		bindingCreated = true
+	}
+
+	result := map[string]any{
 		"ok": true, "session_id": in.SessionID,
 		"seq": evt.Seq, "hash": evt.Hash,
 		"created": created, "session": stored,
-	})
+	}
+	if bindingCreated {
+		result["binding_created"] = true
+		result["binding_subject"] = in.Subject
+		result["binding_type"] = in.BindingType
+		if result["binding_type"] == "" {
+			result["binding_type"] = "agent"
+		}
+	}
+	return marshalResult(result)
 }
 
 func (m *MCPServer) toolHeartbeatSession(ctx context.Context, req *mcp.CallToolRequest, in heartbeatSessionInput) (*mcp.CallToolResult, any, error) {

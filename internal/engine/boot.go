@@ -181,6 +181,14 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	server := NewServer(cfg, nucleus, process)
 	server.SetRouter(router)
 
+	// G0(b): wire the RBAC harness-binding layer so cog_register_session can
+	// create HarnessBindingCRDs for sessions that supply an optional "subject"
+	// field. WireHarnessBackend is set by cmd/cogos/providers_wire.go; nil
+	// (e.g. in tests or CLI-only builds) is safe — naked-by-default contract.
+	if WireHarnessBackend != nil {
+		WireHarnessBackend(server)
+	}
+
 	// Wire the session-activity publisher.
 	if server.busSessions != nil {
 		process.SetSessionActivityPublisher(server.busSessions.AppendEvent)

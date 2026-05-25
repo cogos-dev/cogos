@@ -111,6 +111,11 @@ type Server struct {
 	// closures can emit KernelHandlerSpan events to bus_traces. Nil-safe:
 	// withSpan is a no-op wrapper when spanEmitter is nil.
 	spanEmitter spanEmitter
+
+	// harnessBackend is the RBAC layer for HarnessBindingCRD create/resolve.
+	// Wired from the root package via SetHarnessBackend after construction.
+	// Threaded into the MCP server in registerMCPRoutes. Nil-safe throughout.
+	harnessBackend HarnessAttacher
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -287,6 +292,18 @@ func (s *Server) SetAgentController(ctrl AgentController) {
 	if lhc, ok := ctrl.(*LocalHarnessController); ok && s.busSessions != nil {
 		lhc.SetDashboardBus(s.busSessions)
 		BindDashboardController(lhc)
+	}
+}
+
+// SetHarnessBackend wires the RBAC harness-binding layer into the server.
+// When set before Start, registerMCPRoutes threads it into the MCP server so
+// cog_register_session can create HarnessBindingCRDs for sessions that supply
+// an optional "subject" field. Nil clears any prior backend. Safe to call
+// post-construction (before registerMCPRoutes runs during Start).
+func (s *Server) SetHarnessBackend(h HarnessAttacher) {
+	s.harnessBackend = h
+	if s.mcpServer != nil {
+		s.mcpServer.SetHarnessBackend(h)
 	}
 }
 
