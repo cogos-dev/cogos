@@ -109,6 +109,14 @@ type CompletionRequest struct {
 	// for cold-start simulation in eval workloads.
 	// Non-Ollama providers ignore this field.
 	KeepAlive *any `json:"keep_alive,omitempty"`
+
+	// WorkDir is the working directory for the spawned claude-code process (G3
+	// Part A). When non-empty, the foreground Complete/Stream spawns set
+	// cmd.Dir to this path so the subprocess loads the identity's own
+	// CLAUDE.md rather than the daemon's cwd. Empty means "inherit daemon cwd"
+	// (today's behavior, and the behavior when IdentityNakedDefault=false).
+	// Only ClaudeCodeProvider consults this field; other providers ignore it.
+	WorkDir string `json:"work_dir,omitempty"`
 }
 
 // ProviderMessage is a single conversation turn.

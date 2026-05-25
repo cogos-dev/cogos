@@ -190,7 +190,7 @@ func (p *Process) AssembleContext(query string, messages []ProviderMessage, budg
 	for _, o := range opts {
 		o(&ao)
 	}
-	return p.assembleContextInnerWithOpts(ao.ctx, ao.convID, query, messages, budget, ao.manifestMode, ao.iris, ao.previousTurnSpeculative)
+	return p.assembleContextInnerWithOpts(ao.ctx, ao.convID, query, messages, budget, ao.manifestMode, ao.iris, ao.previousTurnSpeculative, ao.memoryNamespace)
 }
 
 // AssembleOption configures optional AssembleContext parameters.
@@ -202,6 +202,12 @@ type assembleOpts struct {
 	iris                    irisSignal
 	manifestMode            bool
 	previousTurnSpeculative string
+	// memoryNamespace, when non-empty, restricts CogDoc foveation to the
+	// resolved filesystem path prefix for this namespace (G3 Part B). This
+	// is a cog:// URI such as "cog://mem/semantic/agents/sandy/" that the
+	// assembler resolves to a path prefix and uses as a filter. Empty means
+	// no scoping — all indexed documents are eligible (today's behavior).
+	memoryNamespace string
 }
 
 func assembleDefaults() assembleOpts {
@@ -237,7 +243,18 @@ func WithPreviousTurnSpeculative(text string) AssembleOption {
 	return func(o *assembleOpts) { o.previousTurnSpeculative = text }
 }
 
-func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool, iris irisSignal, previousTurnSpeculative string) (*ContextPackage, error) {
+// WithMemoryScope restricts CogDoc foveation to documents whose filesystem
+// paths fall within the resolved namespace (G3 Part B). namespace is a
+// cog:// URI such as "cog://mem/semantic/agents/sandy/"; the assembler
+// resolves it to a filesystem prefix and drops candidates outside that prefix.
+//
+// Pass "" to request no scoping — all indexed documents are eligible (this
+// is the default and must be the behavior when IdentityNakedDefault=false).
+func WithMemoryScope(namespace string) AssembleOption {
+	return func(o *assembleOpts) { o.memoryNamespace = namespace }
+}
+
+func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID string, query string, messages []ProviderMessage, budget int, manifestMode bool, iris irisSignal, previousTurnSpeculative string, memoryNamespace string) (*ContextPackage, error) {
 	if budget <= 0 {
 		budget = p.cfg.EffectiveBudget()
 	}
@@ -326,6 +343,16 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 	var docCandidates []FovealDoc
 	usedTRM := false
 
+	// G3 Part B: resolve memory namespace to a filesystem path prefix.
+	// When memoryNamespace is non-empty, only documents whose absolute paths
+	// start with this prefix are admitted into the candidate set. Empty prefix
+	// means no scoping (all documents eligible) — this is the default and the
+	// flag-off invariant.
+	memScopePrefix := ""
+	if memoryNamespace != "" {
+		memScopePrefix = resolveMemoryNamespacePrefix(p.cfg.WorkspaceRoot, memoryNamespace)
+	}
+
 	// Try TRM scoring first (when model and embedding index are available).
 	if p.trm != nil && p.embeddingIndex != nil && query != "" {
 		trmResults := trmScoreDocs(ctx, p, query, convID, 100)
@@ -335,6 +362,10 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 			for _, tr := range trmResults {
 				score := float64(tr.TRMScore)
 				if score < salienceFloor {
+					continue
+				}
+				// G3 Part B: memory scope filter.
+				if memScopePrefix != "" && !strings.HasPrefix(filepath.ToSlash(tr.IndexResult.ChunkMeta.Path), filepath.ToSlash(memScopePrefix)) {
 					continue
 				}
 				docCandidates = append(docCandidates, FovealDoc{
@@ -366,6 +397,10 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 				continue
 			}
 			if pathMatchesExcludeSubstrings(doc.Path, excludeSubstrings) {
+				continue
+			}
+			// G3 Part B: memory scope filter.
+			if memScopePrefix != "" && !strings.HasPrefix(filepath.ToSlash(doc.Path), filepath.ToSlash(memScopePrefix)) {
 				continue
 			}
 

@@ -368,9 +368,19 @@ func mergeSystemPrompts(nucleus string, clientParts []string) string {
 // Subject is the resolved principal name (e.g. "cog", "alice").
 // Bound is false when no client session id was present or no harness
 // binding was found for it; in that case Subject is empty.
+//
+// WorkspaceRoot is the cog:// URI home for this identity's expression, resolved
+// at binding time from the Identity CRD (G3 Part A). Empty when no CRD exists
+// or the expression carries no workspace_root field.
+//
+// MemoryNamespace is the memory scope for this identity's expression, resolved
+// at binding time from the Identity CRD (G3 Part B). Empty when no CRD exists
+// or the expression carries no memory_namespace field.
 type BoundIdentity struct {
-	Subject string
-	Bound   bool
+	Subject         string
+	Bound           bool
+	WorkspaceRoot   string // cog:// URI, e.g. "cog://workspaces/cog"
+	MemoryNamespace string // cog:// URI, e.g. "cog://mem/semantic/agents/sandy/"
 }
 
 // resolveBoundIdentity extracts the inbound client session id from the
@@ -381,6 +391,12 @@ type BoundIdentity struct {
 //   - No client session id is present in the request.
 //   - harnessBackend is nil (backend not wired).
 //   - No binding exists for the client session id.
+//
+// When a binding is found, it loads the Identity CRD for the subject (G3)
+// and populates WorkspaceRoot and MemoryNamespace from the CRD's expression
+// for the "kernel" audience (with "*" wildcard fallback). A missing CRD or
+// missing expression is treated as minimal binding — the fields are left
+// empty and no error is returned.
 //
 // This helper is reusable across attribution sites; this increment wires
 // it into handleChat only. Other sites (serve_anthropic.go, process.go,
@@ -400,7 +416,18 @@ func (s *Server) resolveBoundIdentity(r *http.Request, reqUser string) BoundIden
 	if !ok || binding == nil {
 		return BoundIdentity{}
 	}
-	return BoundIdentity{Subject: binding.Spec.Subject, Bound: true}
+	bi := BoundIdentity{Subject: binding.Spec.Subject, Bound: true}
+
+	// G3 Step 0: load the Identity CRD and populate WorkspaceRoot +
+	// MemoryNamespace from the "kernel" expression (with "*" wildcard fallback).
+	// Best-effort: any error (missing file, parse failure) leaves fields empty.
+	if binding.Spec.Subject != "" && s.cfg != nil {
+		if expr := resolveIdentityExpression(s.cfg.WorkspaceRoot, binding.Spec.Subject, "kernel"); expr != nil {
+			bi.WorkspaceRoot = expr.WorkspaceRoot
+			bi.MemoryNamespace = expr.MemoryNamespace
+		}
+	}
+	return bi
 }
 
 // handleHealth is the liveness/readiness probe.
@@ -977,13 +1004,40 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	useFullEmbodiment := !s.cfg.IdentityNakedDefault ||
 		(bound.Bound && bound.Subject == nucleusName)
 
+	// G3 Part A: spawn embodiment — set the claude-code working directory.
+	//
+	// flag OFF (default) → WorkDir stays empty; today's behavior (no Dir set).
+	// flag ON + bound    → resolve bound.WorkspaceRoot cog:// URI to fs path.
+	// flag ON + unbound  → neutral os.MkdirTemp so no cog CLAUDE.md loads.
+	if s.cfg.IdentityNakedDefault {
+		if bound.Bound && bound.WorkspaceRoot != "" {
+			if fsPath := resolveWorkspaceRootPath(s.cfg.WorkspaceRoot, bound.WorkspaceRoot); fsPath != "" {
+				creq.WorkDir = fsPath
+			}
+		} else if !bound.Bound {
+			if tmp, err := os.MkdirTemp("", "cog-anon-"); err == nil {
+				creq.WorkDir = tmp
+			}
+		}
+	}
+
+	// G3 Part B: memory scope — build the option slice to pass to AssembleContext.
+	// flag OFF → assembleOpts are unchanged (no WithMemoryScope); today's behavior.
+	// flag ON + bound + non-empty namespace → restrict foveation to namespace.
+	var assembleScopeOpts []AssembleOption
+	if s.cfg.IdentityNakedDefault && bound.Bound && bound.MemoryNamespace != "" {
+		assembleScopeOpts = append(assembleScopeOpts, WithMemoryScope(bound.MemoryNamespace))
+	}
+
 	if useFullEmbodiment {
-		if p, err := s.process.AssembleContext(query, clientMsgs, contextBudget,
+		assembleOpts := []AssembleOption{
 			WithContext(r.Context()),
 			WithConversationID(creq.Metadata.RequestID),
 			WithManifestMode(true),
 			WithPreviousTurnSpeculative(previousSpeculative),
-		); err != nil {
+		}
+		assembleOpts = append(assembleOpts, assembleScopeOpts...)
+		if p, err := s.process.AssembleContext(query, clientMsgs, contextBudget, assembleOpts...); err != nil {
 			slog.Warn("chat: context assembly failed", "err", err)
 			// Fallback: preserve any client-supplied role=system messages as the
 			// provider SystemPrompt, stripping them from the Messages slice so

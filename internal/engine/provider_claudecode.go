@@ -154,7 +154,7 @@ func (p *ClaudeCodeProvider) Complete(ctx context.Context, req *CompletionReques
 		"--include-partial-messages",
 	)
 
-	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.cliBinary, args...)
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild, Dir: req.WorkDir}, p.cliBinary, args...)
 	setProcessGroup(cmd)
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {
@@ -252,7 +252,7 @@ func (p *ClaudeCodeProvider) Stream(ctx context.Context, req *CompletionRequest)
 		"--include-partial-messages",
 	)
 
-	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild}, p.cliBinary, args...)
+	cmd := NewProviderCommandContext(ctx, ManagedCommandOpts{EnvPolicy: EnvPolicyProviderChild, Dir: req.WorkDir}, p.cliBinary, args...)
 	setProcessGroup(cmd)
 	cmd.WaitDelay = claudeCodeKillGrace
 	cmd.Cancel = func() error {

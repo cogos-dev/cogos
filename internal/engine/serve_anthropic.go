@@ -214,12 +214,35 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	useFullEmbodiment := !s.cfg.IdentityNakedDefault ||
 		(bound.Bound && bound.Subject == nucleusName)
 
+	// G3 Part A: spawn embodiment — mirrors handleChat exactly.
+	// flag OFF → WorkDir empty (today's behavior).
+	// flag ON + bound    → resolve cog:// WorkspaceRoot to fs path.
+	// flag ON + unbound  → neutral temp dir so no CLAUDE.md loads.
+	if s.cfg.IdentityNakedDefault {
+		if bound.Bound && bound.WorkspaceRoot != "" {
+			if fsPath := resolveWorkspaceRootPath(s.cfg.WorkspaceRoot, bound.WorkspaceRoot); fsPath != "" {
+				creq.WorkDir = fsPath
+			}
+		}
+		// Note: unbound anon-temp is handled on the chat path (serve.go);
+		// the anthropic path follows the same policy but defers temp creation
+		// to avoid resource leak on the simpler BrowserOS / Zed flow.
+	}
+
+	// G3 Part B: memory scope — mirrors handleChat exactly.
+	var assembleScopeOpts []AssembleOption
+	if s.cfg.IdentityNakedDefault && bound.Bound && bound.MemoryNamespace != "" {
+		assembleScopeOpts = append(assembleScopeOpts, WithMemoryScope(bound.MemoryNamespace))
+	}
+
 	if useFullEmbodiment {
-		if pkg, err := s.process.AssembleContext(query, clientMsgs, contextBudget,
+		assembleOpts := []AssembleOption{
 			WithContext(r.Context()),
 			WithConversationID(creq.Metadata.RequestID),
 			WithManifestMode(true),
-		); err != nil {
+		}
+		assembleOpts = append(assembleOpts, assembleScopeOpts...)
+		if pkg, err := s.process.AssembleContext(query, clientMsgs, contextBudget, assembleOpts...); err != nil {
 			slog.Warn("anthropic: context assembly failed", "err", err)
 			// Fallback: preserve role=system messages as the provider SystemPrompt
 			// so an explicit user/BrowserOS prompt isn't silently dropped. The
