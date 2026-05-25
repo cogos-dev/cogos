@@ -22,6 +22,15 @@ type anthropicMessagesRequest struct {
 	Messages  []anthropicInputMessage `json:"messages"`
 	MaxTokens int                     `json:"max_tokens,omitempty"`
 	Stream    bool                    `json:"stream,omitempty"`
+	Metadata  anthropicRequestMeta    `json:"metadata,omitempty"`
+}
+
+// anthropicRequestMeta holds the optional metadata object from the Anthropic
+// Messages API. The user_id field mirrors the OpenAI user field: a client-
+// supplied string identifying the end-user, used here as the reqUser fallback
+// for identity resolution when no X-Cogos-Session-Id header is present.
+type anthropicRequestMeta struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type anthropicInputMessage struct {
@@ -117,9 +126,17 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	oaiReq := anthropicToOpenAIRequest(&anthropicReq)
 	block := NormalizeAnthropicRequest(body, "http")
 	block.SessionID = s.process.SessionID()
-	if s.nucleus != nil {
+
+	// G1: resolve inbound client session → bound identity for attribution.
+	// The Anthropic metadata.user_id mirrors OpenAI's user field and serves
+	// as the reqUser fallback when no X-Cogos-Session-Id header is present.
+	bound := s.resolveBoundIdentity(r, anthropicReq.Metadata.UserID)
+	if bound.Bound {
+		block.TargetIdentity = bound.Subject
+	} else if s.nucleus != nil {
 		block.TargetIdentity = s.nucleus.Name
 	}
+
 	block.WorkspaceID = filepath.Base(s.cfg.WorkspaceRoot)
 	s.process.RecordBlock(block)
 
@@ -179,16 +196,56 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	if pkg, err := s.process.AssembleContext(query, clientMsgs, contextBudget,
-		WithContext(r.Context()),
-		WithConversationID(creq.Metadata.RequestID),
-		WithManifestMode(true),
-	); err != nil {
-		slog.Warn("anthropic: context assembly failed", "err", err)
-		// Fallback: preserve role=system messages as the provider SystemPrompt
-		// so an explicit user/BrowserOS prompt isn't silently dropped. The
-		// Anthropic upstream API rejects role=system inside messages, so we
-		// MUST extract them on this path.
+	// G1: embodiment gating — mirrors handleChat exactly.
+	//
+	// When IdentityNakedDefault is false (default), behavior is exactly
+	// today's: run AssembleContext + nucleus card on every request. The ONLY
+	// observable difference from before G1 is that bound sessions carry their
+	// own subject in block.TargetIdentity (set above).
+	//
+	// When IdentityNakedDefault is true:
+	//   • nucleus-bound request (bound.Subject == nucleus.Name): full embodiment.
+	//   • foreign-bound or unbound: clean transport — skip AssembleContext,
+	//     forward client messages verbatim (including role:system), no nucleus card.
+	nucleusName := ""
+	if s.nucleus != nil {
+		nucleusName = s.nucleus.Name
+	}
+	useFullEmbodiment := !s.cfg.IdentityNakedDefault ||
+		(bound.Bound && bound.Subject == nucleusName)
+
+	if useFullEmbodiment {
+		if pkg, err := s.process.AssembleContext(query, clientMsgs, contextBudget,
+			WithContext(r.Context()),
+			WithConversationID(creq.Metadata.RequestID),
+			WithManifestMode(true),
+		); err != nil {
+			slog.Warn("anthropic: context assembly failed", "err", err)
+			// Fallback: preserve role=system messages as the provider SystemPrompt
+			// so an explicit user/BrowserOS prompt isn't silently dropped. The
+			// Anthropic upstream API rejects role=system inside messages, so we
+			// MUST extract them on this path.
+			var clientSysParts []string
+			var nonSysMsgs []ProviderMessage
+			for _, m := range clientMsgs {
+				if m.Role == "system" {
+					if strings.TrimSpace(m.Content) != "" {
+						clientSysParts = append(clientSysParts, m.Content)
+					}
+					continue
+				}
+				nonSysMsgs = append(nonSysMsgs, m)
+			}
+			creq.Messages = nonSysMsgs
+			creq.SystemPrompt = mergeSystemPrompts(s.nucleusCard(), clientSysParts)
+		} else {
+			systemPrompt, managedMsgs := pkg.FormatForProvider()
+			creq.SystemPrompt = systemPrompt
+			creq.Messages = managedMsgs
+		}
+	} else {
+		// Clean transport path (IdentityNakedDefault=true, foreign or unbound).
+		// Forward client messages verbatim; no nucleus card; AssembleContext skipped.
 		var clientSysParts []string
 		var nonSysMsgs []ProviderMessage
 		for _, m := range clientMsgs {
@@ -201,11 +258,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			nonSysMsgs = append(nonSysMsgs, m)
 		}
 		creq.Messages = nonSysMsgs
-		creq.SystemPrompt = mergeSystemPrompts(s.nucleusCard(), clientSysParts)
-	} else {
-		systemPrompt, managedMsgs := pkg.FormatForProvider()
-		creq.SystemPrompt = systemPrompt
-		creq.Messages = managedMsgs
+		creq.SystemPrompt = mergeSystemPrompts("", clientSysParts)
 	}
 
 	provider, _, err := s.router.Route(r.Context(), creq)

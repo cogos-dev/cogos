@@ -1694,6 +1694,10 @@ func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 	block := NormalizeIngestBlock(ingestReq, result)
 	block.WorkspaceID = filepath.Base(m.cfg.WorkspaceRoot)
+	// MCP-protocol session IDs (req.Session.ID()) are transport-level random
+	// tokens, not CogOS harness session IDs (registered via cog_register_session).
+	// There is no mapping from transport session to HarnessBindingCRD here,
+	// so the nucleus remains the correct attribution for ingest blocks.
 	if m.nucleus != nil {
 		block.TargetIdentity = m.nucleus.Name
 	}

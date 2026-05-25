@@ -858,6 +858,8 @@ func (p *Process) emitHeartbeat() {
 			Scope:         "local",
 		},
 	}
+	// Heartbeat is a kernel-own action (no inbound per-session request context),
+	// so the nucleus remains the correct identity — no per-session resolution here.
 	if p.nucleus != nil {
 		block.TargetIdentity = p.nucleus.Name
 	}
