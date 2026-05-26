@@ -210,10 +210,22 @@ func (p *BEPProvider) Status() bep.SyncStatus {
 
 func (p *BEPProvider) runFSNotify(w *fsnotify.Watcher) {
 	const debounce = 500 * time.Millisecond
+
+	// All debounce state (pending set, timer) is owned exclusively by this
+	// goroutine. The debounce timer does NOT mutate shared state from its own
+	// goroutine; instead it sends a tick on flushCh which this loop selects on.
+	// This keeps every read/write of `pending` and `timer` on a single
+	// goroutine — no lock needed and no data race (the previous design had the
+	// time.AfterFunc closure write `pending` while the loop read it).
 	pending := make(map[string]struct{})
 	var timer *time.Timer
+	flushCh := make(chan struct{}, 1)
 
-	flushPending := func() {
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+
 		p.mu.Lock()
 		if !p.running {
 			p.mu.Unlock()
@@ -245,6 +257,11 @@ func (p *BEPProvider) runFSNotify(w *fsnotify.Watcher) {
 			}
 			return
 
+		case <-flushCh:
+			// Debounce window elapsed: process accumulated changes. Runs on
+			// this loop goroutine, so touching `pending` here is race-free.
+			flush()
+
 		case event, ok := <-w.Events:
 			if !ok {
 				return
@@ -260,7 +277,16 @@ func (p *BEPProvider) runFSNotify(w *fsnotify.Watcher) {
 			if timer != nil {
 				timer.Stop()
 			}
-			timer = time.AfterFunc(debounce, flushPending)
+			// The timer fires a non-blocking signal; it never touches shared
+			// state. The buffered channel + default in the closure ensure we
+			// never block the timer goroutine and never enqueue more than one
+			// pending tick.
+			timer = time.AfterFunc(debounce, func() {
+				select {
+				case flushCh <- struct{}{}:
+				default:
+				}
+			})
 
 		case err, ok := <-w.Errors:
 			if !ok {
