@@ -8,7 +8,10 @@
 //  5. Record every routing decision for future sentinel training
 //
 // BuildRouter reads .cog/config/providers.yaml and instantiates enabled providers.
-// Falls back to a default Ollama config when no providers.yaml is present.
+// When no providers.yaml is present it probes for a reachable local backend
+// (LM Studio on :1234, then Ollama on :11434) and builds a default config around
+// whichever responds; if neither is up it surfaces a "no local model configured"
+// placeholder rather than a dead default.
 package engine
 
 import (
@@ -329,7 +332,7 @@ func BuildRouter(cfg *Config, opts ...BuildRouterOption) (Router, error) {
 
 	pcfg, err := loadProvidersConfig(cfg)
 	if err != nil {
-		slog.Warn("router: providers.yaml not found, using default (ollama)", "err", err)
+		slog.Warn("router: providers.yaml not found, probing local backends", "err", err)
 		pcfg = defaultProvidersConfig(cfg.LocalModel)
 	}
 
