@@ -1226,7 +1226,58 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 					// If provider not found or disabled: fall through to legacy path silently.
 				}
 			}
-			if !usedStateRoute {
+			// Path 2.5: configured harness_provider default. When no earlier
+			// path selected a provider and cfg.HarnessProvider names a provider,
+			// resolve it the same way as the explicit-provider Path 1 instead of
+			// probing Ollama. This is the EXECUTING node's config, so a
+			// BEP-received remote dispatch uses the target node's harness_provider
+			// (e.g. eclipse -> lmstudio), not the sender's. Takes precedence over
+			// the legacy local_model + detectLocalLLMTarget probe (Path 3) but
+			// stays below explicit req.Provider, model-alias routing (Path 0), and
+			// process-state routing (Path 2) per the field's documented intent.
+			usedHarnessProvider := false
+			if !usedStateRoute && c.cfg != nil && c.cfg.HarnessProvider != "" {
+				hp := c.cfg.HarnessProvider
+				pcfg, perr := loadProvidersConfig(c.cfg)
+				if perr != nil {
+					return nil, &AgentControllerError{
+						Code:    "internal_error",
+						Message: fmt.Sprintf("harness_provider: failed to load providers config: %v", perr),
+					}
+				}
+				pc, ok := pcfg.Providers[hp]
+				if !ok {
+					known := make([]string, 0, len(pcfg.Providers))
+					for k := range pcfg.Providers {
+						known = append(known, k)
+					}
+					return nil, &AgentControllerError{
+						Code:    "invalid_input",
+						Message: fmt.Sprintf("harness_provider %q is not configured (known: %v)", hp, known),
+					}
+				}
+				if !pc.IsEnabled() {
+					return nil, &AgentControllerError{
+						Code:    "invalid_input",
+						Message: fmt.Sprintf("harness_provider %q is disabled in config", hp),
+					}
+				}
+				p, merr := makeProvider(hp, pc, nil)
+				if merr != nil {
+					return nil, &AgentControllerError{
+						Code:    "internal_error",
+						Message: fmt.Sprintf("harness_provider: failed to construct provider %q: %v", hp, merr),
+					}
+				}
+				provider = p
+				model = pc.Model
+				// Populate req.Provider so dispatchSlot records the resolved
+				// provider name in ProviderUsed.
+				req.Provider = hp
+				note = fmt.Sprintf("harness-provider: provider=%s", hp)
+				usedHarnessProvider = true
+			}
+			if !usedStateRoute && !usedHarnessProvider {
 				// Path 3: legacy model-enum routing via local-LLM probe.
 				target, terr := detectLocalLLMTarget(ctx, "")
 				if terr != nil {
