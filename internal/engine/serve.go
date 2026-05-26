@@ -116,6 +116,12 @@ type Server struct {
 	// Wired from the root package via SetHarnessBackend after construction.
 	// Threaded into the MCP server in registerMCPRoutes. Nil-safe throughout.
 	harnessBackend HarnessAttacher
+
+	// bepEngine is the running BEP cluster engine, or nil when
+	// cluster.enabled=false (dark by default). Wired from Boot() after the
+	// engine starts successfully; nil in all other cases. The
+	// /v1/cluster/status handler reads this field — nil → {"enabled":false}.
+	bepEngine *BEPEngine
 }
 
 // NewServer constructs a Server bound to the configured port.
@@ -229,6 +235,13 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 
 	// ACP-client surface: list/browse Claude Code projects+sessions, spawn subprocess.
 	s.registerClaudeCodeRoutes(mux)
+
+	// Cluster / BEP transport status (Phase 2 S2). Dark by default: when
+	// cluster.enabled=false the handler returns {"enabled":false} and no
+	// engine state is inspected. The route is always registered so the
+	// endpoint exists regardless of cluster configuration — callers can
+	// probe it without needing to know whether the cluster was compiled in.
+	s.route(mux, "GET /v1/cluster/status", s.handleClusterStatus)
 
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
