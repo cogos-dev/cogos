@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -525,10 +524,4 @@ func (c *commandReadCloser) Close() error {
 	return nil
 }
 
-func stopBareMetalPID(pid int) error {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return proc.Signal(syscall.SIGTERM)
-}
+// stopBareMetalPID is defined in daemon_stop_unix.go / daemon_stop_windows.go.

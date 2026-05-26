@@ -41,7 +41,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "  cogos <command> [flags]\n\n")
 	fmt.Fprintf(w, "Commands:\n")
 	fmt.Fprintf(w, "  init        Initialize a new workspace (.cog directory)\n")
-	fmt.Fprintf(w, "  serve       Start the kernel daemon in the foreground\n")
+	fmt.Fprintf(w, "  install     Post-install setup (e.g. --add-path adds ~/.cog/bin to PATH)\n")
+	fmt.Fprintf(w, "  serve       Start the kernel daemon in the foreground (--detach to background)\n")
 	fmt.Fprintf(w, "  start       Launch the kernel daemon in a container\n")
 	fmt.Fprintf(w, "  stop        Stop a running daemon\n")
 	fmt.Fprintf(w, "  restart     Pull the latest image and restart the container daemon\n")
@@ -142,6 +143,9 @@ func Main() {
 		case "agents":
 			runAgentsCmd(args[1:], *workspace, *port)
 			return
+		case "install":
+			runInstallCmd(args[1:])
+			return
 		}
 	}
 
@@ -190,7 +194,53 @@ func runServeCmd(args []string, defaultWorkspace string, defaultPort int, defaul
 	workspace := fs.String("workspace", defaultWorkspace, "Workspace root path (auto-detected if empty)")
 	port := fs.Int("port", defaultPort, "HTTP API port (default 6931)")
 	bind := fs.String("bind", defaultBind, "HTTP server bind address (default 127.0.0.1; use 0.0.0.0 for LAN, requires trusted network)")
+	detach := fs.Bool("detach", false, "Run daemon in the background (Unix: detaches into a new session; Windows: prints a background-run template and exits)")
 	_ = fs.Parse(args)
+
+	if *detach {
+		// Resolve the workspace root up front so the parent always passes an
+		// explicit --workspace to the child and can record daemon state at the
+		// correct path (the child auto-detects from cwd otherwise).
+		cfg, err := LoadConfig(*workspace, *port)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: load config: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Rebuild the child args without --detach so it runs in foreground.
+		// Always pin --workspace to the resolved root.
+		childArgs := []string{"serve", "--workspace", cfg.WorkspaceRoot}
+		if cfg.Port != 0 {
+			childArgs = append(childArgs, "--port", fmt.Sprintf("%d", cfg.Port))
+		}
+		if *bind != "" {
+			childArgs = append(childArgs, "--bind", *bind)
+		}
+
+		pid, err := detachServeProcess(childArgs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// MUST-FIX: the child writes its own daemon-state file only after Boot
+		// completes (hundreds of ms). Record state from the parent now, using
+		// the child's PID, so `cogos stop` works immediately after --detach.
+		// The child's planServeState may transiently rewrite this file once it
+		// finishes booting; both writers use the same PID, so stop is correct
+		// throughout the window.
+		state := &DaemonState{
+			Mode:      daemonModeBareMetal,
+			Endpoint:  endpointForPort(cfg.Port),
+			Workspace: cfg.WorkspaceRoot,
+			StartedAt: time.Now().UTC().Format(time.RFC3339),
+			PID:       &pid,
+		}
+		if err := saveDaemonState(state); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: daemon started (pid %d) but state file write failed: %v\n", pid, err)
+		}
+		return
+	}
 	runServe(*workspace, *port, *bind)
 }
 
