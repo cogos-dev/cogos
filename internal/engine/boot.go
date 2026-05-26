@@ -100,6 +100,10 @@ type Kernel struct {
 	// started successfully. Dark by default: when cluster.enabled=false this
 	// field is nil and no BEP goroutines, listeners, or port binds occur.
 	bepEngine *BEPEngine
+
+	// bepProvider is non-nil only when cluster.enabled=true and the provider
+	// file watcher started successfully. Stopped alongside bepEngine in Stop().
+	bepProvider *BEPProvider
 }
 
 // Endpoint returns the base URL of the kernel's HTTP server,
@@ -152,7 +156,12 @@ func (k *Kernel) Stop() error {
 		k.shutdownTelemetry(context.Background())
 	}
 
-	// Shut down BEP engine if it was started (cluster.enabled=true path).
+	// Shut down BEP subsystem if it was started (cluster.enabled=true path).
+	// Stop provider first (halts file-watcher goroutines) then engine
+	// (closes peer connections and drains message goroutines).
+	if k.bepProvider != nil {
+		k.bepProvider.Stop()
+	}
 	if k.bepEngine != nil {
 		k.bepEngine.Stop()
 	}
@@ -299,6 +308,7 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// shipped default (enabled=false) there is ZERO observable difference
 	// from the pre-S2 binary — no listener, no goroutines, no port bind.
 	var bepEngineHandle *BEPEngine
+	var bepProviderHandle *BEPProvider
 	{
 		provider := NewBEPProvider(cfg.WorkspaceRoot)
 		clusterCfg, cfgErr := provider.LoadConfig()
@@ -333,6 +343,29 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 					slog.Error("cluster: BEPEngine.Start failed; cluster transport disabled",
 						"err", startErr)
 				} else {
+					// Phase 2 S3: wire the provider's file-watcher so that local
+					// CRD changes propagate to peers automatically.
+					//
+					// Order matters:
+					//   1. Register the change handler first so no events are lost
+					//      during the window between handler registration and watcher
+					//      start (fsnotify buffers events; the provider flushes them
+					//      after the watcher goroutine starts).
+					//   2. Start the file watcher (creates the dir if absent,
+					//      initialises fsnotify or falls back to polling).
+					//
+					// The provider is stopped in Kernel.Stop() via eng.Stop →
+					// bepEngine reference; provider lifecycle is tied to the engine.
+					provider.AddChangeHandler(eng.NotifyLocalChange)
+					if watchErr := provider.Start(); watchErr != nil {
+						slog.Warn("cluster: BEPProvider.Start failed; local CRD changes will not propagate",
+							"err", watchErr)
+					} else {
+						bepProviderHandle = provider
+						slog.Info("cluster: BEP provider watcher started",
+							"watch_dir", provider.WatchDir())
+					}
+
 					bepEngineHandle = eng
 					server.bepEngine = eng
 					slog.Info("cluster: BEP engine started",
@@ -357,6 +390,7 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		processDone:       processDone,
 		shutdownTelemetry: shutdownTelemetry,
 		bepEngine:         bepEngineHandle,
+		bepProvider:       bepProviderHandle,
 	}
 
 	slog.Info("kernel booted", "endpoint", httpEndpoint, "workspace", cfg.WorkspaceRoot)
