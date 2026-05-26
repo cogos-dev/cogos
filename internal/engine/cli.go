@@ -33,15 +33,57 @@ var (
 	BuildTime = "unknown"
 )
 
+// printUsage writes the top-level command listing to w and returns.
+// It does NOT call os.Exit — callers decide the exit code.
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, "CogOS kernel — continuous-process daemon for AI agents.\n\n")
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  cogos <command> [flags]\n\n")
+	fmt.Fprintf(w, "Commands:\n")
+	fmt.Fprintf(w, "  init        Initialize a new workspace (.cog directory)\n")
+	fmt.Fprintf(w, "  serve       Start the kernel daemon in the foreground\n")
+	fmt.Fprintf(w, "  start       Launch the kernel daemon in a container\n")
+	fmt.Fprintf(w, "  stop        Stop a running daemon\n")
+	fmt.Fprintf(w, "  restart     Pull the latest image and restart the container daemon\n")
+	fmt.Fprintf(w, "  status      Show daemon state and health\n")
+	fmt.Fprintf(w, "  logs        Tail container daemon logs\n")
+	fmt.Fprintf(w, "  health      Perform a quick health check (exits 0 = healthy)\n")
+	fmt.Fprintf(w, "  version     Print build version and exit\n")
+	fmt.Fprintf(w, "  node        Manage node configuration\n")
+	fmt.Fprintf(w, "  reconcile   Run reconciliation loop diagnostics\n")
+	fmt.Fprintf(w, "  mcp         MCP server sub-commands (serve, ...)\n")
+	fmt.Fprintf(w, "  emit        Emit an event onto the kernel bus\n")
+	fmt.Fprintf(w, "  agents      List and query running agents\n")
+	fmt.Fprintf(w, "  docs        Serve workspace documentation\n")
+	fmt.Fprintf(w, "  blobs       Manage content-addressed blob store\n")
+	fmt.Fprintf(w, "  experiment  Run kernel experiments\n")
+	fmt.Fprintf(w, "  manifest    Print workspace manifest\n")
+	fmt.Fprintf(w, "  chat        Start an interactive chat session\n")
+	fmt.Fprintf(w, "  help        Show this help message\n")
+	fmt.Fprintf(w, "\nGlobal flags:\n")
+	fmt.Fprintf(w, "  --workspace PATH   Workspace root (auto-detected from cwd if omitted)\n")
+	fmt.Fprintf(w, "  --port PORT        Daemon HTTP API port (default 6931)\n")
+	fmt.Fprintf(w, "\nRun 'cogos <command> --help' for per-command flags.\n")
+}
+
 func Main() {
 	port := flag.Int("port", 0, "HTTP API port (default 6931)")
 	workspace := flag.String("workspace", "", "Workspace root path (auto-detected if empty)")
+
+	// Override the default flag.Usage so `cogos --help` / `cogos -h` lists
+	// all subcommands rather than only the two global flags.
+	flag.Usage = func() {
+		printUsage(os.Stderr)
+	}
 	flag.Parse()
 
 	// Sub-commands.
 	args := flag.Args()
 	if len(args) > 0 {
 		switch args[0] {
+		case "help":
+			printUsage(os.Stdout)
+			return
 		case "init":
 			runInitCmd(args[1:], *workspace)
 			return
@@ -103,8 +145,18 @@ func Main() {
 		}
 	}
 
-	// Compatibility path: plain `cogos` still serves in the foreground.
-	runServe(*workspace, *port, "")
+	// No subcommand: print help instead of silently starting the daemon.
+	// This fixes the Windows dogfood issue where bare `cogos` failed with a
+	// config-walk error and gave no hint about available subcommands.
+	// Users who want the foreground serve path should use `cogos serve`.
+	if len(args) == 0 {
+		printUsage(os.Stdout)
+		return
+	}
+
+	// Unknown subcommand.
+	fmt.Fprintf(os.Stderr, "cogos: unknown command %q\n\nRun 'cogos help' for usage.\n", args[0])
+	os.Exit(1)
 }
 
 func runInitCmd(args []string, defaultWorkspace string) {
@@ -474,8 +526,9 @@ func runStatusCmd(args []string, defaultWorkspace string, defaultPort int) {
 
 	cfg, err := LoadConfig(*workspace, *port)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: load config: %v\n", err)
-		os.Exit(1)
+		// No workspace found: give a helpful prompt rather than a raw config error.
+		fmt.Fprintf(os.Stdout, "no workspace found; run 'cogos init' to create one\n")
+		return
 	}
 	state, err := loadDaemonState(cfg.WorkspaceRoot)
 	if err != nil {
