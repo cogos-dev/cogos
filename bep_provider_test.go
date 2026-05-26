@@ -65,19 +65,13 @@ func TestBEPProviderStartStop(t *testing.T) {
 	defer p.Stop()
 
 	// Verify running.
-	p.mu.Lock()
-	running := p.running
-	p.mu.Unlock()
-	if !running {
+	if !p.IsRunning() {
 		t.Error("expected running=true after Start()")
 	}
 
 	p.Stop()
 
-	p.mu.Lock()
-	running = p.running
-	p.mu.Unlock()
-	if running {
+	if p.IsRunning() {
 		t.Error("expected running=false after Stop()")
 	}
 }
@@ -107,10 +101,7 @@ func TestBEPProviderStopWhenNotRunningIsNoOp(t *testing.T) {
 	// Stop on a never-started provider should not panic.
 	p.Stop()
 
-	p.mu.Lock()
-	running := p.running
-	p.mu.Unlock()
-	if running {
+	if p.IsRunning() {
 		t.Error("expected running=false on never-started provider")
 	}
 }
@@ -136,15 +127,12 @@ func TestBEPProviderFSNotifyCallback(t *testing.T) {
 	defer p.Stop()
 
 	// The provider should be using fsnotify (not polling) since we have a real dir.
-	p.mu.Lock()
-	hasWatcher := p.watcher != nil
-	p.mu.Unlock()
-	if !hasWatcher {
+	if !p.HasFSWatcher() {
 		t.Skip("fsnotify not available on this platform; skipping fsnotify-specific test")
 	}
 
 	// Write an agent CRD file into the watch directory.
-	crdPath := filepath.Join(p.watchDir, "whirl.agent.yaml")
+	crdPath := filepath.Join(p.WatchDir(), "whirl.agent.yaml")
 	if err := os.WriteFile(crdPath, validAgentCRDYAML("whirl"), 0644); err != nil {
 		t.Fatalf("write CRD file: %v", err)
 	}
@@ -193,27 +181,17 @@ func TestBEPProviderPollingFallback(t *testing.T) {
 		mu.Unlock()
 	})
 
-	// Force polling mode: start the provider, then close the watcher and
-	// launch the polling goroutine manually.
-	// We cannot easily force Start() to skip fsnotify, so we set up manually.
-	p.mu.Lock()
-	if err := os.MkdirAll(p.watchDir, 0755); err != nil {
-		p.mu.Unlock()
-		t.Fatalf("create watchDir: %v", err)
+	// Force polling mode using the test accessor.
+	if err := p.InitPollingForTest(); err != nil {
+		t.Fatalf("InitPollingForTest: %v", err)
 	}
-	p.running = true
-	p.stopCh = make(chan struct{})
-	p.watcher = nil // nil watcher = polling mode
-	p.mu.Unlock()
-
-	go p.runPolling()
 	defer p.Stop()
 
 	// Wait briefly for the initial snapshot to be taken.
 	time.Sleep(200 * time.Millisecond)
 
 	// Write a file — the poller should detect it within its 5s interval.
-	crdPath := filepath.Join(p.watchDir, "poll-test.agent.yaml")
+	crdPath := filepath.Join(p.WatchDir(), "poll-test.agent.yaml")
 	if err := os.WriteFile(crdPath, validAgentCRDYAML("poll-test"), 0644); err != nil {
 		t.Fatalf("write CRD file: %v", err)
 	}
@@ -270,7 +248,7 @@ func TestBEPScanModTimes(t *testing.T) {
 	root := setupBEPWatchDir(t)
 	p := NewBEPProvider(root)
 
-	watchDir := p.watchDir
+	watchDir := p.WatchDir()
 
 	// Create a mix of files.
 	files := map[string]bool{
@@ -291,7 +269,7 @@ func TestBEPScanModTimes(t *testing.T) {
 		t.Fatalf("mkdir subdir: %v", err)
 	}
 
-	result := p.scanModTimes()
+	result := p.ScanModTimes()
 
 	for name, expectIncluded := range files {
 		_, found := result[name]
@@ -338,7 +316,7 @@ func TestBEPDiffAndNotify(t *testing.T) {
 		// deleted.agent.yaml is absent → deletion
 	}
 
-	p.diffAndNotify(old, current)
+	p.DiffAndNotify(old, current)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -372,7 +350,7 @@ func TestBEPDiffAndNotifyNilCallback(t *testing.T) {
 	// No callback set — should not panic.
 	old := map[string]time.Time{"a.agent.yaml": time.Now()}
 	current := map[string]time.Time{}
-	p.diffAndNotify(old, current)
+	p.DiffAndNotify(old, current)
 }
 
 // ─── 7. Receiver: ReceiveAgentCRD ───────────────────────────────────────────────
@@ -388,7 +366,7 @@ func TestBEPReceiveAgentCRD(t *testing.T) {
 	}
 
 	// Verify the file was written.
-	written, err := os.ReadFile(filepath.Join(p.watchDir, "whirl.agent.yaml"))
+	written, err := os.ReadFile(filepath.Join(p.WatchDir(), "whirl.agent.yaml"))
 	if err != nil {
 		t.Fatalf("file not written: %v", err)
 	}
@@ -545,7 +523,7 @@ func TestBEPRemoveAgentCRD(t *testing.T) {
 	p := NewBEPProvider(root)
 
 	// Write a file first.
-	crdPath := filepath.Join(p.watchDir, "doomed.agent.yaml")
+	crdPath := filepath.Join(p.WatchDir(), "doomed.agent.yaml")
 	if err := os.WriteFile(crdPath, validAgentCRDYAML("doomed"), 0644); err != nil {
 		t.Fatalf("write CRD: %v", err)
 	}
@@ -774,9 +752,7 @@ peers:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	p.mu.Lock()
-	p.peers = cfg.Peers
-	p.mu.Unlock()
+	p.SetPeers(cfg.Peers)
 
 	status := p.Status()
 	if !status.Enabled {
@@ -816,12 +792,10 @@ func TestBEPListPeersCopySemantics(t *testing.T) {
 	p := NewBEPProvider(root)
 
 	// Set peers directly.
-	p.mu.Lock()
-	p.peers = []BEPPeer{
+	p.SetPeers([]BEPPeer{
 		{DeviceID: "node-1", Name: "alpha", Address: "10.0.0.1:22000", Trusted: true},
 		{DeviceID: "node-2", Name: "beta", Address: "10.0.0.2:22000", Trusted: false},
-	}
-	p.mu.Unlock()
+	})
 
 	peers1 := p.ListPeers()
 	if len(peers1) != 2 {
@@ -862,11 +836,11 @@ func TestBEPNewBEPProviderDefaultWatchDir(t *testing.T) {
 	p := NewBEPProvider(root)
 
 	expected := filepath.Join(root, ".cog", "bin", "agents", "definitions")
-	if p.watchDir != expected {
-		t.Errorf("watchDir = %q, want %q", p.watchDir, expected)
+	if p.WatchDir() != expected {
+		t.Errorf("watchDir = %q, want %q", p.WatchDir(), expected)
 	}
-	if p.root != root {
-		t.Errorf("root = %q, want %q", p.root, root)
+	if p.Root() != root {
+		t.Errorf("root = %q, want %q", p.Root(), root)
 	}
 }
 
@@ -874,7 +848,7 @@ func TestBEPScanModTimesEmptyDir(t *testing.T) {
 	root := setupBEPWatchDir(t)
 	p := NewBEPProvider(root)
 
-	result := p.scanModTimes()
+	result := p.ScanModTimes()
 	if len(result) != 0 {
 		t.Errorf("expected empty scan for empty dir, got %d entries", len(result))
 	}
@@ -882,7 +856,7 @@ func TestBEPScanModTimesEmptyDir(t *testing.T) {
 
 func TestBEPScanModTimesNonexistentDir(t *testing.T) {
 	p := NewBEPProvider("/nonexistent/path")
-	result := p.scanModTimes()
+	result := p.ScanModTimes()
 	if len(result) != 0 {
 		t.Errorf("expected empty scan for nonexistent dir, got %d entries", len(result))
 	}
@@ -898,7 +872,7 @@ func TestBEPReceiverAtomicWriteNoTmpLeftBehind(t *testing.T) {
 	}
 
 	// Verify no .tmp file remains.
-	entries, err := os.ReadDir(p.watchDir)
+	entries, err := os.ReadDir(p.WatchDir())
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
@@ -914,7 +888,7 @@ func TestBEPRemoveAgentCRDRecordsEvent(t *testing.T) {
 	p := NewBEPProvider(root)
 
 	// Write and remove.
-	crdPath := filepath.Join(p.watchDir, "ephemeral.agent.yaml")
+	crdPath := filepath.Join(p.WatchDir(), "ephemeral.agent.yaml")
 	if err := os.WriteFile(crdPath, validAgentCRDYAML("ephemeral"), 0644); err != nil {
 		t.Fatalf("write: %v", err)
 	}

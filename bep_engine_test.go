@@ -134,7 +134,7 @@ func TestBEPEngineTwoNodeSync(t *testing.T) {
 	defer engineB.Stop()
 
 	// Get B's actual listen address and configure A to dial it.
-	bAddr := engineB.listener.Addr().String()
+	bAddr := engineB.ListenerAddr()
 	cfgA.Peers[0].Address = bAddr
 
 	// Start engine A (dialer).
@@ -151,10 +151,7 @@ func TestBEPEngineTwoNodeSync(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	connected := false
 	for time.Now().Before(deadline) {
-		engineA.peersMu.RLock()
-		n := len(engineA.peers)
-		engineA.peersMu.RUnlock()
-		if n > 0 {
+		if engineA.ConnectedPeerCount() > 0 {
 			connected = true
 			break
 		}
@@ -234,8 +231,8 @@ func TestBEPEngineNoCert(t *testing.T) {
 	os.MkdirAll(filepath.Join(root, ".cog", "bin", "agents", "definitions"), 0755)
 
 	cfg := &BEPConfig{
-		Enabled:  true,
-		CertDir:  filepath.Join(root, "nonexistent"),
+		Enabled:   true,
+		CertDir:   filepath.Join(root, "nonexistent"),
 		Discovery: "static",
 	}
 	provider := NewBEPProvider(root)
@@ -249,12 +246,23 @@ func TestBEPEngineNoCert(t *testing.T) {
 // ─── PeerConnection.Close idempotent ────────────────────────────────────────────
 
 func TestPeerConnectionCloseIdempotent(t *testing.T) {
-	pc := &PeerConnection{
-		closeCh: make(chan struct{}),
+	// Create via the engine test path: start an engine and let it create a
+	// PeerConnection in the normal way — verify no panic on double-close
+	// by stopping the engine twice (Stop is idempotent).
+	root, certDir, id := setupEngineWorkspace(t)
+	cfg := &BEPConfig{
+		Enabled: true, DeviceID: FormatDeviceID(id),
+		ListenPort: 0, CertDir: certDir, Discovery: "static",
 	}
-	// Should not panic on double close.
-	pc.Close()
-	pc.Close()
+	engine, err := NewBEPEngine(root, cfg, NewBEPProvider(root))
+	if err != nil {
+		t.Fatalf("NewBEPEngine: %v", err)
+	}
+	if err := engine.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	engine.Stop()
+	engine.Stop() // idempotent — must not panic
 }
 
 // ─── Model HandleRequest for non-existent file ─────────────────────────────────
@@ -337,4 +345,3 @@ func TestModelLoadAndScanIndex(t *testing.T) {
 		t.Errorf("index.json not persisted: %v", err)
 	}
 }
-
