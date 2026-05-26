@@ -298,6 +298,15 @@ func (s *Server) SetAgentController(ctrl AgentController) {
 	if s.mcpServer != nil {
 		s.mcpServer.SetAgentController(ctrl)
 	}
+	// Phase 2 S4: propagate the dispatcher to the BEP engine if it is already
+	// running (e.g. when SetAgentController is called after Boot). The engine
+	// needs a live AgentDispatcher so it can serve incoming MessageTypeDispatch
+	// from remote peers. No-op when cluster is dark (bepEngine == nil).
+	if s.bepEngine != nil {
+		if d, ok := ctrl.(AgentDispatcher); ok {
+			s.bepEngine.SetDispatcher(d)
+		}
+	}
 	// Piece 2+3: wire dashboard bus into the harness so runCycle drains
 	// pending messages and the respond tool has a publish target. Also bind
 	// the controller to the inlet so incoming messages trigger an immediate
@@ -317,6 +326,17 @@ func (s *Server) SetHarnessBackend(h HarnessAttacher) {
 	s.harnessBackend = h
 	if s.mcpServer != nil {
 		s.mcpServer.SetHarnessBackend(h)
+	}
+}
+
+// SetClusterRouter wires the Phase 2 S4 BEP dispatch router into both the
+// Server and its MCP server so cog_dispatch_to_harness with target_node
+// forwards dispatches to remote peers over the authenticated BEP channel.
+// Called from Boot() after the BEPEngine starts successfully. Nil-safe:
+// when not called, target_node requests return a clear "cluster_disabled" error.
+func (s *Server) SetClusterRouter(r RemoteDispatchRouter) {
+	if s.mcpServer != nil {
+		s.mcpServer.SetClusterRouter(r)
 	}
 }
 

@@ -18,13 +18,15 @@ import (
 type MessageType int32
 
 const (
-	MessageTypeClusterConfig MessageType = 0
-	MessageTypeIndex         MessageType = 1
-	MessageTypeIndexUpdate   MessageType = 2
-	MessageTypeRequest       MessageType = 3
-	MessageTypeResponse      MessageType = 4
-	MessageTypePing          MessageType = 6
-	MessageTypeClose         MessageType = 7
+	MessageTypeClusterConfig  MessageType = 0
+	MessageTypeIndex          MessageType = 1
+	MessageTypeIndexUpdate    MessageType = 2
+	MessageTypeRequest        MessageType = 3
+	MessageTypeResponse       MessageType = 4
+	MessageTypePing           MessageType = 6
+	MessageTypeClose          MessageType = 7
+	MessageTypeDispatch       MessageType = 8 // Phase 2 S4: remote harness dispatch request
+	MessageTypeDispatchResult MessageType = 9 // Phase 2 S4: remote harness dispatch result
 )
 
 type MessageCompression int32

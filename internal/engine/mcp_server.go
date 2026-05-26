@@ -108,6 +108,12 @@ type MCPServer struct {
 	// envelope when IdentityNakedDefault is true (G2 PART C). Nil when not
 	// wired — gates are skipped (permit-by-default). Set via SetCapabilityResolver.
 	capResolver capabilityGater
+
+	// clusterRouter is the Phase 2 S4 BEP dispatch router. Non-nil only when
+	// cluster.enabled=true and the BEPEngine started successfully. When set,
+	// cog_dispatch_to_harness with target_node routed through here instead of
+	// running locally. Set via SetClusterRouter.
+	clusterRouter RemoteDispatchRouter
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
@@ -170,6 +176,15 @@ func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Pro
 // unchanged because the tools resolve the current controller on each call.
 func (m *MCPServer) SetAgentController(ctrl AgentController) {
 	m.agentController = ctrl
+}
+
+// SetClusterRouter wires the Phase 2 S4 BEP dispatch router so that
+// cog_dispatch_to_harness calls with a non-empty target_node are forwarded to
+// the named peer over the authenticated BEP channel. Nil is the default (no
+// cluster transport); the tool returns a clear error when target_node is set
+// but no router is wired.
+func (m *MCPServer) SetClusterRouter(r RemoteDispatchRouter) {
+	m.clusterRouter = r
 }
 
 // SetChannelSessionBackend wires the kernel-owned channel-session minting
@@ -776,6 +791,7 @@ type dispatchToHarnessInput struct {
 	Sub          string                 `json:"sub,omitempty" jsonschema:"OIDC-shaped identity claim: subject (e.g. session id, user handle)."`
 	Aud          string                 `json:"aud,omitempty" jsonschema:"OIDC-shaped identity claim: audience (e.g. \"cogos.kernel\")."`
 	Claims       map[string]interface{} `json:"claims,omitempty" jsonschema:"Free-form OIDC claim bag forwarded to the dispatch's trace metadata."`
+	TargetNode   string                 `json:"target_node,omitempty" jsonschema:"Phase 2 S4: when set, forward this dispatch to the named peer node over the authenticated BEP cluster channel. Requires cluster.enabled=true and the peer to be connected. Empty (default) runs on the local harness."`
 }
 
 // readToolCallsInput mirrors ToolCallQuery for the MCP surface. Time bounds
@@ -1895,8 +1911,9 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 			Aud:    input.Aud,
 			Claims: input.Claims,
 		},
+		TargetNode: input.TargetNode,
 	}
-	result, err := QueryDispatchToHarness(ctx, m.agentController, dr)
+	result, err := QueryDispatchToHarnessRouted(ctx, m.agentController, m.clusterRouter, dr)
 	if err != nil {
 		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/dispatch -d @body.json")
 	}

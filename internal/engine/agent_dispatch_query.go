@@ -84,7 +84,37 @@ func (r *DispatchRequest) Normalize() error {
 // QueryDispatchToHarness wraps an AgentDispatcher with normalization and the
 // "controller installed?" check. Returns ErrAgentUnavailable when the
 // controller is nil or doesn't implement AgentDispatcher.
+//
+// When req.TargetNode is non-empty and a RemoteDispatchRouter is wired (Phase 2
+// S4), the request is forwarded to the named peer over the authenticated BEP
+// channel instead of running locally. Gated on cluster.enabled: when no router
+// is wired and TargetNode is set, the call fails fast with a clear error.
 func QueryDispatchToHarness(ctx context.Context, ctrl AgentController, req DispatchRequest) (*DispatchBatchResult, error) {
+	return QueryDispatchToHarnessRouted(ctx, ctrl, nil, req)
+}
+
+// QueryDispatchToHarnessRouted is the cluster-aware variant used by
+// toolDispatchToHarness (MCPServer) and the HTTP serve_agents path. When
+// router is non-nil and req.TargetNode is non-empty the dispatch is forwarded
+// to the named peer over BEP; otherwise it behaves identically to
+// QueryDispatchToHarness.
+func QueryDispatchToHarnessRouted(ctx context.Context, ctrl AgentController, router RemoteDispatchRouter, req DispatchRequest) (*DispatchBatchResult, error) {
+	// Remote path: TargetNode set + a live cluster router available.
+	if req.TargetNode != "" {
+		if router == nil {
+			return nil, &AgentControllerError{
+				Code:    "cluster_disabled",
+				Message: fmt.Sprintf("target_node=%q requested but cluster transport is not running (cluster.enabled=false or BEP engine not started)", req.TargetNode),
+			}
+		}
+		// Normalize before forwarding so the remote receives a clean request.
+		if err := req.Normalize(); err != nil {
+			return nil, err
+		}
+		return router.RemoteDispatch(ctx, req.TargetNode, req)
+	}
+
+	// Local path — unchanged from before.
 	if ctrl == nil {
 		return nil, ErrAgentUnavailable
 	}

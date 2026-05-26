@@ -104,6 +104,14 @@ type DispatchRequest struct {
 	// Identity propagates OIDC-shaped caller claims for trace metadata.
 	// Optional; see DispatchIdentity for forward-compat notes.
 	Identity DispatchIdentity
+
+	// TargetNode, when non-empty, routes this dispatch to the named peer node
+	// over the authenticated BEP channel instead of running locally. The
+	// remote daemon receives a MessageTypeDispatch, executes the request
+	// against its own harness, and returns a MessageTypeDispatchResult.
+	// Requires cluster.enabled=true and the named peer to be connected.
+	// Empty string (the default) runs locally — unchanged behavior.
+	TargetNode string `json:"target_node,omitempty"`
 }
 
 // DispatchToolCallSummary is the digest of one tool invocation made during a
@@ -182,4 +190,16 @@ type AgentDispatcher interface {
 	// once every slot has either completed, errored, or timed out. The
 	// returned batch is always non-nil when the error is nil.
 	DispatchToHarness(ctx context.Context, req DispatchRequest) (*DispatchBatchResult, error)
+}
+
+// RemoteDispatchRouter is satisfied by BEPEngine (Phase 2 S4). It is the
+// narrow surface QueryDispatchToHarness uses to route a dispatch with a
+// non-empty TargetNode over the authenticated BEP channel to the named peer.
+// Separate from AgentDispatcher so the engine can implement it without
+// becoming an AgentController.
+type RemoteDispatchRouter interface {
+	// RemoteDispatch sends req to the peer named targetNode and blocks until
+	// the result arrives or ctx is cancelled. Returns the batch result or an
+	// AgentControllerError describing the failure.
+	RemoteDispatch(ctx context.Context, targetNode string, req DispatchRequest) (*DispatchBatchResult, error)
 }

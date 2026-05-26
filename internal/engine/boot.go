@@ -368,6 +368,17 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 
 					bepEngineHandle = eng
 					server.bepEngine = eng
+
+					// Phase 2 S4: wire the cluster dispatch router into the
+					// MCP surface so cog_dispatch_to_harness(target_node=...)
+					// routes over BEP. Also wire the local dispatcher into the
+					// engine so it can serve incoming MessageTypeDispatch from
+					// remote peers.
+					server.SetClusterRouter(eng)
+					if ctrl, ok := server.agentController.(AgentDispatcher); ok {
+						eng.SetDispatcher(ctrl)
+					}
+
 					slog.Info("cluster: BEP engine started",
 						"listen_port", clusterCfg.ListenPort,
 						"peers", len(clusterCfg.Peers),
