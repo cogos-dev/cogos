@@ -1,6 +1,9 @@
 package engine
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+)
 
 // registerMCPRoutes mounts the MCP Streamable HTTP handler at /mcp.
 // Explicit method patterns avoid conflicts with the catch-all GET / dashboard route.
@@ -36,7 +39,28 @@ func (s *Server) registerMCPRoutes(mux *http.ServeMux) {
 	}
 	s.mcpServer = mcpSrv
 	h := mcpSrv.Handler()
-	s.routeH(mux, "GET /mcp", h)
+	s.routeH(mux, "GET /mcp", mcpGetHandler(h))
 	s.routeH(mux, "POST /mcp", h)
 	s.routeH(mux, "DELETE /mcp", h)
+}
+
+// mcpGetHandler wraps the MCP streamable-HTTP handler for GET /mcp.
+// A bare GET (no Mcp-Session-Id and Accept does not include text/event-stream)
+// is a browser probe — the MCP SDK returns a cryptic 400 in that case, which
+// reads as "broken" to smoke-test users. Instead return 405 with a one-liner
+// pointing at the JSON-RPC/SSE contract (issue #317).
+// Proper MCP GET requests (SSE stream resume) pass through unchanged.
+func mcpGetHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accept := r.Header.Get("Accept")
+		sessionID := r.Header.Get("Mcp-Session-Id")
+		isMCPStream := strings.Contains(accept, "text/event-stream")
+		if !isMCPStream && sessionID == "" {
+			w.Header().Set("Allow", "POST")
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			http.Error(w, "MCP endpoint: use POST /mcp for JSON-RPC or GET /mcp with Accept: text/event-stream + Mcp-Session-Id for SSE stream.", http.StatusMethodNotAllowed)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

@@ -370,11 +370,19 @@ func fetchModels(t *testing.T, srv *Server) modelsResponse {
 func TestModelsMenu_OrderAndTier(t *testing.T) {
 	t.Parallel()
 
-	srv := newTestServer(t) // no router → no eclipse
+	// Wire a router with both a frontier provider (anthropic) and a local
+	// provider (ollama stub) so all tiers appear. Eclipse is intentionally
+	// absent to keep the assertion list stable.
+	frontierStub := newCloudStub("anthropic", "frontier response")
+	localStub := NewStubProvider("ollama", "local response") // IsLocal = true by default
+	router := NewSimpleRouter(RoutingConfig{Default: "anthropic"})
+	router.RegisterProvider(frontierStub)
+	router.RegisterProvider(localStub)
 
+	srv := newTestServerWithRouter(t, router)
 	resp := fetchModels(t, srv)
 
-	// Must have at least 5 entries (3 aliases + 2 raw ids).
+	// Must have at least 5 entries (2 frontier aliases + 1 local alias + 2 raw ids).
 	if len(resp.Data) < 5 {
 		t.Fatalf("expected >= 5 models, got %d: %+v", len(resp.Data), resp.Data)
 	}
@@ -408,7 +416,14 @@ func TestModelsMenu_OrderAndTier(t *testing.T) {
 func TestModelsMenu_IntentAliasesHaveDescriptions(t *testing.T) {
 	t.Parallel()
 
-	srv := newTestServer(t)
+	// Frontier + local provider so all intent aliases appear.
+	frontierStub := newCloudStub("anthropic", "frontier response")
+	localStub := NewStubProvider("ollama", "local response")
+	router := NewSimpleRouter(RoutingConfig{Default: "anthropic"})
+	router.RegisterProvider(frontierStub)
+	router.RegisterProvider(localStub)
+
+	srv := newTestServerWithRouter(t, router)
 	resp := fetchModels(t, srv)
 
 	byID := make(map[string]modelsResponseModel, len(resp.Data))
@@ -493,19 +508,105 @@ func TestModelsMenu_Object_IsListType(t *testing.T) {
 	}
 }
 
+// ── Availability gating (issue #316) ─────────────────────────────────────────
+
+func TestModelsMenu_FrontierAbsentWhenNoFrontierProvider(t *testing.T) {
+	t.Parallel()
+
+	// Only a local provider — no anthropic/claude-code.
+	localStub := NewStubProvider("ollama", "local response")
+	router := NewSimpleRouter(RoutingConfig{Default: "ollama"})
+	router.RegisterProvider(localStub)
+	srv := newTestServerWithRouter(t, router)
+
+	body, _ := json.Marshal(fetchModels(t, srv))
+
+	for _, id := range []string{"claude-sonnet-4-6", "claude-opus-4-7", "foreground", "deliberation"} {
+		if bytes.Contains(body, []byte(id)) {
+			t.Errorf("%q should NOT appear when no frontier provider is registered; body: %s", id, body)
+		}
+	}
+	// local alias should still appear.
+	if !bytes.Contains(body, []byte("local")) {
+		t.Errorf(`"local" should appear when a local provider is registered; body: %s`, body)
+	}
+}
+
+func TestModelsMenu_LocalAbsentWhenNoLocalProvider(t *testing.T) {
+	t.Parallel()
+
+	// Only a frontier provider — no local backend.
+	frontierStub := newCloudStub("anthropic", "frontier response")
+	router := NewSimpleRouter(RoutingConfig{Default: "anthropic"})
+	router.RegisterProvider(frontierStub)
+	srv := newTestServerWithRouter(t, router)
+
+	body, _ := json.Marshal(fetchModels(t, srv))
+
+	if bytes.Contains(body, []byte(`"local"`)) {
+		t.Errorf(`"local" model should NOT appear when no local provider is registered; body: %s`, body)
+	}
+	// Frontier entries should still appear.
+	for _, id := range []string{"claude-sonnet-4-6", "claude-opus-4-7", "foreground", "deliberation"} {
+		if !bytes.Contains(body, []byte(id)) {
+			t.Errorf("%q should appear when frontier provider is registered; body: %s", id, body)
+		}
+	}
+}
+
+func TestModelsMenu_EmptyWhenNoRouter(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServer(t) // no router at all
+	resp := fetchModels(t, srv)
+
+	if len(resp.Data) != 0 {
+		ids := make([]string, len(resp.Data))
+		for i, m := range resp.Data {
+			ids[i] = m.ID
+		}
+		t.Errorf("expected empty model list when no providers are configured; got %v", ids)
+	}
+}
+
 // TestModelsMenu_AliasesMatchResolver verifies that every static intent alias
 // in the /v1/models menu is also known to ResolveModelRequest (alias coherence).
-// "local" is router-dynamic (requires FirstLocalProvider walk) so it is checked
-// with a stub router rather than nil; "eclipse-26b" is hardware-gated and absent
-// from the static alias table by design.
+// The server router must advertise the aliases in the first place: with
+// availability gating (issue #316) handleModels emits nothing when no provider
+// is registered, so frontier + local stubs are wired so the menu is non-empty
+// and the test actually exercises alias↔resolver coherence (not vacuously).
+// "local" is router-dynamic (requires FirstLocalProvider walk); "eclipse-26b"
+// is hardware-gated and absent from the static alias table by design.
 func TestModelsMenu_AliasesMatchResolver(t *testing.T) {
 	t.Parallel()
 
-	srv := newTestServer(t)
+	// Frontier + local provider so the full cogos-owned alias set is advertised.
+	frontierStub := newCloudStub("anthropic", "frontier response")
+	localStub := NewStubProvider("ollama", "local response")
+	router := NewSimpleRouter(RoutingConfig{Default: "anthropic"})
+	router.RegisterProvider(frontierStub)
+	router.RegisterProvider(localStub)
+
+	srv := newTestServerWithRouter(t, router)
 	resp := fetchModels(t, srv)
 
-	// Build a minimal router that covers the "local" alias (ollama present).
-	r := newStubRouter().addProvider("ollama", "", true)
+	// Guard against vacuous pass: the menu must contain the cogos-owned aliases.
+	var cogosAliases int
+	for _, m := range resp.Data {
+		if m.OwnedBy == "cogos" && m.ID != "eclipse-26b" {
+			cogosAliases++
+		}
+	}
+	if cogosAliases == 0 {
+		t.Fatal("no cogos-owned aliases in /v1/models; test would pass vacuously")
+	}
+
+	// Build a minimal router that covers every alias the resolver maps:
+	// the "local" alias (ollama present, IsLocal) plus the frontier-managed
+	// claude aliases routed through the claude-code provider.
+	r := newStubRouter().
+		addProvider("ollama", "", true).
+		addProvider("claude-code", "", false)
 
 	for _, m := range resp.Data {
 		if m.OwnedBy != "cogos" {
