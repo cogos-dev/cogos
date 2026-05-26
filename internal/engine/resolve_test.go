@@ -571,17 +571,42 @@ func TestModelsMenu_EmptyWhenNoRouter(t *testing.T) {
 
 // TestModelsMenu_AliasesMatchResolver verifies that every static intent alias
 // in the /v1/models menu is also known to ResolveModelRequest (alias coherence).
-// "local" is router-dynamic (requires FirstLocalProvider walk) so it is checked
-// with a stub router rather than nil; "eclipse-26b" is hardware-gated and absent
-// from the static alias table by design.
+// The server router must advertise the aliases in the first place: with
+// availability gating (issue #316) handleModels emits nothing when no provider
+// is registered, so frontier + local stubs are wired so the menu is non-empty
+// and the test actually exercises alias↔resolver coherence (not vacuously).
+// "local" is router-dynamic (requires FirstLocalProvider walk); "eclipse-26b"
+// is hardware-gated and absent from the static alias table by design.
 func TestModelsMenu_AliasesMatchResolver(t *testing.T) {
 	t.Parallel()
 
-	srv := newTestServer(t)
+	// Frontier + local provider so the full cogos-owned alias set is advertised.
+	frontierStub := newCloudStub("anthropic", "frontier response")
+	localStub := NewStubProvider("ollama", "local response")
+	router := NewSimpleRouter(RoutingConfig{Default: "anthropic"})
+	router.RegisterProvider(frontierStub)
+	router.RegisterProvider(localStub)
+
+	srv := newTestServerWithRouter(t, router)
 	resp := fetchModels(t, srv)
 
-	// Build a minimal router that covers the "local" alias (ollama present).
-	r := newStubRouter().addProvider("ollama", "", true)
+	// Guard against vacuous pass: the menu must contain the cogos-owned aliases.
+	var cogosAliases int
+	for _, m := range resp.Data {
+		if m.OwnedBy == "cogos" && m.ID != "eclipse-26b" {
+			cogosAliases++
+		}
+	}
+	if cogosAliases == 0 {
+		t.Fatal("no cogos-owned aliases in /v1/models; test would pass vacuously")
+	}
+
+	// Build a minimal router that covers every alias the resolver maps:
+	// the "local" alias (ollama present, IsLocal) plus the frontier-managed
+	// claude aliases routed through the claude-code provider.
+	r := newStubRouter().
+		addProvider("ollama", "", true).
+		addProvider("claude-code", "", false)
 
 	for _, m := range resp.Data {
 		if m.OwnedBy != "cogos" {

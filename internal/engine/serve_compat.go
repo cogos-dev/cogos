@@ -246,6 +246,12 @@ func isEclipseConfigured(router Router) bool {
 // that can serve frontier (Anthropic/Claude) models. Checks by canonical
 // provider names ("anthropic", "claude-code") and by representative model IDs.
 // Fast: in-memory lookups only, no network I/O.
+//
+// Known tradeoff: this only matches the canonical provider names plus the two
+// representative model IDs. A frontier provider registered under a non-standard
+// name (and not serving either representative model string) would be hidden
+// from the /v1/models menu. Acceptable: the default config and docs use the
+// canonical names; extend the name list here if a new alias is introduced.
 func isFrontierConfigured(router Router) bool {
 	if router == nil {
 		return false
