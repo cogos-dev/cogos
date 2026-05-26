@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -438,7 +439,14 @@ func TestComputePlanServiceNotRunning(t *testing.T) {
 
 // TestBuildRouterRegistersMLXSupervisedType: when providers.yaml declares a
 // type=mlx-supervised entry, BuildRouter registers an MLXSupervisedProvider.
+//
+// mlx-supervised requires Apple Metal; BuildRouter's makeProvider gate
+// (router.go, case mlxSupervisedType) skips it on non-darwin platforms. The
+// registration assertions below therefore only hold on darwin.
 func TestBuildRouterRegistersMLXSupervisedType(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("mlx-supervised only registers on darwin")
+	}
 	t.Parallel()
 	root := makeWorkspace(t)
 	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `

@@ -32,6 +32,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -265,11 +266,19 @@ func (r *WorktreeReconciler) LoadConfig(workspaceRoot string) (any, error) {
 
 // FetchLive runs `git worktree list --porcelain` against the repo root and
 // queries per-worktree git state. Read-only.
+//
+// When git is absent (nil, nil from ListWorktrees) FetchLive returns an empty
+// slice so the reconcile cycle proceeds to ComputePlan with no worktrees — no
+// WARN, no drift, clean first-boot behaviour on machines without git.
 func (r *WorktreeReconciler) FetchLive(ctx context.Context, _ any) (any, error) {
 	live, err := r.GitAdapter.ListWorktrees(ctx, r.RepoRoot)
 	if err != nil {
 		r.setHealth(reconcile.SyncStatusUnknown, reconcile.HealthDegraded, fmt.Sprintf("git list: %v", err))
 		return nil, fmt.Errorf("worktree-reconciler: git list: %w", err)
+	}
+	if live == nil {
+		// git not on PATH; treat as empty worktree set.
+		return []LiveWorktree{}, nil
 	}
 	return live, nil
 }
@@ -718,6 +727,14 @@ type CLIGitAdapter struct{}
 func NewCLIGitAdapter() *CLIGitAdapter { return &CLIGitAdapter{} }
 
 func (a *CLIGitAdapter) ListWorktrees(ctx context.Context, repoRoot string) ([]LiveWorktree, error) {
+	// Check that git is available before attempting the worktree list. On
+	// Windows fresh installs git is frequently absent; missing git is not an
+	// error condition — it just means no worktrees to manage.
+	if _, err := exec.LookPath("git"); err != nil {
+		slog.Debug("worktree-reconciler: git not on PATH, skipping worktree list")
+		return nil, nil
+	}
+
 	cmd := exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain")
 	cmd.Dir = repoRoot
 	out, err := cmd.Output()

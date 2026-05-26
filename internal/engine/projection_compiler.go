@@ -225,6 +225,10 @@ func (c *ProjectionCompiler) Type() string { return CompilerType }
 
 // LoadConfig resolves the source directory, cogblock.py path, and state
 // path from the workspace root. Read-only disk operation.
+//
+// When cogblock.py is absent (fresh install, Windows, Python not set up),
+// LoadConfig logs at DEBUG and returns a nil config so the reconcile cycle
+// exits with "no drift" rather than WARNing on every tick.
 func (c *ProjectionCompiler) LoadConfig(root string) (any, error) {
 	cfg := &CompilerConfig{
 		SourceDir:    filepath.Join(root, ".cog", "mem", "reflective"),
@@ -232,9 +236,17 @@ func (c *ProjectionCompiler) LoadConfig(root string) (any, error) {
 		StatePath:    filepath.Join(root, ".cog", "state", "projection-compiler.json"),
 	}
 	if _, err := os.Stat(cfg.SourceDir); err != nil {
+		if os.IsNotExist(err) {
+			slog.Debug("projection-compiler: source dir absent, skipping", "dir", cfg.SourceDir)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("source dir: %w", err)
 	}
 	if _, err := os.Stat(cfg.CogblockPath); err != nil {
+		if os.IsNotExist(err) {
+			slog.Debug("projection-compiler: cogblock.py absent, skipping", "path", cfg.CogblockPath)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("cogblock.py at %s: %w", cfg.CogblockPath, err)
 	}
 	return cfg, nil
@@ -253,6 +265,10 @@ func resolveCogblockPath(root string) string {
 // each .cog.md file via cogblock.py, and returns the in-memory sourceCogdoc
 // slice. Read-only against source files.
 func (c *ProjectionCompiler) FetchLive(ctx context.Context, config any) (any, error) {
+	// nil config means cogblock.py or source dir is absent — skip silently.
+	if config == nil {
+		return []*sourceCogdoc{}, nil
+	}
 	cfg, ok := config.(*CompilerConfig)
 	if !ok {
 		return nil, fmt.Errorf("projection-compiler: unexpected config type %T", config)
@@ -360,6 +376,10 @@ func deriveSlug(path string, fm map[string]any) string {
 // block list from the same live snapshot (passed through plan.Metadata) to
 // emit events deterministically.
 func (c *ProjectionCompiler) ComputePlan(config any, live any, _ *reconcile.State) (*reconcile.Plan, error) {
+	// nil config means cogblock.py / source dir absent — nothing to compile.
+	if config == nil {
+		return &reconcile.Plan{ResourceType: c.Type()}, nil
+	}
 	cfg := config.(*CompilerConfig)
 	docs, ok := live.([]*sourceCogdoc)
 	if !ok {
@@ -570,6 +590,10 @@ func buildEventFromAction(action reconcile.Action) (projection.Event, error) {
 // BuildState constructs the reconcile.State snapshot. One Resource per
 // extracted block: address = source URI, external_id = content_hash.
 func (c *ProjectionCompiler) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
+	// nil config means cogblock.py / source dir absent — return empty state.
+	if config == nil {
+		return reconcile.NewState(c.Type()), nil
+	}
 	cfg, ok := config.(*CompilerConfig)
 	if !ok {
 		return nil, fmt.Errorf("projection-compiler: unexpected config type %T", config)

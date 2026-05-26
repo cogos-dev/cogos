@@ -33,6 +33,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -170,15 +171,23 @@ func (r *ProjectionReconciler) Type() string {
 
 // LoadConfig discovers the nodes/ directory from the workspace root and
 // returns a ProjectionConfig. This is a read-only disk operation.
+//
+// When the lineage nodes directory does not yet exist (fresh install, or
+// workspace pre-dating the lineage observatory), LoadConfig logs at DEBUG
+// and returns nil so the reconcile cycle exits cleanly with no drift rather
+// than WARNing on every tick. The directory is created by `cogos init` once
+// the user opts into the lineage corpus.
 func (r *ProjectionReconciler) LoadConfig(root string) (any, error) {
 	lineageBase := filepath.Join(root, ".cog", "mem", "semantic", "lineage")
 	nodesDir := filepath.Join(lineageBase, "nodes")
 	projDir := filepath.Join(lineageBase, "projections")
 
-	// Verify nodes directory exists; create projections dir if needed.
+	// Verify nodes directory exists; skip quietly if absent.
 	if _, err := os.Stat(nodesDir); err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("lineage nodes directory not found at %s", nodesDir)
+			slog.Debug("lineage-projection: nodes dir absent, skipping",
+				"kind", r.kind, "dir", nodesDir)
+			return nil, nil
 		}
 		return nil, fmt.Errorf("stat nodes dir: %w", err)
 	}
@@ -196,6 +205,10 @@ func (r *ProjectionReconciler) LoadConfig(root string) (any, error) {
 // FetchLive reads all .cog.md files from the nodes/ directory and parses
 // their frontmatter. This is a read-only observation of the world.
 func (r *ProjectionReconciler) FetchLive(ctx context.Context, config any) (any, error) {
+	// nil config means nodes dir absent — nothing to observe.
+	if config == nil {
+		return []LineageNode{}, nil
+	}
 	cfg, ok := config.(*ProjectionConfig)
 	if !ok {
 		return nil, fmt.Errorf("projection reconciler: unexpected config type %T", config)
@@ -251,6 +264,10 @@ func (r *ProjectionReconciler) FetchLive(ctx context.Context, config any) (any, 
 //
 // This is a pure function: deterministic given (config, live, state).
 func (r *ProjectionReconciler) ComputePlan(config any, live any, state *reconcile.State) (*reconcile.Plan, error) {
+	// nil config means nodes dir absent — nothing to project.
+	if config == nil {
+		return &reconcile.Plan{ResourceType: r.Type()}, nil
+	}
 	cfg := config.(*ProjectionConfig)
 	nodes := live.([]LineageNode)
 
@@ -419,6 +436,10 @@ func (r *ProjectionReconciler) ApplyPlan(ctx context.Context, plan *reconcile.Pl
 // BuildState constructs the reconciler state from live data.
 // Pure function — no side effects.
 func (r *ProjectionReconciler) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
+	// nil config means nodes dir absent — return empty state.
+	if config == nil {
+		return reconcile.NewState(r.Type()), nil
+	}
 	nodes := live.([]LineageNode)
 	cfg := config.(*ProjectionConfig)
 
