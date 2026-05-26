@@ -34,6 +34,7 @@ import (
 	"net"
 	"time"
 
+	bep "github.com/myrgic/cogos/pkg/substrate/bep"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
@@ -94,6 +95,11 @@ type Kernel struct {
 	serverDone      chan error
 	processDone     chan error
 	shutdownTelemetry func(context.Context)
+
+	// bepEngine is non-nil only when cluster.enabled=true and the engine
+	// started successfully. Dark by default: when cluster.enabled=false this
+	// field is nil and no BEP goroutines, listeners, or port binds occur.
+	bepEngine *BEPEngine
 }
 
 // Endpoint returns the base URL of the kernel's HTTP server,
@@ -112,6 +118,14 @@ func (k *Kernel) WorkspaceRoot() string {
 // The daemon is already running when Boot returns.
 func (k *Kernel) ReconcileDaemon() *ReconcileDaemon {
 	return k.reconcileDaemon
+}
+
+// BEPEngine returns the running BEPEngine handle, or nil when
+// cluster.enabled=false (the default). Callers that need to inspect peer
+// status or inject test events can use this handle; nil means the cluster
+// subsystem is dark and no BEP activity of any kind is occurring.
+func (k *Kernel) BEPEngine() *BEPEngine {
+	return k.bepEngine
 }
 
 // Stop cancels the kernel's context and waits for all goroutines to exit
@@ -136,6 +150,11 @@ func (k *Kernel) Stop() error {
 
 	if k.shutdownTelemetry != nil {
 		k.shutdownTelemetry(context.Background())
+	}
+
+	// Shut down BEP engine if it was started (cluster.enabled=true path).
+	if k.bepEngine != nil {
+		k.bepEngine.Stop()
 	}
 
 	return nil
@@ -274,6 +293,59 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		}
 	}()
 
+	// ── BEP cluster engine (Phase 2 S2) ─────────────────────────────────────
+	// Dark by default: only started when cluster.enabled=true.
+	// This mirrors the IdentityNakedDefault dark-flag pattern: with the
+	// shipped default (enabled=false) there is ZERO observable difference
+	// from the pre-S2 binary — no listener, no goroutines, no port bind.
+	var bepEngineHandle *BEPEngine
+	{
+		provider := NewBEPProvider(cfg.WorkspaceRoot)
+		clusterCfg, cfgErr := provider.LoadConfig()
+		if cfgErr != nil {
+			slog.Warn("cluster: failed to load cluster.yaml; BEP engine not started",
+				"err", cfgErr)
+		} else if clusterCfg.Enabled {
+			eng, engErr := NewBEPEngine(cfg.WorkspaceRoot, clusterCfg, provider)
+			if engErr != nil {
+				// Missing cert or other construction failure: log clearly and
+				// continue booting. The kernel is still fully functional without BEP.
+				slog.Error("cluster: BEPEngine construction failed; cluster transport disabled",
+					"err", engErr)
+			} else {
+				// Wire SyncEvents to the kernel's event bus so that peer
+				// connect/disconnect and file-sync events land in the ledger.
+				if server.busSessions != nil {
+					eng.SetEventCallback(func(evt bep.SyncEvent) {
+						_, _ = server.busSessions.AppendEvent(
+							"bus_cluster",
+							"cluster.sync."+evt.Type,
+							"bep-engine",
+							map[string]interface{}{
+								"summary":   evt.Summary,
+								"timestamp": evt.Timestamp,
+							},
+						)
+					})
+				}
+				if startErr := eng.Start(); startErr != nil {
+					// Start failure (e.g. port already in use): log and continue.
+					slog.Error("cluster: BEPEngine.Start failed; cluster transport disabled",
+						"err", startErr)
+				} else {
+					bepEngineHandle = eng
+					server.bepEngine = eng
+					slog.Info("cluster: BEP engine started",
+						"listen_port", clusterCfg.ListenPort,
+						"peers", len(clusterCfg.Peers),
+					)
+				}
+			}
+		} else {
+			slog.Debug("cluster: cluster.enabled=false; BEP engine not started (dark by default)")
+		}
+	}
+
 	k := &Kernel{
 		cfg:               cfg,
 		server:            server,
@@ -284,6 +356,7 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		serverDone:        serverDone,
 		processDone:       processDone,
 		shutdownTelemetry: shutdownTelemetry,
+		bepEngine:         bepEngineHandle,
 	}
 
 	slog.Info("kernel booted", "endpoint", httpEndpoint, "workspace", cfg.WorkspaceRoot)
