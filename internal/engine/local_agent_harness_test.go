@@ -887,3 +887,302 @@ routing:
 		t.Errorf("max concurrent Ollama /api/chat = %d; want <= 1 (typeless ollama provider should still hold ollamaMu)", got)
 	}
 }
+
+// TestDispatchToHarness_HarnessProvider_ResolvesNamedProvider verifies that
+// when req.Provider is empty, req.Model resolves to nothing, no
+// process_state_routing entry matches, and cfg.HarnessProvider names a provider,
+// DispatchToHarness routes to that named provider instead of probing Ollama.
+//
+// This is the core behaviour for cross-node dispatch: a BEP-received remote
+// dispatch arrives with empty Provider and is resolved using the EXECUTING
+// node's harness_provider (e.g. eclipse -> lmstudio), not the legacy probe.
+func TestDispatchToHarness_HarnessProvider_ResolvesNamedProvider(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	// Stand up an openai-compat stub (simulates the lmstudio endpoint).
+	var lmsCalled atomic.Bool
+	lmsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			lmsCalled.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":      "chatcmpl-test",
+				"object":  "chat.completion",
+				"model":   "gemma-4-e4b",
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "lmstudio response"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+			})
+		default:
+			t.Errorf("lmsSrv: unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer lmsSrv.Close()
+
+	// No process_state_routing — only a named provider "lmstudio".
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  lmstudio:
+    type: openai
+    endpoint: `+lmsSrv.URL+`
+    model: gemma-4-e4b
+routing:
+  default: lmstudio
+`)
+
+	// Point the legacy Ollama probe at a dead address so that if the resolution
+	// chain wrongly falls through to Path 3, the test fails loudly (or at least
+	// does not hit lmstudio). HarnessProvider must take precedence.
+	t.Setenv(localLLMEndpointEnv, "http://127.0.0.1:1")
+
+	cfg.HarnessProvider = "lmstudio"
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "harness-provider default test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+
+	if !lmsCalled.Load() {
+		t.Errorf("lmstudio endpoint was NOT called; expected harness_provider to route there instead of the legacy Ollama probe")
+	}
+	if len(batch.Results) != 1 {
+		t.Fatalf("batch.Results len = %d; want 1", len(batch.Results))
+	}
+	if got := batch.Results[0].ProviderUsed; got != "lmstudio" {
+		t.Errorf("ProviderUsed = %q; want \"lmstudio\" (harness_provider path)", got)
+	}
+}
+
+// TestDispatchToHarness_HarnessProvider_ExplicitProviderWins verifies that an
+// explicit req.Provider takes precedence over cfg.HarnessProvider.
+func TestDispatchToHarness_HarnessProvider_ExplicitProviderWins(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var explicitCalled atomic.Bool
+	var harnessCalled atomic.Bool
+
+	explicitSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			explicitCalled.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "chatcmpl-test", "object": "chat.completion", "model": "gemma-4-e4b",
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "explicit"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer explicitSrv.Close()
+
+	harnessSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			harnessCalled.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "chatcmpl-test", "object": "chat.completion", "model": "gemma-4-e4b",
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "harness"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer harnessSrv.Close()
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  explicit-provider:
+    type: openai
+    endpoint: `+explicitSrv.URL+`
+    model: gemma-4-e4b
+  lmstudio:
+    type: openai
+    endpoint: `+harnessSrv.URL+`
+    model: gemma-4-e4b
+routing:
+  default: lmstudio
+`)
+
+	cfg.HarnessProvider = "lmstudio"
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	_, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "explicit-wins test",
+		Provider:       "explicit-provider",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+
+	if !explicitCalled.Load() {
+		t.Errorf("explicit-provider endpoint was NOT called; explicit req.Provider must win over harness_provider")
+	}
+	if harnessCalled.Load() {
+		t.Errorf("harness_provider endpoint WAS called; explicit req.Provider should have taken precedence")
+	}
+}
+
+// TestDispatchToHarness_HarnessProvider_StateRoutingWins verifies that when a
+// process_state_routing entry matches the current state, it takes precedence
+// over cfg.HarnessProvider (state routing is Path 2, harness_provider is the
+// Path 2.5 fallback above the legacy probe).
+func TestDispatchToHarness_HarnessProvider_StateRoutingWins(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var stateCalled atomic.Bool
+	var harnessCalled atomic.Bool
+
+	stateSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			stateCalled.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "chatcmpl-test", "object": "chat.completion", "model": "gemma-4-e4b",
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "state"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer stateSrv.Close()
+
+	harnessSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			harnessCalled.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "chatcmpl-test", "object": "chat.completion", "model": "gemma-4-e4b",
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "harness"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer harnessSrv.Close()
+
+	// receptive -> state-provider via process_state_routing. lmstudio is the
+	// harness_provider fallback that must NOT fire because state routing matched.
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  state-provider:
+    type: openai
+    endpoint: `+stateSrv.URL+`
+    model: gemma-4-e4b
+  lmstudio:
+    type: openai
+    endpoint: `+harnessSrv.URL+`
+    model: gemma-4-e4b
+routing:
+  process_state_routing:
+    receptive: state-provider
+`)
+
+	cfg.HarnessProvider = "lmstudio"
+
+	// NewProcess starts in StateReceptive — matches the routing entry.
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	if got := proc.State().String(); got != "receptive" {
+		t.Fatalf("process initial state = %q; want receptive", got)
+	}
+
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	_, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "state-routing-wins test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+
+	if !stateCalled.Load() {
+		t.Errorf("state-provider endpoint was NOT called; process_state_routing must win over harness_provider")
+	}
+	if harnessCalled.Load() {
+		t.Errorf("harness_provider endpoint WAS called; process_state_routing should have taken precedence")
+	}
+}
+
+// TestDispatchToHarness_EmptyHarnessProvider_FallsBackToLegacy verifies that
+// when cfg.HarnessProvider is empty, dispatch falls through to the legacy
+// Ollama probe path (unchanged behaviour).
+func TestDispatchToHarness_EmptyHarnessProvider_FallsBackToLegacy(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	// HarnessProvider intentionally left empty.
+
+	var ollamaCalled atomic.Bool
+	ollamaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			ollamaCalled.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"models": []map[string]any{{"name": "gemma4:e4b"}},
+			})
+		case "/api/chat":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]any{"role": "assistant", "content": "ollama fallback"},
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
+			})
+		}
+	}))
+	defer ollamaSrv.Close()
+	t.Setenv(localLLMEndpointEnv, ollamaSrv.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	_, _ = ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "empty-harness-provider legacy test",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+
+	if !ollamaCalled.Load() {
+		t.Errorf("Ollama /api/tags was NOT called; empty harness_provider should fall back to the legacy probe path")
+	}
+}
