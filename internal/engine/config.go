@@ -155,6 +155,12 @@ type Config struct {
 
 	LocalModel string
 
+	// HarnessProvider, when non-empty, names a provider from providers(.local).yaml
+	// that the harness uses for inference. Takes precedence over the legacy
+	// local_model + detectLocalLLMTarget (Ollama) probe. When empty, the harness
+	// falls back to the current Ollama-probe path.
+	HarnessProvider string
+
 	localModelConfigured bool
 
 	// IdentityNakedDefault controls per-session identity embedding at the
@@ -194,6 +200,7 @@ type kernelConfigSection struct {
 	EnableServiceControl  *bool             `yaml:"enable_service_control"`
 	IdentityNakedDefault  *bool             `yaml:"identity_naked_default,omitempty"`
 	LocalModel            string            `yaml:"local_model"`
+	HarnessProvider       string            `yaml:"harness_provider"`
 	DigestPaths           map[string]string `yaml:"digest_paths"`
 	KernelLogPath         string            `yaml:"kernel_log_path"`
 	Mod3URL               string            `yaml:"mod3_url"`
@@ -339,6 +346,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.LocalModel != "" {
 		cfg.LocalModel = s.LocalModel
 		cfg.localModelConfigured = true
+	}
+	if s.HarnessProvider != "" {
+		cfg.HarnessProvider = s.HarnessProvider
 	}
 	if len(s.DigestPaths) > 0 {
 		if cfg.DigestPaths == nil {

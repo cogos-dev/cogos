@@ -1913,6 +1913,15 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 		},
 		TargetNode: input.TargetNode,
 	}
+	// Apply harness_provider default: when the caller did not supply an explicit
+	// provider and cfg.HarnessProvider is set, use it as the default. This routes
+	// the harness to the named provider (e.g. "lmstudio") instead of falling
+	// through to the legacy Ollama :11434 probe — critical for cross-node dispatch
+	// to nodes where Ollama is absent. Explicit provider= on the request always
+	// wins; empty HarnessProvider leaves the legacy probe path unchanged.
+	if dr.Provider == "" && m.cfg != nil && m.cfg.HarnessProvider != "" {
+		dr.Provider = m.cfg.HarnessProvider
+	}
 	result, err := QueryDispatchToHarnessRouted(ctx, m.agentController, m.clusterRouter, dr)
 	if err != nil {
 		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/dispatch -d @body.json")
