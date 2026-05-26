@@ -10,12 +10,28 @@ make build && ./cogos serve --workspace ~/my-project
 Or install a pre-built binary:
 
 ```sh
-# macOS Apple Silicon (latest release)
+# macOS Apple Silicon
 curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
 chmod +x cogos && mv cogos ~/.cog/bin/cogos
 ```
 
-For Linux, Windows, and other architectures, see [docs/RELEASING.md](docs/RELEASING.md).
+```sh
+# Linux amd64
+curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
+chmod +x cogos && mv cogos ~/.cog/bin/cogos
+```
+
+```powershell
+# Windows amd64 (PowerShell)
+$dest = "$HOME\.cog\bin"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Invoke-WebRequest -Uri https://github.com/myrgic/cogos/releases/latest/download/cogos-windows-amd64.exe `
+    -OutFile "$dest\cogos.exe"
+Unblock-File "$dest\cogos.exe"
+# Add $dest to your PATH if it isn't already
+```
+
+Other architectures (linux/arm64, darwin/amd64 for Intel Macs) are available on the [Releases page](https://github.com/myrgic/cogos/releases/latest).
 
 ---
 
@@ -371,6 +387,28 @@ make e2e          # Build + run full cold-start test in a container
 ```
 
 A Docker Compose topology with `bridge-{primary,secondary}` and `tailscale-{primary,secondary}` siblings landed in #19.
+
+---
+
+## Logs and troubleshooting
+
+The kernel writes structured logs (JSON, one record per line) to:
+
+```
+<workspace>/.cog/run/kernel.log.jsonl
+```
+
+Quick tail:
+
+```sh
+# Unix
+tail -f /your/workspace/.cog/run/kernel.log.jsonl | jq -c .
+
+# Windows (PowerShell)
+Get-Content "$HOME\my-project\.cog\run\kernel.log.jsonl" -Wait | ForEach-Object { $_ | ConvertFrom-Json }
+```
+
+The same log is exposed over MCP (`cog_tail_kernel_log`) and HTTP (`GET /v1/kernel-log`) so any connected tool can read it without touching the file directly.
 
 ---
 
