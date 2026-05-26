@@ -52,6 +52,9 @@ type BEPEngine struct {
 	stopCh  chan struct{}
 	stopped bool
 	wg      sync.WaitGroup
+
+	// Phase 2 S4: remote dispatch over BEP (see bep_dispatch.go).
+	dispatchFields
 }
 
 // PeerConnection represents an active connection to a peer node.
@@ -115,6 +118,9 @@ func NewBEPEngine(root string, config *bep.Config, provider *BEPProvider) (*BEPE
 		provider:  provider,
 		peers:     make(map[bep.DeviceID]*PeerConnection),
 		stopCh:    make(chan struct{}),
+		dispatchFields: dispatchFields{
+			inflight: make(map[uint32]*dispatchInFlight),
+		},
 	}
 
 	// Create sync model.
@@ -518,6 +524,23 @@ func (e *BEPEngine) runPeerLoop(pc *PeerConnection, peerID bep.DeviceID) {
 					log.Printf("[bep-engine] pong to %s failed: %v", peerShort, err)
 					return
 				}
+
+			case bep.MessageTypeDispatch:
+				// Phase 2 S4: incoming remote dispatch request — run locally
+				// and send the result back to the peer. Runs in a goroutine so
+				// the peer loop is never blocked while a dispatch executes.
+				capturedPc := pc
+				capturedPayload := msg.payload
+				e.wg.Add(1)
+				go func() {
+					defer e.wg.Done()
+					e.handleDispatchMessage(capturedPc, capturedPayload)
+				}()
+
+			case bep.MessageTypeDispatchResult:
+				// Phase 2 S4: incoming result for a locally-initiated remote
+				// dispatch — deliver to the waiting RemoteDispatch caller.
+				e.handleDispatchResultMessage(msg.payload)
 
 			case bep.MessageTypeClose:
 				cl := &bep.Close{}
