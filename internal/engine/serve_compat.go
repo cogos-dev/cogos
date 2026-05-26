@@ -182,23 +182,35 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Determine whether the eclipse provider is configured. We check the live
-	// router (no I/O — ProviderForName / ProviderForModel are in-memory map
-	// lookups). eclipse-26b is only advertised when an eclipse or lmstudio
-	// provider is registered, so the menu stays accurate without probing.
+	// Gate every entry on real provider availability. All checks are in-memory
+	// map lookups (no I/O) — same pattern as isEclipseConfigured.
+	frontierConfigured := isFrontierConfigured(s.router)
+	localConfigured := isLocalConfigured(s.router)
 	eclipseConfigured := isEclipseConfigured(s.router)
 
-	data := []model{
-		// Intent aliases — always present.
-		mkModel("foreground", "cogos", "frontier-managed",
-			"interactive, full capability (managed Claude, Max sub)"),
-		mkModel("deliberation", "cogos", "frontier-managed",
-			"heavier reasoning (Opus)"),
-		mkModel("local", "cogos", "local-sovereign",
-			"private, no egress (E4B on this node)"),
+	var data []model
+	if frontierConfigured {
+		// Intent aliases for frontier-managed tiers.
+		data = append(data,
+			mkModel("foreground", "cogos", "frontier-managed",
+				"interactive, full capability (managed Claude, Max sub)"),
+			mkModel("deliberation", "cogos", "frontier-managed",
+				"heavier reasoning (Opus)"),
+		)
+	}
+	if localConfigured {
+		// Intent alias for the local-sovereign tier.
+		data = append(data,
+			mkModel("local", "cogos", "local-sovereign",
+				"private, no egress (E4B on this node)"),
+		)
+	}
+	if frontierConfigured {
 		// Raw frontier model IDs.
-		mkModel("claude-sonnet-4-6", "anthropic", "frontier-managed", ""),
-		mkModel("claude-opus-4-7", "anthropic", "frontier-managed", ""),
+		data = append(data,
+			mkModel("claude-sonnet-4-6", "anthropic", "frontier-managed", ""),
+			mkModel("claude-opus-4-7", "anthropic", "frontier-managed", ""),
+		)
 	}
 	if eclipseConfigured {
 		data = append(data,
@@ -227,6 +239,38 @@ func isEclipseConfigured(router Router) bool {
 		}
 	}
 	_, ok := router.ProviderForModel("eclipse-26b")
+	return ok
+}
+
+// isFrontierConfigured returns true when the router has a registered provider
+// that can serve frontier (Anthropic/Claude) models. Checks by canonical
+// provider names ("anthropic", "claude-code") and by representative model IDs.
+// Fast: in-memory lookups only, no network I/O.
+func isFrontierConfigured(router Router) bool {
+	if router == nil {
+		return false
+	}
+	for _, name := range []string{"anthropic", "claude-code"} {
+		if _, ok := router.ProviderForName(name); ok {
+			return true
+		}
+	}
+	for _, model := range []string{"claude-sonnet-4-6", "claude-opus-4-7"} {
+		if _, ok := router.ProviderForModel(model); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// isLocalConfigured returns true when the router has at least one registered
+// provider whose Capabilities().IsLocal is true. Uses FirstLocalProvider so
+// the check requires no concrete type assertion. Fast: in-memory lookup only.
+func isLocalConfigured(router Router) bool {
+	if router == nil {
+		return false
+	}
+	_, ok := router.FirstLocalProvider()
 	return ok
 }
 

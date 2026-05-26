@@ -180,7 +180,11 @@ func TestModelLocal_FallsThroughWhenNoLocalProvider(t *testing.T) {
 func TestModelsEndpoint_AdvertisesOpus47(t *testing.T) {
 	t.Parallel()
 
-	srv := newTestServer(t)
+	// Wire a frontier provider so the claude-* entries appear (gated on availability).
+	frontierStub := newCloudStub("anthropic", "frontier response")
+	router := NewSimpleRouter(RoutingConfig{Default: "anthropic"})
+	router.RegisterProvider(frontierStub)
+	srv := newTestServerWithRouter(t, router)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	w := httptest.NewRecorder()
