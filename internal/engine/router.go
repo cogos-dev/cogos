@@ -15,8 +15,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -546,6 +548,14 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 	case "stub":
 		return NewStubProvider(name, "stub response"), nil
 	case mlxSupervisedType:
+		// mlx-supervised requires Apple Metal (macOS only). On any other OS,
+		// skip the provider rather than registering a dead driver — mirrors the
+		// codex GOOS guard at provider_codex.go:99.
+		if runtime.GOOS != "darwin" {
+			slog.Debug("router: mlx-supervised skipped on non-darwin platform",
+				"name", name, "goos", runtime.GOOS)
+			return nil, fmt.Errorf("mlx-supervised provider %q requires darwin (got %s)", name, runtime.GOOS)
+		}
 		supervisor := ServiceSupervisor(NewLaunchctlController())
 		p, err := newMLXSupervisedProvider(name, pc, supervisor)
 		if err != nil {
@@ -563,27 +573,106 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 	}
 }
 
-// defaultProvidersConfig returns a minimal config pointing at local Ollama.
+// probeLocalBackend probes LM Studio (:1234) then Ollama (:11434) with a
+// short timeout. Returns the first reachable (name, endpoint) pair, or
+// ("", "") when neither is up. Used by defaultProvidersConfig to avoid
+// registering a dead default on fresh installs that have no local LLM stack.
+func probeLocalBackend() (name, endpoint string) {
+	type candidate struct {
+		name     string
+		endpoint string
+		path     string
+	}
+	candidates := []candidate{
+		{name: "lmstudio", endpoint: "http://localhost:1234", path: "/v1/models"},
+		{name: "ollama", endpoint: "http://localhost:11434", path: "/api/version"},
+	}
+	client := &http.Client{Timeout: 1 * time.Second}
+	for _, c := range candidates {
+		resp, err := client.Get(c.endpoint + c.path)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode < 500 {
+				return c.name, c.endpoint
+			}
+		}
+	}
+	return "", ""
+}
+
+// defaultProvidersConfig returns a minimal provider config for use when no
+// providers.yaml is present. It probes LM Studio (:1234) then Ollama (:11434)
+// to pick a reachable backend. When neither is up, the config records the
+// state so the router can surface a clear "no local model configured" signal
+// instead of routing to a dead default.
 func defaultProvidersConfig(localModel string) ProvidersConfig {
 	enabled := true
-	if localModel == "" {
-		localModel = defaultOllamaModel
-	}
-	return ProvidersConfig{
-		Providers: map[string]ProviderConfig{
-			"ollama": {
-				Type:     "ollama",
-				Enabled:  &enabled,
-				Endpoint: "http://localhost:11434",
-				Model:    localModel,
-				Timeout:  60,
+	disabledFalse := false
+
+	backendName, backendEndpoint := probeLocalBackend()
+
+	switch backendName {
+	case "lmstudio":
+		// LM Studio is reachable at :1234 (OpenAI-compat).
+		slog.Info("router: no providers.yaml, auto-selected LM Studio as default local backend")
+		return ProvidersConfig{
+			Providers: map[string]ProviderConfig{
+				"lmstudio": {
+					Type:     "openai-compat",
+					Enabled:  &enabled,
+					Endpoint: backendEndpoint,
+					Model:    localModel, // empty = LM Studio uses the loaded model
+					Timeout:  60,
+				},
 			},
-		},
-		Routing: RoutingConfig{
-			Default:        "ollama",
-			LocalThreshold: 0.8,
-			FallbackChain:  []string{"ollama"},
-		},
+			Routing: RoutingConfig{
+				Default:        "lmstudio",
+				LocalThreshold: 0.8,
+				FallbackChain:  []string{"lmstudio"},
+			},
+		}
+
+	case "ollama":
+		// Ollama is reachable; use the configured or default model.
+		if localModel == "" {
+			localModel = defaultOllamaModel
+		}
+		slog.Info("router: no providers.yaml, auto-selected Ollama as default local backend")
+		return ProvidersConfig{
+			Providers: map[string]ProviderConfig{
+				"ollama": {
+					Type:     "ollama",
+					Enabled:  &enabled,
+					Endpoint: backendEndpoint,
+					Model:    localModel,
+					Timeout:  60,
+				},
+			},
+			Routing: RoutingConfig{
+				Default:        "ollama",
+				LocalThreshold: 0.8,
+				FallbackChain:  []string{"ollama"},
+			},
+		}
+
+	default:
+		// Neither LM Studio nor Ollama is reachable. Register a placeholder
+		// provider that is explicitly disabled so the router can report a clear
+		// "no local model configured" state instead of silently failing on the
+		// first inference request.
+		slog.Warn("router: no providers.yaml and no local LLM backend reachable " +
+			"(tried LM Studio :1234, Ollama :11434); add providers.yaml or start a local server")
+		return ProvidersConfig{
+			Providers: map[string]ProviderConfig{
+				"no-local-model": {
+					Type:    "stub",
+					Enabled: &disabledFalse,
+				},
+			},
+			Routing: RoutingConfig{
+				LocalThreshold: 0.8,
+			},
+		}
 	}
 }
 

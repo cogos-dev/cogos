@@ -261,14 +261,25 @@ func TestMakeProviderVLLM(t *testing.T) {
 func TestDefaultProvidersConfig(t *testing.T) {
 	t.Parallel()
 	pcfg := defaultProvidersConfig(defaultOllamaModel)
-	if _, ok := pcfg.Providers["ollama"]; !ok {
-		t.Error("default config should have ollama provider")
-	}
-	if pcfg.Routing.Default != "ollama" {
-		t.Errorf("default routing = %q; want ollama", pcfg.Routing.Default)
-	}
-	if pcfg.Providers["ollama"].Model != defaultOllamaModel {
-		t.Errorf("default ollama model = %q; want %q", pcfg.Providers["ollama"].Model, defaultOllamaModel)
+	// defaultProvidersConfig probes LM Studio (:1234) then Ollama (:11434) and
+	// selects whichever is reachable. On machines with neither running it
+	// returns the no-local-model placeholder. Any of these three outcomes is valid.
+	switch {
+	case pcfg.Providers["ollama"].Type == "ollama":
+		if pcfg.Providers["ollama"].Model != defaultOllamaModel {
+			t.Errorf("ollama model = %q; want %q", pcfg.Providers["ollama"].Model, defaultOllamaModel)
+		}
+		if pcfg.Routing.Default != "ollama" {
+			t.Errorf("routing default = %q; want ollama", pcfg.Routing.Default)
+		}
+	case pcfg.Providers["lmstudio"].Type == "openai-compat":
+		if pcfg.Routing.Default != "lmstudio" {
+			t.Errorf("routing default = %q; want lmstudio", pcfg.Routing.Default)
+		}
+	case pcfg.Providers["no-local-model"].Type == "stub":
+		// No local backend reachable — placeholder config is correct.
+	default:
+		t.Errorf("unexpected default providers config: %+v", pcfg.Providers)
 	}
 }
 

@@ -156,16 +156,16 @@ func (p *pinProvider) Health() reconcile.ResourceStatus {
 }
 
 func init() {
-	reconcile.RegisterProvider("agent", &agentProvider{})
-	reconcile.RegisterProvider("discord", &discordProvider{})
-	reconcile.RegisterProvider("eval", &evalProvider{})
+	reconcile.RegisterProvider("agent", &agentProvider{stubMethods: stubMethods{name: "agent"}})
+	reconcile.RegisterProvider("discord", &discordProvider{stubMethods: stubMethods{name: "discord"}})
+	reconcile.RegisterProvider("eval", &evalProvider{stubMethods: stubMethods{name: "eval"}})
 	reconcile.RegisterProvider("identity", &identityProvider{stubMethods: stubMethods{name: "identity"}})
-	reconcile.RegisterProvider("mcp-tools", &mcpToolsProvider{})
-	reconcile.RegisterProvider("openclaw-agents", &openclawAgentsProvider{})
-	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{})
-	reconcile.RegisterProvider("openclaw-gateway", &openclawGatewayProvider{})
+	reconcile.RegisterProvider("mcp-tools", &mcpToolsProvider{stubMethods: stubMethods{name: "mcp-tools"}})
+	reconcile.RegisterProvider("openclaw-agents", &openclawAgentsProvider{stubMethods: stubMethods{name: "openclaw-agents"}})
+	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{stubMethods: stubMethods{name: "openclaw-cron"}})
+	reconcile.RegisterProvider("openclaw-gateway", &openclawGatewayProvider{stubMethods: stubMethods{name: "openclaw-gateway"}})
 	reconcile.RegisterProvider("pin", globalPinProvider)
-	reconcile.RegisterProvider("service", &serviceProvider{})
+	reconcile.RegisterProvider("service", &serviceProvider{stubMethods: stubMethods{name: "service"}})
 }
 
 // resolveRoot returns the workspace root or an error status.
@@ -188,23 +188,47 @@ func resolveRoot() (string, *reconcile.ResourceStatus) {
 }
 
 // stubMethods satisfies the non-Health parts of reconcile.Reconcilable.
-// All operations return "daemon: operation not available" — the daemon only
-// calls Health() through the proprioception block.
+// These daemon-side stubs are Health()-only: they expose proprioception state
+// to the foveated context block but are not driven through the full
+// LoadConfig→FetchLive→ComputePlan→ApplyPlan cycle.
+//
+// LoadConfig returns a sentinel struct so the reconcile daemon's cycle exits
+// cleanly after BuildState (no WARN spam). FetchLive, ComputePlan, ApplyPlan,
+// and BuildState return explicit "not available" errors so any unexpected
+// caller gets a clear diagnostic rather than a silent nil.
 type stubMethods struct{ name string }
 
+// stubNoopConfig is the no-op sentinel returned by stubMethods.LoadConfig.
+// The reconcile daemon checks for this type in ComputePlan and produces an
+// empty plan, avoiding the WARN-per-tick log noise on fresh installs.
+type stubNoopConfig struct{ name string }
+
 func (s *stubMethods) LoadConfig(_ string) (any, error) {
-	return nil, fmt.Errorf("daemon: LoadConfig not available for %s provider", s.name)
+	// Return a no-op config so the daemon cycle does not WARN on LoadConfig.
+	// Health() is the only meaningful operation for daemon-side stub providers.
+	return &stubNoopConfig{name: s.name}, nil
 }
-func (s *stubMethods) FetchLive(_ context.Context, _ any) (any, error) {
+func (s *stubMethods) FetchLive(_ context.Context, cfg any) (any, error) {
+	// Pass through the stub config so the cycle can proceed to ComputePlan.
+	if _, ok := cfg.(*stubNoopConfig); ok {
+		return cfg, nil
+	}
 	return nil, fmt.Errorf("daemon: FetchLive not available for %s provider", s.name)
 }
-func (s *stubMethods) ComputePlan(_ any, _ any, _ *reconcile.State) (*reconcile.Plan, error) {
+func (s *stubMethods) ComputePlan(cfg any, _ any, _ *reconcile.State) (*reconcile.Plan, error) {
+	if nc, ok := cfg.(*stubNoopConfig); ok {
+		// Return an empty plan so the daemon sees "no drift" and exits quietly.
+		return &reconcile.Plan{ResourceType: nc.name}, nil
+	}
 	return nil, fmt.Errorf("daemon: ComputePlan not available for %s provider", s.name)
 }
 func (s *stubMethods) ApplyPlan(_ context.Context, _ *reconcile.Plan) ([]reconcile.Result, error) {
 	return nil, fmt.Errorf("daemon: ApplyPlan not available for %s provider", s.name)
 }
-func (s *stubMethods) BuildState(_ any, _ any, _ *reconcile.State) (*reconcile.State, error) {
+func (s *stubMethods) BuildState(cfg any, _ any, _ *reconcile.State) (*reconcile.State, error) {
+	if nc, ok := cfg.(*stubNoopConfig); ok {
+		return reconcile.NewState(nc.name), nil
+	}
 	return nil, fmt.Errorf("daemon: BuildState not available for %s provider", s.name)
 }
 

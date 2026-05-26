@@ -18,6 +18,7 @@ package component
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -112,10 +113,16 @@ func init() {
 func (c *ComponentProvider) Type() string { return "component" }
 
 // LoadConfig loads the component registry from .cog/conf/components.cog.md.
+//
+// When LoadRegistry is nil (daemon binary, or fresh install before the CLI DI
+// seams are wired) LoadConfig returns nil so the reconcile daemon cycle exits
+// with "no drift" rather than WARNing on every tick. The full plan/apply path
+// is only available when this provider is driven from the cog CLI binary.
 func (c *ComponentProvider) LoadConfig(root string) (any, error) {
 	c.root = root
 	if LoadRegistry == nil {
-		return nil, fmt.Errorf("component provider: LoadRegistry dependency not wired")
+		slog.Debug("component provider: LoadRegistry not wired (daemon context), skipping cycle")
+		return nil, nil
 	}
 	return LoadRegistry(root)
 }
@@ -123,6 +130,10 @@ func (c *ComponentProvider) LoadConfig(root string) (any, error) {
 // FetchLive runs the component indexer and loads individual blobs for
 // comparison. Returns map[string]*Blob keyed by component path.
 func (c *ComponentProvider) FetchLive(ctx context.Context, config any) (any, error) {
+	// nil config means LoadRegistry was not wired — nothing to observe.
+	if config == nil {
+		return map[string]*Blob{}, nil
+	}
 	root := c.root
 	if root == "" {
 		return nil, fmt.Errorf("component provider: root not set (call LoadConfig first)")
@@ -153,6 +164,10 @@ func (c *ComponentProvider) FetchLive(ctx context.Context, config any) (any, err
 // ComputePlan compares declared config (registry) against live state (blobs)
 // and produces a reconciliation plan.
 func (c *ComponentProvider) ComputePlan(config any, live any, state *reconcile.State) (*reconcile.Plan, error) {
+	// nil config means LoadRegistry was not wired — nothing to plan.
+	if config == nil {
+		return &reconcile.Plan{ResourceType: "component"}, nil
+	}
 	reg := config.(*Registry)
 	blobs := live.(map[string]*Blob)
 
@@ -310,6 +325,10 @@ func (c *ComponentProvider) ApplyPlan(ctx context.Context, plan *reconcile.Plan)
 
 // BuildState constructs reconcile state from live blobs.
 func (c *ComponentProvider) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
+	// nil config means LoadRegistry was not wired — return empty state.
+	if config == nil {
+		return reconcile.NewState("component"), nil
+	}
 	blobs := live.(map[string]*Blob)
 
 	state := &reconcile.State{
