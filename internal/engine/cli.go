@@ -527,8 +527,10 @@ func runStatusCmd(args []string, defaultWorkspace string, defaultPort int) {
 	cfg, err := LoadConfig(*workspace, *port)
 	if err != nil {
 		// No workspace found: give a helpful prompt rather than a raw config error.
-		fmt.Fprintf(os.Stdout, "no workspace found; run 'cogos init' to create one\n")
-		return
+		// Goes to stderr + exit 1 so `if cogos status; then ...` scripts treat
+		// "no workspace" as not-OK, matching conventional status-check semantics.
+		fmt.Fprintln(os.Stderr, "no workspace found; run 'cogos init' to create one")
+		os.Exit(1)
 	}
 	state, err := loadDaemonState(cfg.WorkspaceRoot)
 	if err != nil {
