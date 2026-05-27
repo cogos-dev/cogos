@@ -2,14 +2,14 @@
 
 | Field    | Value                                                                                                  |
 |----------|--------------------------------------------------------------------------------------------------------|
-| Status   | Draft                                                                                                  |
+| Status   | Accepted                                                                                               |
 | Author   | @chazmaniandinkle                                                                                      |
 | Created  | 2026-05-18                                                                                             |
+| Accepted | 2026-05-27 — direction accepted by operator; open questions (§6) resolve during implementation         |
 | Tracking | TBD                                                                                                    |
 | Relates  | [ADR-091](../adrs/091-substrate-as-named-architectural-layer.md), [ADR-092](../adrs/092-substrate-contracts-and-concurrency.md), [ADR-095](../adrs/095-daemon-reconcile-loop-driver.md), [ADR-096](../adrs/096-worktree-reconciler.md), [ADR-097](../adrs/097-memory-projection-reconciler.md), [ADR-098](../adrs/098-skill-projection-reconciler.md), [RFC-025 (cog workspace — cogdoc substrate unity)](https://github.com/myrgic/cogos) |
 
-> **In-progress design.** No decision in this document is promoted to ADR-level at this stage.
-> Implementation PRs will reference this RFC. ADR promotion happens after consolidation.
+> **Accepted direction (2026-05-27).** The operator has accepted consolidating the MCP transport into the kernel daemon as the canonical direction. The open questions in §6 are resolved during implementation; implementation PRs reference this RFC. ADR promotion follows once consolidation lands.
 
 ---
 
