@@ -109,6 +109,18 @@ const (
 	ProjectionConvergenceMap     ProjectionKind = "convergence-map"
 	ProjectionOpenQuestions      ProjectionKind = "open-questions"
 	ProjectionOutreachStatus     ProjectionKind = "outreach-status"
+
+	// ProjectionDecisionLineage projects the decision manifold — the
+	// gravity/inertia field over the corpus's own architectural decisions
+	// (ADRs, RFCs, ratified decision-insights). It is the missing sibling to
+	// ProjectionConvergenceMap: convergence-map projects the *theoretical
+	// antecedent* lineage; decision-lineage projects the *decision* lineage.
+	//
+	// Unlike the six theoretical-lineage kinds (which read the same nodes/
+	// corpus through ProjectionReconciler), decision-lineage reads a different
+	// corpus (the decision records) and is served by DecisionLineageReconciler.
+	// It is registered alongside the others via RegisterProjectionProviders.
+	ProjectionDecisionLineage ProjectionKind = "decision-lineage"
 )
 
 // AllProjectionKinds lists the six canonical projections in generation order.
@@ -665,6 +677,15 @@ func RegisterProjectionProviders() {
 			NewProjectionReconciler(kind),
 		)
 	}
+
+	// The decision-lineage projection is a sibling kind served by a distinct
+	// reconciler (it reads the decision corpus, not the theoretical nodes/
+	// corpus). It registers under the same projection-kind namespace so the
+	// CLI reconcile path and observability treat it uniformly.
+	reconcile.UpsertProvider(
+		"lineage-projection-"+string(ProjectionDecisionLineage),
+		NewDecisionLineageReconciler(),
+	)
 }
 
 // ─── Projection generators ────────────────────────────────────────────────────
