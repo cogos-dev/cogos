@@ -625,3 +625,86 @@ func TestMintChannelSessionID_ShapeAndUniqueness(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+// TestChannelSessionRegister_IssSub_StoredOnRecord verifies Fix A — that
+// iss/sub identity claims supplied via the mod3 seat callback land on the
+// kernel ChannelSessionRecord.
+//
+// This is the kernel half of the session-registration-unification spec: a
+// seat-register that mod3 proxies in must produce a kernel record carrying
+// the WHO (iss/sub) so downstream consumers (cog_list_sessions, the HUD,
+// reconcilers) can see identity without a second mod3 round-trip.
+func TestChannelSessionRegister_IssSub_StoredOnRecord(t *testing.T) {
+	fm := newFakeMod3(t)
+	s, front := newChannelServer(t, fm)
+
+	body, _ := json.Marshal(map[string]any{
+		"session_id":     "cs-identity-test",
+		"participant_id": "channel-client::claude-code-channel",
+		"iss":            "https://cogos.local",
+		"sub":            "chaz",
+	})
+	resp, err := http.Post(front.URL+"/v1/channel-sessions/register",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST register: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d; body: %s", resp.StatusCode, raw)
+	}
+
+	// Kernel record must carry the identity claims.
+	rec, ok := s.channelSessionRegistry.Get("cs-identity-test")
+	if !ok {
+		t.Fatal("expected kernel registry to hold record after register")
+	}
+	if rec.Iss != "https://cogos.local" {
+		t.Fatalf("expected Iss=https://cogos.local on record, got %q", rec.Iss)
+	}
+	if rec.Sub != "chaz" {
+		t.Fatalf("expected Sub=chaz on record, got %q", rec.Sub)
+	}
+}
+
+// TestChannelSessionRegister_IssSub_IdempotentOnReregister verifies that a
+// re-register with the same session_id overwrites the kernel record, preserving
+// the idempotency invariant required by the mod3 → kernel callback.
+// (ChannelSessionRegistry.Put overwrites by session_id — safe to call on
+// every seat re-register.)
+func TestChannelSessionRegister_IssSub_IdempotentOnReregister(t *testing.T) {
+	fm := newFakeMod3(t)
+	s, front := newChannelServer(t, fm)
+
+	registerWith := func(sub string) {
+		body, _ := json.Marshal(map[string]any{
+			"session_id":     "cs-idem-test",
+			"participant_id": "channel-client::claude-code-channel",
+			"iss":            "https://cogos.local",
+			"sub":            sub,
+		})
+		resp, err := http.Post(front.URL+"/v1/channel-sessions/register",
+			"application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST register (sub=%s): %v", sub, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 (sub=%s), got %d", sub, resp.StatusCode)
+		}
+	}
+
+	registerWith("chaz")
+	rec, _ := s.channelSessionRegistry.Get("cs-idem-test")
+	if rec.Sub != "chaz" {
+		t.Fatalf("expected Sub=chaz after first register, got %q", rec.Sub)
+	}
+
+	// Re-register with updated sub — Put overwrites.
+	registerWith("chaz-updated")
+	rec, _ = s.channelSessionRegistry.Get("cs-idem-test")
+	if rec.Sub != "chaz-updated" {
+		t.Fatalf("expected Sub=chaz-updated after re-register, got %q", rec.Sub)
+	}
+}
