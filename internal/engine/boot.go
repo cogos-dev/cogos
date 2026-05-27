@@ -267,6 +267,26 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		}
 	}
 
+	// Wire the decision-lineage watcher. It reads a different corpus than the
+	// theoretical-lineage projections (the ADR/RFC decision records), so it
+	// watches the architecture dirs and re-projects the spine manifold on any
+	// decision change.
+	{
+		decisionProviderType := "lineage-projection-" + string(ProjectionDecisionLineage)
+		for _, corpusDir := range DecisionCorpusDirs(cfg.WorkspaceRoot) {
+			watcher := NewProjectionWatcher(corpusDir, func(watchCtx context.Context) error {
+				reconcileDaemon.Trigger(decisionProviderType)
+				return nil
+			}, 0)
+			if err := watcher.Start(kernelCtx); err != nil {
+				slog.Debug("decision-lineage watcher skipped (corpus dir not present)",
+					"dir", corpusDir, "err", err)
+			} else {
+				slog.Info("decision-lineage watcher started", "corpus_dir", corpusDir)
+			}
+		}
+	}
+
 	// Pre-allocate the listener so we know the actual port before Start returns.
 	// This is necessary when cfg.Port == 0 (OS-assigned ephemeral port) so
 	// that Endpoint() can return a valid URL immediately after Boot.

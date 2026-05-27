@@ -13,13 +13,21 @@
 //   3. Writes the six canonical projection files
 //   4. Watches the nodes/ directory for changes and triggers reconciliation
 //
-// Six registered projection instances (per ADR-094):
+// Six theoretical-lineage projection instances served by ProjectionReconciler
+// (per ADR-094), all reading the same nodes/ corpus:
 //   - pedagogical-descent  — curriculum from Tier 1 antecedents to Tier 3/4 claims
 //   - bibliography         — all Tier 1 nodes, citable references
 //   - lineage-chain        — grounds/extends/supersedes traversal
 //   - convergence-map      — convergence edge cross-reference
 //   - open-questions       — open-gap edges + Tier 3/4 nodes
 //   - outreach-status      — public_exposure_risk audit + demotion templates
+//
+// A SEVENTH projection — decision-lineage — is registered alongside these by
+// RegisterProjectionProviders, but it is served by a SEPARATE reconciler
+// (DecisionLineageReconciler, in decision_lineage_reconciler.go) because it
+// reads a different corpus: the architecture's own decision records
+// (architecture/{adrs,rfcs} + decision-insights), not the theoretical nodes/
+// corpus. It is the decision-lineage sibling to convergence-map.
 //
 // ADR-094 §3: ProjectionReconciler is a substrate primitive.
 // ADR-092 §4: Implements the seven-method Reconcilable contract.
@@ -109,9 +117,26 @@ const (
 	ProjectionConvergenceMap     ProjectionKind = "convergence-map"
 	ProjectionOpenQuestions      ProjectionKind = "open-questions"
 	ProjectionOutreachStatus     ProjectionKind = "outreach-status"
+
+	// ProjectionDecisionLineage projects the decision manifold — the
+	// gravity/inertia field over the corpus's own architectural decisions
+	// (ADRs, RFCs, ratified decision-insights). It is the missing sibling to
+	// ProjectionConvergenceMap: convergence-map projects the *theoretical
+	// antecedent* lineage; decision-lineage projects the *decision* lineage.
+	//
+	// Unlike the six theoretical-lineage kinds (which read the same nodes/
+	// corpus through ProjectionReconciler), decision-lineage reads a different
+	// corpus (the decision records) and is served by DecisionLineageReconciler.
+	// It is registered alongside the others via RegisterProjectionProviders.
+	ProjectionDecisionLineage ProjectionKind = "decision-lineage"
 )
 
-// AllProjectionKinds lists the six canonical projections in generation order.
+// AllProjectionKinds lists the six theoretical-lineage projections served by
+// ProjectionReconciler, in generation order. It deliberately does NOT include
+// ProjectionDecisionLineage: that seventh kind is served by the separate
+// DecisionLineageReconciler (it reads a different corpus) and is registered on
+// its own in RegisterProjectionProviders. This slice is the set of kinds the
+// nodes/-corpus reconciler and its watcher iterate.
 var AllProjectionKinds = []ProjectionKind{
 	ProjectionPedagogicalDescent,
 	ProjectionBibliography,
@@ -665,6 +690,15 @@ func RegisterProjectionProviders() {
 			NewProjectionReconciler(kind),
 		)
 	}
+
+	// The decision-lineage projection is a sibling kind served by a distinct
+	// reconciler (it reads the decision corpus, not the theoretical nodes/
+	// corpus). It registers under the same projection-kind namespace so the
+	// CLI reconcile path and observability treat it uniformly.
+	reconcile.UpsertProvider(
+		"lineage-projection-"+string(ProjectionDecisionLineage),
+		NewDecisionLineageReconciler(),
+	)
 }
 
 // ─── Projection generators ────────────────────────────────────────────────────
