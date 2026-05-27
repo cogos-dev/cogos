@@ -1,18 +1,18 @@
 // config_write_test.go — unit tests for the Config Mutation API.
 //
 // Covers the spec from agent-O-config-mutation-design §Test plan:
-//   1.  Full patch, happy path
-//   2.  Sparse patch, single field
-//   3.  Patch reload-safe field
-//   4.  Null removes a field
-//   5.  Scope: v3 override
-//   6.  Validation rejects bad heartbeat
-//   7.  Validation rejects out-of-range port
-//   8.  Dry run does not touch disk
-//   9.  Atomic write semantics (no torn file under failure)
-//  10.  Backup rotation keeps 10
-//  11.  Corrupt existing file is refused
-//  12.  Concurrent writes serialize
+//  1. Full patch, happy path
+//  2. Sparse patch, single field
+//  3. Patch reload-safe field
+//  4. Null removes a field
+//  5. Scope: v3 override
+//  6. Validation rejects bad heartbeat
+//  7. Validation rejects out-of-range port
+//  8. Dry run does not touch disk
+//  9. Atomic write semantics (no torn file under failure)
+//  10. Backup rotation keeps 10
+//  11. Corrupt existing file is refused
+//  12. Concurrent writes serialize
 //
 // Plus MCP + HTTP roundtrip tests (see config_write_wire_test.go).
 package engine
@@ -47,8 +47,8 @@ func readKernelYAML(t *testing.T, path string) kernelConfig {
 	return kc
 }
 
-// 1. Full patch on a fresh workspace populates every field + creates a backup
-//    when an existing file was overwritten.
+//  1. Full patch on a fresh workspace populates every field + creates a backup
+//     when an existing file was overwritten.
 func TestWriteConfigPatch_FullPatchHappyPath(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
@@ -131,8 +131,8 @@ func TestWriteConfigPatch_SparsePatchPreservesOthers(t *testing.T) {
 	}
 }
 
-// 3. Reload-safe field: requires_restart is still true in v1 (we always
-//    persist + restart), but changed_fields reveals the field is reload-safe.
+//  3. Reload-safe field: requires_restart is still true in v1 (we always
+//     persist + restart), but changed_fields reveals the field is reload-safe.
 func TestWriteConfigPatch_ReloadSafeFieldChange(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
@@ -302,8 +302,8 @@ func TestWriteConfigPatch_DryRun(t *testing.T) {
 	}
 }
 
-// 9. Atomic write semantics — a successful write never produces a torn file,
-//    and the backup is a full copy of the prior content.
+//  9. Atomic write semantics — a successful write never produces a torn file,
+//     and the backup is a full copy of the prior content.
 func TestWriteConfigPatch_AtomicWrite(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
@@ -372,7 +372,7 @@ func TestWriteConfigPatch_BackupRotation(t *testing.T) {
 	}
 }
 
-// 11. Corrupt existing file is refused — the write path refuses to clobber
+//  11. Corrupt existing file is refused — the write path refuses to clobber
 //     unparseable YAML without a rollback first.
 func TestWriteConfigPatch_RefusesCorruptFile(t *testing.T) {
 	t.Parallel()
@@ -402,7 +402,7 @@ func TestWriteConfigPatch_RefusesCorruptFile(t *testing.T) {
 	}
 }
 
-// 12. Concurrent writes serialize — 8 goroutines all set port to different
+//  12. Concurrent writes serialize — 8 goroutines all set port to different
 //     values; no corruption and the final file is a valid YAML with one of
 //     the candidate ports.
 func TestWriteConfigPatch_ConcurrentWritesSerialize(t *testing.T) {
@@ -484,5 +484,113 @@ func TestRollbackConfig_RestoresPriorBackup(t *testing.T) {
 	kc := readKernelYAML(t, path)
 	if kc.LocalModel != "gemma4:b" {
 		t.Errorf("LocalModel after rollback = %q; want gemma4:b", kc.LocalModel)
+	}
+}
+
+//  15. In-place patch preserves comments and does NOT emit zeroed absent fields
+//     or a spurious top-level v3: block — the three clobber modes from issue #342.
+func TestWriteConfigPatch_PreservesCommentsNoZeroNoV3(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	fixture := "# workspace kernel config\n# managed by hand\nollama_embed_model: bge-m3:latest\n"
+	path := seedKernelYAML(t, root, fixture)
+
+	result, err := WriteConfigPatch(root, map[string]any{"local_model": "gemma4:e4b"}, WriteConfigOptions{})
+	if err != nil {
+		t.Fatalf("WriteConfigPatch: %v", err)
+	}
+	if !result.Written {
+		t.Fatalf("expected written=true, got violations=%+v", result.Violations)
+	}
+
+	raw, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("read result: %v", rerr)
+	}
+	out := string(raw)
+
+	// (a) Original comment lines survive.
+	if !strings.Contains(out, "# workspace kernel config") {
+		t.Errorf("comment '# workspace kernel config' not found in output:\n%s", out)
+	}
+	if !strings.Contains(out, "# managed by hand") {
+		t.Errorf("comment '# managed by hand' not found in output:\n%s", out)
+	}
+
+	// (b) No zeroed port field.
+	if strings.Contains(out, "port: 0") {
+		t.Errorf("spurious 'port: 0' found in output:\n%s", out)
+	}
+
+	// (c) No spurious top-level v3: block.
+	if strings.Contains(out, "\nv3:") || strings.HasPrefix(out, "v3:") {
+		t.Errorf("spurious 'v3:' block found in output:\n%s", out)
+	}
+
+	// (d) Original field preserved.
+	if !strings.Contains(out, "ollama_embed_model: bge-m3:latest") {
+		t.Errorf("ollama_embed_model not preserved in output:\n%s", out)
+	}
+
+	// (e) Patched field present.
+	if !strings.Contains(out, "local_model: gemma4:e4b") {
+		t.Errorf("local_model not set in output:\n%s", out)
+	}
+}
+
+//  16. v3-scope patch lands under v3: without zeroing top-level keys and
+//     without an empty v3: block being emitted before the patch.
+func TestWriteConfigPatch_V3ScopeNodePatch(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	// File has only a top-level key and NO v3: section.
+	fixture := "# top comment\nollama_embed_model: bge-m3:latest\n"
+	path := seedKernelYAML(t, root, fixture)
+
+	result, err := WriteConfigPatch(root, map[string]any{"local_model": "gemma4:26b"}, WriteConfigOptions{Scope: "v3"})
+	if err != nil {
+		t.Fatalf("WriteConfigPatch v3: %v", err)
+	}
+	if !result.Written {
+		t.Fatalf("expected written=true, got violations=%+v", result.Violations)
+	}
+
+	raw, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("read result: %v", rerr)
+	}
+	out := string(raw)
+
+	// Top-level comment preserved.
+	if !strings.Contains(out, "# top comment") {
+		t.Errorf("comment '# top comment' not found in output:\n%s", out)
+	}
+
+	// Top-level field preserved, not zeroed.
+	if !strings.Contains(out, "ollama_embed_model: bge-m3:latest") {
+		t.Errorf("ollama_embed_model not preserved in output:\n%s", out)
+	}
+
+	// v3: block created and contains the patched field.
+	if !strings.Contains(out, "v3:") {
+		t.Errorf("v3: section not found in output:\n%s", out)
+	}
+	if !strings.Contains(out, "local_model: gemma4:26b") {
+		t.Errorf("local_model not found under v3: in output:\n%s", out)
+	}
+
+	// No zeroed top-level port.
+	if strings.Contains(out, "port: 0") {
+		t.Errorf("spurious 'port: 0' found in output:\n%s", out)
+	}
+
+	// The v3 section should contain local_model; verify via struct parse.
+	kc := readKernelYAML(t, path)
+	if kc.V3.LocalModel != "gemma4:26b" {
+		t.Errorf("V3.LocalModel = %q; want gemma4:26b", kc.V3.LocalModel)
+	}
+	// Top-level OllamaEmbedModel still present.
+	if kc.OllamaEmbedModel != "bge-m3:latest" {
+		t.Errorf("OllamaEmbedModel = %q; want bge-m3:latest (top-level, unchanged)", kc.OllamaEmbedModel)
 	}
 }
