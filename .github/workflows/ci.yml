@@ -27,6 +27,26 @@ jobs:
       - name: Build (with MCP)
         run: go build -tags mcpserver -o cogos-mcp ./cmd/cogos
 
+  # Cross-compile the entire module for Windows. The build job above only
+  # builds ./cmd/cogos (the daemon), which already cross-compiled cleanly —
+  # but the repo-root package main (cog node init, BEP, local runner) carried
+  # unguarded Unix-only syscalls and broke GOOS=windows undetected (#328).
+  # This guards the whole module against platform regressions.
+  windows-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Cross-compile for Windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ./...
+
   test:
     runs-on: ubuntu-latest
     steps:

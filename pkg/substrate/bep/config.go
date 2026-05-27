@@ -8,10 +8,24 @@ package bep
 
 import "time"
 
+// DefaultListenPort is the BEP listen port assigned to an enabled node that
+// does not specify one in cluster.yaml.
+//
+// It is deliberately NOT 22000. BEP is Syncthing-derived, and 22000 is
+// Syncthing's canonical sync port — so inheriting it collided out of the box
+// for anyone already running personal Syncthing (observed during the Eclipse
+// node bring-up, #336). 6932 sits one above the kernel daemon's HTTP port
+// (6931 = ln(2)×10⁴) and is clear of the Syncthing range (22000/21027/22067).
+//
+// A node can still bind 22000 explicitly via `listenPort: 22000` if it wants
+// to share Syncthing's port deliberately. Per-node port negotiation/discovery
+// (rather than a fixed default) is left as follow-up.
+const DefaultListenPort = 6932
+
 // Peer represents a known peer node in the BEP cluster.
 type Peer struct {
 	DeviceID string    `json:"deviceId" yaml:"deviceId"`
-	Address  string    `json:"address" yaml:"address"`     // host:port or tailscale address
+	Address  string    `json:"address" yaml:"address"` // host:port or tailscale address
 	Name     string    `json:"name" yaml:"name"`
 	Trusted  bool      `json:"trusted" yaml:"trusted"`
 	LastSeen time.Time `json:"lastSeen,omitempty" yaml:"lastSeen,omitempty"`
@@ -19,14 +33,14 @@ type Peer struct {
 
 // Config holds cluster configuration loaded from .cog/config/cluster.yaml.
 type Config struct {
-	Enabled    bool   `yaml:"enabled"`
-	DeviceID   string `yaml:"deviceId,omitempty"`   // this node's ID
-	NodeName   string `yaml:"nodeName,omitempty"`   // human-readable node name
-	ListenPort int    `yaml:"listenPort,omitempty"` // BEP listen port (default 22000)
-	CertDir    string `yaml:"certDir,omitempty"`    // TLS cert directory (default ~/.cog/etc)
-	Peers      []Peer `yaml:"peers,omitempty"`
-	SyncDirs   []string `yaml:"syncDirs,omitempty"` // directories to sync
-	Discovery  string `yaml:"discovery,omitempty"`   // "static", "tailscale", "mdns"
+	Enabled    bool     `yaml:"enabled"`
+	DeviceID   string   `yaml:"deviceId,omitempty"`   // this node's ID
+	NodeName   string   `yaml:"nodeName,omitempty"`   // human-readable node name
+	ListenPort int      `yaml:"listenPort,omitempty"` // BEP listen port (default DefaultListenPort; 0 = OS-assigned random)
+	CertDir    string   `yaml:"certDir,omitempty"`    // TLS cert directory (default ~/.cog/etc)
+	Peers      []Peer   `yaml:"peers,omitempty"`
+	SyncDirs   []string `yaml:"syncDirs,omitempty"`  // directories to sync
+	Discovery  string   `yaml:"discovery,omitempty"` // "static", "tailscale", "mdns"
 }
 
 // SyncStatus returns current sync state for the BEP provider.

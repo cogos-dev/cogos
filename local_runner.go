@@ -425,7 +425,9 @@ func LocalStart(root string, crd *ServiceCRD) (*LocalProcess, error) {
 	}
 	// Detach from the kernel's session/process group so kernel shutdown
 	// (or any signal we propagate) doesn't cascade to supervised services.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// Platform-specific: Setsid on Unix, CREATE_NEW_PROCESS_GROUP on Windows
+	// (see local_runner_unix.go / local_runner_windows.go).
+	configureProcessGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("service %s: start: %w", crd.Metadata.Name, err)
@@ -461,7 +463,7 @@ func LocalStart(root string, crd *ServiceCRD) (*LocalProcess, error) {
 // cmd+args. If they don't match (PID reuse after a crash/reboot, manual
 // replacement, etc.), we log a warning and clear the stale PID file *without
 // sending any signal* — otherwise we'd kill an unrelated user process and,
-// worse, its whole process group, since we start with Setsid.
+// worse, its whole process group, since we start it in its own group.
 func LocalStop(root, name string) error {
 	p, err := readLocalProcess(root, name)
 	if err != nil {
@@ -488,9 +490,9 @@ func LocalStop(root, name string) error {
 		return nil
 	}
 
-	// Signal the whole process group since we start with Setsid.
-	_ = syscall.Kill(-p.PID, syscall.SIGTERM)
-	_ = proc.Signal(syscall.SIGTERM)
+	// Graceful stop of the whole process group (platform-specific:
+	// Kill(-pid, SIGTERM) on Unix, taskkill /T on Windows).
+	terminateProcessGroup(proc, p.PID)
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -500,8 +502,8 @@ func LocalStop(root, name string) error {
 		time.Sleep(250 * time.Millisecond)
 	}
 
-	_ = syscall.Kill(-p.PID, syscall.SIGKILL)
-	_ = proc.Signal(syscall.SIGKILL)
+	// Still alive after the grace period — force-kill the group.
+	killProcessGroup(proc, p.PID)
 	return nil
 }
 

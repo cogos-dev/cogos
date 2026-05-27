@@ -37,17 +37,17 @@ type BEPSyncStatus = bep.SyncStatus
 // Phase 1: file watching + local change detection.
 // Phase 2 (current): integrated with BEPEngine for cross-node sync.
 type BEPProvider struct {
-	root     string // workspace root
-	watchDir string // .cog/bin/agents/definitions/
-	peers    []bep.Peer
-	mu       sync.Mutex
-	running  bool
-	stopCh   chan struct{}
+	root             string // workspace root
+	watchDir         string // .cog/bin/agents/definitions/
+	peers            []bep.Peer
+	mu               sync.Mutex
+	running          bool
+	stopCh           chan struct{}
 	onChange         func(filename string)   // primary callback when a CRD file changes
 	onChangeHandlers []func(filename string) // additional change handlers (e.g., BEPEngine)
-	lastSync time.Time
-	watcher  *fsnotify.Watcher // nil if fsnotify unavailable; falls back to polling
-	receiver *receiverState    // ring buffer for received CRD events
+	lastSync         time.Time
+	watcher          *fsnotify.Watcher // nil if fsnotify unavailable; falls back to polling
+	receiver         *receiverState    // ring buffer for received CRD events
 }
 
 // ─── Constructor ────────────────────────────────────────────────────────────────
@@ -83,6 +83,14 @@ func (p *BEPProvider) LoadConfig() (*bep.Config, error) {
 	var cfg bep.Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse cluster config: %w", err)
+	}
+
+	// An enabled node that omits listenPort gets the package default
+	// (bep.DefaultListenPort), not an OS-assigned random port — peers need a
+	// stable address to dial. Tests that want a random port construct
+	// bep.Config{} directly and bypass this path. See #336.
+	if cfg.Enabled && cfg.ListenPort == 0 {
+		cfg.ListenPort = bep.DefaultListenPort
 	}
 
 	return &cfg, nil
