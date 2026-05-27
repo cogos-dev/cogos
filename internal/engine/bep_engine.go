@@ -158,7 +158,8 @@ func (e *BEPEngine) Start() error {
 	defer e.mu.Unlock()
 
 	// ListenPort 0 means OS-assigned random port (useful for tests).
-	// Default 22000 is set at config creation time (cluster init / cluster.yaml).
+	// Enabled nodes loaded from cluster.yaml are defaulted to
+	// bep.DefaultListenPort by BEPProvider.LoadConfig when unset (#336).
 	addr := fmt.Sprintf(":%d", e.config.ListenPort)
 	ln, err := tls.Listen("tcp", addr, e.tlsConfig)
 	if err != nil {

@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	bep "github.com/myrgic/cogos/pkg/substrate/bep"
 )
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
@@ -312,7 +314,7 @@ func TestBEPDiffAndNotify(t *testing.T) {
 	current := map[string]time.Time{
 		"existing.agent.yaml": now,                      // unchanged
 		"modified.agent.yaml": now.Add(1 * time.Second), // modified
-		"created.agent.yaml":  now,                       // new
+		"created.agent.yaml":  now,                      // new
 		// deleted.agent.yaml is absent → deletion
 	}
 
@@ -715,6 +717,48 @@ discovery: tailscale
 	if len(cfg.SyncDirs) != 1 {
 		t.Errorf("SyncDirs count = %d, want 1", len(cfg.SyncDirs))
 	}
+}
+
+// TestBEPLoadConfigDefaultPort covers the #336 default-port behavior: an
+// enabled node that omits listenPort is assigned bep.DefaultListenPort (off
+// the Syncthing range), an explicit port is preserved, and a disabled config
+// is left untouched.
+func TestBEPLoadConfigDefaultPort(t *testing.T) {
+	t.Run("enabled without listenPort gets default", func(t *testing.T) {
+		root := t.TempDir()
+		writeClusterConfig(t, root, "enabled: true\ndeviceId: node-alpha\ndiscovery: static\n")
+		cfg, err := NewBEPProvider(root).LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.ListenPort != bep.DefaultListenPort {
+			t.Errorf("ListenPort = %d, want default %d", cfg.ListenPort, bep.DefaultListenPort)
+		}
+	})
+
+	t.Run("explicit listenPort preserved", func(t *testing.T) {
+		root := t.TempDir()
+		writeClusterConfig(t, root, "enabled: true\ndeviceId: node-alpha\nlistenPort: 22000\ndiscovery: static\n")
+		cfg, err := NewBEPProvider(root).LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.ListenPort != 22000 {
+			t.Errorf("ListenPort = %d, want explicit 22000", cfg.ListenPort)
+		}
+	})
+
+	t.Run("disabled config not defaulted", func(t *testing.T) {
+		root := t.TempDir()
+		writeClusterConfig(t, root, "enabled: false\ndiscovery: static\n")
+		cfg, err := NewBEPProvider(root).LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.ListenPort != 0 {
+			t.Errorf("ListenPort = %d, want 0 (disabled, untouched)", cfg.ListenPort)
+		}
+	})
 }
 
 func TestBEPLoadConfigInvalidYAML(t *testing.T) {
