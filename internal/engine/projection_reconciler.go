@@ -13,13 +13,21 @@
 //   3. Writes the six canonical projection files
 //   4. Watches the nodes/ directory for changes and triggers reconciliation
 //
-// Six registered projection instances (per ADR-094):
+// Six theoretical-lineage projection instances served by ProjectionReconciler
+// (per ADR-094), all reading the same nodes/ corpus:
 //   - pedagogical-descent  — curriculum from Tier 1 antecedents to Tier 3/4 claims
 //   - bibliography         — all Tier 1 nodes, citable references
 //   - lineage-chain        — grounds/extends/supersedes traversal
 //   - convergence-map      — convergence edge cross-reference
 //   - open-questions       — open-gap edges + Tier 3/4 nodes
 //   - outreach-status      — public_exposure_risk audit + demotion templates
+//
+// A SEVENTH projection — decision-lineage — is registered alongside these by
+// RegisterProjectionProviders, but it is served by a SEPARATE reconciler
+// (DecisionLineageReconciler, in decision_lineage_reconciler.go) because it
+// reads a different corpus: the architecture's own decision records
+// (architecture/{adrs,rfcs} + decision-insights), not the theoretical nodes/
+// corpus. It is the decision-lineage sibling to convergence-map.
 //
 // ADR-094 §3: ProjectionReconciler is a substrate primitive.
 // ADR-092 §4: Implements the seven-method Reconcilable contract.
@@ -123,7 +131,12 @@ const (
 	ProjectionDecisionLineage ProjectionKind = "decision-lineage"
 )
 
-// AllProjectionKinds lists the six canonical projections in generation order.
+// AllProjectionKinds lists the six theoretical-lineage projections served by
+// ProjectionReconciler, in generation order. It deliberately does NOT include
+// ProjectionDecisionLineage: that seventh kind is served by the separate
+// DecisionLineageReconciler (it reads a different corpus) and is registered on
+// its own in RegisterProjectionProviders. This slice is the set of kinds the
+// nodes/-corpus reconciler and its watcher iterate.
 var AllProjectionKinds = []ProjectionKind{
 	ProjectionPedagogicalDescent,
 	ProjectionBibliography,

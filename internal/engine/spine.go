@@ -47,10 +47,27 @@ import (
 //
 // Edge names are matched case-insensitively. Unknown edges contribute the
 // default annotation weight so the field never silently drops a real edge.
+//
+// GRAVITY IS WEIGHTED IN-DEGREE — this intentionally diverges from the
+// decision-manifold cartography's raw-count baseline. The cartography ranked
+// vertebrae by unweighted incoming-edge count; here a structural edge can
+// outweigh several annotation edges, so the top of the ranking shifts (e.g.
+// self-similar-bootstrap, which carries its mass via many `cited-by`
+// annotation edges, drops relative to the raw-count view). To reproduce the
+// raw-count ranking exactly, set every weight (and defaultEdgeWeight) to 1.0:
+// uniform weight 1.0 == raw in-degree.
 var spineEdgeWeights = map[string]float64{
 	// Spine-structural (lineage) edges — high pull.
+	//
+	// supersedes/superseded-by carry the SAME weight in both directions, and
+	// BOTH directions add to their respective node's gravity. This is
+	// intentional: a `superseded-by` edge on a fossil adds gravity to the
+	// fossil (not just to its successor) because the fossil is the genetic
+	// anchor the living structure grew off — a high-gravity fossil is a
+	// load-bearing ancestor, not dead weight. So the supersede relation
+	// deposits structural mass on both the old vertebra and the new one.
 	"supersedes":     3.0,
-	"superseded-by":  3.0, // inverse carries the same structural mass
+	"superseded-by":  3.0,
 	"reshapes":       2.5,
 	"reshaped-by":    2.5,
 	"extends":        2.0,
@@ -60,10 +77,20 @@ var spineEdgeWeights = map[string]float64{
 	"depends-on":     2.5,
 	"depended-on-by": 2.5,
 	"requires":       2.5,
-	"evolved-from":   3.0,
-	"evolves":        3.0,
-	"absorbed-by":    3.0,
-	"unifies":        2.0,
+	// evolved-from / evolves / absorbed-by are DELIBERATE EXTENSIONS to the
+	// evolutionary-spine RFC's edge vocabulary — semantic equivalents of
+	// supersedes (a decision that evolved from / absorbed an earlier one
+	// replaces it) and treated as structural. Accepted by the operator
+	// 2026-05-27.
+	"evolved-from": 3.0,
+	"evolves":      3.0,
+	"absorbed-by":  3.0,
+	// unifies is structural (it is supersede-by-*merging*: it folds two or more
+	// prior vertebrae into one) but weighted SOFTER than supersedes — the prior
+	// decisions are merged, not discarded. Weight 2.0, not 3.0.
+	// This resolves RFC `evolutionary-spine-decision-lineage` Open-Q2
+	// (operator decision 2026-05-27).
+	"unifies": 2.0,
 
 	// Annotation edges — light pull.
 	"grounds":         1.5,
@@ -572,16 +599,31 @@ func (m *Manifold) Lookup(query string) *VertebraMetrics {
 			return v
 		}
 	}
-	for id, v := range m.Vertebrae {
+	// Suffix match (e.g. "84" → "adr-084"/"084"). Collect ALL candidates and
+	// sort by id before returning the first, so a multi-match query is
+	// deterministic regardless of Go's randomized map iteration order.
+	var suffixIDs []string
+	for id := range m.Vertebrae {
 		lid := strings.ToLower(id)
 		if strings.HasSuffix(lid, "-"+q) || strings.HasSuffix(lid, q) {
-			return v
+			suffixIDs = append(suffixIDs, id)
 		}
 	}
-	for _, v := range m.Vertebrae {
+	if len(suffixIDs) > 0 {
+		sort.Strings(suffixIDs)
+		return m.Vertebrae[suffixIDs[0]]
+	}
+
+	// Title substring match — same determinism discipline.
+	var titleIDs []string
+	for id, v := range m.Vertebrae {
 		if strings.Contains(strings.ToLower(v.Decision.Title), q) {
-			return v
+			titleIDs = append(titleIDs, id)
 		}
+	}
+	if len(titleIDs) > 0 {
+		sort.Strings(titleIDs)
+		return m.Vertebrae[titleIDs[0]]
 	}
 	return nil
 }

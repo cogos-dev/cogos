@@ -86,6 +86,10 @@ func runSpineCmd(args []string, defaultWorkspace string) {
 		os.Exit(1)
 	}
 
+	// NOTE: the manifold's computed_at (surfaced in --json) is always fresh
+	// wall-clock at invocation. It is NOT derived from the corpus, so two
+	// --json snapshots of an unchanged corpus differ only in that field;
+	// scripts diffing manifolds should ignore computed_at.
 	manifold := ComputeManifold(decisions, time.Now().UTC())
 
 	// Single-decision view.
