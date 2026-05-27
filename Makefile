@@ -33,14 +33,12 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64 windows-amd64 windows-arm64
 
-.PHONY: all build clean test test-coverage test-integration bench install push image run e2e e2e-local $(PLATFORMS)
+.PHONY: all build clean test test-coverage test-integration bench install push image run e2e e2e-local $(PLATFORMS) $(BINARY)
 
 # Default: build for current platform
 build: $(BINARY)
 
-GO_SOURCES := $(wildcard *.go) $(wildcard harness/*.go)
-
-$(BINARY): $(GO_SOURCES) go.mod harness/go.mod
+$(BINARY):
 	$(GO) build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/cogos
 
 # Build for all platforms
