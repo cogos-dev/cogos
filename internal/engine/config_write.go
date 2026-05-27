@@ -621,9 +621,31 @@ func writeConfigPatchLocked(root string, patch map[string]any, opts WriteConfigO
 	}
 
 	// 7. Serialize + atomic write.
-	out, merr := yaml.Marshal(&merged)
-	if merr != nil {
-		return WriteConfigResult{}, fmt.Errorf("marshal merged config: %w", merr)
+	//
+	// Instead of marshalling the full merged struct (which destroys comments,
+	// zeroes absent fields, and emits a spurious duplicate v3: block), we
+	// patch only the keys the caller actually set, leaving everything else
+	// untouched in the YAML node tree.
+	var out []byte
+	if exists {
+		// Re-read raw bytes (same file we backed up; read again to avoid
+		// holding the bytes across the backup path).
+		rawBytes, rerr2 := os.ReadFile(path)
+		if rerr2 != nil {
+			return WriteConfigResult{}, fmt.Errorf("re-read %s for node patch: %w", path, rerr2)
+		}
+		patched, perr := patchYAMLNodes(rawBytes, patch, opts.Scope)
+		if perr != nil {
+			return WriteConfigResult{}, fmt.Errorf("node-patch kernel.yaml: %w", perr)
+		}
+		out = patched
+	} else {
+		// New file: write only the patched keys under the appropriate scope.
+		minimal, merr := buildMinimalYAML(patch, opts.Scope)
+		if merr != nil {
+			return WriteConfigResult{}, fmt.Errorf("build minimal kernel.yaml: %w", merr)
+		}
+		out = minimal
 	}
 	if werr := atomicWriteConfigFile(path, out); werr != nil {
 		return WriteConfigResult{}, fmt.Errorf("write %s: %w", path, werr)
@@ -784,6 +806,234 @@ func RollbackConfig(root string, opts RollbackOptions) (RollbackResult, error) {
 		Backups:         backupsAfter,
 		Path:            path,
 	}, nil
+}
+
+// ── YAML node-tree patching ─────────────────────────────────────────────────
+
+// patchYAMLNodes parses existing YAML bytes as a yaml.Node document, then
+// sets/updates only the keys present in patch, leaving comments, key order,
+// and all untouched keys intact. For scope "v3" the patch keys land under
+// the v3: mapping (created only if at least one v3 key is patched). The
+// updated document is marshalled back to bytes and returned.
+func patchYAMLNodes(existing []byte, patch map[string]any, scope string) ([]byte, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(existing, &doc); err != nil {
+		return nil, fmt.Errorf("parse existing yaml: %w", err)
+	}
+
+	// yaml.Unmarshal with a *yaml.Node yields a DocumentNode wrapping the root.
+	// Ensure we have a usable document + root mapping.
+	if doc.Kind == 0 {
+		// Empty file — build a fresh document node.
+		doc = yaml.Node{
+			Kind: yaml.DocumentNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.MappingNode, Tag: "!!map"},
+			},
+		}
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return nil, fmt.Errorf("unexpected yaml node kind %v", doc.Kind)
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("root yaml node is not a mapping (kind=%v)", root.Kind)
+	}
+
+	switch scope {
+	case "v3":
+		// Find or create the v3: key inside root.
+		v3Map := findMappingValue(root, "v3")
+		if v3Map == nil {
+			// Create a new v3: key with an empty mapping.
+			keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v3"}
+			valNode := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			root.Content = append(root.Content, keyNode, valNode)
+			v3Map = valNode
+		}
+		for k, v := range patch {
+			setYAMLKey(v3Map, k, v)
+		}
+	default: // "top"
+		for k, v := range patch {
+			setYAMLKey(root, k, v)
+		}
+	}
+
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return nil, fmt.Errorf("re-encode yaml: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("close yaml encoder: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// findMappingValue looks for a key in a yaml.MappingNode and returns its
+// value node, or nil if not found.
+func findMappingValue(m *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// setYAMLKey sets key=val in a yaml.MappingNode. If the key already exists
+// its value node is updated in place; otherwise a new key+value pair is
+// appended. val==nil removes the key (RFC 7396 null → delete).
+func setYAMLKey(m *yaml.Node, key string, val any) {
+	// nil → remove the key from the mapping.
+	if val == nil {
+		for i := 0; i+1 < len(m.Content); i += 2 {
+			if m.Content[i].Value == key {
+				m.Content = append(m.Content[:i], m.Content[i+2:]...)
+				return
+			}
+		}
+		return
+	}
+
+	valNode := anyToYAMLNode(val)
+
+	// Update existing.
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			// Preserve the existing key node (it may carry a comment).
+			m.Content[i+1] = valNode
+			return
+		}
+	}
+
+	// Append new key+value.
+	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+	m.Content = append(m.Content, keyNode, valNode)
+}
+
+// anyToYAMLNode converts a Go value to a yaml.Node suitable for embedding in a
+// node tree. Supports scalars (string, bool, int, float64), map[string]any, and
+// map[string]string (digest_paths).
+func anyToYAMLNode(v any) *yaml.Node {
+	switch val := v.(type) {
+	case string:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: val}
+	case bool:
+		s := "false"
+		if val {
+			s = "true"
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: s}
+	case int:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprintf("%d", val)}
+	case float64:
+		// Prefer integer representation when there is no fractional part.
+		if val == float64(int64(val)) {
+			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprintf("%d", int64(val))}
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: fmt.Sprintf("%g", val)}
+	case map[string]any:
+		n := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		// Sort keys for stable output.
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			n.Content = append(n.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k},
+				anyToYAMLNode(val[k]),
+			)
+		}
+		return n
+	case map[string]string:
+		n := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			n.Content = append(n.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: val[k]},
+			)
+		}
+		return n
+	case []string:
+		n := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		for _, s := range val {
+			n.Content = append(n.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: s})
+		}
+		return n
+	case []any:
+		n := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		for _, s := range val {
+			n.Content = append(n.Content, anyToYAMLNode(s))
+		}
+		return n
+	default:
+		// Fallback: marshal via yaml then parse back to a node.
+		raw, err := yaml.Marshal(v)
+		if err != nil {
+			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%v", v)}
+		}
+		var node yaml.Node
+		if err := yaml.Unmarshal(raw, &node); err != nil {
+			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%v", v)}
+		}
+		if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+			return node.Content[0]
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%v", v)}
+	}
+}
+
+// buildMinimalYAML produces a minimal YAML document from the patch map alone,
+// writing keys only at the relevant scope. No zero-value fields, no empty v3:
+// block unless the scope is "v3".
+func buildMinimalYAML(patch map[string]any, scope string) ([]byte, error) {
+	root := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+
+	switch scope {
+	case "v3":
+		if len(patch) > 0 {
+			v3Val := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			for k, v := range patch {
+				if v != nil {
+					setYAMLKey(v3Val, k, v)
+				}
+			}
+			if len(v3Val.Content) > 0 {
+				root.Content = append(root.Content,
+					&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "v3"},
+					v3Val,
+				)
+			}
+		}
+	default:
+		for k, v := range patch {
+			if v != nil {
+				setYAMLKey(root, k, v)
+			}
+		}
+	}
+
+	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(doc); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // ── Atomic Writer ───────────────────────────────────────────────────────────
