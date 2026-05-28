@@ -199,8 +199,10 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		slog.Info("trm: wired into context assembly pipeline")
 	}
 
-	// Build the inference router.
-	router, err := BuildRouter(cfg)
+	// Build the inference router. Pass the kernel context so the router runs its
+	// background availability maintainer (provider readiness is probed off the
+	// request hot path) and stops cleanly on shutdown.
+	router, err := BuildRouter(cfg, WithRouterContext(ctx))
 	if err != nil {
 		slog.Warn("router build failed; inference disabled", "err", err)
 	}
