@@ -1312,17 +1312,37 @@ func gitTreeHash() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// gitCogTreeHash computes the tree hash of .cog/ directory
+// gitCogTreeHash computes the tree hash of the .cog/ working tree without
+// mutating the real git index.  It stages into a throwaway temp index via
+// GIT_INDEX_FILE so that the caller's staged changes are never touched.
 func gitCogTreeHash(gitRoot string) (string, error) {
-	// Stage .cog/ first to include unstaged changes
+	// Reserve a unique path for the temp index without actually creating the
+	// file: git requires GIT_INDEX_FILE to either not exist or be a valid index
+	// — a zero-byte file causes "index file smaller than expected".
+	tmpIdx, err := os.CreateTemp("", "cog-idx-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp index: %w", err)
+	}
+	tmpIdxPath := tmpIdx.Name()
+	tmpIdx.Close()
+	// Remove so git creates a fresh index at this path.
+	os.Remove(tmpIdxPath) //nolint:errcheck // best-effort; the path is still unique
+	defer os.Remove(tmpIdxPath)
+
+	env := append(os.Environ(), "GIT_INDEX_FILE="+tmpIdxPath)
+
+	// Stage .cog/ into the temp index (includes working-tree changes).
 	stageCmd, stageCancel := gitCmd("-C", gitRoot, "add", "-A", ".cog/")
 	defer stageCancel()
+	stageCmd.Env = env
 	if err := stageCmd.Run(); err != nil {
-		// Non-fatal: may fail if nothing to stage
+		// Non-fatal: may fail on an empty .cog/ or a bare repo.
 	}
 
+	// Write the tree from the temp index.
 	writeCmd, writeCancel := gitCmd("-C", gitRoot, "write-tree", "--prefix=.cog/")
 	defer writeCancel()
+	writeCmd.Env = env
 	out, err := writeCmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to compute tree hash: %w", err)
