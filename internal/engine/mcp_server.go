@@ -114,6 +114,11 @@ type MCPServer struct {
 	// cog_dispatch_to_harness with target_node routed through here instead of
 	// running locally. Set via SetClusterRouter.
 	clusterRouter RemoteDispatchRouter
+
+	// kernelProber is the per-instance TTL cache for the cog://kernel/status
+	// resource (RFC Phase 1). Each MCPServer has its own prober so that test
+	// instances don't share probe state. See mcp_kernel_status.go.
+	kernelProber kernelStatusProber
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
@@ -453,6 +458,17 @@ func (m *MCPServer) registerResources() {
 		Description: "Effective kernel configuration (kernel.yaml resolved against defaults)",
 		MIMEType:    "application/json",
 	}, m.resourceConfig)
+
+	m.server.AddResource(&mcp.Resource{
+		URI:  "cog://kernel/status",
+		Name: "Kernel Status",
+		Description: "Local kernel reachability probe. Reads GET /health on the " +
+			"configured port (default 6931) with a 2 s timeout; result is cached " +
+			"for ~3 s. Shape: {reachable, endpoint, version, identity, node_id, " +
+			"checked_at, latency_ms} when up; {reachable:false, endpoint, " +
+			"checked_at, error} when down.",
+		MIMEType: "application/json",
+	}, m.resourceKernelStatus)
 }
 
 // ── Resource Handlers ───────────────────────────────────────────────────────
