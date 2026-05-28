@@ -34,6 +34,19 @@ import (
 
 var toolCallRejectionsByProvider sync.Map // map[string]*atomic.Int64
 
+// availState is a single provider's last observed readiness.
+type availState struct {
+	ready    bool
+	lastSeen time.Time
+}
+
+// availSnapshot is an immutable map of provider name → readiness, swapped
+// atomically by the background maintainer so Route reads it lock-free.
+type availSnapshot map[string]availState
+
+// defaultAvailTTL is the interval between background availability probes.
+const defaultAvailTTL = 10 * time.Second
+
 // SimpleRouter implements Router with rule-based provider selection.
 type SimpleRouter struct {
 	mu        sync.RWMutex
@@ -41,6 +54,22 @@ type SimpleRouter struct {
 	byName    map[string]Provider
 
 	cfg RoutingConfig
+
+	// Provider availability maintained off the request hot path. A background
+	// goroutine (Start) probes every provider concurrently on availTTL and
+	// swaps an immutable snapshot; Route reads it lock-free via available().
+	// When the snapshot is cold/stale (no maintainer running, just-registered
+	// provider, or stalled ticker) available() falls back to a bounded inline
+	// probe so short-lived callers that never call Start stay correct.
+	//
+	// This is the fix for the per-request blocking probe: a dead provider deep
+	// in the fallback chain used to cost its full TCP timeout on every request
+	// (it was probed inline in Route); now that cost is paid in the background,
+	// concurrently, once per availTTL, and never on a request.
+	avail    atomic.Pointer[availSnapshot]
+	availTTL time.Duration
+	stopCh   chan struct{}
+	stopOnce sync.Once
 
 	// Atomics for lock-free stats.
 	totalRequests atomic.Int64
@@ -52,8 +81,10 @@ type SimpleRouter struct {
 // NewSimpleRouter creates an empty router with the given routing config.
 func NewSimpleRouter(cfg RoutingConfig) *SimpleRouter {
 	return &SimpleRouter{
-		cfg:    cfg,
-		byName: make(map[string]Provider),
+		cfg:      cfg,
+		byName:   make(map[string]Provider),
+		availTTL: defaultAvailTTL,
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -170,7 +201,7 @@ func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provi
 	for i, p := range ordered {
 		caps := p.Capabilities()
 		capsMet := caps.HasAllCapabilities(req.Metadata.RequiredCapabilities)
-		avail := p.Available(ctx)
+		avail := r.available(ctx, p)
 
 		score := ProviderScore{
 			Provider:        p.Name(),
@@ -227,6 +258,94 @@ func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provi
 		"latency_us", time.Since(start).Microseconds())
 
 	return selected, decision, nil
+}
+
+// available reports whether provider p is ready, reading the maintained
+// availability snapshot when it holds a fresh entry and falling back to a
+// bounded inline probe otherwise. The fast path is lock-free and O(1); the
+// fallback exists so callers that never start the background maintainer (and
+// freshly-registered providers not yet probed) still observe real readiness.
+func (r *SimpleRouter) available(ctx context.Context, p Provider) bool {
+	ttl := r.availTTL
+	if ttl <= 0 {
+		ttl = defaultAvailTTL
+	}
+	if snap := r.avail.Load(); snap != nil {
+		if st, ok := (*snap)[p.Name()]; ok && time.Since(st.lastSeen) <= 3*ttl {
+			return st.ready // maintained readiness — no probe on the hot path
+		}
+	}
+	// Cold or stale: probe inline, but bound it so a dead provider can't hang
+	// the request beyond probeTimeout.
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	return p.Available(pctx)
+}
+
+// probeTimeout bounds a single availability probe (background or inline
+// fallback) so one unreachable endpoint can't stall a whole probe cycle.
+const probeTimeout = 2 * time.Second
+
+// probeAll probes every registered provider concurrently, each bounded by
+// probeTimeout, and atomically swaps in the resulting snapshot. A cycle costs
+// roughly the slowest single probe — not the sum — and never blocks Route.
+func (r *SimpleRouter) probeAll(ctx context.Context) {
+	r.mu.RLock()
+	ps := make([]Provider, len(r.providers))
+	copy(ps, r.providers)
+	r.mu.RUnlock()
+
+	next := make(availSnapshot, len(ps))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, p := range ps {
+		wg.Add(1)
+		go func(p Provider) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+			defer cancel()
+			ready := p.Available(pctx)
+			mu.Lock()
+			next[p.Name()] = availState{ready: ready, lastSeen: time.Now()}
+			mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+	r.avail.Store(&next)
+}
+
+// Start primes the availability cache synchronously, then maintains it on a
+// ticker until ctx is cancelled or Close is called. Idempotent callers that
+// never invoke Start keep working via available()'s inline-probe fallback.
+func (r *SimpleRouter) Start(ctx context.Context) {
+	if r.availTTL <= 0 {
+		r.availTTL = defaultAvailTTL
+	}
+	r.probeAll(ctx) // warm the cache before the first request can read it
+	go func() {
+		t := time.NewTicker(r.availTTL)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-r.stopCh:
+				return
+			case <-t.C:
+				r.probeAll(ctx)
+			}
+		}
+	}()
+}
+
+// Close stops the background availability maintainer. Safe to call more than
+// once and safe to call when Start was never invoked.
+func (r *SimpleRouter) Close() {
+	r.stopOnce.Do(func() {
+		if r.stopCh != nil {
+			close(r.stopCh)
+		}
+	})
 }
 
 // Stats returns current routing statistics.
@@ -354,11 +473,19 @@ func BuildRouter(cfg *Config, opts ...BuildRouterOption) (Router, error) {
 	// Auto-discover OpenAI-compatible servers on well-known ports.
 	autoDiscoverOpenAICompat(router, pcfg)
 
+	// Start the background availability maintainer when a lifecycle context is
+	// provided (the long-running daemon). Short-lived callers omit it and rely
+	// on available()'s inline-probe fallback.
+	if bro.ctx != nil {
+		router.Start(bro.ctx)
+	}
+
 	return router, nil
 }
 
 type buildRouterOpts struct {
 	procMgr *ProcessManager
+	ctx     context.Context
 }
 
 // BuildRouterOption configures BuildRouter.
@@ -367,6 +494,15 @@ type BuildRouterOption func(*buildRouterOpts)
 // WithProcessManager provides a ProcessManager for providers that spawn subprocesses.
 func WithProcessManager(pm *ProcessManager) BuildRouterOption {
 	return func(o *buildRouterOpts) { o.procMgr = pm }
+}
+
+// WithRouterContext ties the router's background availability maintainer to
+// ctx. When provided, BuildRouter starts the maintainer (warming the cache
+// before returning); when cancelled, the maintainer stops. Omit it for
+// short-lived callers (one-shot CLIs, tests) — they fall back to inline
+// availability probing and start no goroutine.
+func WithRouterContext(ctx context.Context) BuildRouterOption {
+	return func(o *buildRouterOpts) { o.ctx = ctx }
 }
 
 func loadProvidersConfig(cfg *Config) (ProvidersConfig, error) {
