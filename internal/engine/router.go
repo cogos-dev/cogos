@@ -541,6 +541,26 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 			procMgr = NewProcessManager(ProcessManagerConfig{})
 		}
 		return NewClaudeCodeProvider(name, pc, procMgr), nil
+	case "claude-oauth":
+		// OAuth-credentialed provider using the operator's managed Claude
+		// subscription. Reads credentials from the macOS keychain /
+		// CLAUDE_CODE_OAUTH_TOKEN env var / ~/.claude/.credentials.json.
+		// No API key needed — credential lifecycle is self-managed.
+		//
+		// CLI fallback: on a persistent 429 (subscription burst rate-limit with
+		// overage disabled — see the 429 RCA) the provider delegates to a
+		// claude-code CLI provider, which reaches the same Max subscription via
+		// the official client. Built here so the fallback shares the process
+		// manager.
+		if procMgr == nil {
+			procMgr = NewProcessManager(ProcessManagerConfig{})
+		}
+		cliFallback := NewClaudeCodeProvider(name+"-cli-fallback", ProviderConfig{
+			Type:    "claude-code",
+			Model:   "sonnet", // canonical CLI alias (matches the claude-code provider)
+			Timeout: pc.Timeout,
+		}, procMgr)
+		return NewClaudeOAuthProvider(name, pc, cliFallback), nil
 	case "codex":
 		return NewCodexProvider(name, pc), nil
 	case "pi":
