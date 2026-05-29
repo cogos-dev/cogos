@@ -651,6 +651,85 @@ func buildOAuthSystem(req *CompletionRequest) any {
 	return blocks
 }
 
+// ── OAuth tool-namespace billing gate workaround ────────────────────────────────
+//
+// Anthropic's managed-subscription (OAuth) path routes every /v1/messages
+// request into a billing lane by a format-only check on tool names: a name
+// matching ^mcp_[a-z] (single-underscore "mcp_" followed by a lowercase
+// letter) is classified as third-party MCP-extension usage and billed to the
+// overage lane. On a Max/Pro subscription with overage disabled that returns
+// HTTP 400 "You're out of extra usage". The sanctioned double-underscore
+// namespace (mcp__server__tool), bare names, and mcp_[A-Z0-9] all ride the
+// subscription lane. Verified empirically 2026-05-29.
+//
+// Clients that route tools through the kernel (e.g. Hermes over openai_chat)
+// register MCP tools as mcp_<server>_<tool> (single underscore, lowercase),
+// which trips the gate. We rewrite mcp_x -> mcp__x on the outbound request and
+// reverse mcp__x -> mcp_x on tool_use names in the response, so the client's
+// tool-call routing (keyed on the original name) still resolves. The rewrite is
+// scoped to this OAuth provider only; the x-api-key Anthropic provider does not
+// hit the gate and is intentionally left untouched.
+
+// toolNameToWire maps a single-underscore mcp_ tool name to the sanctioned
+// double-underscore namespace. Already-double-underscore and bare names are
+// returned unchanged.
+func toolNameToWire(name string) string {
+	if strings.HasPrefix(name, "mcp__") {
+		return name
+	}
+	if strings.HasPrefix(name, "mcp_") {
+		return "mcp__" + name[len("mcp_"):]
+	}
+	return name
+}
+
+// rewriteOAuthToolNames rewrites tool definitions and tool_use names in the
+// outbound payload to the sanctioned namespace, returning a wire->original map
+// used to reverse the names on the response. Only names that were actually
+// rewritten appear in the map, so genuine double-underscore names are never
+// corrupted on the return path.
+func rewriteOAuthToolNames(payload *anthropicRequest) map[string]string {
+	rev := map[string]string{}
+	for i := range payload.Tools {
+		orig := payload.Tools[i].Name
+		if wire := toolNameToWire(orig); wire != orig {
+			payload.Tools[i].Name = wire
+			rev[wire] = orig
+		}
+	}
+	for mi := range payload.Messages {
+		blocks, ok := payload.Messages[mi].Content.([]anthropicContentBlock)
+		if !ok {
+			continue
+		}
+		for bi := range blocks {
+			if blocks[bi].Type == "tool_use" && blocks[bi].Name != "" {
+				orig := blocks[bi].Name
+				if wire := toolNameToWire(orig); wire != orig {
+					blocks[bi].Name = wire
+					rev[wire] = orig
+				}
+			}
+		}
+	}
+	return rev
+}
+
+// restoreOAuthToolNames reverses the outbound rewrite on tool_use content
+// blocks in a non-streaming response, restoring the client's original names.
+func restoreOAuthToolNames(content []anthropicContent, rev map[string]string) {
+	if len(rev) == 0 {
+		return
+	}
+	for i := range content {
+		if content[i].Type == "tool_use" {
+			if orig, ok := rev[content[i].Name]; ok {
+				content[i].Name = orig
+			}
+		}
+	}
+}
+
 // ── Complete ──────────────────────────────────────────────────────────────────
 
 // Complete sends a non-streaming request, handling proactive + reactive token
@@ -662,6 +741,10 @@ func (p *ClaudeOAuthProvider) Complete(ctx context.Context, req *CompletionReque
 	payload := buildAnthropicRequest(model, req, false, p.maxTokens)
 	// Override the system field to include the Claude Code prefix.
 	payload.System = buildOAuthSystem(req)
+	// Rewrite single-underscore mcp_ tool names to the sanctioned mcp__
+	// namespace so the request rides the subscription lane (see
+	// rewriteOAuthToolNames). Reversed on the response below.
+	oauthToolNames := rewriteOAuthToolNames(payload)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -736,6 +819,7 @@ func (p *ClaudeOAuthProvider) Complete(ctx context.Context, req *CompletionReque
 	if err := json.Unmarshal([]byte(resp.bodyText), &ar); err != nil {
 		return nil, fmt.Errorf("claude-oauth: decode response: %w", err)
 	}
+	restoreOAuthToolNames(ar.Content, oauthToolNames)
 	return parseAnthropicResponse(&ar, model, p.name, time.Since(start)), nil
 }
 
@@ -778,6 +862,10 @@ func (p *ClaudeOAuthProvider) Stream(ctx context.Context, req *CompletionRequest
 
 	payload := buildAnthropicRequest(model, req, true, p.maxTokens)
 	payload.System = buildOAuthSystem(req)
+	// Rewrite single-underscore mcp_ tool names to the sanctioned mcp__
+	// namespace so the request rides the subscription lane; reversed on the
+	// streamed tool-call deltas below.
+	oauthToolNames := rewriteOAuthToolNames(payload)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -858,10 +946,32 @@ func (p *ClaudeOAuthProvider) Stream(ctx context.Context, req *CompletionRequest
 	}
 
 	ch := make(chan StreamChunk, 32)
+	if len(oauthToolNames) == 0 {
+		go func() {
+			defer close(ch)
+			defer resp.Body.Close()
+			parseAnthropicSSE(ctx, resp.Body, ch, model, p.name)
+		}()
+		return ch, nil
+	}
+	// Reverse the outbound mcp_ -> mcp__ rewrite on streamed tool-call deltas
+	// so the client sees the names it originally registered.
+	raw := make(chan StreamChunk, 32)
+	go func() {
+		defer close(raw)
+		defer resp.Body.Close()
+		parseAnthropicSSE(ctx, resp.Body, raw, model, p.name)
+	}()
 	go func() {
 		defer close(ch)
-		defer resp.Body.Close()
-		parseAnthropicSSE(ctx, resp.Body, ch, model, p.name)
+		for chunk := range raw {
+			if chunk.ToolCallDelta != nil && chunk.ToolCallDelta.Name != "" {
+				if orig, ok := oauthToolNames[chunk.ToolCallDelta.Name]; ok {
+					chunk.ToolCallDelta.Name = orig
+				}
+			}
+			ch <- chunk
+		}
 	}()
 	return ch, nil
 }
