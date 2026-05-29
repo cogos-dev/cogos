@@ -26,13 +26,14 @@
 // single named constant; the subprocess client remains as a fallback.
 //
 // Reference implementation for exact values:
-//   ~/.hermes/hermes-agent/agent/anthropic_adapter.py
-//   functions: refresh_anthropic_oauth_pure, _write_claude_code_credentials,
-//              _read_claude_code_credentials_from_keychain, read_claude_code_credentials,
-//              is_claude_code_token_valid
-//   constants: _COMMON_BETAS, _OAUTH_ONLY_BETAS, _CLAUDE_CODE_SYSTEM_PREFIX,
-//              client_id ("9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
-//              token_endpoints (platform.claude.com → console.anthropic.com)
+//
+//	~/.hermes/hermes-agent/agent/anthropic_adapter.py
+//	functions: refresh_anthropic_oauth_pure, _write_claude_code_credentials,
+//	           _read_claude_code_credentials_from_keychain, read_claude_code_credentials,
+//	           is_claude_code_token_valid
+//	constants: _COMMON_BETAS, _OAUTH_ONLY_BETAS, _CLAUDE_CODE_SYSTEM_PREFIX,
+//	           client_id ("9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+//	           token_endpoints (platform.claude.com → console.anthropic.com)
 package engine
 
 import (
@@ -486,7 +487,7 @@ func NewClaudeOAuthProvider(name string, cfg ProviderConfig, fallback Provider) 
 
 // ── Provider interface ────────────────────────────────────────────────────────
 
-func (p *ClaudeOAuthProvider) Name() string { return p.name }
+func (p *ClaudeOAuthProvider) Name() string  { return p.name }
 func (p *ClaudeOAuthProvider) Model() string { return p.model }
 
 // Available reports whether the provider can serve requests. It does a
@@ -608,27 +609,46 @@ func (p *ClaudeOAuthProvider) effectiveModel(req *CompletionRequest) string {
 // buildOAuthSystem prepends the Claude Code system prefix to every request,
 // then appends context items and the caller's system prompt.
 // Source: _CLAUDE_CODE_SYSTEM_PREFIX usage in the reference implementation.
-func buildOAuthSystem(req *CompletionRequest) string {
-	var sb strings.Builder
-	sb.WriteString(claudeCodeSystemPrefix)
+// anthropicSystemBlock is one text block of a multi-block system prompt, as the
+// Claude Code client sends it.
+type anthropicSystemBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
 
-	// Context items follow the prefix (labelled comment blocks).
+// buildOAuthSystem builds the system field for the OAuth (Max-subscription) path
+// as a MULTI-BLOCK ARRAY, exactly as the genuine Claude Code client does.
+//
+// Anthropic enforces anti-abuse on OAuth tokens: the system prompt's FIRST block
+// must be the canonical Claude Code system prompt. A single system STRING that is
+// anything other than that exact prefix is rejected with 429 rate_limit_error
+// (generic "Error" body, no rate-limit headers). But a block ARRAY whose block[0]
+// is the canonical prefix is accepted, and ANY additional blocks (our identity +
+// foveated context) are allowed. Verified empirically 2026-05-29.
+//
+// So: block[0] = isolated canonical prefix; block[1] = our injected identity +
+// context + caller system prompt (only when non-empty).
+func buildOAuthSystem(req *CompletionRequest) any {
+	blocks := []anthropicSystemBlock{
+		{Type: "text", Text: claudeCodeSystemPrefix},
+	}
+
+	var sb strings.Builder
 	for _, item := range req.Context {
 		if item.Content == "" {
 			continue
 		}
-		fmt.Fprintf(&sb, "\n\n<!-- context id=%q zone=%s salience=%.2f -->\n%s",
+		fmt.Fprintf(&sb, "<!-- context id=%q zone=%s salience=%.2f -->\n%s\n\n",
 			item.ID, item.Zone, item.Salience, item.Content)
 	}
-
-	// Caller's system prompt appended last.
 	if req.SystemPrompt != "" {
-		if sb.Len() > 0 {
-			sb.WriteString("\n\n")
-		}
 		sb.WriteString(req.SystemPrompt)
 	}
-	return sb.String()
+
+	if injected := strings.TrimSpace(sb.String()); injected != "" {
+		blocks = append(blocks, anthropicSystemBlock{Type: "text", Text: injected})
+	}
+	return blocks
 }
 
 // ── Complete ──────────────────────────────────────────────────────────────────

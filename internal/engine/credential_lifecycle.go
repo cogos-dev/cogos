@@ -21,6 +21,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -84,11 +85,11 @@ type CredentialLifecycle struct {
 	source  CredentialSource
 	refresh RefreshFunc
 
-	mu      sync.Mutex
-	cond    *sync.Cond // broadcast when refresh completes
-	cred    OAuthCredential
-	ready   bool // true once the first Resolve succeeded
-	refreshing bool // true while a refresh goroutine holds the gate
+	mu         sync.Mutex
+	cond       *sync.Cond // broadcast when refresh completes
+	cred       OAuthCredential
+	ready      bool  // true once the first Resolve succeeded
+	refreshing bool  // true while a refresh goroutine holds the gate
 	lastErr    error // last refresh error, cleared on success
 }
 
@@ -154,7 +155,30 @@ func (lc *CredentialLifecycle) freshTokenLocked(ctx context.Context, forceRefres
 		return lc.cred.AccessToken, nil
 	}
 
-	// Stale (or forced). Wait if another goroutine is already refreshing.
+	// Re-resolve from source BEFORE attempting a token refresh. The OAuth
+	// credential (keychain / ~/.claude/.credentials.json) is owned and rotated
+	// by the official Claude Code client on its own schedule. Re-reading the
+	// source picks up the client's freshly-rotated token without us touching
+	// the rotating refresh_token flow — which (a) would 429 because the client
+	// has already consumed the single-use refresh token, and (b) would itself
+	// rotate a credential we do not own, breaking the client. We are a *reader*
+	// of the client-maintained credential, not its refresher.
+	if !forceRefresh {
+		lc.mu.Unlock()
+		reCred, reErr := lc.source.Resolve()
+		lc.mu.Lock()
+		if reErr == nil && isFresh(reCred) {
+			lc.cred = reCred
+			slog.Debug("credential lifecycle: re-resolved fresh token from source (client rotated)",
+				"expires_in", time.Until(time.UnixMilli(reCred.ExpiresAtMS)).Round(time.Second).String())
+			return reCred.AccessToken, nil
+		}
+		slog.Debug("credential lifecycle: source has no fresher token; falling back to refresh_token flow",
+			"resolve_err", reErr)
+	}
+
+	// Stale (or forced) and the source had nothing fresher. Wait if another
+	// goroutine is already refreshing.
 	for lc.refreshing {
 		// Release mu and sleep until broadcast wakes us.
 		// Check ctx to avoid blocking forever if the caller cancels.

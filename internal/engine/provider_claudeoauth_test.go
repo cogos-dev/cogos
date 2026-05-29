@@ -117,52 +117,60 @@ func TestSetOAuthHeadersWith1MBeta(t *testing.T) {
 
 // ── buildOAuthSystem ──────────────────────────────────────────────────────────
 
+// oauthSystemBlocks asserts buildOAuthSystem returned a []anthropicSystemBlock
+// whose first block is exactly the canonical Claude Code prefix. Anthropic's
+// OAuth path requires this block-array shape (see buildOAuthSystem).
+func oauthSystemBlocks(t *testing.T, v any) []anthropicSystemBlock {
+	t.Helper()
+	blocks, ok := v.([]anthropicSystemBlock)
+	if !ok {
+		t.Fatalf("buildOAuthSystem must return []anthropicSystemBlock; got %T", v)
+	}
+	if len(blocks) == 0 || blocks[0].Text != claudeCodeSystemPrefix {
+		t.Fatalf("block[0] must be exactly the Claude Code prefix; got %+v", blocks)
+	}
+	return blocks
+}
+
 func TestBuildOAuthSystemPrefixAlwaysPresent(t *testing.T) {
 	t.Parallel()
-	req := &CompletionRequest{
+	blocks := oauthSystemBlocks(t, buildOAuthSystem(&CompletionRequest{
 		SystemPrompt: "Additional instructions.",
-	}
-	system := buildOAuthSystem(req)
-	if !strings.HasPrefix(system, claudeCodeSystemPrefix) {
-		t.Errorf("system should start with Claude Code prefix; got: %q", system[:min(len(system), 80)])
-	}
-	if !strings.Contains(system, "Additional instructions.") {
-		t.Error("system should contain the caller's system prompt")
+	}))
+	if len(blocks) < 2 || !strings.Contains(blocks[1].Text, "Additional instructions.") {
+		t.Errorf("caller's system prompt should be in block[1]; got %+v", blocks)
 	}
 }
 
 func TestBuildOAuthSystemPrefixOnlyWhenNoPrompt(t *testing.T) {
 	t.Parallel()
-	system := buildOAuthSystem(&CompletionRequest{})
-	if system != claudeCodeSystemPrefix {
-		t.Errorf("system = %q; want exactly the prefix when no prompt/context", system)
+	blocks := oauthSystemBlocks(t, buildOAuthSystem(&CompletionRequest{}))
+	if len(blocks) != 1 {
+		t.Errorf("want exactly one block (prefix only) when no prompt/context; got %d", len(blocks))
 	}
 }
 
 func TestBuildOAuthSystemWithContext(t *testing.T) {
 	t.Parallel()
-	req := &CompletionRequest{
+	blocks := oauthSystemBlocks(t, buildOAuthSystem(&CompletionRequest{
 		SystemPrompt: "Nucleus.",
 		Context: []ContextItem{
 			{ID: "cog://mem/note", Zone: ZoneFoveal, Salience: 0.9, Content: "note content"},
 		},
+	}))
+	if len(blocks) < 2 {
+		t.Fatalf("want prefix block + injected block; got %d blocks", len(blocks))
 	}
-	system := buildOAuthSystem(req)
-	if !strings.HasPrefix(system, claudeCodeSystemPrefix) {
-		t.Error("system prefix missing")
+	injected := blocks[1].Text
+	if !strings.Contains(injected, "note content") {
+		t.Error("context item should be in the injected block")
 	}
-	if !strings.Contains(system, "note content") {
-		t.Error("context item should be in system string")
+	if !strings.Contains(injected, "Nucleus.") {
+		t.Error("system prompt should be in the injected block")
 	}
-	if !strings.Contains(system, "Nucleus.") {
-		t.Error("system prompt should be in system string")
-	}
-	// Prefix → context items → system prompt (order matters).
-	prefixIdx := strings.Index(system, claudeCodeSystemPrefix)
-	contextIdx := strings.Index(system, "note content")
-	promptIdx := strings.Index(system, "Nucleus.")
-	if prefixIdx > contextIdx || contextIdx > promptIdx {
-		t.Error("order should be: prefix → context → system prompt")
+	// Within the injected block: context items precede the nucleus system prompt.
+	if strings.Index(injected, "note content") > strings.Index(injected, "Nucleus.") {
+		t.Error("order should be: context → system prompt")
 	}
 }
 
@@ -272,8 +280,8 @@ func TestClaudeOAuthAvailableReactive401(t *testing.T) {
 	defer srv.Close()
 
 	refreshed := OAuthCredential{
-		AccessToken:  newToken,
-		ExpiresAtMS:  time.Now().Add(60 * time.Minute).UnixMilli(),
+		AccessToken: newToken,
+		ExpiresAtMS: time.Now().Add(60 * time.Minute).UnixMilli(),
 	}
 	src := &stubCredentialSource{cred: freshCred()}
 	lc := NewCredentialLifecycle(src, func(_ context.Context, _ string) (OAuthCredential, error) {
@@ -334,14 +342,21 @@ func TestClaudeOAuthComplete(t *testing.T) {
 			http.Error(w, "x-api-key should not be set for OAuth", http.StatusBadRequest)
 			return
 		}
-		// Verify system prefix is in the request body.
+		// Verify system is a block array whose first block is the canonical
+		// Claude Code prefix (the OAuth wire shape; decodes to []any of maps).
 		var reqBody anthropicRequest
 		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
-		if !strings.HasPrefix(reqBody.System, claudeCodeSystemPrefix) {
-			http.Error(w, "missing system prefix", http.StatusBadRequest)
+		sysArr, ok := reqBody.System.([]any)
+		if !ok || len(sysArr) == 0 {
+			http.Error(w, "system should be a non-empty block array", http.StatusBadRequest)
+			return
+		}
+		first, _ := sysArr[0].(map[string]any)
+		if first["text"] != claudeCodeSystemPrefix {
+			http.Error(w, "block[0] must be the Claude Code prefix", http.StatusBadRequest)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(anthropicResponseBody("OAuth response"))
@@ -770,4 +785,3 @@ func TestMakeProviderClaudeOAuth(t *testing.T) {
 // min is available as a builtin since Go 1.21; kept as local for test-file clarity.
 // (shadowing the builtin is fine inside a function, but a package-level redeclaration
 //  is a compilation error in Go 1.21+)
-

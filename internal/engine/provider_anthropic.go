@@ -141,9 +141,12 @@ func (p *AnthropicProvider) effectiveModel(req *CompletionRequest) string {
 // ── Anthropic wire types ──────────────────────────────────────────────────────
 
 type anthropicRequest struct {
-	Model         string               `json:"model"`
-	MaxTokens     int                  `json:"max_tokens"`
-	System        string               `json:"system,omitempty"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	// System is either a plain string (x-api-key path) or a []anthropicSystemBlock
+	// array (OAuth path — the Claude Code client sends system as text blocks,
+	// and Anthropic validates that block[0] is the canonical Claude Code prompt).
+	System        any                  `json:"system,omitempty"`
 	Messages      []anthropicMessage   `json:"messages"`
 	Stream        bool                 `json:"stream,omitempty"`
 	Tools         []anthropicTool      `json:"tools,omitempty"`
