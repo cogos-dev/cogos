@@ -85,6 +85,19 @@ type ChannelSessionRecord struct {
 	// Source records whether the session_id came from the caller or was
 	// minted. Useful for audit; no functional impact.
 	IDSource string `json:"id_source,omitempty"` // "caller" | "minted"
+
+	// Iss / Sub carry the OIDC identity claims forwarded from mod3's seat
+	// registration (Fix A — session-registration-unification). These are the
+	// user_iss/user_sub fields from the channel-client seat; carrying them on
+	// the kernel record makes the WHO visible to kernel consumers without
+	// requiring a second round-trip to mod3.
+	//
+	// Dependency: fully populated only when mod3 is running the
+	// feat/mod3-session-identity-claims branch or later (merged into main).
+	// Callers that don't supply these fields leave them empty; the kernel
+	// record is still valid and the callback is still idempotent.
+	Iss string `json:"iss,omitempty"`
+	Sub string `json:"sub,omitempty"`
 }
 
 // ChannelSessionRegistry is the in-memory map keyed by session_id. It holds
@@ -198,6 +211,12 @@ type channelSessionRegisterRequest struct {
 	Priority              int            `json:"priority,omitempty"`
 	Kinds                 []string       `json:"kinds,omitempty"`
 	Metadata              map[string]any `json:"metadata,omitempty"`
+	// Iss / Sub are OIDC identity claims forwarded from the mod3 seat that
+	// triggered this register callback (Fix A — session-registration-unification).
+	// Optional; absent means the seat was unattributed or the caller does not
+	// carry identity (e.g. a direct kernel-originated registration).
+	Iss string `json:"iss,omitempty"`
+	Sub string `json:"sub,omitempty"`
 }
 
 // channelSessionResponse is the merged shape returned from the kernel. The
@@ -292,6 +311,8 @@ func (s *Server) RegisterChannelSession(ctx context.Context, req channelSessionR
 		RegisteredAt:          now,
 		LastSeen:              now,
 		IDSource:              idSource,
+		Iss:                   req.Iss,
+		Sub:                   req.Sub,
 	}
 
 	// Forward to mod3 with the kernel-issued session_id. Mod3's body is the

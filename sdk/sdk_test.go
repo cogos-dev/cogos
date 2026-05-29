@@ -212,7 +212,7 @@ func TestCogdocTypeValidation(t *testing.T) {
 		// Core types
 		{"identity", true},
 		{"ontology", true},
-		{"mem", true},
+		{"memory", true},
 		{"schema", true},
 		{"decision", true},
 		{"session", true},
