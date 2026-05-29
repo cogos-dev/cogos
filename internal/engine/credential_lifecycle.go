@@ -1,11 +1,14 @@
 // credential_lifecycle.go — OAuth credential lifecycle (vendor-agnostic)
 //
-// Implements the CredentialLifecycle contract from RFC-oauth-credentialed-inference-provider:
+// A reusable primitive for OAuth-bearer inference providers:
 //
 //   - Resolve: obtain credentials from a pluggable CredentialSource.
 //   - Validate: fresh iff now < expiresAt − buffer (60 s). No expiry → fresh if
 //     token present.
-//   - Proactive refresh: before every use, if not fresh, refresh first.
+//   - Re-resolve before refresh: when the cached token is stale, re-read the
+//     source first. If an external client (e.g. a vendor's official CLI) owns
+//     and rotates the credential store, the source already holds a fresh token
+//     and no refresh_token round-trip is needed.
 //   - Reactive refresh: on HTTP 401, refresh once and retry.
 //   - Single-flight: at most one in-flight refresh; concurrent callers wait and
 //     reuse the same result (sync.Cond broadcast, no goroutine leaks).
@@ -14,8 +17,8 @@
 //   - Fail-to-Unavailable: refresh failure returns an error so the caller can
 //     report Unavailable to the router instead of presenting a stale bearer.
 //
-// Nothing in this file is Anthropic-specific. Vendor bindings live in
-// provider_claudeoauth.go and supply the CredentialSource + RefreshFunc.
+// Nothing in this file is vendor-specific. A provider supplies the concrete
+// CredentialSource (keychain / file / env) and RefreshFunc (token-endpoint call).
 package engine
 
 import (
@@ -155,14 +158,14 @@ func (lc *CredentialLifecycle) freshTokenLocked(ctx context.Context, forceRefres
 		return lc.cred.AccessToken, nil
 	}
 
-	// Re-resolve from source BEFORE attempting a token refresh. The OAuth
-	// credential (keychain / ~/.claude/.credentials.json) is owned and rotated
-	// by the official Claude Code client on its own schedule. Re-reading the
-	// source picks up the client's freshly-rotated token without us touching
-	// the rotating refresh_token flow — which (a) would 429 because the client
-	// has already consumed the single-use refresh token, and (b) would itself
-	// rotate a credential we do not own, breaking the client. We are a *reader*
-	// of the client-maintained credential, not its refresher.
+	// Re-resolve from source BEFORE attempting a token refresh. When an external
+	// client (e.g. a vendor's official CLI) owns and rotates the credential store
+	// on its own schedule, re-reading the source picks up that freshly-rotated
+	// token without us touching the rotating refresh_token flow — which, with
+	// single-use refresh tokens, (a) fails if the owner already consumed the
+	// token, and (b) would itself rotate a credential we do not own, breaking the
+	// owner. Prefer being a *reader* of an externally-maintained credential over
+	// competing to refresh it.
 	if !forceRefresh {
 		lc.mu.Unlock()
 		reCred, reErr := lc.source.Resolve()

@@ -158,8 +158,8 @@ func TestFreshTokenFreshCached(t *testing.T) {
 	t.Parallel()
 	src := &mockSource{
 		cred: OAuthCredential{
-			AccessToken:  "tok-fresh",
-			ExpiresAtMS:  futureMS(10 * time.Minute),
+			AccessToken: "tok-fresh",
+			ExpiresAtMS: futureMS(10 * time.Minute),
 		},
 	}
 	var calls atomic.Int64
@@ -214,8 +214,8 @@ func TestFreshTokenProactiveRefreshOnStale(t *testing.T) {
 		ExpiresAtMS:  pastMS(5 * time.Minute), // definitely expired
 	}
 	newCred := OAuthCredential{
-		AccessToken:  "new-tok",
-		ExpiresAtMS:  futureMS(60 * time.Minute),
+		AccessToken: "new-tok",
+		ExpiresAtMS: futureMS(60 * time.Minute),
 	}
 	src := &mockSource{cred: staleCred}
 	var calls atomic.Int64
@@ -300,8 +300,8 @@ func TestReactiveRefreshAndRetry(t *testing.T) {
 		ExpiresAtMS:  futureMS(30 * time.Minute),
 	}
 	newCred := OAuthCredential{
-		AccessToken:  "reactive-tok",
-		ExpiresAtMS:  futureMS(60 * time.Minute),
+		AccessToken: "reactive-tok",
+		ExpiresAtMS: futureMS(60 * time.Minute),
 	}
 	src := &mockSource{cred: freshCred}
 	var calls atomic.Int64
@@ -347,8 +347,8 @@ func TestSingleFlightConcurrentRefresh(t *testing.T) {
 		ExpiresAtMS:  pastMS(5 * time.Minute),
 	}
 	newCred := OAuthCredential{
-		AccessToken:  "new",
-		ExpiresAtMS:  futureMS(60 * time.Minute),
+		AccessToken: "new",
+		ExpiresAtMS: futureMS(60 * time.Minute),
 	}
 	src := &mockSource{cred: staleCred}
 	var calls atomic.Int64
@@ -398,8 +398,8 @@ func TestWriteBackCalledAfterRefresh(t *testing.T) {
 		ExpiresAtMS:  pastMS(5 * time.Minute),
 	}
 	newCred := OAuthCredential{
-		AccessToken:  "new",
-		ExpiresAtMS:  futureMS(60 * time.Minute),
+		AccessToken: "new",
+		ExpiresAtMS: futureMS(60 * time.Minute),
 	}
 	src := &mockSource{cred: staleCred}
 	var calls atomic.Int64
@@ -602,8 +602,8 @@ func TestNoDoubleRefreshAfterSuccessfulRefresh(t *testing.T) {
 		ExpiresAtMS:  pastMS(5 * time.Minute),
 	}
 	newCred := OAuthCredential{
-		AccessToken:  "new",
-		ExpiresAtMS:  futureMS(60 * time.Minute),
+		AccessToken: "new",
+		ExpiresAtMS: futureMS(60 * time.Minute),
 	}
 	src := &mockSource{cred: staleCred}
 	var calls atomic.Int64
@@ -618,6 +618,84 @@ func TestNoDoubleRefreshAfterSuccessfulRefresh(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Errorf("refresh calls = %d; want 1 (no re-refresh)", calls.Load())
+	}
+}
+
+// ── re-resolve before refresh ──────────────────────────────────────────────────
+
+// sequencedSource returns a different credential on each Resolve call, so a test
+// can simulate an external client rotating the credential store between reads.
+type sequencedSource struct {
+	mu      sync.Mutex
+	creds   []OAuthCredential
+	i       int
+	calls   int
+	written []OAuthCredential
+}
+
+func (s *sequencedSource) Resolve() (OAuthCredential, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	c := s.creds[s.i]
+	if s.i < len(s.creds)-1 {
+		s.i++
+	}
+	return c, nil
+}
+
+func (s *sequencedSource) WriteBack(cred OAuthCredential) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.written = append(s.written, cred)
+	return nil
+}
+
+// When the cached token is stale but the source has since been refreshed by its
+// external owner, FreshToken must re-resolve and return the source's fresh token
+// WITHOUT calling the refresh_token flow.
+func TestFreshTokenReResolvesBeforeRefresh(t *testing.T) {
+	t.Parallel()
+	stale := OAuthCredential{AccessToken: "stale", RefreshToken: "rt", ExpiresAtMS: pastMS(time.Minute)}
+	fresh := OAuthCredential{AccessToken: "fresh-from-source", ExpiresAtMS: futureMS(10 * time.Minute)}
+	src := &sequencedSource{creds: []OAuthCredential{stale, fresh}}
+
+	var refreshCalls atomic.Int64
+	lc := NewCredentialLifecycle(src, makeRefreshFunc(
+		OAuthCredential{AccessToken: "refreshed", ExpiresAtMS: futureMS(time.Hour)}, &refreshCalls, 0, nil))
+
+	tok, err := lc.FreshToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tok != "fresh-from-source" {
+		t.Errorf("token = %q; want the re-resolved source token", tok)
+	}
+	if refreshCalls.Load() != 0 {
+		t.Errorf("refresh_token flow called %d times; want 0 (re-resolve should satisfy)", refreshCalls.Load())
+	}
+}
+
+// When BOTH the cached token and a re-resolve are stale, FreshToken falls through
+// to the refresh_token flow.
+func TestFreshTokenRefreshesWhenSourceAlsoStale(t *testing.T) {
+	t.Parallel()
+	stale := OAuthCredential{AccessToken: "stale", RefreshToken: "rt", ExpiresAtMS: pastMS(time.Minute)}
+	src := &sequencedSource{creds: []OAuthCredential{stale}} // always stale
+
+	var refreshCalls atomic.Int64
+	lc := NewCredentialLifecycle(src, makeRefreshFunc(
+		OAuthCredential{AccessToken: "refreshed", ExpiresAtMS: futureMS(time.Hour)}, &refreshCalls, 0, nil))
+
+	tok, err := lc.FreshToken(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tok != "refreshed" {
+		t.Errorf("token = %q; want the refresh_token result when source has nothing fresh", tok)
+	}
+	if refreshCalls.Load() != 1 {
+		t.Errorf("refresh_token flow called %d times; want 1", refreshCalls.Load())
 	}
 }
 
