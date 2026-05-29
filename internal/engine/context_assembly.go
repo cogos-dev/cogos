@@ -109,9 +109,17 @@ type FovealDoc struct {
 
 // ScoredMessage is a conversation turn scored for retention.
 type ScoredMessage struct {
-	Role           string
-	Content        string
-	Tokens         int
+	Role    string
+	Content string
+	// Preserve tool-call linkage and multi-modal parts through scoring so the
+	// provider conversion can reconstruct Anthropic tool_use/tool_result blocks.
+	// Dropping these reduced every history turn to {role, content}, which sent
+	// role:"tool" results to Anthropic verbatim (rejected: "Unexpected role tool").
+	ContentParts []ContentPart
+	Name         string
+	ToolCallID   string
+	ToolCalls    []ToolCall
+	Tokens       int
 	TurnIndex      int     // 0 = oldest
 	RecencyScore   float64 // 1.0 = most recent, decays toward 0
 	RelevanceScore float64 // keyword overlap with current query
@@ -557,7 +565,14 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 	// === Messages (Zone 2 + Zone 3) ===
 	var msgs []ProviderMessage
 	for _, sm := range pkg.Conversation {
-		msgs = append(msgs, ProviderMessage{Role: sm.Role, Content: sm.Content})
+		msgs = append(msgs, ProviderMessage{
+			Role:         sm.Role,
+			Content:      sm.Content,
+			ContentParts: sm.ContentParts,
+			Name:         sm.Name,
+			ToolCallID:   sm.ToolCallID,
+			ToolCalls:    sm.ToolCalls,
+		})
 	}
 	if pkg.CurrentMessage != nil {
 		msgs = append(msgs, *pkg.CurrentMessage)
@@ -587,6 +602,10 @@ func scoreConversationWithEstimator(history []ProviderMessage, keywords []string
 		scored[i] = ScoredMessage{
 			Role:           m.Role,
 			Content:        m.Content,
+			ContentParts:   m.ContentParts,
+			Name:           m.Name,
+			ToolCallID:     m.ToolCallID,
+			ToolCalls:      m.ToolCalls,
 			Tokens:         estimateTokens(m.Content),
 			TurnIndex:      i,
 			RecencyScore:   recency,
