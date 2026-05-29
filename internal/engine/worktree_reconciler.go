@@ -109,6 +109,15 @@ type WorktreePrunedEvent struct {
 	WorktreeID string
 }
 
+// WorktreeAlarmedEvent records that an alarm was already emitted for a worktree
+// path. The reconciler uses this to short-circuit re-emitting the same alarm on
+// every reconcile cycle — without it, an orphaned worktree re-alarms forever and
+// the ledger grows unbounded. Keyed by path (unknown-binding alarms have no
+// worktree_id).
+type WorktreeAlarmedEvent struct {
+	WorktreePath string
+}
+
 // LedgerReader is the read-side dependency the reconciler uses to load
 // `worktree.*` events for its repo root. Production implementations scan
 // `.cog/ledger/*/events.jsonl`; test implementations return an in-memory list.
@@ -125,6 +134,7 @@ type WorktreeLedgerEvent struct {
 	Created  *WorktreeCreatedEvent
 	Terminal *WorktreeTerminalEvent
 	Pruned   *WorktreePrunedEvent
+	Alarmed  *WorktreeAlarmedEvent
 }
 
 // LedgerWriter is the write-side dependency the reconciler uses to emit
@@ -215,10 +225,11 @@ func (r *WorktreeReconciler) Type() string {
 // derived from the ledger (worktrees with a creation event whose lifecycle is
 // not yet pruned).
 type worktreeConfig struct {
-	RepoRoot        string
-	CreatedByPath   map[string]*WorktreeCreatedEvent  // keyed by worktree path
-	TerminalByID    map[string]*WorktreeTerminalEvent // keyed by worktree_id
-	PrunedByID      map[string]struct{}               // set of pruned worktree IDs
+	RepoRoot      string
+	CreatedByPath map[string]*WorktreeCreatedEvent  // keyed by worktree path
+	TerminalByID  map[string]*WorktreeTerminalEvent // keyed by worktree_id
+	PrunedByID    map[string]struct{}               // set of pruned worktree IDs
+	AlarmedByPath map[string]struct{}               // set of already-alarmed worktree paths
 }
 
 // LoadConfig reads all worktree.* ledger events for this RepoRoot and derives
@@ -248,6 +259,7 @@ func (r *WorktreeReconciler) LoadConfig(workspaceRoot string) (any, error) {
 		CreatedByPath: make(map[string]*WorktreeCreatedEvent),
 		TerminalByID:  make(map[string]*WorktreeTerminalEvent),
 		PrunedByID:    make(map[string]struct{}),
+		AlarmedByPath: make(map[string]struct{}),
 	}
 	for _, ev := range events {
 		switch {
@@ -259,6 +271,8 @@ func (r *WorktreeReconciler) LoadConfig(workspaceRoot string) (any, error) {
 			cfg.TerminalByID[t.WorktreeID] = t
 		case ev.Pruned != nil:
 			cfg.PrunedByID[ev.Pruned.WorktreeID] = struct{}{}
+		case ev.Alarmed != nil:
+			cfg.AlarmedByPath[ev.Alarmed.WorktreePath] = struct{}{}
 		}
 	}
 	return cfg, nil
@@ -367,6 +381,17 @@ func (r *WorktreeReconciler) ComputePlan(config any, live any, _ *reconcile.Stat
 			action.Action = reconcile.ActionDelete
 			plan.Summary.Deletes++
 		case ClassAlarmUncommittedOnTerminalDispatch, ClassAlarmUnknownBinding:
+			// Idempotency guard (mirrors the PrunedByID prune guard above): if a
+			// prior `worktree.alarm` event already exists for this path, do NOT
+			// re-emit. Without this the same orphaned worktree re-alarms every
+			// reconcile cycle, growing the ledger unbounded and keeping the
+			// provider perpetually Degraded with no new information.
+			if _, alreadyAlarmed := cfg.AlarmedByPath[c.Live.Path]; alreadyAlarmed {
+				action.Action = reconcile.ActionSkip
+				action.Details["reason"] = "alarm already emitted per ledger"
+				plan.Summary.Skipped++
+				break
+			}
 			// Alarm is encoded as ActionUpdate with classification=alarm.
 			// The reconcile.Action vocabulary lacks a first-class "alarm"
 			// verb; we reuse Update + the classification detail field to
@@ -392,7 +417,7 @@ func (r *WorktreeReconciler) ComputePlan(config any, live any, _ *reconcile.Stat
 //     - any uncommitted changes -> alarm-uncommitted-on-terminal-dispatch
 //     - reason=merged or reason=abandoned and no uncommitted -> removable-clean
 //     - reason=exited (process died) and branch not yet merged/abandoned ->
-//       alive (operator still owns the lifecycle decision)
+//     alive (operator still owns the lifecycle decision)
 func classifyWorktree(w LiveWorktree, cfg *worktreeConfig) classifiedWorktree {
 	created, hasBinding := cfg.CreatedByPath[w.Path]
 	if !hasBinding {
@@ -662,12 +687,12 @@ func (r *WorktreeReconciler) BuildState(config any, live any, existing *reconcil
 		}
 		c := classifyWorktree(w, cfg)
 		attrs := map[string]any{
-			"classification":            string(c.Classification),
-			"branch":                    w.Branch,
-			"detached":                  w.Detached,
-			"locked":                    w.Locked,
-			"has_uncommitted_changes":   w.HasUncommittedChanges,
-			"has_unmerged_commits":      w.HasUnmergedCommits,
+			"classification":          string(c.Classification),
+			"branch":                  w.Branch,
+			"detached":                w.Detached,
+			"locked":                  w.Locked,
+			"has_uncommitted_changes": w.HasUncommittedChanges,
+			"has_unmerged_commits":    w.HasUnmergedCommits,
 		}
 		if c.Created != nil {
 			attrs["worktree_id"] = c.Created.WorktreeID
