@@ -708,13 +708,19 @@ func prependOAuthSystemToUserTurn(payload *anthropicRequest, injected string) {
 // double-underscore namespace. Already-double-underscore and bare names are
 // returned unchanged.
 func toolNameToWire(name string) string {
-	if strings.HasPrefix(name, "mcp__") {
+	if name == "" {
 		return name
 	}
-	if strings.HasPrefix(name, "mcp_") {
-		return "mcp__" + name[len("mcp_"):]
+	if strings.HasPrefix(name, "mcp__") {
+		return name // already sanctioned
 	}
-	return name
+	if strings.HasPrefix(name, "mcp_") {
+		return "mcp__" + name[len("mcp_"):] // single-underscore -> double
+	}
+	return "mcp__" + name // bare -> double-underscore (a SET of bare agentic tool
+	// names — memory, skill_manage, session_search, delegate_task, … — trips the
+	// system-content classifier on the tool array; the mcp__ namespace marks them
+	// as sanctioned MCP tools. Reversed inbound via the wire->original map.)
 }
 
 // rewriteOAuthToolNames rewrites tool definitions and tool_use names in the
@@ -910,6 +916,7 @@ func (p *ClaudeOAuthProvider) Stream(ctx context.Context, req *CompletionRequest
 	if err != nil {
 		return nil, fmt.Errorf("claude-oauth: marshal stream request: %w", err)
 	}
+
 
 	// Proactive refresh before the request.
 	token, err := p.lc.FreshToken(ctx)

@@ -9,8 +9,8 @@ import "testing"
 
 func TestToolNameToWire(t *testing.T) {
 	cases := map[string]string{
-		"cog_get_state":            "cog_get_state",            // bare: unchanged
-		"terminal":                 "terminal",                 // bare: unchanged
+		"cog_get_state":            "mcp__cog_get_state",       // bare -> double (agentic-set fix)
+		"terminal":                 "mcp__terminal",            // bare -> double
 		"mcp_cogos_cog_get_state":  "mcp__cogos_cog_get_state", // single -> double (the gate fix)
 		"mcp_terminal":             "mcp__terminal",            // single -> double
 		"mcp__server__tool":        "mcp__server__tool",        // already sanctioned: unchanged
@@ -45,8 +45,11 @@ func TestRewriteAndRestoreOAuthToolNames(t *testing.T) {
 	if payload.Tools[0].Name != "mcp__cogos_cog_get_state" {
 		t.Errorf("tool[0] = %q, want mcp__cogos_cog_get_state", payload.Tools[0].Name)
 	}
-	if payload.Tools[1].Name != "terminal" {
-		t.Errorf("tool[1] = %q, want terminal (unchanged)", payload.Tools[1].Name)
+	if payload.Tools[1].Name != "mcp__terminal" {
+		t.Errorf("tool[1] = %q, want mcp__terminal (bare -> double)", payload.Tools[1].Name)
+	}
+	if rev["mcp__terminal"] != "terminal" {
+		t.Errorf("rev map must restore bare name: %#v", rev)
 	}
 	if payload.Tools[2].Name != "mcp__already__double" {
 		t.Errorf("tool[2] = %q, want mcp__already__double (unchanged)", payload.Tools[2].Name)
