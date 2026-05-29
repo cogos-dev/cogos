@@ -117,60 +117,83 @@ func TestSetOAuthHeadersWith1MBeta(t *testing.T) {
 
 // ── buildOAuthSystem ──────────────────────────────────────────────────────────
 
-// oauthSystemBlocks asserts buildOAuthSystem returned a []anthropicSystemBlock
-// whose first block is exactly the canonical Claude Code prefix. Anthropic's
-// OAuth path requires this block-array shape (see buildOAuthSystem).
-func oauthSystemBlocks(t *testing.T, v any) []anthropicSystemBlock {
+// The OAuth path keeps the system field canonical-only (Anthropic scores it for
+// "is this genuine Claude Code") and relocates the operator/agent content to the
+// user turn. assertCanonicalOnly checks the system field is exactly the prefix.
+func assertCanonicalOnly(t *testing.T, blocks []anthropicSystemBlock) {
 	t.Helper()
-	blocks, ok := v.([]anthropicSystemBlock)
-	if !ok {
-		t.Fatalf("buildOAuthSystem must return []anthropicSystemBlock; got %T", v)
+	if len(blocks) != 1 || blocks[0].Text != claudeCodeSystemPrefix {
+		t.Fatalf("system field must be exactly the canonical Claude Code prefix; got %+v", blocks)
 	}
-	if len(blocks) == 0 || blocks[0].Text != claudeCodeSystemPrefix {
-		t.Fatalf("block[0] must be exactly the Claude Code prefix; got %+v", blocks)
-	}
-	return blocks
 }
 
-func TestBuildOAuthSystemPrefixAlwaysPresent(t *testing.T) {
+func TestBuildOAuthSystemCanonicalOnly_PromptRelocated(t *testing.T) {
 	t.Parallel()
-	blocks := oauthSystemBlocks(t, buildOAuthSystem(&CompletionRequest{
+	blocks, injected := buildOAuthSystem(&CompletionRequest{
 		SystemPrompt: "Additional instructions.",
-	}))
-	if len(blocks) < 2 || !strings.Contains(blocks[1].Text, "Additional instructions.") {
-		t.Errorf("caller's system prompt should be in block[1]; got %+v", blocks)
+	})
+	assertCanonicalOnly(t, blocks)
+	if !strings.Contains(injected, "Additional instructions.") {
+		t.Errorf("caller's system prompt must be in the relocated string; got %q", injected)
 	}
 }
 
 func TestBuildOAuthSystemPrefixOnlyWhenNoPrompt(t *testing.T) {
 	t.Parallel()
-	blocks := oauthSystemBlocks(t, buildOAuthSystem(&CompletionRequest{}))
-	if len(blocks) != 1 {
-		t.Errorf("want exactly one block (prefix only) when no prompt/context; got %d", len(blocks))
+	blocks, injected := buildOAuthSystem(&CompletionRequest{})
+	assertCanonicalOnly(t, blocks)
+	if injected != "" {
+		t.Errorf("want empty relocated string when no prompt/context; got %q", injected)
 	}
 }
 
-func TestBuildOAuthSystemWithContext(t *testing.T) {
+func TestBuildOAuthSystemWithContext_Relocated(t *testing.T) {
 	t.Parallel()
-	blocks := oauthSystemBlocks(t, buildOAuthSystem(&CompletionRequest{
+	blocks, injected := buildOAuthSystem(&CompletionRequest{
 		SystemPrompt: "Nucleus.",
 		Context: []ContextItem{
 			{ID: "cog://mem/note", Zone: ZoneFoveal, Salience: 0.9, Content: "note content"},
 		},
-	}))
-	if len(blocks) < 2 {
-		t.Fatalf("want prefix block + injected block; got %d blocks", len(blocks))
-	}
-	injected := blocks[1].Text
+	})
+	assertCanonicalOnly(t, blocks)
 	if !strings.Contains(injected, "note content") {
-		t.Error("context item should be in the injected block")
+		t.Error("context item should be in the relocated string")
 	}
 	if !strings.Contains(injected, "Nucleus.") {
-		t.Error("system prompt should be in the injected block")
+		t.Error("system prompt should be in the relocated string")
 	}
-	// Within the injected block: context items precede the nucleus system prompt.
+	// Order within the relocated content: context items precede the system prompt.
 	if strings.Index(injected, "note content") > strings.Index(injected, "Nucleus.") {
 		t.Error("order should be: context → system prompt")
+	}
+}
+
+func TestPrependOAuthSystemToUserTurn(t *testing.T) {
+	t.Parallel()
+	// string content: relocated text is prepended to the existing user message.
+	p := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
+	prependOAuthSystemToUserTurn(p, "IDENTITY")
+	if got, _ := p.Messages[0].Content.(string); !strings.HasPrefix(got, "IDENTITY") || !strings.HasSuffix(got, "hi") {
+		t.Errorf("relocated content must wrap the user message; got %q", got)
+	}
+	// block content: a leading text block is inserted.
+	p2 := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: "go"}}}}}
+	prependOAuthSystemToUserTurn(p2, "IDENTITY")
+	blocks2 := p2.Messages[0].Content.([]anthropicContentBlock)
+	if len(blocks2) != 2 || !strings.Contains(blocks2[0].Text, "IDENTITY") {
+		t.Errorf("want leading IDENTITY block; got %+v", blocks2)
+	}
+	// no user message: one is created.
+	p3 := &anthropicRequest{Messages: []anthropicMessage{{Role: "assistant", Content: "x"}}}
+	prependOAuthSystemToUserTurn(p3, "IDENTITY")
+	if p3.Messages[0].Role != "user" || !strings.Contains(p3.Messages[0].Content.(string), "IDENTITY") {
+		t.Errorf("want a new leading user message; got %+v", p3.Messages)
+	}
+	// empty injected: no-op.
+	p4 := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
+	prependOAuthSystemToUserTurn(p4, "")
+	if p4.Messages[0].Content.(string) != "hi" {
+		t.Error("empty relocated content must be a no-op")
 	}
 }
 
