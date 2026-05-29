@@ -33,12 +33,12 @@ type WorktreeOpts struct {
 
 // WorktreeHandle is the result of a successful SpawnWorktree call.
 type WorktreeHandle struct {
-	Identity   string    // Canonical identity: worktree-{dispatch_id}
-	Path       string    // Absolute path to the worktree on disk
-	Branch     string    // Branch checked out in this worktree
-	Base       string    // Base ref the branch was cut from
+	Identity   string // Canonical identity: worktree-{dispatch_id}
+	Path       string // Absolute path to the worktree on disk
+	Branch     string // Branch checked out in this worktree
+	Base       string // Base ref the branch was cut from
 	CreatedAt  time.Time
-	DispatchID string    // Bound dispatch identity
+	DispatchID string // Bound dispatch identity
 }
 
 // SpawnWorktree is the canonical entry point for substrate-managed worktree
@@ -293,6 +293,16 @@ func projectWorktreeEvent(env *EventEnvelope, repoRoot string) (WorktreeLedgerEv
 			WorktreeID: asStringWT(data["worktree_id"]),
 		}
 		return WorktreeLedgerEvent{Pruned: p}, true
+
+	case BlockWorktreeAlarm:
+		// Filter by repo_root if specified (alarm events carry repo_root).
+		if rr, _ := data["repo_root"].(string); repoRoot != "" && rr != "" && !isSamePath(rr, repoRoot) {
+			return WorktreeLedgerEvent{}, false
+		}
+		a := &WorktreeAlarmedEvent{
+			WorktreePath: asStringWT(data["worktree_path"]),
+		}
+		return WorktreeLedgerEvent{Alarmed: a}, true
 	}
 	return WorktreeLedgerEvent{}, false
 }

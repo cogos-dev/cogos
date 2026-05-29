@@ -86,6 +86,10 @@ func (f *fakeLedger) EmitWorktreeEvent(_ context.Context, eventType CogBlockKind
 		f.events = append(f.events, WorktreeLedgerEvent{Pruned: &WorktreePrunedEvent{
 			WorktreeID: asStringWT(data["worktree_id"]),
 		}})
+	case BlockWorktreeAlarm:
+		f.events = append(f.events, WorktreeLedgerEvent{Alarmed: &WorktreeAlarmedEvent{
+			WorktreePath: asStringWT(data["worktree_path"]),
+		}})
 	}
 	return nil
 }
@@ -231,6 +235,65 @@ func TestWorktreeReconciler_SevenLegacyWorktrees_AllAlarmUnknownBinding(t *testi
 	}
 	if got, want := ledger.emitCountByKind(BlockWorktreeAlarm), len(cases); got != want {
 		t.Errorf("expected %d alarm events emitted, got %d", want, got)
+	}
+}
+
+// TestWorktreeReconcilerAlarmIdempotent verifies the alarm path does not
+// re-emit on every cycle: once a worktree.alarm exists in the ledger for a
+// path, subsequent cycles SKIP it. Without this the ledger grows unbounded
+// (the 280 MB / 453k-event regression the audit found).
+func TestWorktreeReconcilerAlarmIdempotent(t *testing.T) {
+	repoRoot := "/test/cogos"
+	ledger := newFakeLedger(repoRoot)
+	git := newFakeGit(repoRoot)
+	git.addWorktree(LiveWorktree{
+		Path:   "/test/cogos/.claude/worktrees/orphan-xyz",
+		Branch: "orphan-branch",
+	})
+
+	r := NewWorktreeReconciler(repoRoot, ledger, ledger, git)
+	ctx := context.Background()
+
+	runCycle := func() *reconcile.Plan {
+		cfg, err := r.LoadConfig("/test/workspace")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		live, err := r.FetchLive(ctx, cfg)
+		if err != nil {
+			t.Fatalf("FetchLive: %v", err)
+		}
+		plan, err := r.ComputePlan(cfg, live, nil)
+		if err != nil {
+			t.Fatalf("ComputePlan: %v", err)
+		}
+		if _, err := r.ApplyPlan(ctx, plan); err != nil {
+			t.Fatalf("ApplyPlan: %v", err)
+		}
+		return plan
+	}
+
+	// Cycle 1: no prior alarm → emit one (encoded as an Update action).
+	p1 := runCycle()
+	if p1.Summary.Updates != 1 {
+		t.Errorf("cycle 1: Updates=%d want 1 (alarm emitted)", p1.Summary.Updates)
+	}
+	if got := ledger.emitCountByKind(BlockWorktreeAlarm); got != 1 {
+		t.Fatalf("cycle 1: alarm events=%d want 1", got)
+	}
+
+	// Cycles 2–4: prior alarm in ledger → skip, no re-emit.
+	for i := 2; i <= 4; i++ {
+		p := runCycle()
+		if p.Summary.Updates != 0 {
+			t.Errorf("cycle %d: Updates=%d want 0 (already alarmed)", i, p.Summary.Updates)
+		}
+		if p.Summary.Skipped != 1 {
+			t.Errorf("cycle %d: Skipped=%d want 1", i, p.Summary.Skipped)
+		}
+	}
+	if got := ledger.emitCountByKind(BlockWorktreeAlarm); got != 1 {
+		t.Errorf("after 4 cycles: alarm events=%d want 1 (idempotent — no re-emit)", got)
 	}
 }
 
