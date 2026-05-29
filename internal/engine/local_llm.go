@@ -200,13 +200,65 @@ func isLocalEndpoint(endpoint string) bool {
 	return false
 }
 
+// normalizeModelNameForOllama converts an LM-Studio / MLX-style model name
+// (e.g. "google/gemma-4-26b-a4b") to the Ollama tag format ("gemma4:26b")
+// so that cross-format configured names can be matched against the list of
+// locally installed Ollama models.
+//
+// Conversion rules (applied in order):
+//  1. Strip a leading "vendor/" prefix (e.g. "google/gemma-4-26b-a4b" →
+//     "gemma-4-26b-a4b").
+//  2. Replace "gemma-4" with "gemma4" to align with Ollama's naming.
+//  3. Truncate at the size tag (e.g. "26b" or "e4b") and convert
+//     "gemma4-NNb" → "gemma4:NNb".
+//
+// If the name does not look like an LMS-style cross-format name (no "/" and
+// already matches the "family:tag" Ollama shape), the original string is
+// returned unchanged so normal prefix matching still applies.
+var lmsModelPattern = regexp.MustCompile(`^(?:[^/]+/)?gemma-4-([0-9]+[bB]|e[0-9]+[bB])`)
+
+func normalizeModelNameForOllama(name string) string {
+	name = strings.TrimSpace(name)
+	if !strings.Contains(name, "/") && !strings.HasPrefix(strings.ToLower(name), "gemma-4") {
+		// Not an LMS-style name; return as-is so prefix matching is unaffected.
+		return name
+	}
+	lower := strings.ToLower(name)
+	m := lmsModelPattern.FindStringSubmatch(lower)
+	if len(m) < 2 {
+		return name
+	}
+	sizeTag := strings.ToLower(m[1]) // e.g. "26b", "e4b"
+	return "gemma4:" + sizeTag
+}
+
 func resolvePreferredLocalModel(models []string, preferred string) string {
 	preferred = strings.TrimSpace(preferred)
 	if preferred != "" {
+		// First pass: exact match or Ollama-prefix match.
 		for _, model := range models {
 			if model == preferred || strings.HasPrefix(model, preferred) {
 				return model
 			}
+		}
+		// Second pass: try the normalized (Ollama-format) equivalent of the
+		// configured name. This handles LM-Studio / MLX style names like
+		// "google/gemma-4-26b-a4b" that map to Ollama tags like "gemma4:26b".
+		normalized := normalizeModelNameForOllama(preferred)
+		if normalized != preferred {
+			for _, model := range models {
+				if model == normalized || strings.HasPrefix(model, normalized) {
+					return model
+				}
+			}
+		}
+	}
+	// No preferred match: fall back to the canonical E4B floor model if it is
+	// available, rather than returning models[0] which may be a smaller or
+	// unrelated model (e.g. "llama3.2:1b").
+	for _, model := range models {
+		if model == defaultOllamaModel || strings.HasPrefix(model, defaultOllamaModel) {
+			return model
 		}
 	}
 	if len(models) > 0 {
@@ -247,7 +299,12 @@ func resolveDispatchLocalModel(models []string, preferred string, requested Disp
 		if selected == "" {
 			return "", DispatchModelE4B, "no local models are loaded"
 		}
-		if preferred != "" && selected != preferred {
+		// Report a mismatch when neither the preferred name nor its
+		// normalized Ollama equivalent was found, so the operator can
+		// diagnose configuration drift.  "selected" at this point is the
+		// E4B floor (from resolvePreferredLocalModel's fallback logic)
+		// rather than an arbitrary models[0].
+		if preferred != "" && selected != preferred && selected != normalizeModelNameForOllama(preferred) {
 			return selected, DispatchModelE4B, fmt.Sprintf("configured local model %q not loaded, using %q", preferred, selected)
 		}
 		return selected, DispatchModelE4B, ""

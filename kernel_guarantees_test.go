@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -550,4 +551,84 @@ func TestCycleDetection(t *testing.T) {
 	}
 
 	t.Logf("✓ Cycle detection verified (detected: %v)", err)
+}
+
+// TestGitCogTreeHash_NoIndexMutation verifies that gitCogTreeHash does not mutate
+// the real git index.  This is the regression test for the "runaway staged index"
+// bug where the function ran `git add -A .cog/` as a side effect.
+func TestGitCogTreeHash_NoIndexMutation(t *testing.T) {
+	// Skip if git is not available.
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not in PATH")
+	}
+
+	// Create a real git repo in a temp dir.
+	repoDir := t.TempDir()
+	mustRunGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+	mustRunGit("init", "-b", "main")
+	mustRunGit("config", "user.email", "test@example.com")
+	mustRunGit("config", "user.name", "Test")
+
+	// Create .cog/ with a tracked file and an initial commit so write-tree works.
+	cogDir := filepath.Join(repoDir, ".cog")
+	if err := os.MkdirAll(cogDir, 0755); err != nil {
+		t.Fatalf("mkdir .cog: %v", err)
+	}
+	trackedFile := filepath.Join(cogDir, "id.cog")
+	if err := os.WriteFile(trackedFile, []byte("id: test\n"), 0644); err != nil {
+		t.Fatalf("write id.cog: %v", err)
+	}
+	mustRunGit("add", ".cog/id.cog")
+	mustRunGit("commit", "-m", "init")
+
+	// Now write an UNSTAGED file into .cog/ — this simulates daemon output.
+	ephemeralFile := filepath.Join(cogDir, "observations", "scraper-output.json")
+	if err := os.MkdirAll(filepath.Dir(ephemeralFile), 0755); err != nil {
+		t.Fatalf("mkdir observations: %v", err)
+	}
+	if err := os.WriteFile(ephemeralFile, []byte(`{"data":"ephemeral"}`), 0644); err != nil {
+		t.Fatalf("write ephemeral: %v", err)
+	}
+
+	// Capture the index state BEFORE calling gitCogTreeHash.
+	indexBefore := gitIndexStatus(t, repoDir)
+
+	// Call the function under test.
+	hash, err := gitCogTreeHash(repoDir)
+	if err != nil {
+		t.Fatalf("gitCogTreeHash returned error: %v", err)
+	}
+	if hash == "" {
+		t.Fatal("gitCogTreeHash returned empty hash")
+	}
+
+	// Capture the index state AFTER.
+	indexAfter := gitIndexStatus(t, repoDir)
+
+	// The real index must be identical before and after.
+	if indexBefore != indexAfter {
+		t.Errorf("gitCogTreeHash mutated the git index:\nbefore: %q\nafter:  %q", indexBefore, indexAfter)
+	}
+
+	t.Logf("✓ gitCogTreeHash computed hash %s without mutating index", hash[:8])
+}
+
+// gitIndexStatus returns `git status --porcelain` output for the staged portion,
+// used as a fingerprint for index state in tests.
+func gitIndexStatus(t *testing.T, repoDir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "diff", "--cached", "--name-status")
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git diff --cached: %v", err)
+	}
+	return string(out)
 }
