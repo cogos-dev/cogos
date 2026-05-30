@@ -83,12 +83,15 @@ func TestPoisonedSessionReplay(t *testing.T) {
 			// reproduce the raw conversion to check it separately.
 			rawConverted := convertRawToAnthropicMessages(providerMsgs)
 			rawViolations := validateAnthropicMessages(rawConverted)
-			if len(rawViolations) > 0 {
-				t.Logf("RED confirmed: tail-%d raw input has %d violation(s): %v",
-					l, len(rawViolations), rawViolations)
-			} else {
-				t.Logf("tail-%d raw input was already clean (no violations to demonstrate RED phase)", l)
+			// RED (hard): the poisoned session MUST demonstrate a real violation at
+			// every length, else this test proves nothing — a green-only test on a
+			// clean input is worthless. All five lengths 500'd live before R1.
+			if len(rawViolations) == 0 {
+				t.Fatalf("RED phase failed: tail-%d raw input was already clean — "+
+					"the poisoned-session replay must exhibit a real /v1/messages violation", l)
 			}
+			t.Logf("RED confirmed: tail-%d raw input has %d violation(s): %v",
+				l, len(rawViolations), rawViolations)
 
 			// GREEN: the normalized output from buildAnthropicRequest must be clean.
 			vs := validateAnthropicMessages(ar.Messages)
