@@ -672,14 +672,9 @@ func prependOAuthSystemToUserTurn(payload *anthropicRequest, injected string) {
 	if injected == "" {
 		return
 	}
-	// Insert the relocated content as its OWN leading user message rather than
-	// merging it into the first user message. Merging prepended a text block
-	// ahead of existing content; when the first user message carried a
-	// tool_result (a foveation window beginning on a tool-response turn), that
-	// put text BEFORE the tool_result, which Anthropic rejects ("tool_use ...
-	// without tool_result immediately after" — a tool_result must be the first
-	// block of a tool-response message). A separate leading user message never
-	// lands text before a tool_result; consecutive user messages are accepted.
+	// Prepend as a plain leading user message. The post-OAuth normalize pass
+	// (normalizeAnthropicMessages) will merge consecutive user messages (I2)
+	// and ensure tool_result blocks lead (I4) if needed.
 	payload.Messages = append([]anthropicMessage{{Role: "user", Content: injected}}, payload.Messages...)
 }
 
