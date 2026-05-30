@@ -260,6 +260,17 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 		StopSequences: req.Stop,
 	}
 
+	// Defensively repair orphan tool_use/tool_result pairs before building the
+	// Anthropic wire format.  FormatForProvider already runs this repair on the
+	// managed path; this call covers clean-transport (serve.go:1101) and the
+	// tool-hop loop (appendToolHopMessages) that mutate req.Messages after
+	// assembly.  Both paths funnel through buildAnthropicRequest so one call here
+	// is the universal safety net.
+	if repaired, n := repairToolPairing(req.Messages); n > 0 {
+		slog.Info("context.tool_pairing_repair.anthropic", "dropped", n)
+		req.Messages = repaired
+	}
+
 	// Map conversation messages, handling tool result and tool_use history.
 	ar.Messages = make([]anthropicMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
