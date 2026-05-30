@@ -53,3 +53,4 @@ autoresearch-foveated/
 # Harness scratch + ephemeral parallel-agent worktrees
 .claude/
 agent-worktrees/
+cogos-worktrees/
