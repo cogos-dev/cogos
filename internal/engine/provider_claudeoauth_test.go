@@ -170,29 +170,28 @@ func TestBuildOAuthSystemWithContext_Relocated(t *testing.T) {
 
 func TestPrependOAuthSystemToUserTurn(t *testing.T) {
 	t.Parallel()
-	// string content: relocated text is prepended to the existing user message.
+	// Relocated content is inserted as its OWN leading user message (never merged),
+	// so it can never land a text block before a tool_result in a tool-response turn.
 	p := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
 	prependOAuthSystemToUserTurn(p, "IDENTITY")
-	if got, _ := p.Messages[0].Content.(string); !strings.HasPrefix(got, "IDENTITY") || !strings.HasSuffix(got, "hi") {
-		t.Errorf("relocated content must wrap the user message; got %q", got)
+	if len(p.Messages) != 2 || p.Messages[0].Role != "user" || p.Messages[0].Content.(string) != "IDENTITY" {
+		t.Fatalf("want a separate leading IDENTITY user message; got %+v", p.Messages)
 	}
-	// block content: a leading text block is inserted.
-	p2 := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: "go"}}}}}
+	if p.Messages[1].Content.(string) != "hi" {
+		t.Errorf("original user message must be untouched; got %+v", p.Messages[1])
+	}
+	// Regression (the live bug): a first user message carrying a tool_result must
+	// stay block-0 with no text prepended ahead of it.
+	p2 := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "tool_result", ToolUseID: "a", Content: "out"}}}}}
 	prependOAuthSystemToUserTurn(p2, "IDENTITY")
-	blocks2 := p2.Messages[0].Content.([]anthropicContentBlock)
-	if len(blocks2) != 2 || !strings.Contains(blocks2[0].Text, "IDENTITY") {
-		t.Errorf("want leading IDENTITY block; got %+v", blocks2)
-	}
-	// no user message: one is created.
-	p3 := &anthropicRequest{Messages: []anthropicMessage{{Role: "assistant", Content: "x"}}}
-	prependOAuthSystemToUserTurn(p3, "IDENTITY")
-	if p3.Messages[0].Role != "user" || !strings.Contains(p3.Messages[0].Content.(string), "IDENTITY") {
-		t.Errorf("want a new leading user message; got %+v", p3.Messages)
+	blocks := p2.Messages[1].Content.([]anthropicContentBlock)
+	if len(blocks) != 1 || blocks[0].Type != "tool_result" {
+		t.Errorf("tool_result must remain the first block of its message; got %+v", blocks)
 	}
 	// empty injected: no-op.
 	p4 := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
 	prependOAuthSystemToUserTurn(p4, "")
-	if p4.Messages[0].Content.(string) != "hi" {
+	if len(p4.Messages) != 1 || p4.Messages[0].Content.(string) != "hi" {
 		t.Error("empty relocated content must be a no-op")
 	}
 }

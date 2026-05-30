@@ -667,22 +667,15 @@ func prependOAuthSystemToUserTurn(payload *anthropicRequest, injected string) {
 	if injected == "" {
 		return
 	}
-	wrapped := injected + "\n\n---\n\n"
-	for i := range payload.Messages {
-		if payload.Messages[i].Role != "user" {
-			continue
-		}
-		switch c := payload.Messages[i].Content.(type) {
-		case string:
-			payload.Messages[i].Content = wrapped + c
-		case []anthropicContentBlock:
-			payload.Messages[i].Content = append([]anthropicContentBlock{{Type: "text", Text: wrapped}}, c...)
-		default:
-			payload.Messages[i].Content = wrapped
-		}
-		return
-	}
-	payload.Messages = append([]anthropicMessage{{Role: "user", Content: wrapped}}, payload.Messages...)
+	// Insert the relocated content as its OWN leading user message rather than
+	// merging it into the first user message. Merging prepended a text block
+	// ahead of existing content; when the first user message carried a
+	// tool_result (a foveation window beginning on a tool-response turn), that
+	// put text BEFORE the tool_result, which Anthropic rejects ("tool_use ...
+	// without tool_result immediately after" — a tool_result must be the first
+	// block of a tool-response message). A separate leading user message never
+	// lands text before a tool_result; consecutive user messages are accepted.
+	payload.Messages = append([]anthropicMessage{{Role: "user", Content: injected}}, payload.Messages...)
 }
 
 // ── OAuth tool-namespace billing gate workaround ────────────────────────────────
