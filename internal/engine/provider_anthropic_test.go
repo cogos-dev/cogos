@@ -102,19 +102,25 @@ func TestBuildAnthropicRequestContextItems(t *testing.T) {
 	}
 	ar := buildAnthropicRequest("m", req, false, 1024)
 
+	// The x-api-key path keeps System as a plain string (the OAuth path uses a
+	// block array; see buildOAuthSystem).
+	sys, ok := ar.System.(string)
+	if !ok {
+		t.Fatalf("x-api-key System should be a string; got %T", ar.System)
+	}
 	// System should contain both context items and the system prompt.
-	if !strings.Contains(ar.System, "relevant note") {
+	if !strings.Contains(sys, "relevant note") {
 		t.Error("system should contain context item content")
 	}
-	if !strings.Contains(ar.System, "background") {
+	if !strings.Contains(sys, "background") {
 		t.Error("system should contain background context item")
 	}
-	if !strings.Contains(ar.System, "Identity block.") {
+	if !strings.Contains(sys, "Identity block.") {
 		t.Error("system should contain SystemPrompt after context items")
 	}
 	// Context items appear before the identity block.
-	contextIdx := strings.Index(ar.System, "relevant note")
-	identityIdx := strings.Index(ar.System, "Identity block.")
+	contextIdx := strings.Index(sys, "relevant note")
+	identityIdx := strings.Index(sys, "Identity block.")
 	if contextIdx > identityIdx {
 		t.Error("context items should be prepended before SystemPrompt")
 	}

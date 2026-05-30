@@ -210,6 +210,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data,
 			mkModel("claude-sonnet-4-6", "anthropic", "frontier-managed", ""),
 			mkModel("claude-opus-4-7", "anthropic", "frontier-managed", ""),
+			mkModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost"),
 		)
 	}
 	if eclipseConfigured {
@@ -256,7 +257,7 @@ func isFrontierConfigured(router Router) bool {
 	if router == nil {
 		return false
 	}
-	for _, name := range []string{"anthropic", "claude-code"} {
+	for _, name := range []string{"claude-oauth", "anthropic", "claude-code"} {
 		if _, ok := router.ProviderForName(name); ok {
 			return true
 		}

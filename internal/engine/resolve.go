@@ -11,14 +11,15 @@
 //
 // Alias table (intent → provider + model override):
 //
-//	foreground    → claude-code, claude-sonnet-4-6   (interactive, full capability)
-//	deliberation  → claude-code, claude-opus-4-7     (heavier reasoning)
-//	claude        → claude-code, ""                  (generic managed alias)
-//	codex         → codex,       ""
-//	ollama        → ollama,      ""                  (+ injectKernelTools)
-//	kernel-agent  → ollama,      ""                  (+ injectKernelTools)
-//	local         → first local provider, ""
-//	""            → default routing (all fields empty)
+//	foreground        → claude-oauth, claude-sonnet-4-6  (interactive, full capability)
+//	deliberation      → claude-oauth, claude-opus-4-7    (heavier reasoning)
+//	haiku/sonnet/opus → claude-oauth, <model id>         (per-model selection)
+//	claude            → claude-oauth, ""                 (generic managed alias)
+//	codex             → codex,        ""
+//	ollama            → ollama,       ""                 (+ injectKernelTools)
+//	kernel-agent      → ollama,       ""                 (+ injectKernelTools)
+//	local             → first local provider, ""
+//	""                → default routing (all fields empty)
 //
 // For any other string the function falls through to the router:
 //  1. ProviderForName — exact provider-name match (no ModelOverride)
@@ -43,16 +44,23 @@ type ModelResolution struct {
 // Entries here are the canonical alias table shared by the gateway and dispatch.
 // Keep in sync with the /v1/models menu in serve_compat.go.
 var intentAliases = map[string]ModelResolution{
-	// Managed-frontier aliases.
-	"foreground":   {PreferProvider: "claude-code", ModelOverride: "claude-sonnet-4-6"},
-	"deliberation": {PreferProvider: "claude-code", ModelOverride: "claude-opus-4-7"},
-	// Raw model IDs that should route to the claude-code provider.
-	"claude-sonnet-4-6": {PreferProvider: "claude-code", ModelOverride: "claude-sonnet-4-6"},
-	"claude-opus-4-7":   {PreferProvider: "claude-code", ModelOverride: "claude-opus-4-7"},
-	// Short convenience aliases.
-	"claude": {PreferProvider: "claude-code"},
-	"sonnet": {PreferProvider: "claude-code", ModelOverride: "claude-sonnet-4-6"},
-	"opus":   {PreferProvider: "claude-code", ModelOverride: "claude-opus-4-7"},
+	// Managed-frontier aliases → claude-oauth (Anthropic via the Max-subscription
+	// OAuth bearer, direct /v1/messages, no CLI subprocess). claude-code stays
+	// registered as the router fallback and as claude-oauth's internal 429
+	// fallback, so nothing is stranded if the OAuth path is unavailable.
+	"foreground":   {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
+	"deliberation": {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
+	// Raw model IDs that should route to claude-oauth.
+	"claude-sonnet-4-6": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
+	"claude-opus-4-7":   {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
+	// Short convenience aliases — per-model selection (haiku / sonnet / opus).
+	// claude-oauth is model-agnostic (effectiveModel honours ModelOverride), so a
+	// single provider serves the whole family; any other raw claude-* id falls
+	// through to default routing (claude-oauth) with ModelOverride preserved.
+	"claude": {PreferProvider: "claude-oauth"},
+	"haiku":  {PreferProvider: "claude-oauth", ModelOverride: "claude-haiku-4-5-20251001"},
+	"sonnet": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
+	"opus":   {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
 	// Other provider aliases.
 	"codex": {PreferProvider: "codex"},
 	// Local/kernel aliases — injectKernelTools tells the gateway to wire tools.
@@ -68,11 +76,12 @@ var intentAliases = map[string]ModelResolution{
 // targets) is still available; unknown-model strings that would need a router
 // probe fall through to empty (no resolution).
 //
-// Behavior for every existing model string is preserved byte-for-byte:
+// Managed-frontier strings now resolve to claude-oauth (see the alias table
+// above); all other strings are unchanged:
 //
 //	""            → {} (empty, default routing)
 //	"local"       → resolved via router.FirstLocalProvider / ProviderForName("ollama")
-//	"claude"      → {claude-code, ""}
+//	"claude"      → {claude-oauth, ""}
 //	"codex"       → {codex, ""}
 //	"ollama"      → {ollama, "", injectKernelTools}
 //	"kernel-agent"→ {ollama, "", injectKernelTools}

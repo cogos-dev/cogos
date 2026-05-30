@@ -810,3 +810,43 @@ func TestDebugZoneItemExposesCombinedScore(t *testing.T) {
 		t.Errorf("DebugZoneItem.CombinedScore = %v; want 0.5", got)
 	}
 }
+
+// Regression: tool-call linkage (ToolCallID, ToolCalls) must survive the
+// scoreConversation -> ScoredMessage -> FormatForProvider round-trip. Dropping
+// it reduced history turns to {role, content}, sending role:"tool" results to
+// Anthropic verbatim -> 400 "Unexpected role tool".
+func TestContextAssemblyPreservesToolLinkage(t *testing.T) {
+	history := []ProviderMessage{
+		{Role: "user", Content: "run ls"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1", Name: "terminal"}}},
+		{Role: "tool", ToolCallID: "call_1", Content: "file1 file2"},
+	}
+	scored := scoreConversation(history, nil)
+	if len(scored) != 3 {
+		t.Fatalf("want 3 scored messages; got %d", len(scored))
+	}
+	if scored[1].ToolCalls == nil || scored[1].ToolCalls[0].ID != "call_1" {
+		t.Errorf("scored assistant must keep ToolCalls; got %+v", scored[1])
+	}
+	if scored[2].ToolCallID != "call_1" {
+		t.Errorf("scored tool result must keep ToolCallID; got %q", scored[2].ToolCallID)
+	}
+
+	pkg := &ContextPackage{Conversation: scored}
+	_, msgs := pkg.FormatForProvider()
+	var tool, asst *ProviderMessage
+	for i := range msgs {
+		switch msgs[i].Role {
+		case "tool":
+			tool = &msgs[i]
+		case "assistant":
+			asst = &msgs[i]
+		}
+	}
+	if tool == nil || tool.ToolCallID != "call_1" {
+		t.Fatalf("FormatForProvider must preserve tool ToolCallID; got %+v", tool)
+	}
+	if asst == nil || len(asst.ToolCalls) != 1 || asst.ToolCalls[0].ID != "call_1" {
+		t.Fatalf("FormatForProvider must preserve assistant ToolCalls; got %+v", asst)
+	}
+}

@@ -141,9 +141,12 @@ func (p *AnthropicProvider) effectiveModel(req *CompletionRequest) string {
 // ── Anthropic wire types ──────────────────────────────────────────────────────
 
 type anthropicRequest struct {
-	Model         string               `json:"model"`
-	MaxTokens     int                  `json:"max_tokens"`
-	System        string               `json:"system,omitempty"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	// System is either a plain string (x-api-key path) or a []anthropicSystemBlock
+	// array (OAuth path — the Claude Code client sends system as text blocks,
+	// and Anthropic validates that block[0] is the canonical Claude Code prompt).
+	System        any                  `json:"system,omitempty"`
 	Messages      []anthropicMessage   `json:"messages"`
 	Stream        bool                 `json:"stream,omitempty"`
 	Tools         []anthropicTool      `json:"tools,omitempty"`
@@ -255,6 +258,17 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 		Temperature:   req.Temperature,
 		TopP:          req.TopP,
 		StopSequences: req.Stop,
+	}
+
+	// Defensively repair orphan tool_use/tool_result pairs before building the
+	// Anthropic wire format.  FormatForProvider already runs this repair on the
+	// managed path; this call covers clean-transport (serve.go:1101) and the
+	// tool-hop loop (appendToolHopMessages) that mutate req.Messages after
+	// assembly.  Both paths funnel through buildAnthropicRequest so one call here
+	// is the universal safety net.
+	if repaired, n := repairToolPairing(req.Messages); n > 0 {
+		slog.Info("context.tool_pairing_repair.anthropic", "dropped", n)
+		req.Messages = repaired
 	}
 
 	// Map conversation messages, handling tool result and tool_use history.

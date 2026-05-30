@@ -3,9 +3,9 @@
 //
 // G1 tests:
 //   - Gateway regression: every pre-existing model string resolves identically.
-//   - New intent aliases: foreground → claude-code/sonnet; deliberation → claude-code/opus.
+//   - New intent aliases: foreground → claude-oauth/sonnet; deliberation → claude-oauth/opus.
 //   - Dispatch model-string path: claude-opus-4-7 / deliberation / opus all reach
-//     claude-code+override when the provider is configured.
+//     claude-oauth+override when the provider is configured.
 //   - Dispatch with no model uses process_state_routing (via existing path).
 //   - Dispatch with e4b / 26b uses legacy path.
 //
@@ -101,8 +101,8 @@ func TestResolveModelRequest_EmptyModelNilRouter(t *testing.T) {
 func TestResolveModelRequest_Claude(t *testing.T) {
 	t.Parallel()
 	res := ResolveModelRequest(nil, "claude", "req-1")
-	if res.PreferProvider != "claude-code" {
-		t.Errorf("claude: PreferProvider = %q; want claude-code", res.PreferProvider)
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("claude: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "" {
 		t.Errorf("claude: ModelOverride = %q; want empty", res.ModelOverride)
@@ -221,8 +221,8 @@ func TestResolveModelRequest_ModelID_WithMatchingProvider(t *testing.T) {
 func TestResolveModelRequest_Foreground(t *testing.T) {
 	t.Parallel()
 	res := ResolveModelRequest(nil, "foreground", "req-fg")
-	if res.PreferProvider != "claude-code" {
-		t.Errorf("foreground: PreferProvider = %q; want claude-code", res.PreferProvider)
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("foreground: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "claude-sonnet-4-6" {
 		t.Errorf("foreground: ModelOverride = %q; want claude-sonnet-4-6", res.ModelOverride)
@@ -235,8 +235,8 @@ func TestResolveModelRequest_Foreground(t *testing.T) {
 func TestResolveModelRequest_Deliberation(t *testing.T) {
 	t.Parallel()
 	res := ResolveModelRequest(nil, "deliberation", "req-delib")
-	if res.PreferProvider != "claude-code" {
-		t.Errorf("deliberation: PreferProvider = %q; want claude-code", res.PreferProvider)
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("deliberation: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "claude-opus-4-7" {
 		t.Errorf("deliberation: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
@@ -246,8 +246,8 @@ func TestResolveModelRequest_Deliberation(t *testing.T) {
 func TestResolveModelRequest_SonnetModelID(t *testing.T) {
 	t.Parallel()
 	res := ResolveModelRequest(nil, "claude-sonnet-4-6", "req-s")
-	if res.PreferProvider != "claude-code" {
-		t.Errorf("claude-sonnet-4-6: PreferProvider = %q; want claude-code", res.PreferProvider)
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("claude-sonnet-4-6: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "claude-sonnet-4-6" {
 		t.Errorf("claude-sonnet-4-6: ModelOverride = %q; want claude-sonnet-4-6", res.ModelOverride)
@@ -257,8 +257,8 @@ func TestResolveModelRequest_SonnetModelID(t *testing.T) {
 func TestResolveModelRequest_OpusModelID(t *testing.T) {
 	t.Parallel()
 	res := ResolveModelRequest(nil, "claude-opus-4-7", "req-o")
-	if res.PreferProvider != "claude-code" {
-		t.Errorf("claude-opus-4-7: PreferProvider = %q; want claude-code", res.PreferProvider)
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("claude-opus-4-7: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "claude-opus-4-7" {
 		t.Errorf("claude-opus-4-7: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
@@ -268,8 +268,8 @@ func TestResolveModelRequest_OpusModelID(t *testing.T) {
 func TestResolveModelRequest_OpusShortAlias(t *testing.T) {
 	t.Parallel()
 	res := ResolveModelRequest(nil, "opus", "req-o2")
-	if res.PreferProvider != "claude-code" {
-		t.Errorf("opus: PreferProvider = %q; want claude-code", res.PreferProvider)
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("opus: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "claude-opus-4-7" {
 		t.Errorf("opus: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
@@ -281,14 +281,14 @@ func TestResolveModelRequest_OpusShortAlias(t *testing.T) {
 // These tests exercise the gateway's handleChat + ResolveModelRequest to verify
 // the new aliases work end-to-end without touching the dispatch harness directly
 // (which would require a live LLM). The relevant assertion is that the provider
-// stub registered as "claude-code" receives the request when model=foreground or
+// stub registered as "claude-oauth" receives the request when model=foreground or
 // model=deliberation.
 
 func TestGateway_ForegroundRoutes_ToClaudeCode(t *testing.T) {
 	t.Parallel()
 
-	ccStub := NewStubProvider("claude-code", "cc response")
-	router := NewSimpleRouter(RoutingConfig{Default: "claude-code"})
+	ccStub := NewStubProvider("claude-oauth", "cc response")
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
 	router.RegisterProvider(ccStub)
 
 	srv := newTestServerWithRouter(t, router)
@@ -302,7 +302,7 @@ func TestGateway_ForegroundRoutes_ToClaudeCode(t *testing.T) {
 		t.Errorf("foreground: status = %d; want 200", w.Code)
 	}
 	if ccStub.lastRequest == nil {
-		t.Error("foreground: claude-code stub not called")
+		t.Error("foreground: claude-oauth stub not called")
 	}
 	// ModelOverride should be forwarded to the provider.
 	if ccStub.lastRequest != nil && ccStub.lastRequest.ModelOverride != "claude-sonnet-4-6" {
@@ -314,8 +314,8 @@ func TestGateway_ForegroundRoutes_ToClaudeCode(t *testing.T) {
 func TestGateway_DeliberationRoutes_ToClaudeCode(t *testing.T) {
 	t.Parallel()
 
-	ccStub := NewStubProvider("claude-code", "cc opus response")
-	router := NewSimpleRouter(RoutingConfig{Default: "claude-code"})
+	ccStub := NewStubProvider("claude-oauth", "cc opus response")
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
 	router.RegisterProvider(ccStub)
 
 	srv := newTestServerWithRouter(t, router)
@@ -329,7 +329,7 @@ func TestGateway_DeliberationRoutes_ToClaudeCode(t *testing.T) {
 		t.Errorf("deliberation: status = %d; want 200", w.Code)
 	}
 	if ccStub.lastRequest == nil {
-		t.Error("deliberation: claude-code stub not called")
+		t.Error("deliberation: claude-oauth stub not called")
 	}
 	if ccStub.lastRequest != nil && ccStub.lastRequest.ModelOverride != "claude-opus-4-7" {
 		t.Errorf("deliberation: ModelOverride = %q; want claude-opus-4-7",
@@ -513,7 +513,7 @@ func TestModelsMenu_Object_IsListType(t *testing.T) {
 func TestModelsMenu_FrontierAbsentWhenNoFrontierProvider(t *testing.T) {
 	t.Parallel()
 
-	// Only a local provider — no anthropic/claude-code.
+	// Only a local provider — no anthropic/claude-oauth.
 	localStub := NewStubProvider("ollama", "local response")
 	router := NewSimpleRouter(RoutingConfig{Default: "ollama"})
 	router.RegisterProvider(localStub)
@@ -603,10 +603,10 @@ func TestModelsMenu_AliasesMatchResolver(t *testing.T) {
 
 	// Build a minimal router that covers every alias the resolver maps:
 	// the "local" alias (ollama present, IsLocal) plus the frontier-managed
-	// claude aliases routed through the claude-code provider.
+	// claude aliases routed through the claude-oauth provider.
 	r := newStubRouter().
 		addProvider("ollama", "", true).
-		addProvider("claude-code", "", false)
+		addProvider("claude-oauth", "", false)
 
 	for _, m := range resp.Data {
 		if m.OwnedBy != "cogos" {
