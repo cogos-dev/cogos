@@ -1552,3 +1552,126 @@ echo "invoked" >> "` + logPath + `"
 	}
 	return stubPath, count
 }
+
+// ─── format field propagation ─────────────────────────────────────────────────
+
+// TestBuildSynthesizeBody_FormatOgg verifies that buildSynthesizeBody
+// includes a "format" key when mod3SpeakInput.Format is set.
+func TestBuildSynthesizeBody_FormatOgg(t *testing.T) {
+	in := mod3SpeakInput{Text: "hello", Format: "ogg"}
+	body := buildSynthesizeBody(in)
+	if got, ok := body["format"]; !ok || got != "ogg" {
+		t.Fatalf("expected format=ogg in synthesize body, got %v (present=%v)", got, ok)
+	}
+}
+
+// TestBuildSynthesizeBody_FormatEmpty verifies that buildSynthesizeBody
+// omits the "format" key when Format is empty.
+func TestBuildSynthesizeBody_FormatEmpty(t *testing.T) {
+	in := mod3SpeakInput{Text: "hello"}
+	body := buildSynthesizeBody(in)
+	if _, ok := body["format"]; ok {
+		t.Fatal("expected format key absent when Format is empty")
+	}
+}
+
+// TestBuildSpeakBody_FormatOgg verifies that buildSpeakBody (queue path)
+// includes a "format" key when mod3SpeakInput.Format is set.
+func TestBuildSpeakBody_FormatOgg(t *testing.T) {
+	in := mod3SpeakInput{Text: "hello", Format: "ogg"}
+	body := buildSpeakBody(in)
+	if got, ok := body["format"]; !ok || got != "ogg" {
+		t.Fatalf("expected format=ogg in speak body, got %v (present=%v)", got, ok)
+	}
+}
+
+// TestBuildSpeakBody_FormatEmpty verifies that buildSpeakBody omits the
+// "format" key when Format is empty.
+func TestBuildSpeakBody_FormatEmpty(t *testing.T) {
+	in := mod3SpeakInput{Text: "hello"}
+	body := buildSpeakBody(in)
+	if _, ok := body["format"]; ok {
+		t.Fatal("expected format key absent when Format is empty")
+	}
+}
+
+// TestMod3Speak_SkipPlayback_FormatOgg_SentToSynthesize verifies that when
+// format="ogg" and skip_playback=true the request body forwarded to mod3's
+// /v1/synthesize contains {"format": "ogg"}.
+func TestMod3Speak_SkipPlayback_FormatOgg_SentToSynthesize(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:         "hello ogg",
+		SkipPlayback: true,
+		Format:       "ogg",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	last := fm.last()
+	if last.Path != "/v1/synthesize" {
+		t.Fatalf("expected /v1/synthesize, got %q", last.Path)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(last.Body, &got); err != nil {
+		t.Fatalf("decode captured body: %v", err)
+	}
+	if got["format"] != "ogg" {
+		t.Fatalf("expected format=ogg in forwarded body, got %v", got["format"])
+	}
+}
+
+// TestMod3Speak_SkipPlayback_FormatAbsent_NoKeyInSynthesize verifies that
+// format is not forwarded when skip_playback=true and Format is unset.
+func TestMod3Speak_SkipPlayback_FormatAbsent_NoKeyInSynthesize(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:         "no format",
+		SkipPlayback: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	last := fm.last()
+	var got map[string]any
+	if err := json.Unmarshal(last.Body, &got); err != nil {
+		t.Fatalf("decode captured body: %v", err)
+	}
+	if _, ok := got["format"]; ok {
+		t.Fatalf("expected format key absent in forwarded body, got %v", got["format"])
+	}
+}
+
+// TestMod3Speak_QueuePath_FormatOgg_SentToSpeak verifies that when
+// format="ogg" on the primary queue path the request body forwarded to mod3's
+// /v1/speak contains {"format": "ogg"}.
+func TestMod3Speak_QueuePath_FormatOgg_SentToSpeak(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	_, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:   "hello ogg queue",
+		Format: "ogg",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	last := fm.last()
+	if last.Path != "/v1/speak" {
+		t.Fatalf("expected /v1/speak, got %q", last.Path)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(last.Body, &got); err != nil {
+		t.Fatalf("decode captured body: %v", err)
+	}
+	if got["format"] != "ogg" {
+		t.Fatalf("expected format=ogg in forwarded speak body, got %v", got["format"])
+	}
+}
