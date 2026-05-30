@@ -578,14 +578,10 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 		msgs = append(msgs, *pkg.CurrentMessage)
 	}
 
-	// Repair orphan tool_use/tool_result pairs produced by budget eviction before
-	// handing the slice to the provider.  The repair is drop-only so it never adds
-	// messages; the CurrentMessage (always a real user turn) is never a tool msg
-	// and is therefore unaffected.
-	if repaired, n := repairToolPairing(msgs); n > 0 {
-		slog.Info("context.tool_pairing_repair", "dropped", n)
-		msgs = repaired
-	}
+	// Tool-pairing repair is now handled by the wire-layer normalizer
+	// (normalizeAnthropicMessages) inside buildAnthropicRequest, which operates
+	// on the FINAL block structure and can enforce I4 block-order as well.
+	// The pre-conversion repairToolPairing call here is subsumed and removed.
 
 	return systemPrompt, msgs
 }
@@ -804,7 +800,13 @@ func selectConversationTurns(conv []ScoredMessage, budget int) []ScoredMessage {
 }
 
 // repairToolPairing drops orphan tool_use / tool_result messages from a
-// ProviderMessage slice so that Anthropic's pairing invariant always holds:
+// ProviderMessage slice so that Anthropic's pairing invariant always holds.
+//
+// SUPERSEDED: this function is no longer called from production paths. Its
+// logic is subsumed by normalizeAnthropicMessages (anthropic_normalize.go)
+// which operates on the FINAL []anthropicMessage block structure and additionally
+// enforces I4 block-order. This function is retained to keep existing tests
+// (TestRepairToolPairing_*) passing during the transition.
 //
 //   - Every role=="tool" message must have a matching role=="assistant" message
 //     with a ToolCall whose ID equals ToolCallID immediately upstream.
