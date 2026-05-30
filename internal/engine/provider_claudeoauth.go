@@ -663,18 +663,18 @@ func buildOAuthSystem(req *CompletionRequest) ([]anthropicSystemBlock, string) {
 // prependOAuthSystemToUserTurn moves the relocated system content into the first user
 // message (creating one if absent), so it rides the user turn rather than the
 // classifier-scored system field. See buildOAuthSystem.
+//
+// Block-order safety (I4) is now guaranteed by the second normalizeAnthropicMessages
+// call that runs after this function (in Complete and Stream). The earlier version
+// used a separate leading user message to avoid text-before-tool_result (F7/P5);
+// that complexity is now subsumed by the normalizer's I4 pass.
 func prependOAuthSystemToUserTurn(payload *anthropicRequest, injected string) {
 	if injected == "" {
 		return
 	}
-	// Insert the relocated content as its OWN leading user message rather than
-	// merging it into the first user message. Merging prepended a text block
-	// ahead of existing content; when the first user message carried a
-	// tool_result (a foveation window beginning on a tool-response turn), that
-	// put text BEFORE the tool_result, which Anthropic rejects ("tool_use ...
-	// without tool_result immediately after" — a tool_result must be the first
-	// block of a tool-response message). A separate leading user message never
-	// lands text before a tool_result; consecutive user messages are accepted.
+	// Prepend as a plain leading user message. The post-OAuth normalize pass
+	// (normalizeAnthropicMessages) will merge consecutive user messages (I2)
+	// and ensure tool_result blocks lead (I4) if needed.
 	payload.Messages = append([]anthropicMessage{{Role: "user", Content: injected}}, payload.Messages...)
 }
 
@@ -781,6 +781,16 @@ func (p *ClaudeOAuthProvider) Complete(ctx context.Context, req *CompletionReque
 	// namespace so the request rides the subscription lane (see
 	// rewriteOAuthToolNames). Reversed on the response below.
 	oauthToolNames := rewriteOAuthToolNames(payload)
+	// Second normalize pass: the OAuth late mutators (prependOAuthSystemToUserTurn +
+	// rewriteOAuthToolNames) run AFTER buildAnthropicRequest, so they can introduce
+	// new I2 adjacency (leading user + first user) and I4 block-order issues.
+	// The normalizer is idempotent so this second call is a no-op on already-legal
+	// sequences and fixes only what the late mutators introduced.
+	{
+		repaired, rpt2 := normalizeAnthropicMessages(payload.Messages)
+		payload.Messages = repaired
+		rpt2.emit("claudeoauth.post_relocate")
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -904,6 +914,13 @@ func (p *ClaudeOAuthProvider) Stream(ctx context.Context, req *CompletionRequest
 	// namespace so the request rides the subscription lane; reversed on the
 	// streamed tool-call deltas below.
 	oauthToolNames := rewriteOAuthToolNames(payload)
+	// Second normalize pass: same rationale as Complete — late OAuth mutators
+	// may introduce I2/I4 violations that the normalizer fixes idempotently.
+	{
+		repaired, rpt2 := normalizeAnthropicMessages(payload.Messages)
+		payload.Messages = repaired
+		rpt2.emit("claudeoauth.stream.post_relocate")
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
