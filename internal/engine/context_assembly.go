@@ -1063,11 +1063,24 @@ func extractFrontmatterYAML(content string) (string, string, bool) {
 	return yamlBlock, body, true
 }
 
+// descriptionExemptTypes lists cogdoc types that intentionally omit the
+// description field — flagging them as missing would be a false positive.
+var descriptionExemptTypes = map[string]bool{
+	"session":           true,
+	"observation-index": true,
+	"audit":             true,
+	"pointer":           true,
+}
+
 func missingSchemaIssues(content string) []string {
 	presence := frontmatterPresence(content)
 	var issues []string
+	// Skip the description check for subtypes that don't use it.
+	// Read the raw type value so we can exempt known subtypes.
 	if !presence["description"] {
-		issues = append(issues, "missing_description")
+		if docType := frontmatterTypeValue(content); !descriptionExemptTypes[docType] {
+			issues = append(issues, "missing_description")
+		}
 	}
 	if !presence["tags"] {
 		issues = append(issues, "missing_tags")
@@ -1076,6 +1089,21 @@ func missingSchemaIssues(content string) []string {
 		issues = append(issues, "missing_type")
 	}
 	return issues
+}
+
+// frontmatterTypeValue extracts the raw string value of the "type" field from
+// YAML frontmatter.  Returns "" if the frontmatter is absent or type is unset.
+func frontmatterTypeValue(content string) string {
+	yamlBlock, _, ok := extractFrontmatterYAML(content)
+	if !ok {
+		return ""
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(yamlBlock), &raw); err != nil {
+		return ""
+	}
+	t, _ := raw["type"].(string)
+	return t
 }
 
 func frontmatterPresence(content string) map[string]bool {

@@ -124,15 +124,18 @@ func searchMemoryFTS(dbPath, workspaceRoot, query string, limit int, sector stri
 }
 
 // buildFTSQuery converts a plain search string into an FTS5 query.
-// Multi-word queries become OR-joined terms so each word matches
+// All terms are double-quoted to prevent FTS5 syntax errors from special
+// characters like leading '-' or 'type:' prefixes.
+// Multi-word queries become OR-joined quoted terms so each word matches
 // independently, matching the constellation SDK behaviour.
-// Single words are passed through as-is.
 func buildFTSQuery(raw string) string {
 	words := strings.Fields(strings.TrimSpace(raw))
-	if len(words) <= 1 {
+	if len(words) == 0 {
 		return raw
 	}
-	// Quote each word to avoid FTS5 syntax issues with special characters.
+	// Quote each word to avoid FTS5 syntax issues with special characters
+	// (e.g. leading '-', 'type:' prefix, etc.).  Always quote, even for a
+	// single term, so that queries like '-foo' don't produce FTS5 errors.
 	parts := make([]string, len(words))
 	for i, w := range words {
 		// Strip characters that could break FTS5 quoting.

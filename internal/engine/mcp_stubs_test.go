@@ -173,7 +173,7 @@ func TestBuildFTSQuery(t *testing.T) {
 		input string
 		want  string
 	}{
-		{"claude", "claude"},
+		{"claude", `"claude"`},
 		{"claude code", `"claude" OR "code"`},
 		{"  spaced  query  ", `"spaced" OR "query"`},
 	}
