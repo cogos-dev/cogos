@@ -252,7 +252,7 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 				// If the registry also can't resolve it, fall through to
 				// ErrUnknownAuthority (preserves fail-closed semantics).
 			}
-			return nil, fmt.Errorf("%w: workspace %q in URI %q", ErrUnknownAuthority, uriType, uri)
+			return nil, fmt.Errorf("%w: workspace %q in URI %q — cross-workspace registry not implemented; for a local doc use the bare form: cog:mem/<path>", ErrUnknownAuthority, uriType, uri)
 		}
 		return nil, fmt.Errorf("unknown cog: projection %q in URI %q", uriType, uri)
 	}
