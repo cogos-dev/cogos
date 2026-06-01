@@ -133,12 +133,19 @@ func buildFTSQuery(raw string) string {
 	if len(words) == 0 {
 		return raw
 	}
-	// Quote each word to avoid FTS5 syntax issues with special characters
-	// (e.g. leading '-', 'type:' prefix, etc.).  Always quote, even for a
-	// single term, so that queries like '-foo' don't produce FTS5 errors.
+	// Single-word: pass through unquoted (token match, broader results).
+	// Strip FTS5 special chars that would cause parse errors (leading dash,
+	// column-filter colon, double-quotes).
+	if len(words) == 1 {
+		w := words[0]
+		w = strings.ReplaceAll(w, `"`, "")
+		w = strings.TrimLeft(w, "-")
+		w = strings.ReplaceAll(w, ":", "")
+		return w
+	}
+	// Multi-word: phrase-quote each term and join with OR.
 	parts := make([]string, len(words))
 	for i, w := range words {
-		// Strip characters that could break FTS5 quoting.
 		w = strings.ReplaceAll(w, `"`, "")
 		parts[i] = `"` + w + `"`
 	}
