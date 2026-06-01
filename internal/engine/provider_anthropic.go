@@ -171,6 +171,9 @@ type anthropicContentBlock struct {
 	Input     json.RawMessage       `json:"input,omitempty"`       // type == "tool_use"
 	Content   string                `json:"content,omitempty"`     // type == "tool_result"
 	Source    *anthropicImageSource `json:"source,omitempty"`      // type == "image"
+	// Thinking block fields (type == "thinking" or "redacted_thinking").
+	Thinking  string `json:"thinking,omitempty"`   // type == "thinking"
+	Signature string `json:"signature,omitempty"`  // type == "thinking" signed block (may be present on redacted_thinking too)
 }
 
 // anthropicImageSource is the base64 image payload for Anthropic vision requests.
@@ -260,40 +263,26 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 		StopSequences: req.Stop,
 	}
 
-	// Defensively repair orphan tool_use/tool_result pairs before building the
-	// Anthropic wire format.  FormatForProvider already runs this repair on the
-	// managed path; this call covers clean-transport (serve.go:1101) and the
-	// tool-hop loop (appendToolHopMessages) that mutate req.Messages after
-	// assembly.  Both paths funnel through buildAnthropicRequest so one call here
-	// is the universal safety net.
-	if repaired, n := repairToolPairing(req.Messages); n > 0 {
-		slog.Info("context.tool_pairing_repair.anthropic", "dropped", n)
-		req.Messages = repaired
-	}
-
-	// Map conversation messages, handling tool result and tool_use history.
+	// Map conversation messages to the Anthropic wire format.
+	// role:"tool" messages become role:"user" with a tool_result content block;
+	// each is emitted as a fresh user message (normalizeAnthropicMessages below
+	// will merge consecutive user messages and enforce I2/I4 block-order).
+	// The old merge-into-preceding-user logic (ad-hoc I2/I4) is subsumed by the
+	// normalizer; emit one fresh user message per tool result here.
 	ar.Messages = make([]anthropicMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		switch {
 		case m.Role == "tool" && m.ToolCallID != "":
-			// Tool result: Anthropic requires role:"user" with a tool_result content block.
-			// Merge consecutive tool results into the preceding user message if possible,
-			// or create a new user message.
-			block := anthropicContentBlock{
-				Type:      "tool_result",
-				ToolUseID: m.ToolCallID,
-				Content:   m.Content,
-			}
-			// If the last message is already a user message with structured content, append.
-			if n := len(ar.Messages); n > 0 && ar.Messages[n-1].Role == "user" {
-				if blocks, ok := ar.Messages[n-1].Content.([]anthropicContentBlock); ok {
-					ar.Messages[n-1].Content = append(blocks, block)
-					continue
-				}
-			}
+			// Tool result: always emit a fresh role:"user" message with one
+			// tool_result block. The normalizer (I2) will merge consecutive user
+			// messages and (I4) will ensure tool_result blocks lead.
 			ar.Messages = append(ar.Messages, anthropicMessage{
-				Role:    "user",
-				Content: []anthropicContentBlock{block},
+				Role: "user",
+				Content: []anthropicContentBlock{{
+					Type:      "tool_result",
+					ToolUseID: m.ToolCallID,
+					Content:   m.Content,
+				}},
 			})
 
 		case m.Role == "assistant" && len(m.ToolCalls) > 0:
@@ -336,6 +325,14 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 	if req.ToolChoice != "" {
 		ar.ToolChoice = mapAnthropicToolChoice(req.ToolChoice)
 	}
+
+	// Apply the wire-layer normalizer: enforces I1-I6 on the FINAL block
+	// structure. This is the universal FORMAT safety net, replacing the
+	// pre-conversion repairToolPairing call (which ran on ProviderMessages
+	// before conversion and could not see block order — the F7 class of bugs).
+	repaired, rpt := normalizeAnthropicMessages(ar.Messages)
+	ar.Messages = repaired
+	rpt.emit("buildAnthropicRequest")
 
 	return ar
 }

@@ -135,7 +135,9 @@ func (m *MCPServer) registerMod3Tools() {
 		Name: "mod3_speak",
 		Description: "Synthesize text to speech via mod3's queue-aware /v1/speak " +
 			"endpoint. Required: text. Optional: session_id, voice, speed, " +
-			"emotion, skip_playback (return raw base64 bytes without queuing). " +
+			"emotion, skip_playback (return raw base64 bytes without queuing), " +
+			"format (audio container: \"wav\" default, \"pcm\" raw 16-bit LE, " +
+			"\"ogg\" audio/ogg;codecs=opus — most useful with skip_playback=true). " +
 			"Returns mod3's queue state: status (speaking|queued), job_id, " +
 			"queue_position (0=playing immediately, N=queued at position N). " +
 			"Concurrent calls are serialized by mod3's drain thread — no " +
@@ -230,6 +232,13 @@ type mod3SpeakInput struct {
 	// playback. Useful for callers routing audio elsewhere (dashboard WS,
 	// file write, etc). Default false.
 	SkipPlayback bool `json:"skip_playback,omitempty"`
+	// Format selects the audio container format returned by mod3. Supported
+	// values: "wav" (default, audio/wav), "pcm" (raw 16-bit LE PCM),
+	// "ogg" (audio/ogg;codecs=opus via /v1/synthesize?format=ogg).
+	// Only meaningful when skip_playback=true; the queue path (/v1/speak)
+	// passes format through to mod3 but playback support depends on mod3's
+	// drain thread.
+	Format string `json:"format,omitempty"`
 }
 
 type mod3StopInput struct {
@@ -458,6 +467,9 @@ func buildSpeakBody(in mod3SpeakInput) map[string]any {
 	if in.SessionID != "" {
 		body["session_id"] = in.SessionID
 	}
+	if in.Format != "" {
+		body["format"] = in.Format
+	}
 	return body
 }
 
@@ -476,6 +488,9 @@ func buildSynthesizeBody(in mod3SpeakInput) map[string]any {
 	}
 	if in.SessionID != "" {
 		body["session_id"] = in.SessionID
+	}
+	if in.Format != "" {
+		body["format"] = in.Format
 	}
 	return body
 }
@@ -705,9 +720,9 @@ func (m *MCPServer) proxyMod3Bytes(ctx context.Context, method, path string, bod
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	// Accept both audio and JSON so a single client path covers synthesize
-	// (audio/wav) and the rest (application/json).
-	req.Header.Set("Accept", "audio/wav, application/json")
+	// Accept audio, JSON, and ogg so a single client path covers synthesize
+	// (audio/wav, audio/ogg), raw PCM, and the rest (application/json).
+	req.Header.Set("Accept", "audio/wav, audio/ogg, application/json")
 
 	client := m.getModalityProxy().client
 	if client == nil {
