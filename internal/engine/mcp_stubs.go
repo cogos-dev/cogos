@@ -54,8 +54,8 @@ func searchMemoryFTS(dbPath, workspaceRoot, query string, limit int, sector stri
 		sqlStr = `
 			SELECT d.id, d.path, d.title, d.type, d.sector, d.status,
 			       bm25(documents_fts) AS rank
-			FROM documents_fts
-			JOIN documents d ON d.rowid = documents_fts.rowid
+			FROM documents_fts f
+			JOIN documents d ON d.id = f.id
 			WHERE documents_fts MATCH ?
 			  AND d.status != 'deprecated'
 			  AND d.sector = ?
@@ -67,8 +67,8 @@ func searchMemoryFTS(dbPath, workspaceRoot, query string, limit int, sector stri
 		sqlStr = `
 			SELECT d.id, d.path, d.title, d.type, d.sector, d.status,
 			       bm25(documents_fts) AS rank
-			FROM documents_fts
-			JOIN documents d ON d.rowid = documents_fts.rowid
+			FROM documents_fts f
+			JOIN documents d ON d.id = f.id
 			WHERE documents_fts MATCH ?
 			  AND d.status != 'deprecated'
 			ORDER BY rank
