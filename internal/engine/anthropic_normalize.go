@@ -632,16 +632,6 @@ func validateAnthropicMessages(msgs []anthropicMessage) []string {
 	}
 
 	// V-I6: signed thinking blocks in non-final assistant turns (v1 policy).
-	//
-	// Deliberate strip-vs-check asymmetry: the normalizer strips ALL thinking
-	// (passThinkingAndEmpty, "v1: strip all") as a belt, but the checker only
-	// flags SIGNED thinking on non-final assistants. That is the sole config
-	// Anthropic actually 400s on — a stale signature over content the foveator
-	// mutated. Unsigned thinking is inert to the API, so the checker correctly
-	// stays silent on it; a future round-trip that intentionally preserves
-	// unsigned thinking will not trip a false positive here, while a signature
-	// leak (the real regression) still will. Keep both behaviors in sync if the
-	// v1 strip-all policy is relaxed.
 	lastAssistantIdx := -1
 	for i, m := range msgs {
 		if m.Role == "assistant" {

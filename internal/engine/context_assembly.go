@@ -799,6 +799,180 @@ func selectConversationTurns(conv []ScoredMessage, budget int) []ScoredMessage {
 	return out
 }
 
+// repairToolPairing drops orphan tool_use / tool_result messages from a
+// ProviderMessage slice so that Anthropic's pairing invariant always holds.
+//
+// SUPERSEDED: this function is no longer called from production paths. Its
+// logic is subsumed by normalizeAnthropicMessages (anthropic_normalize.go)
+// which operates on the FINAL []anthropicMessage block structure and additionally
+// enforces I4 block-order. This function is retained to keep existing tests
+// (TestRepairToolPairing_*) passing during the transition.
+//
+//   - Every role=="tool" message must have a matching role=="assistant" message
+//     with a ToolCall whose ID equals ToolCallID immediately upstream.
+//   - Every role=="assistant" message with ToolCalls must have a corresponding
+//     role=="tool" result for each ToolCall.ID downstream.
+//
+// The function is deliberately drop-only (no stub injection) because orphaned
+// calls were truncated by the budget eviction loop — injecting stubs risks the
+// model re-acting on phantom calls. An assistant with all its results evicted
+// but non-empty Content is kept as plain assistant text (ToolCalls=nil).
+//
+// Algorithm (two-pass + fixpoint reconcile):
+//
+//	Pass A — drop orphan tool_result messages (tool_result whose tool_use is
+//	         absent upstream).  Walks the slice once with a rolling set of known
+//	         IDs that is reset on each new assistant message and cleared on each
+//	         real user message.  Matches Hermes _repair_message_sequence pass 1.
+//
+//	Pass B — reconcile assistant tool_use against surviving tool_result messages.
+//	         Builds resultIDs from surviving role=="tool" messages; per assistant
+//	         with ToolCalls, keeps only tc entries whose ID appears in resultIDs;
+//	         drops the whole assistant message if all ToolCalls are gone AND
+//	         Content is empty.
+//
+//	Reconcile — runs A->B, then re-drops any tool_result whose assistant was
+//	            dropped in Pass B (single fixpoint; the repair is idempotent on
+//	            the result because Pass A runs first on the already-cleaned
+//	            slice).
+//
+// Returns the repaired slice and the number of messages dropped.
+func repairToolPairing(msgs []ProviderMessage) ([]ProviderMessage, int) {
+	// Fast path: nothing to repair when there are no tool messages.
+	hasTools := false
+	for i := range msgs {
+		if msgs[i].Role == "tool" || (msgs[i].Role == "assistant" && len(msgs[i].ToolCalls) > 0) {
+			hasTools = true
+			break
+		}
+	}
+	if !hasTools {
+		return msgs, 0
+	}
+
+	dropped := 0
+
+	// -- Pass A: drop orphan tool_result messages --------------------------------
+	// A tool_result is orphaned when its ToolCallID is not present in the
+	// immediately-preceding assistant message's ToolCalls set.
+	knownIDs := make(map[string]bool)
+	passA := make([]ProviderMessage, 0, len(msgs))
+	for _, m := range msgs {
+		switch m.Role {
+		case "assistant":
+			// Reset the known-ID set for each new assistant message.
+			knownIDs = make(map[string]bool)
+			for _, tc := range m.ToolCalls {
+				if tc.ID != "" {
+					knownIDs[tc.ID] = true
+				}
+			}
+			passA = append(passA, m)
+		case "tool":
+			if m.ToolCallID != "" && knownIDs[m.ToolCallID] {
+				passA = append(passA, m)
+			} else {
+				// Orphan tool_result -- no preceding assistant tool_use.
+				dropped++
+				slog.Debug("repairToolPairing: dropped orphan tool_result",
+					"tool_call_id", m.ToolCallID,
+				)
+			}
+		default:
+			// A user (or system) message closes the current tool-result run;
+			// subsequent tool messages without a fresh assistant tool_call
+			// are orphans.  Clear the known set.
+			knownIDs = make(map[string]bool)
+			passA = append(passA, m)
+		}
+	}
+
+	// -- Pass B: drop assistant tool_uses with no downstream tool_result --------
+	// Build the set of surviving result IDs from Pass A output.
+	resultIDs := make(map[string]bool)
+	for _, m := range passA {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			resultIDs[m.ToolCallID] = true
+		}
+	}
+
+	passB := make([]ProviderMessage, 0, len(passA))
+	for _, m := range passA {
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			passB = append(passB, m)
+			continue
+		}
+		// Keep only ToolCalls that have a surviving result.
+		var kept []ToolCall
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" && resultIDs[tc.ID] {
+				kept = append(kept, tc)
+			} else {
+				slog.Debug("repairToolPairing: dropped orphan tool_use",
+					"tool_call_id", tc.ID,
+					"tool_name", tc.Name,
+				)
+				dropped++
+			}
+		}
+		if len(kept) == 0 && m.Content == "" {
+			// All tool_uses gone and no text -- drop the whole assistant message.
+			dropped++
+			slog.Debug("repairToolPairing: dropped assistant message with all tool_uses gone and no text")
+			continue
+		}
+		m.ToolCalls = kept // nil when kept is nil (all results evicted, text kept)
+		passB = append(passB, m)
+	}
+
+	// -- Reconcile: re-drop tool_result whose assistant was dropped in Pass B ---
+	// After Pass B some assistants may have been dropped, leaving tool_result
+	// messages that survived Pass A but are now orphaned.
+	survivingAssistantIDs := make(map[string]bool)
+	for _, m := range passB {
+		if m.Role == "assistant" {
+			for _, tc := range m.ToolCalls {
+				if tc.ID != "" {
+					survivingAssistantIDs[tc.ID] = true
+				}
+			}
+		}
+	}
+	out := make([]ProviderMessage, 0, len(passB))
+	for _, m := range passB {
+		if m.Role == "tool" && m.ToolCallID != "" && !survivingAssistantIDs[m.ToolCallID] {
+			dropped++
+			slog.Debug("repairToolPairing: dropped newly-orphaned tool_result after Pass B",
+				"tool_call_id", m.ToolCallID,
+			)
+			continue
+		}
+		out = append(out, m)
+	}
+
+	// -- Merge consecutive plain-text user messages created by Pass B drops -----
+	// When a dropped assistant sat between two user messages they become adjacent.
+	// Only merge string-content users; leave multimodal (ContentParts) users alone.
+	merged := make([]ProviderMessage, 0, len(out))
+	for _, m := range out {
+		if len(merged) > 0 &&
+			m.Role == "user" && merged[len(merged)-1].Role == "user" &&
+			len(m.ContentParts) == 0 && len(merged[len(merged)-1].ContentParts) == 0 {
+			prev := &merged[len(merged)-1]
+			if prev.Content != "" && m.Content != "" {
+				prev.Content = prev.Content + "\n\n" + m.Content
+			} else {
+				prev.Content = prev.Content + m.Content
+			}
+			dropped++ // count the merge as a drop
+			continue
+		}
+		merged = append(merged, m)
+	}
+
+	return merged, dropped
+}
+
 // messageRelevance scores a message's content against query keywords.
 func messageRelevance(content string, keywords []string) float64 {
 	if len(keywords) == 0 {

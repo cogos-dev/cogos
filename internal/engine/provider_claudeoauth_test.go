@@ -170,9 +170,8 @@ func TestBuildOAuthSystemWithContext_Relocated(t *testing.T) {
 
 func TestPrependOAuthSystemToUserTurn(t *testing.T) {
 	t.Parallel()
-	// Relocated content is inserted as a leading user message; the wire-format
-	// normalizer (normalizeAnthropicMessages) then guarantees user-first ordering,
-	// alternation, and tool_result-block-0 on the final structure.
+	// Relocated content is inserted as its OWN leading user message (never merged),
+	// so it can never land a text block before a tool_result in a tool-response turn.
 	p := &anthropicRequest{Messages: []anthropicMessage{{Role: "user", Content: "hi"}}}
 	prependOAuthSystemToUserTurn(p, "IDENTITY")
 	if len(p.Messages) != 2 || p.Messages[0].Role != "user" || p.Messages[0].Content.(string) != "IDENTITY" {
