@@ -137,7 +137,10 @@ func (m *MCPServer) registerMod3Tools() {
 			"endpoint. Required: text. Optional: session_id, voice, speed, " +
 			"emotion, skip_playback (return raw base64 bytes without queuing), " +
 			"format (audio container: \"wav\" default, \"pcm\" raw 16-bit LE, " +
-			"\"ogg\" audio/ogg;codecs=opus — most useful with skip_playback=true). " +
+			"\"ogg\" audio/ogg;codecs=opus — most useful with skip_playback=true), " +
+			"output_path (when set with skip_playback=true, writes audio bytes " +
+			"to this path and returns {ok, path, bytes} instead of base64 — " +
+			"avoids the MCP output-cap hit for large audio files). " +
 			"Returns mod3's queue state: status (speaking|queued), job_id, " +
 			"queue_position (0=playing immediately, N=queued at position N). " +
 			"Concurrent calls are serialized by mod3's drain thread — no " +
@@ -239,6 +242,12 @@ type mod3SpeakInput struct {
 	// passes format through to mod3 but playback support depends on mod3's
 	// drain thread.
 	Format string `json:"format,omitempty"`
+	// OutputPath, when set together with skip_playback=true, causes the
+	// kernel to write the audio bytes directly to this path and return
+	// {"ok":true,"path":"...","bytes":N} instead of the audio_base64 blob.
+	// This avoids the ~240k char MCP output cap hit from base64-encoding
+	// large audio files. The path must be writable by the kernel process.
+	OutputPath string `json:"output_path,omitempty"`
 }
 
 type mod3StopInput struct {
@@ -333,12 +342,32 @@ func (m *MCPServer) toolMod3SpeakRawBytes(ctx context.Context, in mod3SpeakInput
 	}
 
 	metrics := extractMod3Metrics(headers)
+
+	// OutputPath: write bytes directly to disk and return path+size.
+	// This avoids base64 encoding (and the MCP ~240k char output cap)
+	// for callers that only need the file on disk.
+	if in.OutputPath != "" {
+		if writeErr := os.WriteFile(in.OutputPath, audio, 0o644); writeErr != nil {
+			return mod3ErrorResult(fmt.Sprintf("write output_path %q: %v", in.OutputPath, writeErr))
+		}
+		result := map[string]any{
+			"ok":      true,
+			"path":    in.OutputPath,
+			"bytes":   len(audio),
+			"metrics": metrics,
+		}
+		if in.SessionID != "" {
+			result["session_id"] = in.SessionID
+		}
+		return marshalResult(result)
+	}
+
 	result := map[string]any{
-		"ok":           true,
-		"bytes":        len(audio),
-		"metrics":      metrics,
-		"session_id":   in.SessionID,
-		"audio_base64": base64.StdEncoding.EncodeToString(audio),
+		"ok":              true,
+		"bytes":           len(audio),
+		"metrics":         metrics,
+		"session_id":      in.SessionID,
+		"audio_base64":    base64.StdEncoding.EncodeToString(audio),
 		"playback_status": "skipped",
 	}
 	return marshalResult(result)

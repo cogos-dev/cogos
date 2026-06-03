@@ -1675,3 +1675,75 @@ func TestMod3Speak_QueuePath_FormatOgg_SentToSpeak(t *testing.T) {
 		t.Fatalf("expected format=ogg in forwarded speak body, got %v", got["format"])
 	}
 }
+
+// TestMod3Speak_OutputPath_WritesFileAndReturnsPath verifies that when
+// output_path is set together with skip_playback=true the audio is written
+// to disk and the response contains {ok, path, bytes} with no audio_base64.
+func TestMod3Speak_OutputPath_WritesFileAndReturnsPath(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	tmpFile := t.TempDir() + "/reply.ogg"
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:         "write to disk",
+		SkipPlayback: true,
+		Format:       "ogg",
+		OutputPath:   tmpFile,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected success, got error: %v", decodeToolText(t, res))
+	}
+
+	out := decodeToolText(t, res)
+
+	// Must have ok=true, path=tmpFile, bytes>0.
+	if ok, _ := out["ok"].(bool); !ok {
+		t.Fatalf("expected ok=true, got %v", out["ok"])
+	}
+	if p, _ := out["path"].(string); p != tmpFile {
+		t.Fatalf("expected path=%q, got %q", tmpFile, p)
+	}
+	if b, _ := out["bytes"].(float64); b <= 0 {
+		t.Fatalf("expected bytes>0, got %v", out["bytes"])
+	}
+
+	// Must NOT include audio_base64 (that's the whole point).
+	if _, present := out["audio_base64"]; present {
+		t.Fatal("audio_base64 must be absent when output_path is set")
+	}
+
+	// Verify the file exists on disk and has the expected byte count.
+	data, readErr := os.ReadFile(tmpFile)
+	if readErr != nil {
+		t.Fatalf("file not written: %v", readErr)
+	}
+	if bytesField, _ := out["bytes"].(float64); int(bytesField) != len(data) {
+		t.Fatalf("bytes field %v != file size %d", out["bytes"], len(data))
+	}
+}
+
+// TestMod3Speak_OutputPath_WriteError_ReturnsToolError verifies that a
+// write failure (unwritable path) is surfaced as a tool error, not a Go error.
+func TestMod3Speak_OutputPath_WriteError_ReturnsToolError(t *testing.T) {
+	fm := newFakeMod3Proxy(t)
+	m := newProxyMCP(t, fm)
+
+	// Use an obviously unwritable path: a nonexistent nested dir.
+	badPath := t.TempDir() + "/no/such/dir/reply.ogg"
+
+	res, _, err := m.toolMod3Speak(context.Background(), nil, mod3SpeakInput{
+		Text:         "bad path",
+		SkipPlayback: true,
+		OutputPath:   badPath,
+	})
+	if err != nil {
+		t.Fatalf("unexpected Go error (should be tool error): %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError=true for unwritable output_path")
+	}
+}
