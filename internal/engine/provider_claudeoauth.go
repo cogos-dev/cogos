@@ -430,6 +430,140 @@ func claudeOAuthRefresh(ctx context.Context, refreshToken string) (OAuthCredenti
 	return OAuthCredential{}, fmt.Errorf("claude-oauth: all token endpoints failed")
 }
 
+// ── claude_code read-only refresh (PATCH-007 port) ───────────────────────────
+//
+// The credential the managed-subscription provider mirrors (source ==
+// claude_code) is OWNED and rotated by Claude Code itself, which is the sole
+// writer of the macOS keychain entry "Claude Code-credentials". The refresh
+// token is SINGLE-USE. If the kernel POSTs that refresh token to the Anthropic
+// OAuth endpoint it (a) races Claude Code for the one-shot rotation, and (b)
+// lands the rotated pair only in ~/.claude/.credentials.json — a file Claude
+// Code >=2.1.114 ignores in favour of the keychain — orphaning the rotation and
+// causing hung/cancelled inference requests after every `claude /login` or
+// token rotation.
+//
+// So for the claude_code source the kernel is a READ-ONLY keychain MIRROR. It
+// NEVER POSTs the refresh token. When its mirrored credential is stale it
+// delegates the refresh to the OWNER (Claude Code) by running the user-space
+// actuator ~/.hermes/bin/claude-token-refresh (a single-flight headless
+// `claude -p`; fast-exits 0 if the token is already fresh), then re-mirrors.
+// If the keychain is still stale after that, the refresh token is likely
+// revoked and the credential surfaces as unavailable (needs interactive
+// `claude /login`) — the kernel does NOT loop and does NOT POST as a fallback.
+//
+// Architecture mirrors the canonical Python fix verbatim in ordering:
+//
+//	Reference: ~/.hermes/hermes-agent/agent/credential_pool.py
+//	           CredentialPool._refresh_entry, the PATCH-007 branch
+//	           (commit 5752ef82d). Python sequence:
+//	             synced = _sync_anthropic_entry_from_credentials_file(entry)   # mirror
+//	             if not _entry_needs_refresh(synced): return synced
+//	             run ~/.hermes/bin/claude-token-refresh (timeout 45)           # actuator
+//	             synced = _sync_anthropic_entry_from_credentials_file(synced)  # re-mirror
+//	             if not _entry_needs_refresh(synced): return synced
+//	             if force: _mark_exhausted(entry)                              # surface stale
+//	             return None
+//
+// In the Go kernel the equivalent of "_sync_anthropic_entry_from_credentials_file"
+// (keychain-first read) is the CredentialSource.Resolve already wired into the
+// CredentialLifecycle, and "_entry_needs_refresh" is the lifecycle's isFresh.
+// We express the read-only behaviour as the provider's RefreshFunc so the POST
+// path (claudeOAuthRefresh, above — preserved unchanged for any non-claude_code
+// OAuth source) is structurally unreachable for the managed subscription.
+
+// claudeTokenRefreshActuator is the user-space owner-delegating refresh actuator.
+// Source: EXT-010, ~/.hermes/bin/claude-token-refresh.
+var claudeTokenRefreshActuator = filepath.Join(os.Getenv("HOME"), ".hermes", "bin", "claude-token-refresh")
+
+// claudeTokenRefreshActuatorTimeout bounds the actuator subprocess. Matches the
+// Python reference (subprocess.run(..., timeout=45)).
+const claudeTokenRefreshActuatorTimeout = 45 * time.Second
+
+// runClaudeTokenRefreshActuator delegates the OAuth refresh to its owner (Claude
+// Code) by running the EXT-010 actuator. It is bounded by a context timeout,
+// tolerates a missing binary (no-op), and passes NO secret on argv — the
+// actuator reads/writes the keychain itself. stdin/stdout/stderr are detached
+// (the actuator's only side effect we care about is the refreshed keychain
+// token, which we pick up on the subsequent re-mirror).
+//
+// Source: PATCH-007 actuator invocation in _refresh_entry (subprocess.run with
+// DEVNULL on all three streams, timeout=45).
+func runClaudeTokenRefreshActuator(ctx context.Context, actuatorPath string) {
+	if actuatorPath == "" {
+		return
+	}
+	if _, err := os.Stat(actuatorPath); err != nil {
+		// Actuator absent (e.g. non-Hermes host) — tolerate; we simply cannot
+		// delegate a refresh and will surface the stale credential below.
+		slog.Debug("claude-oauth: refresh actuator not present; skipping owner delegation",
+			"actuator", actuatorPath, "err", err)
+		return
+	}
+	runCtx, cancel := context.WithTimeout(ctx, claudeTokenRefreshActuatorTimeout)
+	defer cancel()
+
+	// No arguments: the actuator takes no credential on argv (no secret leak to
+	// process listings); it operates on the keychain directly.
+	cmd := exec.CommandContext(runCtx, actuatorPath)
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Run(); err != nil {
+		// Non-fatal: a failed/timed-out actuator just means we couldn't trigger
+		// an owner refresh. The caller re-mirrors and surfaces staleness; it
+		// never falls back to POSTing the refresh token.
+		slog.Debug("claude-oauth: refresh actuator returned error (delegation best-effort)",
+			"actuator", actuatorPath, "err", err)
+	}
+}
+
+// newClaudeCodeReadOnlyRefresh builds the RefreshFunc used by the managed
+// subscription (source == claude_code). It NEVER POSTs the refresh token.
+//
+// The CredentialLifecycle calls this only after it has already re-resolved the
+// source and found nothing fresher (see freshTokenLocked: it re-reads the
+// source keychain-first before invoking RefreshFunc). This RefreshFunc adds the
+// owner-delegation step: run the actuator, then re-mirror by resolving the
+// source again. If the freshly-mirrored credential is now fresh, it is returned
+// (and adopted by the lifecycle); otherwise an error is returned so the provider
+// surfaces Unavailable / needs-interactive-login rather than presenting a stale
+// bearer or POSTing.
+//
+// The returned func ignores the refreshToken argument entirely — by contract we
+// never exchange it. This is the structural no-POST invariant.
+func newClaudeCodeReadOnlyRefresh(src CredentialSource, actuatorPath string) RefreshFunc {
+	return func(ctx context.Context, _ /* refreshToken — intentionally unused: never POSTed */ string) (OAuthCredential, error) {
+		// Step 1 (mirror): re-read what Claude Code currently holds
+		// (keychain-first). The lifecycle already did this once before calling
+		// us, but re-reading here keeps this func correct in isolation and
+		// matches the Python branch's leading _sync call.
+		if cred, err := src.Resolve(); err == nil && isFresh(cred) {
+			return cred, nil
+		}
+
+		// Step 2 (delegate): ask the owner (Claude Code) to refresh its own
+		// keychain token via the user-space actuator. Bounded, best-effort,
+		// no secret on argv, tolerates a missing binary.
+		runClaudeTokenRefreshActuator(ctx, actuatorPath)
+
+		// Step 3 (re-mirror): read the (hopefully) owner-refreshed keychain token.
+		cred, err := src.Resolve()
+		if err != nil {
+			return OAuthCredential{}, fmt.Errorf("claude-oauth: read-only refresh: re-mirror after actuator: %w", err)
+		}
+		if isFresh(cred) {
+			return cred, nil
+		}
+
+		// Step 4 (surface stale): still stale after owner delegation. The
+		// refresh token is likely revoked → needs interactive `claude /login`.
+		// Return an error (the lifecycle propagates it as Unavailable). We do
+		// NOT loop and do NOT POST the refresh token as a fallback.
+		return OAuthCredential{}, fmt.Errorf(
+			"claude-oauth: credential stale after owner refresh; interactive `claude /login` required (refresh token likely revoked)")
+	}
+}
+
 // ── ClaudeOAuthProvider ───────────────────────────────────────────────────────
 
 // ClaudeOAuthProvider implements Provider against the Anthropic Messages API
@@ -471,7 +605,14 @@ func NewClaudeOAuthProvider(name string, cfg ProviderConfig, fallback Provider) 
 	}
 
 	src := newClaudeCodeCredentialSource()
-	lc := NewCredentialLifecycle(src, claudeOAuthRefresh)
+	// The mirrored credential (source == claude_code) is owned and rotated by
+	// Claude Code itself. The kernel is a READ-ONLY keychain mirror: its
+	// RefreshFunc NEVER POSTs the single-use refresh token. When the mirror is
+	// stale it delegates the refresh to the owner (Claude Code) via the
+	// user-space actuator, then re-mirrors. See newClaudeCodeReadOnlyRefresh /
+	// PATCH-007. The POST-ing claudeOAuthRefresh is retained for any future
+	// non-claude_code OAuth source but is intentionally NOT wired here.
+	lc := NewCredentialLifecycle(src, newClaudeCodeReadOnlyRefresh(src, claudeTokenRefreshActuator))
 
 	return &ClaudeOAuthProvider{
 		name:      name,
