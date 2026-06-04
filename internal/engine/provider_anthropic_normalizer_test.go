@@ -187,6 +187,62 @@ func Test_GoldenCase_LeadingAssistant(t *testing.T) {
 	}
 }
 
+// Test_GoldenCase_TrailingAssistant: I7 — a conversation ending with an assistant
+// message must be repaired to end with a user message (Anthropic rejects
+// assistant-terminated requests with HTTP 400 "must end with a user message").
+func Test_GoldenCase_TrailingAssistant(t *testing.T) {
+	t.Parallel()
+	input := []anthropicMessage{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: []anthropicContentBlock{{Type: "text", Text: "trailing"}}},
+	}
+
+	// RED: raw input must fail the checker with an I7 violation.
+	rawViolations := validateAnthropicMessages(input)
+	if !containsPrefix(rawViolations, "I7:") {
+		t.Fatalf("RED phase failed: raw input did not trigger I7 violation; got %v", rawViolations)
+	}
+
+	// GREEN: normalized output must be checker-clean and end with a user message.
+	normalized, rpt := normalizeAnthropicMessages(input)
+	greenViolations := validateAnthropicMessages(normalized)
+	if len(greenViolations) != 0 {
+		t.Fatalf("GREEN phase failed: normalized output still violates: %v", greenViolations)
+	}
+	if len(normalized) != 1 || normalized[len(normalized)-1].Role != "user" {
+		t.Errorf("expected sequence ending in user; got %+v", normalized)
+	}
+	if rpt.TrailingDropped == 0 {
+		t.Error("expected TrailingDropped > 0 in RepairReport")
+	}
+}
+
+// Test_GoldenCase_EvictionOrphanedToolCall: the live-bug scenario. Upstream context
+// eviction drops the trailing tool_result that followed an assistant tool_use turn;
+// passToolPairing (I3) strips the now-orphaned tool_use, leaving an assistant
+// text-only tail; passTrailingUser (I7) must then drop that tail so the request ends
+// with the user message — preventing the 400 "must end with a user message".
+func Test_GoldenCase_EvictionOrphanedToolCall(t *testing.T) {
+	t.Parallel()
+	input := []anthropicMessage{
+		{Role: "user", Content: "do the thing"},
+		{Role: "assistant", Content: []anthropicContentBlock{
+			{Type: "text", Text: "calling tool"},
+			{Type: "tool_use", ID: "toolu_1", Name: "search", Input: json.RawMessage(`{}`)},
+		}},
+		// tool_result for toolu_1 was evicted upstream — assistant tool_use is now orphaned.
+	}
+
+	normalized, _ := normalizeAnthropicMessages(input)
+	greenViolations := validateAnthropicMessages(normalized)
+	if len(greenViolations) != 0 {
+		t.Fatalf("normalized output violates invariants: %v", greenViolations)
+	}
+	if len(normalized) == 0 || normalized[len(normalized)-1].Role != "user" {
+		t.Errorf("expected sequence ending in user after orphan+trailing repair; got %+v", normalized)
+	}
+}
+
 // Test_GoldenCase_ConsecutiveUser: I2 user adjacency, merged.
 func Test_GoldenCase_ConsecutiveUser(t *testing.T) {
 	t.Parallel()
@@ -194,6 +250,8 @@ func Test_GoldenCase_ConsecutiveUser(t *testing.T) {
 		{Role: "user", Content: "a"},
 		{Role: "user", Content: "b"},
 		{Role: "assistant", Content: []anthropicContentBlock{{Type: "text", Text: "ok"}}},
+		// trailing user keeps the fixture I2-only (a valid request ends with user).
+		{Role: "user", Content: "c"},
 	}
 
 	rawViolations := validateAnthropicMessages(input)
@@ -206,8 +264,8 @@ func Test_GoldenCase_ConsecutiveUser(t *testing.T) {
 	if len(greenViolations) != 0 {
 		t.Fatalf("GREEN phase failed: %v", greenViolations)
 	}
-	if len(normalized) != 2 {
-		t.Errorf("expected 2 messages after merge; got %d", len(normalized))
+	if len(normalized) != 3 {
+		t.Errorf("expected 3 messages after merge (user, assistant, user); got %d", len(normalized))
 	}
 	if rpt.ConsecutiveMerged == 0 {
 		t.Error("expected ConsecutiveMerged > 0 in RepairReport")
@@ -227,6 +285,8 @@ func Test_GoldenCase_ConsecutiveAssistant(t *testing.T) {
 			{Type: "text", Text: "ans2"},
 			{Type: "thinking", Thinking: "t2", Signature: "sig2"},
 		}},
+		// trailing user keeps the fixture I2-only (a valid request ends with user).
+		{Role: "user", Content: "followup"},
 	}
 
 	rawViolations := validateAnthropicMessages(input)
@@ -239,8 +299,8 @@ func Test_GoldenCase_ConsecutiveAssistant(t *testing.T) {
 	if len(greenViolations) != 0 {
 		t.Fatalf("GREEN phase failed: %v", greenViolations)
 	}
-	if len(normalized) != 2 {
-		t.Errorf("expected 2 messages; got %d", len(normalized))
+	if len(normalized) != 3 {
+		t.Errorf("expected 3 messages (user, merged-assistant, user); got %d", len(normalized))
 	}
 	if rpt.ConsecutiveMerged == 0 {
 		t.Error("expected ConsecutiveMerged > 0")

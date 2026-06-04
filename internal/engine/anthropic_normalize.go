@@ -45,6 +45,7 @@ type RepairReport struct {
 	EmptyAssistantDropped   int // I5: empty assistant messages dropped
 	EmptyUserDropped        int // I5: empty user messages dropped (defensive)
 	ThinkingStripped        int // I6: thinking/redacted_thinking blocks stripped
+	TrailingDropped         int // I7: trailing non-user (assistant) messages dropped
 	SettleIterations        int // how many settle-loop passes ran (1 = clean first pass)
 }
 
@@ -54,7 +55,7 @@ func (r RepairReport) Total() int {
 		r.OrphanToolUseDropped + r.OrphanToolResultDropped +
 		r.EmptyMsgAfterPairing + r.BlockOrderReordered +
 		r.EmptyAssistantDropped + r.EmptyUserDropped +
-		r.ThinkingStripped
+		r.ThinkingStripped + r.TrailingDropped
 }
 
 // emit logs the repair report via slog when any repair was performed.
@@ -75,6 +76,7 @@ func (r RepairReport) emit(site string) {
 		"empty_assistant_dropped", r.EmptyAssistantDropped,
 		"empty_user_dropped", r.EmptyUserDropped,
 		"thinking_stripped", r.ThinkingStripped,
+		"trailing_dropped", r.TrailingDropped,
 		"settle_iterations", r.SettleIterations,
 	)
 }
@@ -219,6 +221,11 @@ func normalizeAnthropicMessages(msgs []anthropicMessage) ([]anthropicMessage, Re
 		// Pass 5: I1 leading-user-drop.
 		msgs, rpt = passLeadingUser(msgs, rpt)
 
+		// Pass 6: I7 trailing-user-drop (symmetric to I1). Runs inside the settle
+		// loop so a dropped trailing assistant can expose an orphan tool_result that
+		// I3 then cleans up on the next iteration, and vice-versa, before fixpoint.
+		msgs, rpt = passTrailingUser(msgs, rpt)
+
 		rpt.SettleIterations = iter + 1
 
 		// Fixpoint: length didn't change AND no repair counters changed.
@@ -231,7 +238,8 @@ func normalizeAnthropicMessages(msgs []anthropicMessage) ([]anthropicMessage, Re
 			rpt.OrphanToolResultDropped != beforeRpt.OrphanToolResultDropped ||
 			rpt.EmptyMsgAfterPairing != beforeRpt.EmptyMsgAfterPairing ||
 			rpt.EmptyAssistantDropped != beforeRpt.EmptyAssistantDropped ||
-			rpt.EmptyUserDropped != beforeRpt.EmptyUserDropped
+			rpt.EmptyUserDropped != beforeRpt.EmptyUserDropped ||
+			rpt.TrailingDropped != beforeRpt.TrailingDropped
 		if !changed {
 			break
 		}
@@ -519,6 +527,24 @@ func passLeadingUser(msgs []anthropicMessage, rpt RepairReport) ([]anthropicMess
 	return msgs, rpt
 }
 
+// passTrailingUser handles I7: drop trailing non-user (assistant) messages so the
+// conversation ends with a user turn. The Anthropic Messages API rejects a request
+// whose final message is an assistant message ("does not support assistant message
+// prefill. The conversation must end with a user message") with HTTP 400.
+//
+// A request can end on an assistant message after upstream context eviction drops
+// the trailing tool_result(s) that followed an assistant tool_use turn: passToolPairing
+// (I3) then strips the now-orphaned tool_use blocks, leaving an assistant text-only
+// message as the tail. This is the symmetric counterpart to passLeadingUser (I1):
+// I1 guarantees the sequence starts with user, I7 guarantees it ends with user.
+func passTrailingUser(msgs []anthropicMessage, rpt RepairReport) ([]anthropicMessage, RepairReport) {
+	for len(msgs) > 0 && msgs[len(msgs)-1].Role != "user" {
+		msgs = msgs[:len(msgs)-1]
+		rpt.TrailingDropped++
+	}
+	return msgs, rpt
+}
+
 // ── validateAnthropicMessages ─────────────────────────────────────────────────
 
 // validateAnthropicMessages is a pure checker returning one human-readable
@@ -546,6 +572,15 @@ func validateAnthropicMessages(msgs []anthropicMessage) []string {
 		violations = append(violations, fmt.Sprintf(
 			"I1: first message must be user, got %q",
 			msgs[0].Role,
+		))
+	}
+
+	// V-I7: last message must be user (Anthropic rejects assistant-terminated
+	// requests — "the conversation must end with a user message").
+	if last := msgs[len(msgs)-1]; last.Role != "user" {
+		violations = append(violations, fmt.Sprintf(
+			"I7: last message must be user, got %q",
+			last.Role,
 		))
 	}
 
