@@ -276,74 +276,27 @@ func (s *claudeCodeCredentialSource) readCredFile() (OAuthCredential, bool) {
 	}, true
 }
 
-// WriteBack writes the refreshed credential back to ~/.claude/.credentials.json,
-// preserving other top-level fields and the existing scopes field.
-// Source: _write_claude_code_credentials (Python reference).
+// WriteBack is intentionally a NO-OP for the Claude Code credential source.
 //
-// Security: the temp file is created with O_EXCL at 0600, so it is never
-// world-readable even briefly. os.Rename is atomic on POSIX.
-func (s *claudeCodeCredentialSource) WriteBack(cred OAuthCredential) error {
-	// Read existing file to preserve other top-level fields and scopes.
-	existing := make(map[string]json.RawMessage)
-	if data, err := os.ReadFile(s.credPath); err == nil {
-		_ = json.Unmarshal(data, &existing)
-	}
-
-	// Build the claudeAiOauth sub-object, preserving existing scopes if not
-	// returned by the refresh response.
-	oauthObj := claudeAiOauthJSON{
-		AccessToken:  cred.AccessToken,
-		RefreshToken: cred.RefreshToken,
-		ExpiresAt:    cred.ExpiresAtMS,
-	}
-	// Preserve scopes from the existing record.
-	if raw, ok := existing["claudeAiOauth"]; ok {
-		var prev claudeAiOauthJSON
-		if err := json.Unmarshal(raw, &prev); err == nil {
-			oauthObj.Scopes = prev.Scopes
-		}
-	}
-
-	oauthRaw, err := json.Marshal(oauthObj)
-	if err != nil {
-		return fmt.Errorf("claude-oauth: marshal oauth: %w", err)
-	}
-	existing["claudeAiOauth"] = json.RawMessage(oauthRaw)
-
-	newData, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("claude-oauth: marshal credentials: %w", err)
-	}
-
-	// Ensure parent directory exists.
-	if err := os.MkdirAll(filepath.Dir(s.credPath), 0700); err != nil {
-		return fmt.Errorf("claude-oauth: mkdir: %w", err)
-	}
-
-	// Write to a temp file at 0600 then rename atomically.
-	tmp := s.credPath + fmt.Sprintf(".tmp.%d", os.Getpid())
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return fmt.Errorf("claude-oauth: create tmp: %w", err)
-	}
-	_, writeErr := f.Write(newData)
-	syncErr := f.Sync()
-	closeErr := f.Close()
-	if writeErr != nil || syncErr != nil || closeErr != nil {
-		_ = os.Remove(tmp)
-		if writeErr != nil {
-			return fmt.Errorf("claude-oauth: write tmp: %w", writeErr)
-		}
-		if syncErr != nil {
-			return fmt.Errorf("claude-oauth: sync tmp: %w", syncErr)
-		}
-		return fmt.Errorf("claude-oauth: close tmp: %w", closeErr)
-	}
-
-	if err := os.Rename(tmp, s.credPath); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("claude-oauth: rename: %w", err)
-	}
+// Claude Code is the sole owner and writer of ~/.claude/.credentials.json and
+// the macOS keychain entry it mirrors. The kernel is a strict READ-ONLY mirror
+// of that credential (see newClaudeCodeReadOnlyRefresh): it never POSTs the
+// single-use refresh token, and it must likewise never WRITE the credential
+// file. The read-only refresh only ever surfaces the current keychain value
+// (or a Resolve() fallback that may be stale), so a WriteBack here can only
+// either redundantly rewrite the keychain value — churning the file mtime — or
+// poison Claude Code's file fallback store with a stale token, which forces an
+// interactive `claude /login`.
+//
+// Observed live 2026-06-04 (issue #363): under an eclipse-down fallback loop
+// the kernel routed periodic inference to claude-oauth ~every 10s; each refresh
+// triggered this WriteBack, rewriting the file every ~10s and injecting a stale
+// token, causing repeated "OAuth token revoked · Please run /login" logouts
+// with only a single claude-code process running. #361 made the refresh
+// read-only but left this write active; making WriteBack a no-op completes the
+// read-only-mirror discipline. The generic CredentialLifecycle WriteBack call
+// is retained for other OAuth sources that legitimately own their own store.
+func (s *claudeCodeCredentialSource) WriteBack(_ OAuthCredential) error {
 	return nil
 }
 

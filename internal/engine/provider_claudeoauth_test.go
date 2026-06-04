@@ -691,7 +691,10 @@ func TestClaudeOAuthStreamHTTPError(t *testing.T) {
 // ── claudeCodeCredentialSource.WriteBack ──────────────────────────────────────
 
 func TestClaudeCodeCredentialSourceWriteBack(t *testing.T) {
-	// Not parallel: uses a temp dir.
+	// WriteBack is a NO-OP for the Claude Code source: the kernel is a read-only
+	// mirror and Claude Code owns ~/.claude/.credentials.json (issue #363).
+	// Seeding a file then calling WriteBack must leave it byte-for-byte UNCHANGED
+	// and must NOT write the kernel-supplied token. Not parallel: uses a temp dir.
 	dir := t.TempDir()
 	credPath := filepath.Join(dir, "credentials.json")
 
@@ -709,6 +712,7 @@ func TestClaudeCodeCredentialSourceWriteBack(t *testing.T) {
 	}
 	raw, _ := json.Marshal(initial)
 	_ = os.WriteFile(credPath, raw, 0600)
+	before, _ := os.ReadFile(credPath)
 
 	newCred := OAuthCredential{
 		AccessToken:  "new-access",
@@ -719,48 +723,31 @@ func TestClaudeCodeCredentialSourceWriteBack(t *testing.T) {
 		t.Fatalf("WriteBack: %v", err)
 	}
 
-	// Read back and verify.
-	data, err := os.ReadFile(credPath)
+	// File must be unchanged (no-op).
+	after, err := os.ReadFile(credPath)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
+	if string(before) != string(after) {
+		t.Errorf("WriteBack must be a no-op but file changed.\nbefore: %s\nafter:  %s", before, after)
+	}
+
+	// The kernel-supplied token must NOT have been written into CC's file.
 	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(data, &doc); err != nil {
+	if err := json.Unmarshal(after, &doc); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-
-	// Other top-level fields must be preserved.
-	if _, ok := doc["primaryApiKey"]; !ok {
-		t.Error("primaryApiKey should be preserved")
-	}
-
-	// claudeAiOauth must be updated.
 	var oauth claudeAiOauthJSON
 	if err := json.Unmarshal(doc["claudeAiOauth"], &oauth); err != nil {
 		t.Fatalf("Unmarshal claudeAiOauth: %v", err)
 	}
-	if oauth.AccessToken != "new-access" {
-		t.Errorf("accessToken = %q; want new-access", oauth.AccessToken)
-	}
-	if oauth.RefreshToken != "new-refresh" {
-		t.Errorf("refreshToken = %q; want new-refresh", oauth.RefreshToken)
-	}
-	if oauth.ExpiresAt != 99999 {
-		t.Errorf("expiresAt = %d; want 99999", oauth.ExpiresAt)
-	}
-	// Scopes from old record should be preserved.
-	if len(oauth.Scopes) == 0 {
-		t.Error("scopes should be preserved from prior record")
-	}
-
-	// File permissions must be 0600.
-	fi, _ := os.Stat(credPath)
-	if fi.Mode().Perm() != 0600 {
-		t.Errorf("file mode = %o; want 0600", fi.Mode().Perm())
+	if oauth.AccessToken == "new-access" {
+		t.Error("WriteBack wrote the kernel token into Claude Code's credential file; must be read-only")
 	}
 }
 
 func TestClaudeCodeCredentialSourceWriteBackNoExisting(t *testing.T) {
+	// No-op WriteBack must NOT create the credential file (issue #363).
 	// Not parallel: uses a temp dir.
 	dir := t.TempDir()
 	credPath := filepath.Join(dir, "credentials.json")
@@ -775,13 +762,8 @@ func TestClaudeCodeCredentialSourceWriteBackNoExisting(t *testing.T) {
 		t.Fatalf("WriteBack on new file: %v", err)
 	}
 
-	data, _ := os.ReadFile(credPath)
-	var doc map[string]json.RawMessage
-	_ = json.Unmarshal(data, &doc)
-	var oauth claudeAiOauthJSON
-	_ = json.Unmarshal(doc["claudeAiOauth"], &oauth)
-	if oauth.AccessToken != "tok" {
-		t.Errorf("accessToken = %q; want tok", oauth.AccessToken)
+	if _, err := os.Stat(credPath); !os.IsNotExist(err) {
+		t.Errorf("WriteBack created the credential file; must be a no-op (read-only mirror)")
 	}
 }
 
