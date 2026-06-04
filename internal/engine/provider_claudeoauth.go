@@ -8,8 +8,8 @@
 //
 //  1. claudeCodeCredentialSource — a CredentialSource that reads from (in
 //     priority order) the macOS keychain, CLAUDE_CODE_OAUTH_TOKEN env var,
-//     and ~/.claude/.credentials.json.  WriteBack writes atomically to the
-//     JSON file only (the keychain is updated by the official client).
+//     and ~/.claude/.credentials.json.  WriteBack is a NO-OP: Claude Code owns
+//     that store and the kernel is a strict read-only mirror (see issue #363).
 //
 //  2. claudeOAuthRefreshFunc — a RefreshFunc that calls the Anthropic OAuth
 //     token endpoint with the refresh token and returns a new OAuthCredential.
@@ -188,8 +188,8 @@ func getClaudeCodeVersion() string {
 // claudeCodeCredentialSource reads Claude Code OAuth credentials from the
 // macOS keychain ("Claude Code-credentials"), CLAUDE_CODE_OAUTH_TOKEN env var,
 // and ~/.claude/.credentials.json (in that priority order).
-// WriteBack writes to ~/.claude/.credentials.json only (the keychain is managed
-// by the official Claude Code client).
+// WriteBack is a no-op: Claude Code is the sole owner/writer of that store; the
+// kernel must never write it (see WriteBack and issue #363).
 type claudeCodeCredentialSource struct {
 	credPath string // defaults to claudeCredentialsFile; overridable in tests
 }
