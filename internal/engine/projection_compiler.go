@@ -523,9 +523,9 @@ func (c *ProjectionCompiler) ApplyPlan(ctx context.Context, plan *reconcile.Plan
 	return results, nil
 }
 
-// compilerCfgFromPlan is a defensive accessor; ComputePlan does not stash the
-// config on the plan today, but ApplyPlan may receive one via test harnesses
-// that pre-stamp plan.Metadata.
+// compilerCfgFromPlan retrieves the *CompilerConfig that ComputePlan stamps
+// into plan.Metadata["compiler_config"], so ApplyPlan can persist compiler
+// state. Returns an error if absent (e.g. a plan from a different producer).
 func compilerCfgFromPlan(plan *reconcile.Plan) (*CompilerConfig, error) {
 	if plan == nil || plan.Metadata == nil {
 		return nil, fmt.Errorf("no plan metadata")

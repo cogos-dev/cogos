@@ -108,11 +108,13 @@ func runReconcileCycle(
 		t.Fatalf("ComputePlan: %v", err)
 	}
 
-	// Stash the cfg on plan metadata so ApplyPlan can persist state.
-	if plan.Metadata == nil {
-		plan.Metadata = map[string]any{}
+	// ComputePlan must stamp compiler_config into plan.Metadata so ApplyPlan can
+	// persist HashByAnchor state. Asserting it here exercises the production path
+	// (the daemon relies on this auto-stamp; do NOT hand-stamp it in the harness,
+	// or the test would mask a regression of that wiring).
+	if got, ok := plan.Metadata["compiler_config"].(*CompilerConfig); !ok || got != cfg {
+		t.Fatalf("ComputePlan did not stamp compiler_config into plan.Metadata (got %v, ok=%v)", plan.Metadata["compiler_config"], ok)
 	}
-	plan.Metadata["compiler_config"] = cfg
 
 	results, err := c.ApplyPlan(ctx, plan)
 	if err != nil {
