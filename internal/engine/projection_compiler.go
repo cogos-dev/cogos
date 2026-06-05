@@ -27,9 +27,9 @@
 // not a markdown parser; per ADR §Implementation §Dependencies cogblock.py
 // is the reference implementation. The path is resolved via, in order:
 //
-//   1. ProjectionCompilerConfig.CogblockPath (explicit injection)
-//   2. environment variable COGBLOCK_PY
-//   3. <workspaceRoot>/scripts/cogblock.py
+//  1. ProjectionCompilerConfig.CogblockPath (explicit injection)
+//  2. environment variable COGBLOCK_PY
+//  3. <workspaceRoot>/scripts/cogblock.py
 //
 // Per ADR-091 layering this file is Kernel (engine package). The event
 // types it emits live in pkg/substrate/projection (Substrate layer).
@@ -392,6 +392,10 @@ func (c *ProjectionCompiler) ComputePlan(config any, live any, _ *reconcile.Stat
 		ResourceType: c.Type(),
 		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
 		ConfigPath:   cfg.SourceDir,
+		// Stamp the config so ApplyPlan can persist HashByAnchor state via
+		// writeCompilerState. Without this the daemon re-creates all blocks
+		// every cycle (creates=N forever) because state never persists.
+		Metadata: map[string]any{"compiler_config": cfg},
 	}
 
 	for _, doc := range docs {
@@ -519,9 +523,9 @@ func (c *ProjectionCompiler) ApplyPlan(ctx context.Context, plan *reconcile.Plan
 	return results, nil
 }
 
-// compilerCfgFromPlan is a defensive accessor; ComputePlan does not stash the
-// config on the plan today, but ApplyPlan may receive one via test harnesses
-// that pre-stamp plan.Metadata.
+// compilerCfgFromPlan retrieves the *CompilerConfig that ComputePlan stamps
+// into plan.Metadata["compiler_config"], so ApplyPlan can persist compiler
+// state. Returns an error if absent (e.g. a plan from a different producer).
 func compilerCfgFromPlan(plan *reconcile.Plan) (*CompilerConfig, error) {
 	if plan == nil || plan.Metadata == nil {
 		return nil, fmt.Errorf("no plan metadata")

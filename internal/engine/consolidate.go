@@ -152,6 +152,7 @@ func readLedgerEvents(workspaceRoot string) ([]consolidationEvent, map[consolida
 		}
 
 		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024) // raise token cap: ledger events can hold large payloads
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			if len(line) == 0 {
@@ -365,6 +366,7 @@ func ArchivedSessions(workspaceRoot, sessionID string) (map[string]struct{}, err
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024) // raise token cap: ledger events can hold large payloads
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
