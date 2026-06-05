@@ -37,7 +37,6 @@ package engine
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -311,7 +310,7 @@ func (r *ProjectionReconciler) ComputePlan(config any, live any, state *reconcil
 		return nil, fmt.Errorf("reading projection %s: %w", projPath, err)
 	}
 
-	if err != nil || !bytes.Equal(existing, []byte(projected)) {
+	if err != nil || !equalIgnoringTimestamp(existing, []byte(projected)) {
 		action := reconcile.ActionCreate
 		if err == nil {
 			action = reconcile.ActionUpdate
