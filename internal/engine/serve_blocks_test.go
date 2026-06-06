@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -171,5 +172,52 @@ func TestParseSHA256DigestRoundTrip(t *testing.T) {
 	}
 	if _, ok := parseSHA256Digest("sha256:"); ok {
 		t.Error("prefix only: parser accepted")
+	}
+}
+
+// TestPutBlockStreamsLargeBlob proves the PUT handler streams a large blob to
+// disk (via io.TeeReader + temp file + rolling SHA-256) without buffering it in
+// memory or rejecting it on a size cap, then confirms the stored bytes round
+// trip back through GET intact. Mirrors the GET large-blob streaming test.
+func TestPutBlockStreamsLargeBlob(t *testing.T) {
+	t.Parallel()
+	handler, _ := newBlobsTestServer(t)
+
+	const size = 200 << 20 // 200 MiB
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	sum := sha256.Sum256(payload)
+	hashHex := hex.EncodeToString(sum[:])
+
+	// PUT the blob. The body must be a fresh reader the handler can stream.
+	putRec := httptest.NewRecorder()
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/blocks/"+hashHex, bytes.NewReader(payload))
+	handler.ServeHTTP(putRec, putReq)
+
+	if putRec.Code != http.StatusCreated && putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d; want 201 or 200; body=%q", putRec.Code, putRec.Body.String())
+	}
+
+	// GET it back and verify the full payload round trips.
+	getRec := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/blocks/"+hashHex, nil)
+	handler.ServeHTTP(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d; want 200; body=%q", getRec.Code, getRec.Body.String())
+	}
+
+	got, err := io.ReadAll(getRec.Body)
+	if err != nil {
+		t.Fatalf("read GET body: %v", err)
+	}
+	if len(got) != size {
+		t.Fatalf("GET body length = %d; want %d", len(got), size)
+	}
+	gotSum := sha256.Sum256(got)
+	if hex.EncodeToString(gotSum[:]) != hashHex {
+		t.Fatalf("GET body sha256 = %s; want %s", hex.EncodeToString(gotSum[:]), hashHex)
 	}
 }
