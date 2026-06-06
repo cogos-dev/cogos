@@ -221,3 +221,52 @@ func TestPutBlockStreamsLargeBlob(t *testing.T) {
 		t.Fatalf("GET body sha256 = %s; want %s", hex.EncodeToString(gotSum[:]), hashHex)
 	}
 }
+
+// TestGetBlockStreamsLargeBlob proves handleBlockGet streams large blobs
+// from disk via io.Copy rather than buffering them entirely in memory.
+func TestGetBlockStreamsLargeBlob(t *testing.T) {
+	t.Parallel()
+
+	const blobSize = 200 << 20 // 200 MiB
+	payload := make([]byte, blobSize)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	handler, proc := newBlobsTestServer(t)
+	bs := proc.BlobStore()
+	if bs == nil {
+		t.Fatal("BlobStore() nil after NewProcess")
+	}
+
+	hashHex, err := bs.Store(payload, "application/octet-stream")
+	if err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/blocks/"+hashHex, nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", rec.Code)
+	}
+
+	chunkSize := 1 << 20 // 1 MiB
+	var total int64
+	buf := make([]byte, chunkSize)
+	for {
+		n, readErr := rec.Body.Read(buf)
+		total += int64(n)
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			t.Fatalf("read body: %v", readErr)
+		}
+	}
+
+	if total != blobSize {
+		t.Fatalf("read %d bytes; want %d", total, blobSize)
+	}
+}

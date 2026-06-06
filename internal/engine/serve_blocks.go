@@ -45,12 +45,13 @@ func (s *Server) registerBlockRoutes(mux *http.ServeMux) {
 	s.route(mux, "GET /v1/blobs/{digest}", s.handleBlobGet)
 }
 
-// handleBlockGet returns blob content by hash.
+// handleBlockGet returns blob content by hash, streaming the file to the
+// response writer without buffering the full content in memory. This is
+// required for multi-GB model shards that would otherwise OOM the server.
 //
 //	GET /v1/blocks/{hash}
 //	200 → raw blob content (application/octet-stream)
 //	404 → blob not found
-//	409 → integrity check failed
 func (s *Server) handleBlockGet(w http.ResponseWriter, r *http.Request) {
 	hash := r.PathValue("hash")
 	if hash == "" || len(hash) != 64 {
@@ -59,16 +60,27 @@ func (s *Server) handleBlockGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bs := NewBlobStore(s.cfg.WorkspaceRoot)
-	content, err := bs.Get(hash)
+	f, err := bs.Open(hash)
 	if err != nil {
 		http.Error(w, "blob not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, "stat failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Blob-Hash", hash)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
-	_, _ = w.Write(content)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
+	if _, err := io.Copy(w, f); err != nil {
+		// Response headers already sent; log and move on. Client will see
+		// a truncated body and can retry.
+		slog.Warn("blocks: stream copy error", "hash", hash[:12], "err", err)
+	}
 }
 
 // handleBlobGet resolves an ADR-084 content digest to raw blob bytes via
@@ -152,12 +164,13 @@ func parseSHA256Digest(digest string) (string, bool) {
 }
 
 // handleBlockPut stores a blob, verifying the hash matches the content.
+// The body is streamed through a rolling SHA-256 hasher via io.TeeReader
+// so multi-GB model shards never need to be buffered in memory.
 //
 //	PUT /v1/blocks/{hash}
 //	Body: raw blob content
 //	201 → stored successfully
 //	400 → hash mismatch
-//	413 → too large
 func (s *Server) handleBlockPut(w http.ResponseWriter, r *http.Request) {
 	hash := r.PathValue("hash")
 	if hash == "" || len(hash) != 64 {
@@ -165,36 +178,40 @@ func (s *Server) handleBlockPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Limit to 500MB.
-	const maxBlobSize = 500 << 20
-	content, err := io.ReadAll(io.LimitReader(r.Body, maxBlobSize+1))
+	// Storage is content-addressed; the URL-provided hash is the expected
+	// hash. We stream the body into a temp file while computing SHA-256,
+	// then atomically move into the BlobStore on hash match.
+	tmpFile, err := os.CreateTemp("", "blob-put-*")
 	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "temp file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if int64(len(content)) > maxBlobSize {
-		http.Error(w, "blob too large (max 500MB)", http.StatusRequestEntityTooLarge)
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	hasher := sha256.New()
+	tee := io.TeeReader(r.Body, hasher)
+
+	if _, err := io.Copy(tmpFile, tee); err != nil {
+		tmpFile.Close()
+		http.Error(w, "write error: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		http.Error(w, "close temp: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Verify hash.
-	actual := sha256.Sum256(content)
-	actualHex := hex.EncodeToString(actual[:])
-	if actualHex != hash {
-		slog.Warn("blocks: hash mismatch on PUT", "expected", hash[:12], "actual", actualHex[:12])
+	actual := hex.EncodeToString(hasher.Sum(nil))
+	if !strings.EqualFold(actual, hash) {
+		slog.Warn("blocks: hash mismatch on PUT", "expected", hash[:12], "actual", actual[:12])
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error":    "hash mismatch",
 			"expected": hash,
-			"actual":   actualHex,
+			"actual":   actual,
 		})
-		return
-	}
-
-	bs := NewBlobStore(s.cfg.WorkspaceRoot)
-	if err := bs.Init(); err != nil {
-		http.Error(w, "init blob store: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -203,19 +220,33 @@ func (s *Server) handleBlockPut(w http.ResponseWriter, r *http.Request) {
 		ct = "application/octet-stream"
 	}
 
-	if _, err := bs.Store(content, ct); err != nil {
+	bs := NewBlobStore(s.cfg.WorkspaceRoot)
+	if err := bs.Init(); err != nil {
+		http.Error(w, "init blob store: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// StoreFile does a content-addressed atomic rename; if another concurrent
+	// PUT already stored this hash, it returns the existing hash. The content
+	// is verified by the rolling hasher above, so we trust the bytes.
+	if _, err := bs.StoreFile(tmpPath, ct); err != nil {
 		http.Error(w, "store failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("blocks: stored", "hash", hash[:12], "size", len(content))
+	info, statErr := os.Stat(tmpPath)
+	size := int64(0)
+	if statErr == nil {
+		size = info.Size()
+	}
+
+	slog.Info("blocks: stored", "hash", hash[:12], "size", size)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"stored": true,
 		"hash":   hash,
-		"size":   len(content),
+		"size":   size,
 	})
 }
 
