@@ -7,8 +7,10 @@
 package engine
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -171,5 +173,178 @@ func TestParseSHA256DigestRoundTrip(t *testing.T) {
 	}
 	if _, ok := parseSHA256Digest("sha256:"); ok {
 		t.Error("prefix only: parser accepted")
+	}
+}
+
+// TestPutBlockStreamsLargeBlob proves the PUT handler streams a large blob to
+// disk (via io.TeeReader + temp file + rolling SHA-256) without buffering it in
+// memory or rejecting it on a size cap, then confirms the stored bytes round
+// trip back through GET intact. Mirrors the GET large-blob streaming test.
+func TestPutBlockStreamsLargeBlob(t *testing.T) {
+	t.Parallel()
+	handler, _ := newBlobsTestServer(t)
+
+	const size = 200 << 20 // 200 MiB
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	sum := sha256.Sum256(payload)
+	hashHex := hex.EncodeToString(sum[:])
+
+	// PUT the blob. The body must be a fresh reader the handler can stream.
+	putRec := httptest.NewRecorder()
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/blocks/"+hashHex, bytes.NewReader(payload))
+	handler.ServeHTTP(putRec, putReq)
+
+	if putRec.Code != http.StatusCreated && putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d; want 201 or 200; body=%q", putRec.Code, putRec.Body.String())
+	}
+
+	// GET it back and verify the full payload round trips.
+	getRec := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/blocks/"+hashHex, nil)
+	handler.ServeHTTP(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d; want 200; body=%q", getRec.Code, getRec.Body.String())
+	}
+
+	got, err := io.ReadAll(getRec.Body)
+	if err != nil {
+		t.Fatalf("read GET body: %v", err)
+	}
+	if len(got) != size {
+		t.Fatalf("GET body length = %d; want %d", len(got), size)
+	}
+	gotSum := sha256.Sum256(got)
+	if hex.EncodeToString(gotSum[:]) != hashHex {
+		t.Fatalf("GET body sha256 = %s; want %s", hex.EncodeToString(gotSum[:]), hashHex)
+	}
+}
+
+// TestGetBlockStreamsLargeBlob proves handleBlockGet streams large blobs
+// from disk via io.Copy rather than buffering them entirely in memory.
+func TestGetBlockStreamsLargeBlob(t *testing.T) {
+	t.Parallel()
+
+	const blobSize = 200 << 20 // 200 MiB
+	payload := make([]byte, blobSize)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	handler, proc := newBlobsTestServer(t)
+	bs := proc.BlobStore()
+	if bs == nil {
+		t.Fatal("BlobStore() nil after NewProcess")
+	}
+
+	hashHex, err := bs.Store(payload, "application/octet-stream")
+	if err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/blocks/"+hashHex, nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", rec.Code)
+	}
+
+	chunkSize := 1 << 20 // 1 MiB
+	var total int64
+	buf := make([]byte, chunkSize)
+	for {
+		n, readErr := rec.Body.Read(buf)
+		total += int64(n)
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			t.Fatalf("read body: %v", readErr)
+		}
+	}
+
+	if total != blobSize {
+		t.Fatalf("read %d bytes; want %d", total, blobSize)
+	}
+}
+
+// TestPostBlocksVerify exercises the delta endpoint: given a mix of stored and
+// absent hashes, the handler must classify each into present/missing. Two blobs
+// are seeded and a third (never-stored) hash is included to prove the absent
+// branch. Assertions are order-independent because the handler iterates the
+// request slice and the test does not depend on a particular ordering.
+func TestPostBlocksVerify(t *testing.T) {
+	t.Parallel()
+	handler, proc := newBlobsTestServer(t)
+
+	bs := proc.BlobStore()
+	if bs == nil {
+		t.Fatal("BlobStore() nil after NewProcess")
+	}
+
+	h1, err := bs.Store([]byte("verify fixture one"), "application/octet-stream")
+	if err != nil {
+		t.Fatalf("Store h1: %v", err)
+	}
+	h2, err := bs.Store([]byte("verify fixture two"), "application/octet-stream")
+	if err != nil {
+		t.Fatalf("Store h2: %v", err)
+	}
+
+	// A well-formed 64-hex hash for content that was never stored.
+	absent := strings.Repeat("a", 64)
+
+	reqBody, err := json.Marshal(map[string][]string{
+		"hashes": {h1, h2, absent},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/blocks/verify", bytes.NewReader(reqBody))
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200; body=%q", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Present []string `json:"present"`
+		Missing []string `json:"missing"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	toSet := func(s []string) map[string]struct{} {
+		m := make(map[string]struct{}, len(s))
+		for _, v := range s {
+			m[v] = struct{}{}
+		}
+		return m
+	}
+
+	present := toSet(resp.Present)
+	if len(present) != 2 {
+		t.Fatalf("present = %v; want exactly {%s, %s}", resp.Present, h1, h2)
+	}
+	if _, ok := present[h1]; !ok {
+		t.Errorf("present missing h1=%s; got %v", h1, resp.Present)
+	}
+	if _, ok := present[h2]; !ok {
+		t.Errorf("present missing h2=%s; got %v", h2, resp.Present)
+	}
+
+	missing := toSet(resp.Missing)
+	if len(missing) != 1 {
+		t.Fatalf("missing = %v; want exactly {%s}", resp.Missing, absent)
+	}
+	if _, ok := missing[absent]; !ok {
+		t.Errorf("missing should contain absent=%s; got %v", absent, resp.Missing)
 	}
 }

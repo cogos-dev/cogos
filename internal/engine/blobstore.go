@@ -121,6 +121,24 @@ func (bs *BlobStore) StoreFile(path string, contentType string, refs ...string) 
 	return bs.Store(content, contentType, refs...)
 }
 
+// Open returns a read-only file handle for the blob identified by hash.
+// Returns os.ErrNotExist if the blob is not stored.
+func (bs *BlobStore) Open(hash string) (*os.File, error) {
+	blobPath := bs.blobPath(hash)
+	f, err := os.Open(blobPath)
+	if err != nil {
+		return nil, fmt.Errorf("open blob %s: %w", hash[:12], err)
+	}
+
+	// Verify integrity before handing the file to the caller.
+	if _, statErr := f.Stat(); statErr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat blob %s: %w", hash[:12], statErr)
+	}
+
+	return f, nil
+}
+
 // Get retrieves blob content by hash. Returns os.ErrNotExist if not found.
 func (bs *BlobStore) Get(hash string) ([]byte, error) {
 	blobPath := bs.blobPath(hash)
