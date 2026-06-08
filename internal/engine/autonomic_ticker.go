@@ -24,9 +24,30 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
+)
+
+// healBackoff tracks consecutive self-heal failures per provider so that a
+// persistently-degraded provider (e.g. one whose config file has a parse
+// error that survives across reconcile cycles) does not busyloop the CPU.
+//
+// Policy: after the Nth consecutive failure the provider is skipped for
+// 2^(N-1) ticks, capped at healBackoffMaxSkip. A single WARN is emitted on
+// the first skip; subsequent skips at the same backoff depth are silent to
+// avoid log spam. Recovery (a successful reconcile) resets the counter.
+var (
+	healBackoffMu      sync.Mutex
+	healBackoffFails   = map[string]int{}    // consecutive failure count per provider
+	healBackoffSkipsAt = map[string]int{}    // tick count at which backoff expires
+	healTickCount      int                   // monotonic tick counter
+)
+
+const (
+	healBackoffMaxSkip = 64 // cap at ~64 ticks (~64 min at default interval)
+	healBackoffWarnAt  = 3  // emit WARN once when consecutive failures reach this
 )
 
 // --- Constants ---------------------------------------------------------------
@@ -262,6 +283,11 @@ func snapshotFingerprint(snap KernelHealthSnapshot) string {
 // propagate — a failed apply leaves Health() degraded, which will trigger the
 // LLM escalation predicate on the same tick if needed.
 func healDegradedProviders(ctx context.Context) {
+	healBackoffMu.Lock()
+	healTickCount++
+	currentTick := healTickCount
+	healBackoffMu.Unlock()
+
 	names := reconcile.ListProviders()
 	for _, name := range names {
 		p, err := reconcile.GetProvider(name)
@@ -277,8 +303,28 @@ func healDegradedProviders(ctx context.Context) {
 			h.Sync == reconcile.SyncStatusOutOfSync
 
 		if !needsHeal {
+			// Successful state: reset failure counter.
+			healBackoffMu.Lock()
+			if healBackoffFails[name] > 0 {
+				slog.Info("autonomic: self-heal: provider recovered, resetting backoff",
+					"provider", name,
+					"was_fail_count", healBackoffFails[name],
+				)
+				delete(healBackoffFails, name)
+				delete(healBackoffSkipsAt, name)
+			}
+			healBackoffMu.Unlock()
 			continue
 		}
+
+		// Check backoff: if a previous failure scheduled a skip window, honour it.
+		healBackoffMu.Lock()
+		skipUntil, onBackoff := healBackoffSkipsAt[name]
+		if onBackoff && currentTick < skipUntil {
+			healBackoffMu.Unlock()
+			continue // silently skip — already warned when backoff was set
+		}
+		healBackoffMu.Unlock()
 
 		slog.Info("autonomic: self-heal: starting reconcile cycle",
 			"provider", name,
@@ -290,6 +336,7 @@ func healDegradedProviders(ctx context.Context) {
 		cfg, err := p.LoadConfig("")
 		if err != nil {
 			slog.Warn("autonomic: self-heal: LoadConfig failed", "provider", name, "err", err)
+			healRecordFailure(name, currentTick, "LoadConfig", err)
 			continue
 		}
 
@@ -297,6 +344,7 @@ func healDegradedProviders(ctx context.Context) {
 		live, err := p.FetchLive(ctx, cfg)
 		if err != nil {
 			slog.Warn("autonomic: self-heal: FetchLive failed", "provider", name, "err", err)
+			healRecordFailure(name, currentTick, "FetchLive", err)
 			continue
 		}
 
@@ -304,6 +352,7 @@ func healDegradedProviders(ctx context.Context) {
 		plan, err := p.ComputePlan(cfg, live, nil)
 		if err != nil {
 			slog.Warn("autonomic: self-heal: ComputePlan failed", "provider", name, "err", err)
+			healRecordFailure(name, currentTick, "ComputePlan", err)
 			continue
 		}
 		if plan == nil || !plan.Summary.HasChanges() {
@@ -319,12 +368,64 @@ func healDegradedProviders(ctx context.Context) {
 				"err", err,
 				"results", len(results),
 			)
+			healRecordFailure(name, currentTick, "ApplyPlan", err)
 			continue
 		}
+
+		// Successful apply: reset backoff.
+		healBackoffMu.Lock()
+		if healBackoffFails[name] > 0 {
+			slog.Info("autonomic: self-heal: apply succeeded, resetting backoff",
+				"provider", name,
+				"was_fail_count", healBackoffFails[name],
+			)
+			delete(healBackoffFails, name)
+			delete(healBackoffSkipsAt, name)
+		}
+		healBackoffMu.Unlock()
+
 		slog.Info("autonomic: self-heal: apply complete",
 			"provider", name,
 			"actions", len(plan.Actions),
 			"results", len(results),
+		)
+	}
+}
+
+// healRecordFailure increments the consecutive failure counter for a provider
+// and schedules a backoff skip window. The skip depth doubles each time,
+// capped at healBackoffMaxSkip ticks. A WARN is emitted once when the
+// failure count first reaches healBackoffWarnAt.
+func healRecordFailure(name string, currentTick int, step string, err error) {
+	healBackoffMu.Lock()
+	defer healBackoffMu.Unlock()
+
+	healBackoffFails[name]++
+	n := healBackoffFails[name]
+
+	// Compute skip window: 2^(n-1), capped.
+	skip := 1
+	for i := 1; i < n && skip < healBackoffMaxSkip; i++ {
+		skip *= 2
+	}
+	if skip > healBackoffMaxSkip {
+		skip = healBackoffMaxSkip
+	}
+	healBackoffSkipsAt[name] = currentTick + skip
+
+	if n == healBackoffWarnAt {
+		slog.Warn("autonomic: self-heal: provider repeatedly failing, entering backoff",
+			"provider", name,
+			"step", step,
+			"err", err,
+			"consecutive_failures", n,
+			"skip_ticks", skip,
+		)
+	} else if n > healBackoffWarnAt {
+		slog.Debug("autonomic: self-heal: provider still failing, extending backoff",
+			"provider", name,
+			"consecutive_failures", n,
+			"skip_ticks", skip,
 		)
 	}
 }
