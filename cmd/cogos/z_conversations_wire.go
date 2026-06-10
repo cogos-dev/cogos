@@ -69,7 +69,7 @@ func init() {
 		if prev != nil {
 			prev(srv)
 		}
-		conversations.RegisterConversationTools(srv.Server(), srv.TrackTool, daemonConversationsProvider)
+		conversations.RegisterConversationTools(srv.Server(), srv.TrackTool, daemonConversationsProvider, srv.MaxToolOutputBytes())
 	}
 
 	// Wire the cog:conversations URI resolver behind GET /v1/uri/resolve.

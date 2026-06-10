@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -36,13 +37,21 @@ type ToolTracker func(*mcp.Tool) *mcp.Tool
 func identityTracker(t *mcp.Tool) *mcp.Tool { return t }
 
 // RegisterConversationTools registers the three conversation MCP tools on the
-// given server. provider may be nil — tools return "not configured" in that case.
-// tracker is MCPServer.TrackTool; pass nil to skip manifest tracking (tests).
-func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider *Provider) {
+// given server. provider may be nil — tools return "not configured" in that
+// case. tracker is MCPServer.TrackTool; pass nil to skip manifest tracking
+// (tests). maxBytes caps the byte length of any text response; pass 0 to use
+// the default (32 KiB) — set at registration time because the handlers are
+// closures that capture it.
+func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider *Provider, maxBytes int) {
 	if tracker == nil {
 		tracker = identityTracker
 	}
-
+	if maxBytes <= 0 {
+		maxBytes = defaultConvMaxBytes
+	}
+	if maxBytes < minConvMaxBytes {
+		maxBytes = minConvMaxBytes
+	}
 	mcp.AddTool(server, tracker(&mcp.Tool{
 		Name: "cog_search_conversations",
 		Description: "Full-text search over indexed operator conversation history. " +
@@ -51,7 +60,7 @@ func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider
 			"use limit to cap results (default 20). " +
 			"Alternatively, pass uri=cog:conversations/… to dereference a query-aware URI directly " +
 			"(RFC-query-aware-conversation-uris R1-R6); mixing uri with other params is an error.",
-	}), makeSearchConversationsHandler(provider))
+	}), makeSearchConversationsHandler(provider, maxBytes))
 
 	mcp.AddTool(server, tracker(&mcp.Tool{
 		Name: "cog_get_conversation_turn",
@@ -59,7 +68,7 @@ func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider
 			"Use after cog_search_conversations to drill into a specific hit. " +
 			"Alternatively, pass uri=cog:conversations/<source>/<session>#id-<uuid> or " +
 			"#turn-N to address a turn via URI (RFC-query-aware-conversation-uris).",
-	}), makeGetConversationTurnHandler(provider))
+	}), makeGetConversationTurnHandler(provider, maxBytes))
 
 	mcp.AddTool(server, tracker(&mcp.Tool{
 		Name: "cog_list_conversations",
@@ -67,7 +76,29 @@ func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider
 			"(title, turn count, time bounds, identity, entrypoint). " +
 			"Optional since/until (RFC3339) and identity filters. " +
 			"Returns most-recent sessions first.",
-	}), makeListConversationsHandler(provider))
+	}), makeListConversationsHandler(provider, maxBytes))
+}
+
+const (
+	defaultConvMaxBytes = 32 * 1024 // 32 KiB — mirrors engine.DefaultMaxToolOutputBytes
+	minConvMaxBytes     = 4 * 1024  // 4 KiB floor
+)
+
+// capConvOutput trims s to at most maxBytes at a UTF-8 boundary and appends
+// the truncation marker. Mirrors engine.capToolOutput without creating a
+// cross-package dependency.
+func capConvOutput(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf(
+		"\n[output truncated: returned %d of %d bytes; narrow with offset/limit/filters, or dereference cog:conversations/... where applicable]",
+		cut, len(s),
+	)
 }
 
 // ─── cog_search_conversations ────────────────────────────────────────────────
@@ -89,7 +120,7 @@ type searchConversationsInput struct {
 	Limit     int    `json:"limit,omitempty"`
 }
 
-func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConversationsInput, map[string]any] {
+func makeSearchConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[searchConversationsInput, map[string]any] {
 	return func(ctx context.Context, req *mcp.CallToolRequest, input searchConversationsInput) (*mcp.CallToolResult, map[string]any, error) {
 		if p == nil {
 			return convErrorResult("conversations provider not wired"), nil, nil
@@ -182,8 +213,9 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 			"hits":  out,
 		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
+		text := capConvOutput(string(b), maxBytes)
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+			Content: []mcp.Content{&mcp.TextContent{Text: text}},
 		}, resp, nil
 	}
 }
@@ -203,7 +235,7 @@ type getConversationTurnInput struct {
 	TurnIndex int    `json:"turn_index,omitempty"`
 }
 
-func makeGetConversationTurnHandler(p *Provider) mcp.ToolHandlerFor[getConversationTurnInput, map[string]any] {
+func makeGetConversationTurnHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[getConversationTurnInput, map[string]any] {
 	return func(ctx context.Context, req *mcp.CallToolRequest, input getConversationTurnInput) (*mcp.CallToolResult, map[string]any, error) {
 		if p == nil {
 			return convErrorResult("conversations provider not wired"), nil, nil
@@ -261,8 +293,9 @@ func makeGetConversationTurnHandler(p *Provider) mcp.ToolHandlerFor[getConversat
 			"is_tool_call": turn.IsToolCall,
 		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
+		text := capConvOutput(string(b), maxBytes)
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+			Content: []mcp.Content{&mcp.TextContent{Text: text}},
 		}, resp, nil
 	}
 }
@@ -276,7 +309,7 @@ type listConversationsInput struct {
 	Limit    int    `json:"limit,omitempty"`
 }
 
-func makeListConversationsHandler(p *Provider) mcp.ToolHandlerFor[listConversationsInput, map[string]any] {
+func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[listConversationsInput, map[string]any] {
 	return func(ctx context.Context, req *mcp.CallToolRequest, input listConversationsInput) (*mcp.CallToolResult, map[string]any, error) {
 		if p == nil {
 			return convErrorResult("conversations provider not wired"), nil, nil
@@ -338,8 +371,9 @@ func makeListConversationsHandler(p *Provider) mcp.ToolHandlerFor[listConversati
 			"count":    len(out),
 		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
+		text := capConvOutput(string(b), maxBytes)
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+			Content: []mcp.Content{&mcp.TextContent{Text: text}},
 		}, resp, nil
 	}
 }

@@ -969,7 +969,11 @@ func (m *MCPServer) toolAssembleContext(ctx context.Context, req *mcp.CallToolRe
 		return textResult(fmt.Sprintf("context assembly failed: %v", err))
 	}
 
-	return marshalResult(assembled)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(assembled, maxBytes)
 }
 
 func (m *MCPServer) toolCheckCoherence(ctx context.Context, req *mcp.CallToolRequest, input checkCoherenceInput) (*mcp.CallToolResult, any, error) {
@@ -978,7 +982,11 @@ func (m *MCPServer) toolCheckCoherence(ctx context.Context, req *mcp.CallToolReq
 		return fallbackResult(fmt.Sprintf("coherence check failed: %v", err),
 			"./scripts/cog coherence check")
 	}
-	return marshalResult(report)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(report, maxBytes)
 }
 
 func (m *MCPServer) toolGetState(ctx context.Context, req *mcp.CallToolRequest, input getStateInput) (*mcp.CallToolResult, any, error) {
@@ -1059,7 +1067,11 @@ func (m *MCPServer) toolSearchMemory(ctx context.Context, req *mcp.CallToolReque
 		return fallbackResult(fmt.Sprintf("search failed: %v", err),
 			fmt.Sprintf("./scripts/cog memory search %q", input.Query))
 	}
-	return marshalResult(results)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(results, maxBytes)
 }
 
 // toolGetNucleus — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
@@ -1110,17 +1122,22 @@ func (m *MCPServer) toolReadCogdoc(ctx context.Context, req *mcp.CallToolRequest
 		result.SchemaHint = fmt.Sprintf("This CogDoc is missing a description field. If you can summarize it in one sentence, include it in your next response as: COGDOC_PATCH: %s | description: your summary here", uri)
 	}
 
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+
 	// If fragment specified, extract section
 	if res.Fragment != "" {
 		section := extractSection(content, res.Fragment)
 		if section != "" {
 			result.Fragment = res.Fragment
 			result.Content = section
-			return marshalResult(result)
+			return capMarshalResult(result, maxBytes)
 		}
 	}
 
-	return marshalResult(result)
+	return capMarshalResult(result, maxBytes)
 }
 
 func (m *MCPServer) toolPatchFrontmatter(ctx context.Context, req *mcp.CallToolRequest, input patchFrontmatterInput) (*mcp.CallToolResult, any, error) {
@@ -1535,7 +1552,7 @@ func (m *MCPServer) toolReadLedger(ctx context.Context, req *mcp.CallToolRequest
 		return fallbackResult(fmt.Sprintf("read ledger failed: %v", err),
 			"ls .cog/ledger/ && cat .cog/ledger/<session_id>/events.jsonl")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 func (m *MCPServer) toolReadEvents(ctx context.Context, req *mcp.CallToolRequest, input readEventsInput) (*mcp.CallToolResult, any, error) {
@@ -1566,7 +1583,7 @@ func (m *MCPServer) toolReadEvents(ctx context.Context, req *mcp.CallToolRequest
 		return fallbackResult(fmt.Sprintf("read events failed: %v", err),
 			"ls .cog/ledger/ && cat .cog/ledger/*/events.jsonl")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 func (m *MCPServer) toolTailEvents(ctx context.Context, req *mcp.CallToolRequest, input tailEventsInput) (*mcp.CallToolResult, any, error) {
@@ -1638,7 +1655,7 @@ func (m *MCPServer) toolTailEvents(ctx context.Context, req *mcp.CallToolRequest
 	for _, env := range replay {
 		events = append(events, envelopeToLedgerEvent(env))
 		if len(events) >= maxEvents {
-			return marshalResult(map[string]any{
+			return m.cappedMarshal(map[string]any{
 				"count":          len(events),
 				"events":         events,
 				"stopped_reason": "max_events",
@@ -1676,7 +1693,7 @@ tailLoop:
 		stopped = "max_events"
 	}
 
-	return marshalResult(map[string]any{
+	return m.cappedMarshal(map[string]any{
 		"count":          len(events),
 		"events":         events,
 		"stopped_reason": stopped,
@@ -1852,7 +1869,7 @@ func (m *MCPServer) toolTailKernelLog(ctx context.Context, req *mcp.CallToolRequ
 			fmt.Sprintf("tail -n 100 %s | jq -c .", path),
 		)
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // intToStr renders an int as a string for BuildKernelLogQueryFromValues.
@@ -1888,7 +1905,7 @@ func (m *MCPServer) toolGetAgentState(ctx context.Context, req *mcp.CallToolRequ
 	if err != nil {
 		return agentErrorResult(err, "curl http://localhost:6931/v1/agents/primary")
 	}
-	return marshalResult(snap)
+	return m.cappedMarshal(snap)
 }
 
 // toolTriggerAgentLoop implements cog_trigger_agent_loop — manually
@@ -1933,7 +1950,7 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 	if err != nil {
 		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/dispatch -d @body.json")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // agentErrorResult translates AgentControllerError into the MCP fallback
@@ -2017,7 +2034,7 @@ func (m *MCPServer) toolRenderPeerAwarenessPacket(ctx context.Context, req *mcp.
 		return fallbackResult(fmt.Sprintf("render failed: %v", err),
 			"curl 'http://localhost:6931/v1/peer-awareness?sid=<sid>'")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // toolReadToolCalls is the MCP handler for cog_read_tool_calls. It parses the
@@ -2054,7 +2071,7 @@ func (m *MCPServer) toolReadToolCalls(ctx context.Context, req *mcp.CallToolRequ
 		return fallbackResult(fmt.Sprintf("query failed: %v", err),
 			"grep '\"type\":\"tool\\.' .cog/ledger/*/events.jsonl")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // toolTailToolCalls returns a snapshot of the most recent tool-call rows for
@@ -2100,7 +2117,7 @@ func (m *MCPServer) toolTailToolCalls(ctx context.Context, req *mcp.CallToolRequ
 			"tail -f .cog/ledger/*/events.jsonl | grep '\"type\":\"tool\\.'")
 	}
 	stopped := "snapshot"
-	return marshalResult(map[string]any{
+	return m.cappedMarshal(map[string]any{
 		"count":          result.Count,
 		"events":         result.Calls,
 		"stopped_reason": stopped,
@@ -2160,7 +2177,7 @@ func (m *MCPServer) toolReadConversation(ctx context.Context, req *mcp.CallToolR
 		return fallbackResult(fmt.Sprintf("query failed: %v", err),
 			fmt.Sprintf("jq -c . .cog/run/turns/%s.jsonl", sessionID))
 	}
-	return marshalResult(res)
+	return m.cappedMarshal(res)
 }
 
 // ── Config Mutation API ──────────────────────────────────────────────────────
@@ -2249,7 +2266,7 @@ func (m *MCPServer) toolSearchTraces(ctx context.Context, req *mcp.CallToolReque
 			"ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
 		)
 	}
-	return marshalResult(res)
+	return m.cappedMarshal(res)
 }
 
 // buildTraceQueryFromInput validates the MCP input shape and normalizes it
@@ -2508,7 +2525,16 @@ func (m *MCPServer) toolReadFile(ctx context.Context, req *mcp.CallToolRequest, 
 		offset = 0
 	}
 
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+
 	scanner := bufio.NewScanner(f)
+	// Expand the scanner buffer so individual lines up to 1 MiB don't fail
+	// with "token too long" — we rely on the byte cap below to prevent
+	// megabyte blowout instead.
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	var buf bytes.Buffer
 	lineNo := 0
 	linesWritten := 0
@@ -2528,13 +2554,25 @@ func (m *MCPServer) toolReadFile(ctx context.Context, req *mcp.CallToolRequest, 
 		}
 		fmt.Fprintf(&buf, "%4d\t%s\n", lineNo, scanner.Text())
 		linesWritten++
+		// Byte cap: stop accumulating once we exceed the output cap.
+		// This is the primary guard against minified-blob blowout.
+		if buf.Len() >= maxBytes {
+			if scanner.Scan() {
+				truncated = true
+			}
+			break
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return textResult(fmt.Sprintf("read error: %v", err))
 	}
 
+	content, byteTruncated := capToolOutput(buf.String(), maxBytes)
+	if byteTruncated {
+		truncated = true
+	}
 	return marshalResult(map[string]any{
-		"content":   buf.String(),
+		"content":   content,
 		"lines":     linesWritten,
 		"truncated": truncated,
 	})
@@ -2692,10 +2730,14 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 		}
 	}
 
-	return marshalResult(map[string]any{
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(map[string]any{
 		"matches":   matches,
 		"truncated": truncated,
-	})
+	}, maxBytes)
 }
 
 // extractSection pulls a section from markdown by heading anchor.
