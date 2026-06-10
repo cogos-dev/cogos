@@ -169,23 +169,43 @@ type ObservatoryConfig struct {
 
 // providerConfig is the internal config bundle built by LoadConfig.
 type providerConfig struct {
-	Root        string
-	Observatory ObservatoryConfig
-	SourceFiles []sourceFileInfo // expanded from SourceDirs
+	Root          string
+	Observatory   ObservatoryConfig
+	SourceFiles   []sourceFileInfo   // CC UUID JSONLs expanded from SourceDirs
+	IngestSources []ingestSourceInfo // normalized ingest sources expanded from IngestDirs
 }
 
-// sourceFileInfo is metadata about one discovered source JSONL.
+// sourceFileInfo is metadata about one discovered Claude Code source JSONL.
 type sourceFileInfo struct {
 	Path      string
-	SessionID string    // index key: UUID for CC sessions; "<source>/<session_id>" for ingest sessions
+	SessionID string // derived from filename (UUID before .jsonl)
 	Mtime     time.Time
 	Size      int64
-	// IsIngest is true when this file was discovered via IngestDirs (normalized
-	// ingest surface) rather than SourceDirs (CC UUID JSONL path).
-	IsIngest bool
-	// IngestSource is the <source> component from the ingest path hierarchy
-	// (e.g. "hermes-darkstar"). Empty for CC source_dirs files.
-	IngestSource string
+}
+
+// ingestSourceInfo is the aggregate of one normalized ingest <source>
+// directory. An ingest FILE is a transport artifact (one per observer run);
+// records from many sessions are interleaved within a file and one session
+// may span several files. Planning therefore happens at SOURCE granularity:
+// the aggregate (TotalSize, LatestMtime) over all files is the drift signal,
+// and ApplyPlan re-parses every file of the source to rebuild its sessions.
+type ingestSourceInfo struct {
+	// Source is the observer-declared source id (directory name, e.g.
+	// "hermes-darkstar").
+	Source string
+
+	// Dir is the absolute path of the source directory.
+	Dir string
+
+	// Files are the absolute paths of the source's JSONL files, sorted by
+	// name (observer run files are timestamp-named → chronological order).
+	Files []string
+
+	// TotalSize is the sum of file sizes (drift detection).
+	TotalSize int64
+
+	// LatestMtime is the most recent file mtime (drift detection).
+	LatestMtime time.Time
 }
 
 // liveState is the result of FetchLive.
