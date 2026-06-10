@@ -1,0 +1,251 @@
+// Package all wires all production provider and MCP-extension registrations
+// used by the kernel daemon (cmd/cogos).
+//
+// Motivation (ADR-101 test-gap C):
+//
+//	Before this package existed the wiring lived exclusively in cmd/cogos
+//	(a package main, not importable by test helpers outside that directory).
+//	Extracting it here allows testkernel-based tests to apply the same
+//	production registration set that the daemon boots with, closing the
+//	"cmd/cogos assembly" gap where a dropped registration goes undetected
+//	until a live kernel is interrogated.
+//
+// Design rules:
+//   - No package-level init().  The two functions below are pure setters;
+//     callers (cmd/cogos init() blocks) decide when to invoke them.
+//   - No package-level state beyond the helpers shared by the two functions.
+//     The eval provider and harness registry are owned by the caller and
+//     passed in; conversations provider is similarly owned by the caller.
+//   - cmd/cogos stays as the owner of package-level provider vars so that
+//     the existing cmd/cogos test (z_conversations_wire_test.go) can reach
+//     them without indirection.
+//
+// Usage in cmd/cogos:
+//
+//	// providers_wire.go init():
+//	all.Register(daemonEvalProvider, daemonHarnessRegistry)
+//
+//	// z_conversations_wire.go init():
+//	all.RegisterConversations(daemonConversationsProvider)
+//
+// Usage in tests:
+//
+//	// Reset engine globals, apply production wiring, boot kernel.
+//	all.Register(eval.New(nil, nil), subidentity.NewHarnessRegistry())
+//	all.RegisterConversations(conversations.NewProvider())
+//	k, _ := testkernel.Boot(ctx, t)
+package all
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/myrgic/cogos/internal/conversations"
+	"github.com/myrgic/cogos/internal/engine"
+	"github.com/myrgic/cogos/internal/eval"
+	"github.com/myrgic/cogos/internal/providers/component"
+	"github.com/myrgic/cogos/internal/providers/daemon"
+	_ "github.com/myrgic/cogos/internal/providers/site" // registers "site" with pkg/reconcile
+	"github.com/myrgic/cogos/internal/workspace"
+	subidentity "github.com/myrgic/cogos/pkg/substrate/identity"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
+	"gopkg.in/yaml.v3"
+)
+
+// ── workspace helpers (duplicated from cmd/cogos per ADR-085 rule 7) ─────────
+
+// globalConfig is the minimal shape of ~/.cog/node/global.yaml used by
+// workspace resolution.
+type globalConfig struct {
+	CurrentWorkspace string                    `yaml:"current-workspace,omitempty"`
+	Workspaces       map[string]*workspaceEntry `yaml:"workspaces,omitempty"`
+}
+
+type workspaceEntry struct {
+	Path string `yaml:"path"`
+}
+
+type configProvider struct{ cfg *globalConfig }
+
+func (p configProvider) CurrentWorkspace() string { return p.cfg.CurrentWorkspace }
+func (p configProvider) WorkspacePath(name string) (string, bool) {
+	e, ok := p.cfg.Workspaces[name]
+	if !ok || e == nil {
+		return "", false
+	}
+	return e.Path, ok
+}
+
+// loadGlobalConfig reads ~/.cog/node/global.yaml with the legacy fallback.
+// Returns empty config on ENOENT.
+func loadGlobalConfig() (workspace.ConfigProvider, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return configProvider{cfg: &globalConfig{Workspaces: make(map[string]*workspaceEntry)}}, nil
+	}
+	newPath := filepath.Join(home, ".cog", "node", "global.yaml")
+	oldPath := filepath.Join(home, ".cog", "config")
+
+	path := newPath
+	if _, statErr := os.Stat(newPath); os.IsNotExist(statErr) {
+		if _, statErr2 := os.Stat(oldPath); statErr2 == nil {
+			path = oldPath
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return configProvider{cfg: &globalConfig{Workspaces: make(map[string]*workspaceEntry)}}, nil
+		}
+		return nil, fmt.Errorf("providers/all: read global config: %w", err)
+	}
+
+	var cfg globalConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("providers/all: parse global config: %w", err)
+	}
+	if cfg.Workspaces == nil {
+		cfg.Workspaces = make(map[string]*workspaceEntry)
+	}
+	return configProvider{cfg: &cfg}, nil
+}
+
+// gitRoot returns the top-level git repository containing the process
+// working directory.
+func gitRoot() (string, error) {
+	var out bytes.Buffer
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("not a git repository")
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+// uriRegistryLocator adapts engine.ResolveWorkspacePath to the pin.WorkspaceLocator
+// interface without exporting engine's internal resolver type.
+type uriRegistryLocator struct{}
+
+func (a *uriRegistryLocator) LocateWorkspace(ctx context.Context, name string) (string, error) {
+	return engine.ResolveWorkspacePath(ctx, name)
+}
+
+// ── Registration ──────────────────────────────────────────────────────────────
+
+// Register sets the four engine hook variables that the kernel daemon uses
+// at boot:
+//
+//   - engine.RegisterProviders — reconcile provider registry + ProjectionCompiler
+//   - engine.SetProvidersWorkspace — workspace root injection into providers
+//   - engine.RegisterMCPExtensions — eval MCP tools (initial chain)
+//   - engine.WireHarnessBackend — RBAC harness-binding layer
+//
+// Also wires workspace.LoadConfig and workspace.GitRoot so that
+// workspace.ResolveWorkspace() can resolve via the global registry and git root
+// detection in addition to COG_ROOT.
+//
+// Register replaces (not chains) any previously set values for these four
+// hooks. Call RegisterConversations after Register to add the conversations
+// layer on top.
+//
+// Callers own evalProvider and harnessRegistry. Pass eval.New(nil, nil) and
+// subidentity.NewHarnessRegistry() for production defaults.
+func Register(evalProvider *eval.EvalProvider, harnessRegistry *subidentity.HarnessRegistry) {
+	// Wire workspace resolution DI seams.
+	workspace.LoadConfig = func() (workspace.ConfigProvider, error) {
+		return loadGlobalConfig()
+	}
+	workspace.GitRoot = gitRoot
+
+	// The named import of internal/providers/daemon above triggered daemon.init()
+	// (and component.init() via daemon's blank import), registering all 10
+	// production providers with pkg/reconcile.
+	engine.RegisterProviders = func() {
+		// providers already registered by internal/providers/daemon init()
+		engine.RegisterProjectionCompiler()
+	}
+
+	engine.SetProvidersWorkspace = func(workspaceRoot string) {
+		daemon.SetWorkspaceRoot(workspaceRoot)
+		component.SetWorkspaceRoot(workspaceRoot)
+		if workspaceRoot != "" {
+			engine.RegisterWorktreeReconciler(workspaceRoot, nil, nil, nil)
+		}
+		daemon.SetPinWorkspaceLocator(&uriRegistryLocator{})
+		if workspaceRoot != "" && evalProvider != nil {
+			_, _ = evalProvider.LoadConfig(workspaceRoot)
+		}
+	}
+
+	engine.RegisterMCPExtensions = func(srv *engine.MCPServer) {
+		if evalProvider != nil {
+			eval.RegisterEvalTools(srv.Server(), evalProvider)
+		}
+	}
+
+	engine.WireHarnessBackend = func(s *engine.Server) {
+		if harnessRegistry != nil {
+			s.SetHarnessBackend(harnessRegistry)
+		}
+	}
+}
+
+// RegisterConversations chains the conversations layer onto the already-set
+// engine.RegisterMCPExtensions hook and calls engine.SetConversationsResolver.
+//
+// Must be called AFTER Register (or after any other code that sets
+// engine.RegisterMCPExtensions) so the chain is: eval tools → conversations
+// tools, matching the init() ordering in cmd/cogos ("p" before "z").
+//
+// Also registers the conversations provider with pkg/reconcile so the daemon's
+// proprioception Health() block includes it, and wires workspace root injection
+// so the provider's index is initialised on engine.SetProvidersWorkspace.
+//
+// provider must be non-nil; pass conversations.NewProvider() for production.
+func RegisterConversations(provider *conversations.Provider) {
+	if provider == nil {
+		return
+	}
+
+	// Register provider with reconcile registry.
+	reconcile.RegisterProvider("conversations", provider)
+
+	// Chain workspace root injection.
+	prevSetWorkspace := engine.SetProvidersWorkspace
+	engine.SetProvidersWorkspace = func(workspaceRoot string) {
+		if prevSetWorkspace != nil {
+			prevSetWorkspace(workspaceRoot)
+		}
+		if workspaceRoot != "" {
+			_, _ = provider.LoadConfig(workspaceRoot)
+		}
+	}
+
+	// Chain MCP extension registration.
+	prev := engine.RegisterMCPExtensions
+	engine.RegisterMCPExtensions = func(srv *engine.MCPServer) {
+		if prev != nil {
+			prev(srv)
+		}
+		conversations.RegisterConversationTools(srv.Server(), srv.TrackTool, provider, srv.MaxToolOutputBytes())
+	}
+
+	// Wire conversations URI resolver.
+	engine.SetConversationsResolver(&conversationsURIResolver{p: provider})
+}
+
+// conversationsURIResolver adapts conversations.Provider to
+// engine.ConversationsResolver.
+type conversationsURIResolver struct {
+	p *conversations.Provider
+}
+
+func (r *conversationsURIResolver) ResolveURI(_ context.Context, uri string) (any, error) {
+	return r.p.ResolveURI(uri)
+}
