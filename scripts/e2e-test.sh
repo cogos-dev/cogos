@@ -125,6 +125,54 @@ check_output "health has identity"       '"identity":"CogOS"'  "http://localhost
 check_output "context returns state"     '"state":"receptive"' "http://localhost:$PORT/v1/context"
 check_output "context has nucleus"       '"nucleus":"CogOS"'   "http://localhost:$PORT/v1/context"
 
+# ── Phase 3b: MCP Transport Probe ────────────────────────────────────────────
+# Exercises the wire protocol the daemon actually serves to agents:
+# initialize → tools/list → one tools/call. Catches dead wiring (a tool
+# registered in source but absent from the live daemon) and transport
+# regressions that direct-method unit tests structurally cannot see.
+
+echo "Phase 3b: MCP transport"
+MCP_URL="http://localhost:$PORT/mcp"
+MCP_H_CT='Content-Type: application/json'
+MCP_H_ACC='Accept: application/json, text/event-stream'
+
+MCP_SID=$(curl -s -D - -o /dev/null -m 10 -X POST "$MCP_URL" -H "$MCP_H_CT" -H "$MCP_H_ACC"     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}'     | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}')
+if [ -n "${MCP_SID:-}" ]; then
+    echo "  PASS  mcp initialize (session $MCP_SID)"
+    pass=$((pass + 1))
+else
+    echo "  FAIL  mcp initialize (no session id)"
+    fail=$((fail + 1))
+fi
+
+mcp_post() {
+    curl -s -m 15 -X POST "$MCP_URL" -H "$MCP_H_CT" -H "$MCP_H_ACC" \
+        ${MCP_SID:+-H "Mcp-Session-Id: ${MCP_SID}"} -d "$1"
+}
+mcp_post '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1 || true
+
+TOOLS_OUT=$(mcp_post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+# Golden tool set: one per wired subsystem, so a dropped registration chain
+# (providers_wire.go / z_*_wire.go) fails loudly here.
+for tool in cog_get_state cog_search_memory cog_search_conversations cog_list_sessions cog_read_cogdoc; do
+    if echo "$TOOLS_OUT" | grep -q "\"$tool\""; then
+        echo "  PASS  tools/list has $tool"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  tools/list has $tool"
+        fail=$((fail + 1))
+    fi
+done
+
+CALL_OUT=$(mcp_post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cog_get_state","arguments":{}}}')
+if echo "$CALL_OUT" | grep -q '"result"' && ! echo "$CALL_OUT" | grep -q '"isError":true'; then
+    echo "  PASS  tools/call cog_get_state"
+    pass=$((pass + 1))
+else
+    echo "  FAIL  tools/call cog_get_state (got: $(echo "$CALL_OUT" | head -c 200))"
+    fail=$((fail + 1))
+fi
+
 # Version endpoint.
 VERSION_OUT=$($COGOS version 2>&1)
 if echo "$VERSION_OUT" | grep -q "cogos.*build="; then
