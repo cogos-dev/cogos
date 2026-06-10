@@ -46,8 +46,10 @@ import (
 	"time"
 )
 
-// ErrURIReservedParam is returned when a caller passes a reserved query param
-// (component= or ontology=) that is not yet supported.
+// ErrURIReservedParam is retained for backward compatibility. It is no longer
+// returned by the parser — component= and ontology= are now active params.
+// Callers that import this error for equality checks will see no behaviour
+// change since the parser never returns it from v0.2 onwards.
 var ErrURIReservedParam = errors.New("reserved param: not yet supported")
 
 // ErrURIUnknownParam is returned for any unrecognised query parameter.
@@ -93,6 +95,16 @@ type URIQuery struct {
 
 	// Fragment addressing.
 	Fragment *FragmentSpec
+
+	// v0.2 ontology-as-class params (activated in v0.2 groundwork).
+	// ComponentClass filters records by L1 component class.
+	// Only records whose Turn.Component matches are returned.
+	// Note: v0.1 records are all session.turn — say so in responses.
+	ComponentClass string // component=<class>; empty = all classes
+
+	// OntologyVersion is the requested L1 version for validation.
+	// The resolver rejects mismatches with an explicit error.
+	OntologyVersion string // ontology=<id>@<version>; empty = no validation
 }
 
 // FragmentSpec describes the resolved fragment form.
@@ -138,6 +150,13 @@ type ResolvedTurn struct {
 
 	// Source is the observer source id (empty for CC sessions).
 	Source string `json:"source,omitempty"`
+
+	// v0.2 L3 version tags — populated on records indexed with ontology
+	// enforcement enabled. Empty for records indexed before v0.2.
+	// Component is always "session.turn" for v0.1 records.
+	Component       string `json:"component,omitempty"`
+	OntologyVersion string `json:"ontology_version,omitempty"`
+	MappingVersion  string `json:"mapping_version,omitempty"`
 }
 
 // ParseConversationURI parses and validates a cog:conversations URI.
@@ -203,15 +222,12 @@ func parseConversationQueryParams(queryStr string, uq *URIQuery) error {
 		return nil
 	}
 
-	// Known params — processed below.
+	// Known params — all processed below (component= and ontology= now active).
 	known := map[string]bool{
 		"q": true, "role": true, "since": true, "until": true,
 		"limit": true, "offset": true, "order": true,
 		"res": true, "fields": true,
-	}
-	// Reserved params — must produce explicit error, not be silently ignored.
-	reserved := map[string]bool{
-		"component": true, "ontology": true,
+		"component": true, "ontology": true, // v0.2 activated
 	}
 
 	for _, pair := range strings.Split(queryStr, "&") {
@@ -221,9 +237,6 @@ func parseConversationQueryParams(queryStr string, uq *URIQuery) error {
 		k, v, _ := strings.Cut(pair, "=")
 		k = strings.TrimSpace(k)
 
-		if reserved[k] {
-			return fmt.Errorf("%w: %q (planned for v0.2 ontology-as-class)", ErrURIReservedParam, k)
-		}
 		if !known[k] {
 			return fmt.Errorf("%w: %q", ErrURIUnknownParam, k)
 		}
@@ -278,6 +291,19 @@ func parseConversationQueryParams(queryStr string, uq *URIQuery) error {
 			}
 		case "fields":
 			uq.Fields = strings.Split(v, ",")
+		case "component":
+			// component= filters by L1 component class.
+			// Validation against the loaded ontology happens at resolve time.
+			if v == "" {
+				return fmt.Errorf("invalid component= value: must be a non-empty component class name")
+			}
+			uq.ComponentClass = v
+		case "ontology":
+			// ontology= is validated against the loaded L1 at resolve time.
+			if v == "" {
+				return fmt.Errorf("invalid ontology= value: must be a non-empty version reference")
+			}
+			uq.OntologyVersion = v
 		}
 	}
 	return nil
@@ -359,11 +385,45 @@ func (uq *URIQuery) isBounded() bool {
 // ResolveConversationURI resolves a cog:conversations URI against the given
 // index and returns the resulting slice. ErrUnknownAuthority is returned for
 // cross-workspace authority forms.
+//
+// Deprecated: use ResolveConversationURIWithOntology when ontology enforcement
+// is available. This variant passes nil ontology (component= and ontology= params
+// accepted in the URI but not validated).
 func ResolveConversationURI(raw string, idx *Index) (*ResolvedSlice, error) {
+	return ResolveConversationURIWithOntology(raw, idx, nil)
+}
+
+// ResolveConversationURIWithOntology resolves a cog:conversations URI against
+// the given index, optionally validating component= and ontology= URI params
+// against the loaded ontology. lo may be nil — when nil, the params are parsed
+// but not validated against a loaded L1 (component= filters by string match
+// only; ontology= is accepted and recorded but not verified).
+func ResolveConversationURIWithOntology(raw string, idx *Index, lo *LoadedOntology) (*ResolvedSlice, error) {
 	uq, err := ParseConversationURI(raw)
 	if err != nil {
 		return nil, err
 	}
+
+	// v0.2 ontology= validation: if an ontology version is requested, verify
+	// it matches the loaded L1. Explicit mismatch → error.
+	if uq.OntologyVersion != "" {
+		if lo == nil || lo.L1 == nil {
+			return nil, fmt.Errorf("ontology=%q requested but no ontology is loaded; "+
+				"set ontology_dir in observatory config", uq.OntologyVersion)
+		}
+		if err := lo.OntologyVersionCheck(uq.OntologyVersion); err != nil {
+			return nil, err
+		}
+	}
+
+	// v0.2 component= validation: if a component class is requested and an
+	// ontology is loaded, verify the class exists in the L1.
+	if uq.ComponentClass != "" && lo != nil && lo.L1 != nil {
+		if err := lo.ComponentClass(uq.ComponentClass); err != nil {
+			return nil, err
+		}
+	}
+
 	return resolveQuery(raw, uq, idx)
 }
 
@@ -457,6 +517,20 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 					continue
 				}
 			}
+			// v0.2 component= filter: filter records that carry a component
+			// class. Records ingested before v0.2 have an empty Component
+			// field and are included when component= is set (the filter is
+			// applied as a best-effort: if the field is unpopulated, it is
+			// treated as session.turn per v0.1 invariant).
+			if uq.ComponentClass != "" {
+				effectiveClass := t.Component
+				if effectiveClass == "" {
+					effectiveClass = "session.turn" // v0.1 invariant
+				}
+				if effectiveClass != uq.ComponentClass {
+					continue
+				}
+			}
 			allTurns = append(allTurns, t)
 		}
 	}
@@ -503,6 +577,12 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 			rt.Text = abstractText(t.Text)
 		case ResPointer:
 			// No text — refs+metadata only.
+		}
+		// v0.2 L3 tags: carry component/ontology/mapping versions when present.
+		if t.Component != "" {
+			rt.Component = t.Component
+			rt.OntologyVersion = t.OntologyVersion
+			rt.MappingVersion = t.MappingVersion
 		}
 		resolved = append(resolved, rt)
 	}
