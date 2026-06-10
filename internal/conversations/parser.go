@@ -78,6 +78,11 @@ type rawAITitle struct {
 // updating meta in place. r is typically an os.File; it is NOT closed.
 // The caller controls open/close. callback may return false to abort early.
 //
+// Dedup: turns with a duplicate uuid within the same session are silently
+// skipped. This handles resumed/compacted JSONL files where CC re-appends
+// historical turns that are already present, causing the same uuid to appear
+// at two different turn_indexes.
+//
 // ParseSession is purely functional: no global state, no side effects beyond
 // the callbacks. Tests can supply a strings.Reader fixture.
 func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMeta, callback func(Turn) bool) error {
@@ -88,6 +93,7 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, maxScannerTokenSize), maxScannerTokenSize)
 
+	seenUUIDs := make(map[string]struct{})
 	turnIndex := 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -115,6 +121,13 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 			}
 
 		case "user":
+			// UUID dedup: skip turns whose uuid has already been seen in this session.
+			if rec.UUID != "" {
+				if _, dup := seenUUIDs[rec.UUID]; dup {
+					continue
+				}
+				seenUUIDs[rec.UUID] = struct{}{}
+			}
 			turn, ok := parseUserRecord(&rec, sessionID, turnIndex, maxTurnLen)
 			if !ok {
 				continue
@@ -127,6 +140,13 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 			meta.TurnCount = turnIndex
 
 		case "assistant":
+			// UUID dedup: skip turns whose uuid has already been seen in this session.
+			if rec.UUID != "" {
+				if _, dup := seenUUIDs[rec.UUID]; dup {
+					continue
+				}
+				seenUUIDs[rec.UUID] = struct{}{}
+			}
 			turn, ok := parseAssistantRecord(&rec, sessionID, turnIndex, maxTurnLen)
 			if !ok {
 				continue

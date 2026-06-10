@@ -10,12 +10,13 @@
 // raw JSONL.
 //
 // Package layout:
-//   - types.go      — shared model types (SessionMeta, Turn, IndexEntry, etc.)
-//   - parser.go     — streaming JSONL parser (bufio.Scanner; never os.ReadFile)
-//   - index.go      — in-memory full-text index backed by flat projection files
-//   - provider.go   — Reconcilable implementation
-//   - mcp_tools.go  — cog_search_conversations, cog_get_conversation_turn,
-//                     cog_list_conversations tool registrations
+//   - types.go         — shared model types (SessionMeta, Turn, IndexEntry, etc.)
+//   - parser.go        — streaming JSONL parser (bufio.Scanner; never os.ReadFile)
+//   - ingest_parser.go — normalized ingest surface parser (cogos.observatory.conversations/v0.1)
+//   - index.go         — in-memory full-text index backed by flat projection files
+//   - provider.go      — Reconcilable implementation
+//   - mcp_tools.go     — cog_search_conversations, cog_get_conversation_turn,
+//                        cog_list_conversations tool registrations
 package conversations
 
 import "time"
@@ -27,12 +28,22 @@ const (
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
 	RoleSystem    Role = "system"
+	RoleTool      Role = "tool"
 )
 
 // SessionMeta carries per-session metadata without loading turn content.
 type SessionMeta struct {
-	// SessionID is the UUID from the JSONL file name.
+	// SessionID is the UUID from the JSONL file name (CC path) or the
+	// observer-declared session_id (normalized ingest path).
 	SessionID string `json:"session_id"`
+
+	// Source identifies the observer that produced this session. Empty for
+	// sessions ingested via the CC source_dirs path; set to the <source>
+	// component of the ingest path for normalized ingest records.
+	//
+	// The index keys normalized-ingest sessions as "<source>/<session_id>" to
+	// prevent collision with CC UUID session keys.
+	Source string `json:"source,omitempty"`
 
 	// SourcePath is the absolute path to the source JSONL.
 	SourcePath string `json:"source_path"`
@@ -96,15 +107,16 @@ type Turn struct {
 
 // SearchHit is one result returned by cog_search_conversations.
 type SearchHit struct {
-	SessionID  string    `json:"session_id"`
-	TurnIndex  int       `json:"turn_index"`
-	UUID       string    `json:"uuid"`
-	Timestamp  time.Time `json:"timestamp"`
-	Role       Role      `json:"role"`
-	Excerpt    string    `json:"excerpt"`    // ~300-char snippet containing the match
-	Context    string    `json:"context,omitempty"` // preceding/following text
-	SessionTitle string  `json:"session_title,omitempty"`
-	Identity   string    `json:"identity,omitempty"`
+	SessionID    string    `json:"session_id"`
+	TurnIndex    int       `json:"turn_index"`
+	UUID         string    `json:"uuid"`
+	Timestamp    time.Time `json:"timestamp"`
+	Role         Role      `json:"role"`
+	Excerpt      string    `json:"excerpt"`              // ~300-char snippet containing the match
+	Context      string    `json:"context,omitempty"`   // preceding/following text
+	SessionTitle string    `json:"session_title,omitempty"`
+	Identity     string    `json:"identity,omitempty"`
+	Source       string    `json:"source,omitempty"` // observer source id, empty for CC sessions
 }
 
 // IndexDepth describes how thoroughly a session is indexed.
@@ -125,9 +137,16 @@ type IndexEntry struct {
 // ObservatoryConfig is the deserialized form of .cog/config/observatory.yaml.
 // Uses yaml struct tags so gopkg.in/yaml.v3 can unmarshal it correctly.
 type ObservatoryConfig struct {
-	// SourceDirs is the list of JSONL source directories to scan.
+	// SourceDirs is the list of JSONL source directories to scan for
+	// Claude Code session files (UUID-named .jsonl).
 	// Defaults to ["~/.claude/projects/-Users-slowbro"].
 	SourceDirs []string `yaml:"source_dirs" json:"source_dirs,omitempty"`
+
+	// IngestDirs is the list of normalized ingest root directories. Each
+	// directory is expected to contain <source>/*.jsonl subdirectories whose
+	// records conform to cogos.observatory.conversations/v0.1.
+	// Defaults to ["<workspace>/.cog/observatory/ingest"].
+	IngestDirs []string `yaml:"ingest_dirs" json:"ingest_dirs,omitempty"`
 
 	// IncludePatterns are glob patterns relative to each SourceDir.
 	// Defaults to ["*.jsonl"].
@@ -150,17 +169,43 @@ type ObservatoryConfig struct {
 
 // providerConfig is the internal config bundle built by LoadConfig.
 type providerConfig struct {
-	Root        string
-	Observatory ObservatoryConfig
-	SourceFiles []sourceFileInfo // expanded from SourceDirs
+	Root          string
+	Observatory   ObservatoryConfig
+	SourceFiles   []sourceFileInfo   // CC UUID JSONLs expanded from SourceDirs
+	IngestSources []ingestSourceInfo // normalized ingest sources expanded from IngestDirs
 }
 
-// sourceFileInfo is metadata about one discovered source JSONL.
+// sourceFileInfo is metadata about one discovered Claude Code source JSONL.
 type sourceFileInfo struct {
 	Path      string
-	SessionID string    // derived from filename (UUID before .jsonl)
+	SessionID string // derived from filename (UUID before .jsonl)
 	Mtime     time.Time
 	Size      int64
+}
+
+// ingestSourceInfo is the aggregate of one normalized ingest <source>
+// directory. An ingest FILE is a transport artifact (one per observer run);
+// records from many sessions are interleaved within a file and one session
+// may span several files. Planning therefore happens at SOURCE granularity:
+// the aggregate (TotalSize, LatestMtime) over all files is the drift signal,
+// and ApplyPlan re-parses every file of the source to rebuild its sessions.
+type ingestSourceInfo struct {
+	// Source is the observer-declared source id (directory name, e.g.
+	// "hermes-darkstar").
+	Source string
+
+	// Dir is the absolute path of the source directory.
+	Dir string
+
+	// Files are the absolute paths of the source's JSONL files, sorted by
+	// name (observer run files are timestamp-named → chronological order).
+	Files []string
+
+	// TotalSize is the sum of file sizes (drift detection).
+	TotalSize int64
+
+	// LatestMtime is the most recent file mtime (drift detection).
+	LatestMtime time.Time
 }
 
 // liveState is the result of FetchLive.

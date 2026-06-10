@@ -81,16 +81,23 @@ func (p *Provider) LoadConfig(root string) (any, error) {
 	}
 	p.mu.Unlock()
 
-	// Discover source JSONL files.
+	// Discover CC source JSONL files.
 	files, err := discoverSourceFiles(obs)
 	if err != nil {
 		return nil, fmt.Errorf("conversations: discover source files: %w", err)
 	}
 
+	// Discover normalized ingest sources.
+	ingestSources, err := discoverIngestSources(obs)
+	if err != nil {
+		return nil, fmt.Errorf("conversations: discover ingest sources: %w", err)
+	}
+
 	return &providerConfig{
-		Root:        root,
-		Observatory: obs,
-		SourceFiles: files,
+		Root:          root,
+		Observatory:   obs,
+		SourceFiles:   files,
+		IngestSources: ingestSources,
 	}, nil
 }
 
@@ -152,7 +159,16 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 		sourceSet[f.SessionID] = f
 	}
 
-	// Walk source files.
+	// Split live entries: CC sessions have Meta.Source == ""; normalized
+	// ingest sessions carry their observer source id.
+	ingestEntriesBySource := make(map[string][]IndexEntry)
+	for _, entry := range ls.Entries {
+		if entry.Meta.Source != "" {
+			ingestEntriesBySource[entry.Meta.Source] = append(ingestEntriesBySource[entry.Meta.Source], entry)
+		}
+	}
+
+	// ── CC source files ──────────────────────────────────────────────────────
 	for _, f := range cfg.SourceFiles {
 		existing, indexed := ls.Entries[f.SessionID]
 		switch {
@@ -175,12 +191,12 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 				ResourceType: "conversations",
 				Name:         f.SessionID,
 				Details: map[string]any{
-					"source_path":   f.Path,
-					"mtime":         f.Mtime.Format(time.RFC3339),
-					"size":          f.Size,
-					"prev_mtime":    existing.Meta.SourceMtime.Format(time.RFC3339),
-					"prev_size":     existing.Meta.SourceSize,
-					"prev_turns":    existing.Meta.TurnCount,
+					"source_path": f.Path,
+					"mtime":       f.Mtime.Format(time.RFC3339),
+					"size":        f.Size,
+					"prev_mtime":  existing.Meta.SourceMtime.Format(time.RFC3339),
+					"prev_size":   existing.Meta.SourceSize,
+					"prev_turns":  existing.Meta.TurnCount,
 				},
 			})
 			plan.Summary.Updates++
@@ -199,9 +215,67 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 		}
 	}
 
-	// Sessions in index but no longer in source.
-	for sid := range ls.Entries {
-		if _, inSource := sourceSet[sid]; !inSource {
+	// ── Normalized ingest sources (one action per SOURCE, not per file) ──────
+	configuredIngest := make(map[string]struct{}, len(cfg.IngestSources))
+	for _, src := range cfg.IngestSources {
+		configuredIngest[src.Source] = struct{}{}
+		indexed := ingestEntriesBySource[src.Source]
+		details := map[string]any{
+			"is_ingest":    true,
+			"source_dir":   src.Dir,
+			"ingest_files": src.Files,
+			"total_size":   src.TotalSize,
+			"latest_mtime": src.LatestMtime.Format(time.RFC3339),
+		}
+
+		switch {
+		case len(indexed) == 0:
+			plan.Actions = append(plan.Actions, reconcile.Action{
+				Action:       reconcile.ActionCreate,
+				ResourceType: "conversations",
+				Name:         src.Source,
+				Details:      details,
+			})
+			plan.Summary.Creates++
+
+		case isIngestDrift(indexed, src):
+			details["prev_sessions"] = len(indexed)
+			plan.Actions = append(plan.Actions, reconcile.Action{
+				Action:       reconcile.ActionUpdate,
+				ResourceType: "conversations",
+				Name:         src.Source,
+				Details:      details,
+			})
+			plan.Summary.Updates++
+
+		default:
+			plan.Actions = append(plan.Actions, reconcile.Action{
+				Action:       reconcile.ActionSkip,
+				ResourceType: "conversations",
+				Name:         src.Source,
+				Details: map[string]any{
+					"reason":   "in sync",
+					"sessions": len(indexed),
+				},
+			})
+			plan.Summary.Skipped++
+		}
+	}
+
+	// ── Deletes ──────────────────────────────────────────────────────────────
+	// CC sessions in index but no longer in source; ingest sessions whose
+	// source is no longer configured. Stale sessions within a still-configured
+	// ingest source are pruned by ApplyPlan after re-parse.
+	for sid, entry := range ls.Entries {
+		var stale bool
+		if entry.Meta.Source == "" {
+			_, inSource := sourceSet[sid]
+			stale = !inSource
+		} else {
+			_, configured := configuredIngest[entry.Meta.Source]
+			stale = !configured
+		}
+		if stale {
 			plan.Actions = append(plan.Actions, reconcile.Action{
 				Action:       reconcile.ActionDelete,
 				ResourceType: "conversations",
@@ -267,6 +341,22 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 
 		switch action.Action {
 		case reconcile.ActionCreate, reconcile.ActionUpdate:
+			if isIngest, _ := action.Details["is_ingest"].(bool); isIngest {
+				// Normalized ingest: action.Name is the SOURCE; re-parse all
+				// of its files and rebuild every session of that source.
+				if applyErr := applyIngestSource(idx, action); applyErr != nil {
+					res.Status = reconcile.ApplyFailed
+					res.Error = fmt.Sprintf("index ingest source %s: %v", action.Name, applyErr)
+					results = append(results, res)
+					errs = append(errs, res.Error)
+					continue
+				}
+				res.Status = reconcile.ApplySucceeded
+				res.CreatedID = action.Name
+				results = append(results, res)
+				continue
+			}
+
 			sourcePath, _ := action.Details["source_path"].(string)
 			if sourcePath == "" {
 				res.Status = reconcile.ApplyFailed
@@ -365,6 +455,7 @@ func (p *Provider) BuildState(_ any, live any, existing *reconcile.State) (*reco
 			LastRefreshed: now,
 			Attributes: map[string]any{
 				"source_path":   m.SourcePath,
+				"source":        m.Source,
 				"turn_count":    m.TurnCount,
 				"first_turn_at": m.FirstTurnAt.Format(time.RFC3339),
 				"last_turn_at":  m.LastTurnAt.Format(time.RFC3339),
@@ -457,6 +548,7 @@ func loadObservatoryConfig(root string) (ObservatoryConfig, error) {
 		if os.IsNotExist(err) {
 			// Default config.
 			obs.SourceDirs = defaultSourceDirs()
+			obs.IngestDirs = defaultIngestDirs(root)
 			obs.IncludePatterns = []string{"*.jsonl"}
 			obs.MaxTurnLength = defaultMaxTurnLen
 			return obs, nil
@@ -472,6 +564,9 @@ func loadObservatoryConfig(root string) (ObservatoryConfig, error) {
 	if len(obs.SourceDirs) == 0 {
 		obs.SourceDirs = defaultSourceDirs()
 	}
+	if len(obs.IngestDirs) == 0 {
+		obs.IngestDirs = defaultIngestDirs(root)
+	}
 	if len(obs.IncludePatterns) == 0 {
 		obs.IncludePatterns = []string{"*.jsonl"}
 	}
@@ -482,7 +577,17 @@ func loadObservatoryConfig(root string) (ObservatoryConfig, error) {
 	return obs, nil
 }
 
-// discoverSourceFiles scans SourceDirs and returns matching JSONL files.
+// defaultIngestDirs returns the default ingest root directory for the given
+// workspace root: <root>/.cog/observatory/ingest. Returns nil if absent.
+func defaultIngestDirs(root string) []string {
+	candidate := filepath.Join(root, ".cog", "observatory", "ingest")
+	if _, err := os.Stat(candidate); err == nil {
+		return []string{candidate}
+	}
+	return nil
+}
+
+// discoverSourceFiles scans SourceDirs and returns matching CC JSONL files.
 func discoverSourceFiles(obs ObservatoryConfig) ([]sourceFileInfo, error) {
 	var files []sourceFileInfo
 	seen := make(map[string]struct{})
@@ -536,6 +641,77 @@ func discoverSourceFiles(obs ObservatoryConfig) ([]sourceFileInfo, error) {
 		return files[i].SessionID < files[j].SessionID
 	})
 	return files, nil
+}
+
+// discoverIngestSources scans IngestDirs for <source>/*.jsonl files and
+// returns one ingestSourceInfo per source directory, aggregating file list,
+// total size, and latest mtime. Sources appearing under multiple ingest roots
+// are merged into one entry.
+func discoverIngestSources(obs ObservatoryConfig) ([]ingestSourceInfo, error) {
+	bySource := make(map[string]*ingestSourceInfo)
+
+	for _, ingestRoot := range obs.IngestDirs {
+		expanded := expandHome(ingestRoot)
+		sourceDirs, err := os.ReadDir(expanded)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read ingest dir %s: %w", expanded, err)
+		}
+
+		for _, sourceEntry := range sourceDirs {
+			if !sourceEntry.IsDir() {
+				continue
+			}
+			sourceName := sourceEntry.Name()
+			sourceDir := filepath.Join(expanded, sourceName)
+
+			jsonlEntries, err := os.ReadDir(sourceDir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return nil, fmt.Errorf("read ingest source dir %s: %w", sourceDir, err)
+			}
+
+			src, ok := bySource[sourceName]
+			if !ok {
+				src = &ingestSourceInfo{Source: sourceName, Dir: sourceDir}
+				bySource[sourceName] = src
+			}
+
+			for _, je := range jsonlEntries {
+				if je.IsDir() {
+					continue
+				}
+				name := je.Name()
+				if !strings.HasSuffix(name, ".jsonl") {
+					continue
+				}
+				fi, err := je.Info()
+				if err != nil {
+					continue
+				}
+				src.Files = append(src.Files, filepath.Join(sourceDir, name))
+				src.TotalSize += fi.Size()
+				if fi.ModTime().After(src.LatestMtime) {
+					src.LatestMtime = fi.ModTime()
+				}
+			}
+		}
+	}
+
+	var out []ingestSourceInfo
+	for _, src := range bySource {
+		if len(src.Files) == 0 {
+			continue
+		}
+		sort.Strings(src.Files)
+		out = append(out, *src)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Source < out[j].Source })
+	return out, nil
 }
 
 // sessionIDFromFilename extracts the UUID from a filename like
@@ -628,4 +804,108 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	}
 
 	return meta, turns, nil
+}
+
+// isIngestDrift returns true when the indexed sessions of a source are stale
+// compared to the source's current file aggregate. All sessions of a source
+// share the same stored (SourceSize, SourceMtime) aggregate values from the
+// last apply, so checking one entry suffices; we check all defensively.
+func isIngestDrift(indexed []IndexEntry, src ingestSourceInfo) bool {
+	for _, entry := range indexed {
+		if entry.Meta.SourceSize != src.TotalSize {
+			return true
+		}
+		diff := entry.Meta.SourceMtime.Sub(src.LatestMtime)
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > 2*time.Second {
+			return true
+		}
+	}
+	return false
+}
+
+// applyIngestSource re-parses every file of an ingest source (action.Name),
+// upserts each resulting session, and prunes index sessions of that source
+// that no longer appear in the parse result.
+func applyIngestSource(idx *Index, action reconcile.Action) error {
+	sourceDir, _ := action.Details["source_dir"].(string)
+	files := stringSliceDetail(action.Details["ingest_files"])
+	if len(files) == 0 {
+		return fmt.Errorf("no ingest_files in plan action")
+	}
+
+	// Aggregate stats for drift bookkeeping on each session meta.
+	var totalSize int64
+	var latestMtime time.Time
+	acc := newIngestAccumulator(defaultMaxTurnLen)
+	for _, path := range files {
+		fi, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+		totalSize += fi.Size()
+		if fi.ModTime().After(latestMtime) {
+			latestMtime = fi.ModTime()
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", path, err)
+		}
+		consumeErr := acc.ConsumeFile(f)
+		f.Close()
+		if consumeErr != nil {
+			return fmt.Errorf("parse %s: %w", path, consumeErr)
+		}
+	}
+
+	now := time.Now().UTC()
+	parsed := make(map[string]struct{})
+	for _, sess := range acc.Sessions() {
+		sess.Meta.SourcePath = sourceDir
+		sess.Meta.IndexedAt = now
+		sess.Meta.SourceMtime = latestMtime
+		sess.Meta.SourceSize = totalSize
+		if err := idx.UpsertSession(sess.Meta, sess.Turns); err != nil {
+			return fmt.Errorf("upsert session %s: %w", sess.Meta.SessionID, err)
+		}
+		parsed[sess.Meta.SessionID] = struct{}{}
+	}
+
+	// Prune sessions of this source that vanished from the parse result
+	// (observer files are append-only, so this is rare — defensive only).
+	for _, meta := range idx.ListSessions(time.Time{}, time.Time{}, "") {
+		if meta.Source != action.Name {
+			continue
+		}
+		if _, ok := parsed[meta.SessionID]; !ok {
+			if err := idx.DeleteSession(meta.SessionID); err != nil {
+				return fmt.Errorf("prune stale session %s: %w", meta.SessionID, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// stringSliceDetail coerces a plan-action detail value into []string.
+// Handles both the in-process []string form and the []any form a JSON
+// round-trip would produce.
+func stringSliceDetail(v any) []string {
+	switch t := v.(type) {
+	case []string:
+		return t
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
