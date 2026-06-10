@@ -78,7 +78,10 @@ type searchConversationsInput struct {
 	URI string `json:"uri,omitempty"`
 
 	// Standard filter params (mutually exclusive with URI).
-	Query     string `json:"query"`
+	// Query is omitempty so the SDK-generated input schema does not mark it
+	// required — a uri-only call must pass schema validation. The handler
+	// enforces "query required unless uri is set" at runtime.
+	Query     string `json:"query,omitempty"`
 	Since     string `json:"since,omitempty"`
 	Until     string `json:"until,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
@@ -192,8 +195,12 @@ type getConversationTurnInput struct {
 	// Mixing uri with SessionID/TurnIndex is an error.
 	URI string `json:"uri,omitempty"`
 
-	SessionID string `json:"session_id"`
-	TurnIndex int    `json:"turn_index"`
+	// session_id/turn_index are omitempty so the SDK-generated input schema
+	// does not mark them required — a uri-only call must pass schema
+	// validation. The handler enforces "session_id required unless uri is
+	// set" at runtime.
+	SessionID string `json:"session_id,omitempty"`
+	TurnIndex int    `json:"turn_index,omitempty"`
 }
 
 func makeGetConversationTurnHandler(p *Provider) mcp.ToolHandlerFor[getConversationTurnInput, map[string]any] {
