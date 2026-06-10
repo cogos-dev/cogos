@@ -4,9 +4,19 @@
 // Records with an unknown schema value are rejected and logged; the parser
 // never guesses at schema semantics.
 //
-// Dedup on the normalized path:
+// An ingest FILE is a transport artifact (one file per observer run) that may
+// contain records from MANY sessions interleaved — the schema carries
+// session_id per record precisely for this. The ingestAccumulator therefore
+// groups records by composite key "<source>/<session_id>" while consuming
+// files, and a session may SPAN files across observer runs (incremental runs
+// append later messages for the same session_id). Dedup spans files within a
+// session:
 //   - When refs contains a "stable_id" key: dedup by that value.
 //   - Otherwise: dedup by SHA-256 of "<role>\x00<timestamp>\x00<text>".
+//
+// Turn UUID is the raw stable_id value when present (e.g. "hermes-cog:1"),
+// else the content hash. Internal dedup-key namespacing never leaks into the
+// uuid.
 //
 // Monotonic turn_index is assigned per (source, session_id) when absent from
 // the record.
@@ -20,8 +30,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strings"
-	"time"
 )
 
 // knownIngestSchemas is the set of schema values this parser speaks.
@@ -54,34 +62,63 @@ type ingestRecord struct {
 
 // ingestRefs is the optional refs object within an ingest record.
 type ingestRefs struct {
-	StableID any    `json:"stable_id,omitempty"` // stable per-record id for dedup
-	DB       string `json:"db,omitempty"`
-	MessageID any   `json:"message_id,omitempty"`
+	StableID  any    `json:"stable_id,omitempty"` // stable per-record id for dedup
+	DB        string `json:"db,omitempty"`
+	MessageID any    `json:"message_id,omitempty"`
 }
 
-// ParseIngestSession streams turns from a normalized ingest JSONL. r is the
-// open file (caller controls open/close). The indexKey is the composite
-// "<source>/<session_id>" used as the session key in the index.
-//
-// Behaviour:
-//   - Records with unknown schema → rejected, logged, counted in stats.
-//   - Records with unknown role  → rejected, logged.
-//   - Missing required fields (source, session_id, role, timestamp, text) → rejected, logged.
-//   - Duplicate records (by stable_id or content hash) → silently skipped.
-//   - turn_index absent           → assigned monotonically from 0.
-//   - text longer than maxTurnLen → truncated with " [truncated]" suffix.
-//
-// Returns the number of records rejected due to schema mismatch.
-func ParseIngestSession(r io.Reader, indexKey string, maxTurnLen int, meta *SessionMeta, callback func(Turn) bool) (rejectedSchemas int, err error) {
+// ingestSessionAccum collects the meta + turns for one (source, session_id)
+// while files are being consumed.
+type ingestSessionAccum struct {
+	Meta  SessionMeta
+	Turns []Turn
+
+	// seen holds internal dedup keys for this session. The map spans files:
+	// incremental observer runs may re-emit records already ingested from an
+	// earlier file.
+	seen map[string]struct{}
+}
+
+// ingestAccumulator consumes ingest JSONL files and groups records into
+// per-session accumulators keyed by "<source>/<session_id>".
+type ingestAccumulator struct {
+	maxTurnLen int
+
+	// sessions maps composite key → accumulator.
+	sessions map[string]*ingestSessionAccum
+
+	// order records first-seen order of session keys for deterministic output.
+	order []string
+
+	// RejectedSchemas counts records rejected for an unknown schema value.
+	RejectedSchemas int
+}
+
+// newIngestAccumulator returns an empty accumulator.
+func newIngestAccumulator(maxTurnLen int) *ingestAccumulator {
 	if maxTurnLen <= 0 {
 		maxTurnLen = defaultMaxTurnLen
 	}
+	return &ingestAccumulator{
+		maxTurnLen: maxTurnLen,
+		sessions:   make(map[string]*ingestSessionAccum),
+	}
+}
 
+// ConsumeFile streams one ingest JSONL from r, validating and routing each
+// record into its session accumulator. r is typically an os.File; it is NOT
+// closed — the caller controls open/close.
+//
+// Behaviour per record:
+//   - unknown schema → rejected, logged, counted in RejectedSchemas
+//   - missing required fields (source, session_id, role, timestamp, text) → rejected, logged
+//   - unknown role → rejected, logged
+//   - duplicate (by stable_id or content hash, within session) → silently skipped
+//   - turn_index absent → assigned monotonically per session
+//   - text longer than maxTurnLen → truncated with " [truncated]" suffix
+func (a *ingestAccumulator) ConsumeFile(r io.Reader) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, maxScannerTokenSize), maxScannerTokenSize)
-
-	seen := make(map[string]struct{}) // dedup keys seen so far
-	turnIndex := 0
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -97,125 +134,140 @@ func ParseIngestSession(r io.Reader, indexKey string, maxTurnLen int, meta *Sess
 
 		// Schema validation — reject and log unknown schemas.
 		if !knownIngestSchemas[rec.Schema] {
-			log.Printf("conversations/ingest: rejected record with unknown schema %q in session %s", rec.Schema, indexKey)
-			rejectedSchemas++
+			log.Printf("conversations/ingest: rejected record with unknown schema %q (source=%q session_id=%q)", rec.Schema, rec.Source, rec.SessionID)
+			a.RejectedSchemas++
 			continue
 		}
 
 		// Required field validation.
 		if rec.Source == "" || rec.SessionID == "" || rec.Role == "" || rec.Timestamp == "" || rec.Text == "" {
-			log.Printf("conversations/ingest: rejected record missing required fields in session %s (source=%q session_id=%q role=%q timestamp=%q text_len=%d)",
-				indexKey, rec.Source, rec.SessionID, rec.Role, rec.Timestamp, len(rec.Text))
+			log.Printf("conversations/ingest: rejected record missing required fields (source=%q session_id=%q role=%q timestamp=%q text_len=%d)",
+				rec.Source, rec.SessionID, rec.Role, rec.Timestamp, len(rec.Text))
 			continue
 		}
 
 		// Role validation.
 		role, roleOK := validIngestRoles[rec.Role]
 		if !roleOK {
-			log.Printf("conversations/ingest: rejected record with unknown role %q in session %s", rec.Role, indexKey)
+			log.Printf("conversations/ingest: rejected record with unknown role %q (source=%q session_id=%q)", rec.Role, rec.Source, rec.SessionID)
 			continue
 		}
 
-		// Dedup key.
-		dedupKey := ingestDedupKey(rec)
-		if _, dup := seen[dedupKey]; dup {
+		key := indexKeyForIngest(rec.Source, rec.SessionID)
+		sess, ok := a.sessions[key]
+		if !ok {
+			sess = &ingestSessionAccum{
+				Meta: SessionMeta{
+					SessionID: key,
+					Source:    rec.Source,
+				},
+				seen: make(map[string]struct{}),
+			}
+			a.sessions[key] = sess
+			a.order = append(a.order, key)
+		}
+
+		// Dedup within the session (spans files).
+		turnUUID, dedupKey := ingestRecordID(rec)
+		if _, dup := sess.seen[dedupKey]; dup {
 			continue
 		}
-		seen[dedupKey] = struct{}{}
+		sess.seen[dedupKey] = struct{}{}
 
 		// Assign monotonic turn_index when absent.
-		idx := turnIndex
+		idx := len(sess.Turns)
 		if rec.TurnIndex != nil {
 			idx = *rec.TurnIndex
 		}
 
 		// Truncate text.
 		text := rec.Text
-		if len(text) > maxTurnLen {
-			text = text[:maxTurnLen] + " [truncated]"
+		if len(text) > a.maxTurnLen {
+			text = text[:a.maxTurnLen] + " [truncated]"
 		}
 
 		ts := parseTimestamp(rec.Timestamp)
-		updateTimeBounds(meta, ts)
+		updateTimeBounds(&sess.Meta, ts)
 
-		// Session title from any record that carries one.
-		if rec.SessionTitle != "" && meta.Title == "" {
-			meta.Title = rec.SessionTitle
+		// Session title / identity propagate from any record that carries them.
+		if rec.SessionTitle != "" && sess.Meta.Title == "" {
+			sess.Meta.Title = rec.SessionTitle
 		}
-		// Identity from any record that carries one.
-		if rec.Identity != "" && meta.Identity == "" {
-			meta.Identity = rec.Identity
+		if rec.Identity != "" && sess.Meta.Identity == "" {
+			sess.Meta.Identity = rec.Identity
 		}
 
-		turn := Turn{
-			UUID:      dedupKey, // stable identifier within the index
-			SessionID: indexKey,
+		sess.Turns = append(sess.Turns, Turn{
+			UUID:      turnUUID,
+			SessionID: key,
 			TurnIndex: idx,
 			Role:      role,
 			Timestamp: ts,
 			Text:      text,
-		}
-
-		if !callback(turn) {
-			return rejectedSchemas, nil
-		}
-		turnIndex++
-		meta.TurnCount = turnIndex
+		})
+		sess.Meta.TurnCount = len(sess.Turns)
 	}
 
-	return rejectedSchemas, scanner.Err()
+	return scanner.Err()
 }
 
-// ingestDedupKey returns the dedup key for an ingest record.
+// Sessions returns the accumulated sessions in first-seen order.
+func (a *ingestAccumulator) Sessions() []*ingestSessionAccum {
+	out := make([]*ingestSessionAccum, 0, len(a.order))
+	for _, key := range a.order {
+		out = append(out, a.sessions[key])
+	}
+	return out
+}
+
+// ingestRecordID returns the turn UUID and the internal dedup key for an
+// ingest record.
 //
-// Priority:
-//  1. refs.stable_id (if present and non-empty after string conversion)
-//  2. SHA-256 of "<role>\x00<timestamp>\x00<text>"
-func ingestDedupKey(rec ingestRecord) string {
-	// Try to extract stable_id from refs.
-	if len(rec.Refs) > 0 {
-		var refs ingestRefs
-		if json.Unmarshal(rec.Refs, &refs) == nil && refs.StableID != nil {
-			var stableStr string
-			switch v := refs.StableID.(type) {
-			case string:
-				stableStr = v
-			case float64:
-				stableStr = fmt.Sprintf("%.0f", v)
-			default:
-				b, _ := json.Marshal(v)
-				stableStr = string(b)
-			}
-			if stableStr != "" {
-				return "stable:" + rec.Source + ":" + stableStr
-			}
-		}
+// UUID priority:
+//  1. refs.stable_id verbatim (observers emit "<source>:<message_id>",
+//     e.g. "hermes-cog:1") — never re-prefixed.
+//  2. First 16 hex chars of SHA-256("<role>\x00<timestamp>\x00<text>").
+//
+// The dedup key carries an internal namespace prefix ("s:" / "h:") so a
+// stable_id can never collide with a content hash, but that prefix never
+// appears in the UUID.
+func ingestRecordID(rec ingestRecord) (uuid string, dedupKey string) {
+	if stable := ingestStableID(rec); stable != "" {
+		return stable, "s:" + stable
 	}
 
-	// Fall back to content hash.
 	h := sha256.New()
 	h.Write([]byte(rec.Role))
 	h.Write([]byte{0})
 	h.Write([]byte(rec.Timestamp))
 	h.Write([]byte{0})
 	h.Write([]byte(rec.Text))
-	return "hash:" + hex.EncodeToString(h.Sum(nil))[:16]
+	sum := hex.EncodeToString(h.Sum(nil))[:16]
+	return sum, "h:" + sum
+}
+
+// ingestStableID extracts refs.stable_id as a string, or "" when absent.
+func ingestStableID(rec ingestRecord) string {
+	if len(rec.Refs) == 0 {
+		return ""
+	}
+	var refs ingestRefs
+	if json.Unmarshal(rec.Refs, &refs) != nil || refs.StableID == nil {
+		return ""
+	}
+	switch v := refs.StableID.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
 }
 
 // indexKeyForIngest builds the composite session key used in the index for
 // normalized ingest sessions: "<source>/<session_id>".
 func indexKeyForIngest(source, sessionID string) string {
 	return source + "/" + sessionID
-}
-
-// parseIngestTimestamp parses an ingest record timestamp. Accepts RFC3339 with
-// or without sub-second precision, and Python isoformat strings that use a
-// space separator instead of 'T'.
-func parseIngestTimestamp(s string) time.Time {
-	if s == "" {
-		return time.Time{}
-	}
-	// Normalise Python isoformat space separator to 'T'.
-	normalised := strings.Replace(s, " ", "T", 1)
-	return parseTimestamp(normalised)
 }
