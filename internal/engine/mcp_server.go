@@ -2591,7 +2591,17 @@ readLoop:
 		linesWritten++
 	}
 
-	content, byteTruncated := capToolOutput(buf.String(), maxBytes)
+	// Use the true file size as the marker denominator: the reader above is
+	// bounded, so len(buf) understates a large file by design.
+	totalBytes := int64(buf.Len())
+	var fileSize int64 = -1
+	if fi, statErr := f.Stat(); statErr == nil {
+		fileSize = fi.Size()
+		if fi.Size() > totalBytes {
+			totalBytes = fi.Size()
+		}
+	}
+	content, byteTruncated := capToolOutputWithTotal(buf.String(), maxBytes, totalBytes)
 	if byteTruncated {
 		truncated = true
 	}
@@ -2600,8 +2610,8 @@ readLoop:
 		"lines":     linesWritten,
 		"truncated": truncated,
 	}
-	if fi, statErr := f.Stat(); statErr == nil {
-		resp["file_size_bytes"] = fi.Size()
+	if fileSize >= 0 {
+		resp["file_size_bytes"] = fileSize
 	}
 	if overflowed {
 		resp["note"] = fmt.Sprintf(

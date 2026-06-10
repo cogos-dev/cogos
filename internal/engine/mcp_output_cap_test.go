@@ -509,3 +509,16 @@ func TestCappedMarshal_AppliesCap(t *testing.T) {
 // Ensure imports are used.
 var _ = os.Stat
 var _ = mcp.NewServer
+
+func TestCapToolOutputWithTotal_TrueDenominator(t *testing.T) {
+	// A bounded reader hands us only ~cap bytes of a much larger source; the
+	// marker must report the true source size, not the bytes read.
+	s := strings.Repeat("A", 40_000)
+	out, truncated := capToolOutputWithTotal(s, 32768, 5_000_009)
+	if !truncated {
+		t.Fatal("expected truncation")
+	}
+	if !strings.Contains(out, "of 5000009 bytes") {
+		t.Fatalf("marker denominator should be true total; got marker tail: %q", out[len(out)-160:])
+	}
+}

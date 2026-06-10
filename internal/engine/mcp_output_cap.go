@@ -63,8 +63,21 @@ const (
 // Returns (possibly truncated string, true) when truncation occurred; returns
 // (s, false) when s fits within maxBytes.
 func capToolOutput(s string, maxBytes int) (string, bool) {
+	return capToolOutputWithTotal(s, maxBytes, int64(len(s)))
+}
+
+// capToolOutputWithTotal is capToolOutput with an externally-known total
+// source size. When a reader is BOUNDED (e.g. cog_read_file stops at the cap
+// rather than slurping a 5GB file), len(s) understates the source: a marker
+// saying "returned 32768 of 32774 bytes" on a 5MB file misleads the caller
+// into thinking 6 bytes are missing. Pass the os.Stat size (or other true
+// total) so the denominator tells the truth.
+func capToolOutputWithTotal(s string, maxBytes int, totalBytes int64) (string, bool) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxToolOutputBytes
+	}
+	if totalBytes < int64(len(s)) {
+		totalBytes = int64(len(s))
 	}
 	if len(s) <= maxBytes {
 		return s, false
@@ -78,7 +91,7 @@ func capToolOutput(s string, maxBytes int) (string, bool) {
 
 	marker := fmt.Sprintf(
 		"\n[output truncated: returned %d of %d bytes; narrow with offset/limit/filters, or dereference cog:conversations/... where applicable]",
-		cut, len(s),
+		cut, totalBytes,
 	)
 	return s[:cut] + marker, true
 }
