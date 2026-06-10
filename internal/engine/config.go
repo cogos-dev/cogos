@@ -172,6 +172,14 @@ type Config struct {
 	// Configurable via identity_naked_default: true in kernel.yaml.
 	IdentityNakedDefault bool
 
+	// MaxToolOutputBytes caps the byte length of any cog_* MCP tool text
+	// response before it is sent to the agent. Responses that exceed the cap
+	// are truncated at a UTF-8 rune boundary and annotated with an explicit
+	// truncation marker. 0 means use DefaultMaxToolOutputBytes (32 KiB).
+	// A hard floor of MinToolOutputBytes (4 KiB) prevents absurdly low values.
+	// Configurable via max_tool_output_bytes in kernel.yaml.
+	MaxToolOutputBytes int
+
 	// CoreInference is the node's declared N-tier inference contract.
 	// Loaded from .cog/config/core-inference.yaml; falls back to
 	// inference.DefaultCoreInferenceConfig() if the file is absent.
@@ -208,6 +216,11 @@ type kernelConfigSection struct {
 	// When empty, LoadConfig uses workspaceRoot/.cog/config/core-inference.yaml.
 	// Reserved for future use — not yet wired into the loader.
 	CoreInferencePath string `yaml:"core_inference_path,omitempty"`
+
+	// MaxToolOutputBytes caps MCP tool response text at this many bytes.
+	// 0 means use DefaultMaxToolOutputBytes (32 KiB).
+	// Floor: MinToolOutputBytes (4 KiB).
+	MaxToolOutputBytes int `yaml:"max_tool_output_bytes,omitempty"`
 }
 
 // kernelConfig is the on-disk YAML shape of .cog/config/kernel.yaml.
@@ -363,6 +376,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.Mod3URL != "" {
 		cfg.Mod3URL = s.Mod3URL
+	}
+	if s.MaxToolOutputBytes != 0 {
+		cfg.MaxToolOutputBytes = s.MaxToolOutputBytes
 	}
 }
 

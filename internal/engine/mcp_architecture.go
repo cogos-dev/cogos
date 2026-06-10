@@ -170,9 +170,9 @@ func (m *MCPServer) execArchitectureTool(ctx context.Context, scriptName string,
 	var parsed any
 	if err := json.Unmarshal(out, &parsed); err != nil {
 		// Some tools may emit non-JSON (e.g., list --format=table); return raw.
-		return marshalResult(map[string]any{"output": string(out)})
+		return m.cappedMarshal(map[string]any{"output": string(out)})
 	}
-	return marshalResult(parsed)
+	return m.cappedMarshal(parsed)
 }
 
 // ─── Tool handlers ───────────────────────────────────────────────────────────

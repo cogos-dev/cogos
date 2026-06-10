@@ -969,7 +969,11 @@ func (m *MCPServer) toolAssembleContext(ctx context.Context, req *mcp.CallToolRe
 		return textResult(fmt.Sprintf("context assembly failed: %v", err))
 	}
 
-	return marshalResult(assembled)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(assembled, maxBytes)
 }
 
 func (m *MCPServer) toolCheckCoherence(ctx context.Context, req *mcp.CallToolRequest, input checkCoherenceInput) (*mcp.CallToolResult, any, error) {
@@ -978,7 +982,11 @@ func (m *MCPServer) toolCheckCoherence(ctx context.Context, req *mcp.CallToolReq
 		return fallbackResult(fmt.Sprintf("coherence check failed: %v", err),
 			"./scripts/cog coherence check")
 	}
-	return marshalResult(report)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(report, maxBytes)
 }
 
 func (m *MCPServer) toolGetState(ctx context.Context, req *mcp.CallToolRequest, input getStateInput) (*mcp.CallToolResult, any, error) {
@@ -1059,7 +1067,11 @@ func (m *MCPServer) toolSearchMemory(ctx context.Context, req *mcp.CallToolReque
 		return fallbackResult(fmt.Sprintf("search failed: %v", err),
 			fmt.Sprintf("./scripts/cog memory search %q", input.Query))
 	}
-	return marshalResult(results)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(results, maxBytes)
 }
 
 // toolGetNucleus — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
@@ -1110,17 +1122,22 @@ func (m *MCPServer) toolReadCogdoc(ctx context.Context, req *mcp.CallToolRequest
 		result.SchemaHint = fmt.Sprintf("This CogDoc is missing a description field. If you can summarize it in one sentence, include it in your next response as: COGDOC_PATCH: %s | description: your summary here", uri)
 	}
 
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+
 	// If fragment specified, extract section
 	if res.Fragment != "" {
 		section := extractSection(content, res.Fragment)
 		if section != "" {
 			result.Fragment = res.Fragment
 			result.Content = section
-			return marshalResult(result)
+			return capMarshalResult(result, maxBytes)
 		}
 	}
 
-	return marshalResult(result)
+	return capMarshalResult(result, maxBytes)
 }
 
 func (m *MCPServer) toolPatchFrontmatter(ctx context.Context, req *mcp.CallToolRequest, input patchFrontmatterInput) (*mcp.CallToolResult, any, error) {
@@ -1535,7 +1552,7 @@ func (m *MCPServer) toolReadLedger(ctx context.Context, req *mcp.CallToolRequest
 		return fallbackResult(fmt.Sprintf("read ledger failed: %v", err),
 			"ls .cog/ledger/ && cat .cog/ledger/<session_id>/events.jsonl")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 func (m *MCPServer) toolReadEvents(ctx context.Context, req *mcp.CallToolRequest, input readEventsInput) (*mcp.CallToolResult, any, error) {
@@ -1566,7 +1583,7 @@ func (m *MCPServer) toolReadEvents(ctx context.Context, req *mcp.CallToolRequest
 		return fallbackResult(fmt.Sprintf("read events failed: %v", err),
 			"ls .cog/ledger/ && cat .cog/ledger/*/events.jsonl")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 func (m *MCPServer) toolTailEvents(ctx context.Context, req *mcp.CallToolRequest, input tailEventsInput) (*mcp.CallToolResult, any, error) {
@@ -1638,7 +1655,7 @@ func (m *MCPServer) toolTailEvents(ctx context.Context, req *mcp.CallToolRequest
 	for _, env := range replay {
 		events = append(events, envelopeToLedgerEvent(env))
 		if len(events) >= maxEvents {
-			return marshalResult(map[string]any{
+			return m.cappedMarshal(map[string]any{
 				"count":          len(events),
 				"events":         events,
 				"stopped_reason": "max_events",
@@ -1676,7 +1693,7 @@ tailLoop:
 		stopped = "max_events"
 	}
 
-	return marshalResult(map[string]any{
+	return m.cappedMarshal(map[string]any{
 		"count":          len(events),
 		"events":         events,
 		"stopped_reason": stopped,
@@ -1852,7 +1869,7 @@ func (m *MCPServer) toolTailKernelLog(ctx context.Context, req *mcp.CallToolRequ
 			fmt.Sprintf("tail -n 100 %s | jq -c .", path),
 		)
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // intToStr renders an int as a string for BuildKernelLogQueryFromValues.
@@ -1888,7 +1905,7 @@ func (m *MCPServer) toolGetAgentState(ctx context.Context, req *mcp.CallToolRequ
 	if err != nil {
 		return agentErrorResult(err, "curl http://localhost:6931/v1/agents/primary")
 	}
-	return marshalResult(snap)
+	return m.cappedMarshal(snap)
 }
 
 // toolTriggerAgentLoop implements cog_trigger_agent_loop — manually
@@ -1933,7 +1950,7 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 	if err != nil {
 		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/dispatch -d @body.json")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // agentErrorResult translates AgentControllerError into the MCP fallback
@@ -2017,7 +2034,7 @@ func (m *MCPServer) toolRenderPeerAwarenessPacket(ctx context.Context, req *mcp.
 		return fallbackResult(fmt.Sprintf("render failed: %v", err),
 			"curl 'http://localhost:6931/v1/peer-awareness?sid=<sid>'")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // toolReadToolCalls is the MCP handler for cog_read_tool_calls. It parses the
@@ -2054,7 +2071,7 @@ func (m *MCPServer) toolReadToolCalls(ctx context.Context, req *mcp.CallToolRequ
 		return fallbackResult(fmt.Sprintf("query failed: %v", err),
 			"grep '\"type\":\"tool\\.' .cog/ledger/*/events.jsonl")
 	}
-	return marshalResult(result)
+	return m.cappedMarshal(result)
 }
 
 // toolTailToolCalls returns a snapshot of the most recent tool-call rows for
@@ -2100,7 +2117,7 @@ func (m *MCPServer) toolTailToolCalls(ctx context.Context, req *mcp.CallToolRequ
 			"tail -f .cog/ledger/*/events.jsonl | grep '\"type\":\"tool\\.'")
 	}
 	stopped := "snapshot"
-	return marshalResult(map[string]any{
+	return m.cappedMarshal(map[string]any{
 		"count":          result.Count,
 		"events":         result.Calls,
 		"stopped_reason": stopped,
@@ -2160,7 +2177,7 @@ func (m *MCPServer) toolReadConversation(ctx context.Context, req *mcp.CallToolR
 		return fallbackResult(fmt.Sprintf("query failed: %v", err),
 			fmt.Sprintf("jq -c . .cog/run/turns/%s.jsonl", sessionID))
 	}
-	return marshalResult(res)
+	return m.cappedMarshal(res)
 }
 
 // ── Config Mutation API ──────────────────────────────────────────────────────
@@ -2249,7 +2266,7 @@ func (m *MCPServer) toolSearchTraces(ctx context.Context, req *mcp.CallToolReque
 			"ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
 		)
 	}
-	return marshalResult(res)
+	return m.cappedMarshal(res)
 }
 
 // buildTraceQueryFromInput validates the MCP input shape and normalizes it
@@ -2466,9 +2483,16 @@ func (m *MCPServer) toolReadFile(ctx context.Context, req *mcp.CallToolRequest, 
 		workspaceRoot = m.cfg.WorkspaceRoot
 	}
 
+	// Bare relative paths resolve against the workspace root, not the kernel
+	// process CWD — "blob.json" means "<workspace>/blob.json" to a caller.
+	inputPath := input.Path
+	if !filepath.IsAbs(inputPath) && workspaceRoot != "" {
+		inputPath = filepath.Join(workspaceRoot, inputPath)
+	}
+
 	// Workspace jail: reject paths that are not under the workspace root.
 	// We resolve both to absolute paths so symlink traversal can't escape.
-	abs, err := filepath.Abs(input.Path)
+	abs, err := filepath.Abs(inputPath)
 	if err != nil {
 		return textResult(fmt.Sprintf("invalid path: %v", err))
 	}
@@ -2508,36 +2532,94 @@ func (m *MCPServer) toolReadFile(ctx context.Context, req *mcp.CallToolRequest, 
 		offset = 0
 	}
 
-	scanner := bufio.NewScanner(f)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+
+	// Chunked line reading via readLineCapped — unlike bufio.Scanner this can
+	// NEVER fail with "token too long" on arbitrarily long lines (the
+	// minified-one-line-blob case from the 2026-06-04 diagnosis). It also
+	// never reads more than ~maxBytes+ε from disk: once the output budget is
+	// exhausted mid-line, the rest of the file is left unread.
+	reader := bufio.NewReaderSize(f, 64*1024)
 	var buf bytes.Buffer
 	lineNo := 0
 	linesWritten := 0
 	truncated := false
+	overflowed := false // a single line exceeded the remaining byte budget
 
-	for scanner.Scan() {
-		lineNo++
-		if lineNo <= offset {
+readLoop:
+	for {
+		// Skip offset lines — must be fully drained to find line boundaries,
+		// but nothing is retained.
+		if lineNo < offset {
+			_, _, rerr := readLineCapped(reader, 0, true)
+			if rerr == io.EOF {
+				break readLoop
+			}
+			if rerr != nil {
+				return textResult(fmt.Sprintf("read error: %v", rerr))
+			}
+			lineNo++
 			continue
 		}
-		if linesWritten >= limit {
-			// Peek to see if there's more.
-			if scanner.Scan() {
+		if linesWritten >= limit || buf.Len() >= maxBytes {
+			// Bounds hit — peek one byte to detect remaining content.
+			if _, rerr := reader.ReadByte(); rerr == nil {
 				truncated = true
 			}
-			break
+			break readLoop
 		}
-		fmt.Fprintf(&buf, "%4d\t%s\n", lineNo, scanner.Text())
+		remaining := maxBytes - buf.Len()
+		line, overflow, rerr := readLineCapped(reader, remaining, false)
+		if rerr == io.EOF {
+			break readLoop
+		}
+		if rerr != nil {
+			return textResult(fmt.Sprintf("read error: %v", rerr))
+		}
+		lineNo++
+		fmt.Fprintf(&buf, "%4d\t%s\n", lineNo, line)
+		if overflow {
+			// The line was cut at the byte budget and its tail was left
+			// unread — stop here; line numbering beyond this point is unknown.
+			truncated = true
+			overflowed = true
+			break readLoop
+		}
 		linesWritten++
 	}
-	if err := scanner.Err(); err != nil {
-		return textResult(fmt.Sprintf("read error: %v", err))
-	}
 
-	return marshalResult(map[string]any{
-		"content":   buf.String(),
+	// Use the true file size as the marker denominator: the reader above is
+	// bounded, so len(buf) understates a large file by design.
+	totalBytes := int64(buf.Len())
+	var fileSize int64 = -1
+	if fi, statErr := f.Stat(); statErr == nil {
+		fileSize = fi.Size()
+		if fi.Size() > totalBytes {
+			totalBytes = fi.Size()
+		}
+	}
+	content, byteTruncated := capToolOutputWithTotal(buf.String(), maxBytes, totalBytes)
+	if byteTruncated {
+		truncated = true
+	}
+	resp := map[string]any{
+		"content":   content,
 		"lines":     linesWritten,
 		"truncated": truncated,
-	})
+	}
+	if fileSize >= 0 {
+		resp["file_size_bytes"] = fileSize
+	}
+	if overflowed {
+		resp["note"] = fmt.Sprintf(
+			"line %d exceeded the %d-byte output cap and was cut mid-line; the rest of the file was not scanned, so line numbering beyond this point is unknown — use offset/limit to page",
+			lineNo, maxBytes,
+		)
+	}
+	return marshalResult(resp)
 }
 
 // toolGrepFiles implements cog_grep_files. Runs ripgrep (rg) when available,
@@ -2555,13 +2637,17 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 		workspaceRoot = m.cfg.WorkspaceRoot
 	}
 
-	// Resolve search path.
+	// Resolve search path. Bare relative paths resolve against the workspace
+	// root, not the kernel process CWD.
 	searchPath := input.Path
 	if searchPath == "" {
 		searchPath = workspaceRoot
 	}
 	if searchPath == "" {
 		searchPath = "."
+	}
+	if !filepath.IsAbs(searchPath) && workspaceRoot != "" {
+		searchPath = filepath.Join(workspaceRoot, searchPath)
 	}
 
 	absSearch, err := filepath.Abs(searchPath)
@@ -2615,9 +2701,20 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 		}
 		cmd := exec.CommandContext(ctx, rgPath, args...)
 		out, _ := cmd.Output() // exit 1 means no match, not an error we care about
-		scanner := bufio.NewScanner(bytes.NewReader(out))
-		for scanner.Scan() {
-			line := scanner.Text()
+		// readLineCapped instead of bufio.Scanner: a single match on a
+		// minified multi-megabyte line must not abort (or silently stop)
+		// output parsing. Over-long lines are retained up to grepLineKeep
+		// and drained; the response-level byte cap bounds the final JSON.
+		reader := bufio.NewReaderSize(bytes.NewReader(out), 64*1024)
+		for {
+			lineBytes, _, rerr := readLineCapped(reader, grepLineKeep, true)
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return textResult(fmt.Sprintf("read rg output: %v", rerr))
+			}
+			line := string(lineBytes)
 			// rg --no-heading format: path:linenum:text
 			parts := strings.SplitN(line, ":", 3)
 			if len(parts) < 3 {
@@ -2663,11 +2760,22 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 				return nil
 			}
 			defer f.Close()
-			scanner := bufio.NewScanner(f)
+			// readLineCapped instead of bufio.Scanner: a >64 KiB line used
+			// to silently stop the scan of the rest of the file. Over-long
+			// lines are matched against their first grepLineKeep bytes and
+			// fully drained so subsequent lines are still scanned.
+			reader := bufio.NewReaderSize(f, 64*1024)
 			lineNo := 0
-			for scanner.Scan() {
+			for {
+				lineBytes, _, rerr := readLineCapped(reader, grepLineKeep, true)
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					return nil // unreadable file — skip, like open errors
+				}
 				lineNo++
-				if re.MatchString(scanner.Text()) {
+				if re.Match(lineBytes) {
 					if len(matches) >= maxResults {
 						truncated = true
 						return io.EOF
@@ -2681,7 +2789,7 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 					matches = append(matches, matchEntry{
 						Path: relPath,
 						Line: lineNo,
-						Text: scanner.Text(),
+						Text: string(lineBytes),
 					})
 				}
 			}
@@ -2692,10 +2800,14 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 		}
 	}
 
-	return marshalResult(map[string]any{
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(map[string]any{
 		"matches":   matches,
 		"truncated": truncated,
-	})
+	}, maxBytes)
 }
 
 // extractSection pulls a section from markdown by heading anchor.
