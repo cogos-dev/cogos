@@ -162,9 +162,11 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 				ResourceType: "conversations",
 				Name:         f.SessionID,
 				Details: map[string]any{
-					"source_path": f.Path,
-					"mtime":       f.Mtime.Format(time.RFC3339),
-					"size":        f.Size,
+					"source_path":   f.Path,
+					"mtime":         f.Mtime.Format(time.RFC3339),
+					"size":          f.Size,
+					"is_ingest":     f.IsIngest,
+					"ingest_source": f.IngestSource,
 				},
 			})
 			plan.Summary.Creates++
@@ -181,6 +183,8 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 					"prev_mtime":    existing.Meta.SourceMtime.Format(time.RFC3339),
 					"prev_size":     existing.Meta.SourceSize,
 					"prev_turns":    existing.Meta.TurnCount,
+					"is_ingest":     f.IsIngest,
+					"ingest_source": f.IngestSource,
 				},
 			})
 			plan.Summary.Updates++
@@ -275,8 +279,16 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				errs = append(errs, res.Error)
 				continue
 			}
+			isIngest, _ := action.Details["is_ingest"].(bool)
+			ingestSource, _ := action.Details["ingest_source"].(string)
+			sf := sourceFileInfo{
+				Path:         sourcePath,
+				SessionID:    action.Name,
+				IsIngest:     isIngest,
+				IngestSource: ingestSource,
+			}
 
-			meta, turns, err := indexSession(sourcePath, action.Name, defaultMaxTurnLen)
+			meta, turns, err := indexSession(sourcePath, action.Name, defaultMaxTurnLen, sf)
 			if err != nil {
 				res.Status = reconcile.ApplyFailed
 				res.Error = fmt.Sprintf("index session %s: %v", action.Name, err)
@@ -365,6 +377,7 @@ func (p *Provider) BuildState(_ any, live any, existing *reconcile.State) (*reco
 			LastRefreshed: now,
 			Attributes: map[string]any{
 				"source_path":   m.SourcePath,
+				"source":        m.Source,
 				"turn_count":    m.TurnCount,
 				"first_turn_at": m.FirstTurnAt.Format(time.RFC3339),
 				"last_turn_at":  m.LastTurnAt.Format(time.RFC3339),
@@ -457,6 +470,7 @@ func loadObservatoryConfig(root string) (ObservatoryConfig, error) {
 		if os.IsNotExist(err) {
 			// Default config.
 			obs.SourceDirs = defaultSourceDirs()
+			obs.IngestDirs = defaultIngestDirs(root)
 			obs.IncludePatterns = []string{"*.jsonl"}
 			obs.MaxTurnLength = defaultMaxTurnLen
 			return obs, nil
@@ -472,6 +486,9 @@ func loadObservatoryConfig(root string) (ObservatoryConfig, error) {
 	if len(obs.SourceDirs) == 0 {
 		obs.SourceDirs = defaultSourceDirs()
 	}
+	if len(obs.IngestDirs) == 0 {
+		obs.IngestDirs = defaultIngestDirs(root)
+	}
 	if len(obs.IncludePatterns) == 0 {
 		obs.IncludePatterns = []string{"*.jsonl"}
 	}
@@ -482,11 +499,23 @@ func loadObservatoryConfig(root string) (ObservatoryConfig, error) {
 	return obs, nil
 }
 
-// discoverSourceFiles scans SourceDirs and returns matching JSONL files.
+// defaultIngestDirs returns the default ingest root directory for the given
+// workspace root: <root>/.cog/observatory/ingest. Returns nil if absent.
+func defaultIngestDirs(root string) []string {
+	candidate := filepath.Join(root, ".cog", "observatory", "ingest")
+	if _, err := os.Stat(candidate); err == nil {
+		return []string{candidate}
+	}
+	return nil
+}
+
+// discoverSourceFiles scans SourceDirs (CC UUID JSONL) and IngestDirs
+// (normalized ingest surface) and returns the union as sourceFileInfo entries.
 func discoverSourceFiles(obs ObservatoryConfig) ([]sourceFileInfo, error) {
 	var files []sourceFileInfo
 	seen := make(map[string]struct{})
 
+	// ── CC source_dirs path ──────────────────────────────────────────────────
 	for _, dir := range obs.SourceDirs {
 		expanded := expandHome(dir)
 		entries, err := os.ReadDir(expanded)
@@ -532,9 +561,84 @@ func discoverSourceFiles(obs ObservatoryConfig) ([]sourceFileInfo, error) {
 		}
 	}
 
+	// ── Normalized ingest path ───────────────────────────────────────────────
+	ingestFiles, err := discoverIngestFiles(obs)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range ingestFiles {
+		if _, dup := seen[f.Path]; dup {
+			continue
+		}
+		seen[f.Path] = struct{}{}
+		files = append(files, f)
+	}
+
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].SessionID < files[j].SessionID
 	})
+	return files, nil
+}
+
+// discoverIngestFiles scans IngestDirs for <source>/*.jsonl files conforming
+// to the normalized ingest surface schema. Returns one sourceFileInfo per file
+// with IsIngest=true and SessionID keyed as "<source>/<filename_stem>".
+func discoverIngestFiles(obs ObservatoryConfig) ([]sourceFileInfo, error) {
+	var files []sourceFileInfo
+
+	for _, ingestRoot := range obs.IngestDirs {
+		expanded := expandHome(ingestRoot)
+		sourceDirs, err := os.ReadDir(expanded)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read ingest dir %s: %w", expanded, err)
+		}
+
+		for _, sourceEntry := range sourceDirs {
+			if !sourceEntry.IsDir() {
+				continue
+			}
+			sourceName := sourceEntry.Name()
+			sourceDir := filepath.Join(expanded, sourceName)
+
+			jsonlEntries, err := os.ReadDir(sourceDir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return nil, fmt.Errorf("read ingest source dir %s: %w", sourceDir, err)
+			}
+
+			for _, je := range jsonlEntries {
+				if je.IsDir() {
+					continue
+				}
+				name := je.Name()
+				if !strings.HasSuffix(name, ".jsonl") {
+					continue
+				}
+				stem := strings.TrimSuffix(name, ".jsonl")
+				// Composite index key: "<source>/<filename_stem>".
+				indexKey := indexKeyForIngest(sourceName, stem)
+				absPath := filepath.Join(sourceDir, name)
+
+				fi, err := je.Info()
+				if err != nil {
+					continue
+				}
+				files = append(files, sourceFileInfo{
+					Path:         absPath,
+					SessionID:    indexKey,
+					Mtime:        fi.ModTime(),
+					Size:         fi.Size(),
+					IsIngest:     true,
+					IngestSource: sourceName,
+				})
+			}
+		}
+	}
 	return files, nil
 }
 
@@ -598,7 +702,11 @@ func isDrift(meta SessionMeta, f sourceFileInfo) bool {
 
 // indexSession opens sourcePath, streams turns, and returns the resulting
 // SessionMeta and Turn slice. Does not hold the file open after return.
-func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []Turn, error) {
+//
+// When sf.IsIngest is true the normalized ingest parser (ingest_parser.go) is
+// used instead of the CC JSONL parser; sf.IngestSource is populated into the
+// returned SessionMeta.Source.
+func indexSession(sourcePath, sessionID string, maxTurnLen int, sf sourceFileInfo) (SessionMeta, []Turn, error) {
 	fi, err := os.Stat(sourcePath)
 	if err != nil {
 		return SessionMeta{}, nil, fmt.Errorf("stat %s: %w", sourcePath, err)
@@ -612,6 +720,7 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 
 	meta := SessionMeta{
 		SessionID:   sessionID,
+		Source:      sf.IngestSource,
 		SourcePath:  sourcePath,
 		IndexedAt:   time.Now().UTC(),
 		SourceMtime: fi.ModTime(),
@@ -619,6 +728,22 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	}
 
 	var turns []Turn
+
+	if sf.IsIngest {
+		rejected, parseErr := ParseIngestSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
+			turns = append(turns, t)
+			return true
+		})
+		if parseErr != nil {
+			return meta, turns, fmt.Errorf("parse ingest %s: %w", sourcePath, parseErr)
+		}
+		if rejected > 0 {
+			// Non-fatal: we already logged per-record rejections.
+			_ = rejected
+		}
+		return meta, turns, nil
+	}
+
 	err = ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true

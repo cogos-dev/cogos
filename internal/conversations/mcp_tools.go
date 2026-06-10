@@ -94,6 +94,7 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 			Excerpt      string `json:"excerpt"`
 			SessionTitle string `json:"session_title,omitempty"`
 			Identity     string `json:"identity,omitempty"`
+			Source       string `json:"source,omitempty"`
 		}
 		out := make([]hitOut, 0, len(hits))
 		for _, h := range hits {
@@ -110,6 +111,7 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 				Excerpt:      h.Excerpt,
 				SessionTitle: h.SessionTitle,
 				Identity:     h.Identity,
+				Source:       h.Source,
 			})
 		}
 
@@ -209,6 +211,7 @@ func makeListConversationsHandler(p *Provider) mcp.ToolHandlerFor[listConversati
 
 		type sessionOut struct {
 			SessionID   string `json:"session_id"`
+			Source      string `json:"source,omitempty"`
 			Title       string `json:"title,omitempty"`
 			TurnCount   int    `json:"turn_count"`
 			FirstTurnAt string `json:"first_turn_at,omitempty"`
@@ -221,6 +224,7 @@ func makeListConversationsHandler(p *Provider) mcp.ToolHandlerFor[listConversati
 		for _, m := range metas {
 			so := sessionOut{
 				SessionID:  m.SessionID,
+				Source:     m.Source,
 				Title:      m.Title,
 				TurnCount:  m.TurnCount,
 				Identity:   m.Identity,
