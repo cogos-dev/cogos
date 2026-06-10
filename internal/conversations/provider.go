@@ -40,6 +40,16 @@ type Provider struct {
 	lastPlanSummary reconcile.Summary
 	lastErrors      []string
 	operation       reconcile.OperationPhase
+
+	// ontology is the loaded L1+L2 ontology set. nil when enforcement is
+	// disabled (ontology_dir not set or absent from the workspace).
+	ontology *LoadedOntology
+
+	// quarantine is the writer for quarantined records.
+	quarantine *QuarantineWriter
+
+	// coverage accumulates per-source coverage metrics across reconcile runs.
+	coverage *CoverageTracker
 }
 
 // NewProvider constructs a ConversationsProvider. The root workspace path
@@ -47,7 +57,27 @@ type Provider struct {
 func NewProvider() *Provider {
 	return &Provider{
 		operation: reconcile.OperationIdle,
+		coverage:  NewCoverageTracker(),
 	}
+}
+
+// Coverage returns a snapshot of the current per-source coverage metrics.
+// The returned map is a copy and safe to read without holding the provider lock.
+func (p *Provider) Coverage() map[string]SourceCoverage {
+	p.mu.Lock()
+	cov := p.coverage
+	p.mu.Unlock()
+	if cov == nil {
+		return make(map[string]SourceCoverage)
+	}
+	return cov.All()
+}
+
+// Ontology returns the loaded ontology (may be nil when enforcement is disabled).
+func (p *Provider) Ontology() *LoadedOntology {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ontology
 }
 
 // Type returns the resource type identifier.
@@ -60,19 +90,20 @@ func (p *Provider) Type() string { return "conversations" }
 func (p *Provider) ResolveURI(uri string) (*ResolvedSlice, error) {
 	p.mu.Lock()
 	idx := p.index
+	ont := p.ontology
 	p.mu.Unlock()
 
 	if idx == nil {
 		return nil, fmt.Errorf("conversations index not initialised — run cog reconcile conversations first")
 	}
-	return ResolveConversationURI(uri, idx)
+	return ResolveConversationURIWithOntology(uri, idx, ont)
 }
 
 // ─── LoadConfig ──────────────────────────────────────────────────────────────
 
 // LoadConfig reads .cog/config/observatory.yaml (if present), discovers JSONL
-// source files in each configured SourceDir, and initialises the index if not
-// already loaded.
+// source files in each configured SourceDir, initialises the index if not
+// already loaded, and loads the ontology from the ontology_dir when present.
 func (p *Provider) LoadConfig(root string) (any, error) {
 	p.mu.Lock()
 	p.root = root
@@ -96,6 +127,27 @@ func (p *Provider) LoadConfig(root string) (any, error) {
 	}
 	p.mu.Unlock()
 
+	// Load ontology + mappings from ontology_dir (always attempt; missing dir is ok).
+	ontologyDir := obs.OntologyDir
+	if ontologyDir == "" {
+		ontologyDir = defaultOntologyDir(root)
+	}
+	lo, ontErr := LoadOntologyDir(expandHome(ontologyDir))
+	if ontErr != nil {
+		return nil, fmt.Errorf("conversations: load ontology: %w", ontErr)
+	}
+
+	// Set up quarantine writer and coverage tracker.
+	quarantineDir := filepath.Join(root, QuarantineDir)
+
+	p.mu.Lock()
+	p.ontology = lo
+	p.quarantine = NewQuarantineWriter(quarantineDir)
+	if p.coverage == nil {
+		p.coverage = NewCoverageTracker()
+	}
+	p.mu.Unlock()
+
 	// Discover CC source JSONL files.
 	files, err := discoverSourceFiles(obs)
 	if err != nil {
@@ -113,6 +165,7 @@ func (p *Provider) LoadConfig(root string) (any, error) {
 		Observatory:   obs,
 		SourceFiles:   files,
 		IngestSources: ingestSources,
+		Ontology:      lo,
 	}, nil
 }
 
@@ -329,6 +382,9 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 	p.mu.Lock()
 	p.operation = reconcile.OperationSyncing
 	idx := p.index
+	ont := p.ontology
+	qw := p.quarantine
+	cov := p.coverage
 	p.mu.Unlock()
 	defer func() {
 		p.mu.Lock()
@@ -359,7 +415,7 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 			if isIngest, _ := action.Details["is_ingest"].(bool); isIngest {
 				// Normalized ingest: action.Name is the SOURCE; re-parse all
 				// of its files and rebuild every session of that source.
-				if applyErr := applyIngestSource(idx, action); applyErr != nil {
+				if applyErr := applyIngestSource(idx, action, ont, qw, cov); applyErr != nil {
 					res.Status = reconcile.ApplyFailed
 					res.Error = fmt.Sprintf("index ingest source %s: %v", action.Name, applyErr)
 					results = append(results, res)
@@ -532,6 +588,12 @@ func (p *Provider) Health() reconcile.ResourceStatus {
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 const defaultMaxTurnLen = 8192
+
+// defaultOntologyDir returns the default ontology directory for the given
+// workspace root: <root>/.cog/observatory/ontology. Returns "" if absent.
+func defaultOntologyDir(root string) string {
+	return filepath.Join(root, ".cog", "observatory", "ontology")
+}
 
 // defaultSourceDirs returns the default JSONL source directories to scan.
 // Prefers ~/.claude/projects/-Users-slowbro; falls back gracefully.
@@ -844,7 +906,10 @@ func isIngestDrift(indexed []IndexEntry, src ingestSourceInfo) bool {
 // applyIngestSource re-parses every file of an ingest source (action.Name),
 // upserts each resulting session, and prunes index sessions of that source
 // that no longer appear in the parse result.
-func applyIngestSource(idx *Index, action reconcile.Action) error {
+//
+// ont, qw, cov may be nil; when non-nil, ontology enforcement, quarantine
+// routing, and coverage tracking are applied during ConsumeFile.
+func applyIngestSource(idx *Index, action reconcile.Action, ont *LoadedOntology, qw *QuarantineWriter, cov *CoverageTracker) error {
 	sourceDir, _ := action.Details["source_dir"].(string)
 	files := stringSliceDetail(action.Details["ingest_files"])
 	if len(files) == 0 {
@@ -855,6 +920,9 @@ func applyIngestSource(idx *Index, action reconcile.Action) error {
 	var totalSize int64
 	var latestMtime time.Time
 	acc := newIngestAccumulator(defaultMaxTurnLen)
+	acc.Ontology = ont
+	acc.Quarantine = qw
+	acc.Coverage = cov
 	for _, path := range files {
 		fi, err := os.Stat(path)
 		if err != nil {
