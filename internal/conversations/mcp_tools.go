@@ -2,13 +2,20 @@
 //
 // Registers three MCP tools on a provided *mcp.Server:
 //
-//   cog_search_conversations  — full-text search over indexed turns
-//   cog_get_conversation_turn — fetch one turn by session_id + turn_index
-//   cog_list_conversations    — list indexed sessions with metadata
+//	cog_search_conversations  — full-text search over indexed turns
+//	cog_get_conversation_turn — fetch one turn by session_id + turn_index
+//	cog_list_conversations    — list indexed sessions with metadata
+//
+// Both cog_search_conversations and cog_get_conversation_turn accept an
+// optional `uri` parameter (cog:conversations/… URI, RFC-query-aware-conversation-uris).
+// When `uri` is provided it fully determines the query; mixing `uri` with other
+// filter params is an error.
 //
 // Registration pattern mirrors internal/eval/mcp_tools.go:
 // the caller (kernel boot or conversations_wiring.go) calls
-// RegisterConversationTools(server, provider) after wiring the Provider.
+// RegisterConversationTools(server, tracker, provider) after wiring the Provider.
+// tracker is MCPServer.TrackTool — passed as a function value so this package
+// does not import internal/engine (circular import).
 package conversations
 
 import (
@@ -20,36 +27,61 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// ToolTracker is a function that records a tool in the manifest registry and
+// returns the pointer unchanged. Pass MCPServer.TrackTool as this argument.
+// When nil (e.g. tests), tools are registered without manifest tracking.
+type ToolTracker func(*mcp.Tool) *mcp.Tool
+
+// identityTracker is a no-op tracker for callers that don't need manifest tracking.
+func identityTracker(t *mcp.Tool) *mcp.Tool { return t }
+
 // RegisterConversationTools registers the three conversation MCP tools on the
 // given server. provider may be nil — tools return "not configured" in that case.
-func RegisterConversationTools(server *mcp.Server, provider *Provider) {
-	mcp.AddTool(server, &mcp.Tool{
+// tracker is MCPServer.TrackTool; pass nil to skip manifest tracking (tests).
+func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider *Provider) {
+	if tracker == nil {
+		tracker = identityTracker
+	}
+
+	mcp.AddTool(server, tracker(&mcp.Tool{
 		Name: "cog_search_conversations",
 		Description: "Full-text search over indexed operator conversation history. " +
 			"Returns hits with session_id, timestamp, role, and an excerpt centred on the match. " +
 			"Use since/until (RFC3339) to narrow by time; use identity to filter by operator; " +
-			"use limit to cap results (default 20).",
-	}, makeSearchConversationsHandler(provider))
+			"use limit to cap results (default 20). " +
+			"Alternatively, pass uri=cog:conversations/… to dereference a query-aware URI directly " +
+			"(RFC-query-aware-conversation-uris R1-R6); mixing uri with other params is an error.",
+	}), makeSearchConversationsHandler(provider))
 
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(server, tracker(&mcp.Tool{
 		Name: "cog_get_conversation_turn",
 		Description: "Fetch the full text of one conversation turn by session_id and turn_index. " +
-			"Use after cog_search_conversations to drill into a specific hit.",
-	}, makeGetConversationTurnHandler(provider))
+			"Use after cog_search_conversations to drill into a specific hit. " +
+			"Alternatively, pass uri=cog:conversations/<source>/<session>#id-<uuid> or " +
+			"#turn-N to address a turn via URI (RFC-query-aware-conversation-uris).",
+	}), makeGetConversationTurnHandler(provider))
 
-	mcp.AddTool(server, &mcp.Tool{
+	mcp.AddTool(server, tracker(&mcp.Tool{
 		Name: "cog_list_conversations",
 		Description: "List indexed conversation sessions with metadata " +
 			"(title, turn count, time bounds, identity, entrypoint). " +
 			"Optional since/until (RFC3339) and identity filters. " +
 			"Returns most-recent sessions first.",
-	}, makeListConversationsHandler(provider))
+	}), makeListConversationsHandler(provider))
 }
 
 // ─── cog_search_conversations ────────────────────────────────────────────────
 
 type searchConversationsInput struct {
-	Query     string `json:"query"`
+	// URI mode: pass a cog:conversations/… URI to dereference directly.
+	// Mixing uri with any other field is an error.
+	URI string `json:"uri,omitempty"`
+
+	// Standard filter params (mutually exclusive with URI).
+	// Query is omitempty so the SDK-generated input schema does not mark it
+	// required — a uri-only call must pass schema validation. The handler
+	// enforces "query required unless uri is set" at runtime.
+	Query     string `json:"query,omitempty"`
 	Since     string `json:"since,omitempty"`
 	Until     string `json:"until,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
@@ -62,15 +94,38 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 		if p == nil {
 			return convErrorResult("conversations provider not wired"), nil, nil
 		}
-		if input.Query == "" {
-			return convErrorResult("query is required"), nil, nil
-		}
 
 		p.mu.Lock()
 		idx := p.index
 		p.mu.Unlock()
 		if idx == nil {
 			return convErrorResult("index not yet initialised — run cog reconcile conversations first"), nil, nil
+		}
+
+		// URI mode: dereference the URI directly.
+		if input.URI != "" {
+			// Detect mixing.
+			hasOtherParams := input.Query != "" || input.Since != "" || input.Until != "" ||
+				input.SessionID != "" || input.Identity != "" || input.Limit != 0
+			if hasOtherParams {
+				return convErrorResult(ErrURIMixedParams.Error()), nil, nil
+			}
+
+			slice, err := ResolveConversationURI(input.URI, idx)
+			if err != nil {
+				return convErrorResult(fmt.Sprintf("resolve uri %q: %v", input.URI, err)), nil, nil
+			}
+
+			resp := sliceToMap(slice)
+			b, _ := json.MarshalIndent(resp, "", "  ")
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+			}, resp, nil
+		}
+
+		// Standard mode.
+		if input.Query == "" {
+			return convErrorResult("query is required (or provide uri=)"), nil, nil
 		}
 
 		since, until, err := parseTimeRange(input.Since, input.Until)
@@ -89,6 +144,7 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 			SessionID    string `json:"session_id"`
 			TurnIndex    int    `json:"turn_index"`
 			UUID         string `json:"uuid,omitempty"`
+			IDAnchor     string `json:"id_anchor,omitempty"`
 			Timestamp    string `json:"timestamp,omitempty"`
 			Role         string `json:"role"`
 			Excerpt      string `json:"excerpt"`
@@ -102,10 +158,15 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 			if !h.Timestamp.IsZero() {
 				ts = h.Timestamp.Format(time.RFC3339)
 			}
+			idAnchor := ""
+			if h.UUID != "" {
+				idAnchor = "#id-" + h.UUID
+			}
 			out = append(out, hitOut{
 				SessionID:    h.SessionID,
 				TurnIndex:    h.TurnIndex,
 				UUID:         h.UUID,
+				IDAnchor:     idAnchor,
 				Timestamp:    ts,
 				Role:         string(h.Role),
 				Excerpt:      h.Excerpt,
@@ -116,9 +177,9 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 		}
 
 		resp := map[string]any{
-			"query":  input.Query,
-			"count":  len(out),
-			"hits":   out,
+			"query": input.Query,
+			"count": len(out),
+			"hits":  out,
 		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
 		return &mcp.CallToolResult{
@@ -130,8 +191,16 @@ func makeSearchConversationsHandler(p *Provider) mcp.ToolHandlerFor[searchConver
 // ─── cog_get_conversation_turn ───────────────────────────────────────────────
 
 type getConversationTurnInput struct {
-	SessionID  string `json:"session_id"`
-	TurnIndex  int    `json:"turn_index"`
+	// URI mode: cog:conversations/<source>/<session>#id-<uuid> or #turn-N.
+	// Mixing uri with SessionID/TurnIndex is an error.
+	URI string `json:"uri,omitempty"`
+
+	// session_id/turn_index are omitempty so the SDK-generated input schema
+	// does not mark them required — a uri-only call must pass schema
+	// validation. The handler enforces "session_id required unless uri is
+	// set" at runtime.
+	SessionID string `json:"session_id,omitempty"`
+	TurnIndex int    `json:"turn_index,omitempty"`
 }
 
 func makeGetConversationTurnHandler(p *Provider) mcp.ToolHandlerFor[getConversationTurnInput, map[string]any] {
@@ -139,15 +208,36 @@ func makeGetConversationTurnHandler(p *Provider) mcp.ToolHandlerFor[getConversat
 		if p == nil {
 			return convErrorResult("conversations provider not wired"), nil, nil
 		}
-		if input.SessionID == "" {
-			return convErrorResult("session_id is required"), nil, nil
-		}
 
 		p.mu.Lock()
 		idx := p.index
 		p.mu.Unlock()
 		if idx == nil {
 			return convErrorResult("index not yet initialised — run cog reconcile conversations first"), nil, nil
+		}
+
+		// URI mode.
+		if input.URI != "" {
+			hasOtherParams := input.SessionID != "" || input.TurnIndex != 0
+			if hasOtherParams {
+				return convErrorResult(ErrURIMixedParams.Error()), nil, nil
+			}
+
+			slice, err := ResolveConversationURI(input.URI, idx)
+			if err != nil {
+				return convErrorResult(fmt.Sprintf("resolve uri %q: %v", input.URI, err)), nil, nil
+			}
+
+			resp := sliceToMap(slice)
+			b, _ := json.MarshalIndent(resp, "", "  ")
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
+			}, resp, nil
+		}
+
+		// Standard mode.
+		if input.SessionID == "" {
+			return convErrorResult("session_id is required (or provide uri=)"), nil, nil
 		}
 
 		turn, ok := idx.GetTurn(input.SessionID, input.TurnIndex)
@@ -160,13 +250,14 @@ func makeGetConversationTurnHandler(p *Provider) mcp.ToolHandlerFor[getConversat
 			ts = turn.Timestamp.Format(time.RFC3339)
 		}
 		resp := map[string]any{
-			"session_id":  turn.SessionID,
-			"turn_index":  turn.TurnIndex,
-			"uuid":        turn.UUID,
-			"parent_uuid": turn.ParentUUID,
-			"role":        string(turn.Role),
-			"timestamp":   ts,
-			"text":        turn.Text,
+			"session_id":   turn.SessionID,
+			"turn_index":   turn.TurnIndex,
+			"uuid":         turn.UUID,
+			"id_anchor":    "#id-" + turn.UUID,
+			"parent_uuid":  turn.ParentUUID,
+			"role":         string(turn.Role),
+			"timestamp":    ts,
+			"text":         turn.Text,
 			"is_tool_call": turn.IsToolCall,
 		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
@@ -283,4 +374,20 @@ func convErrorResult(msg string) *mcp.CallToolResult {
 		Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
 		IsError: true,
 	}
+}
+
+// sliceToMap converts a ResolvedSlice to a map[string]any for JSON output.
+func sliceToMap(slice *ResolvedSlice) map[string]any {
+	m := map[string]any{
+		"uri":         slice.URI,
+		"resolved_at": slice.ResolvedAt.Format(time.RFC3339),
+		"count":       slice.Count,
+		"sources":     slice.Sources,
+		"bounded":     slice.Bounded,
+		"turns":       slice.Turns,
+	}
+	if slice.ContentHash != "" {
+		m["content_hash"] = slice.ContentHash
+	}
+	return m
 }

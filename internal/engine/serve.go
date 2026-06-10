@@ -178,6 +178,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "GET /health", s.handleHealth)
 	s.route(mux, "GET /v1/context", s.handleContext)
 	s.route(mux, "GET /v1/resolve", s.handleResolve)
+	s.route(mux, "GET /v1/uri/resolve", s.handleURIResolve)
 	s.route(mux, "GET /v1/cogdoc/read", s.handleCogDocRead)
 	s.route(mux, "GET /v1/debug/last", s.handleDebugLast)
 	s.route(mux, "GET /v1/debug/context", s.handleDebugContext)
