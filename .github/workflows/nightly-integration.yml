@@ -1,0 +1,143 @@
+# nightly-integration.yml — runs the integration-tagged test suites on a schedule.
+#
+# Context: 10 *_test.go files behind -tags integration/dispatchlive were never
+# run in CI (audit 2026-06-09). This workflow gives them a nightly home.
+#
+# Two jobs:
+#   integration-selfcontained — packages whose integration tests are hermetic
+#     (httptest/tempdir-based): ./internal/engine/ and ./sdk/.
+#     The engine package also contains provider integration tests that call
+#     real Ollama/OpenAI-compat endpoints; those tests each have a t.Skip
+#     guard and will be skipped cleanly on ubuntu runners where no such
+#     server is running.  A red run here is a real failure.
+#
+#   integration-ollama — packages whose integration tests require a live
+#     Ollama instance: the root package (decompose pipeline) and
+#     ./pkg/cogdoc_review/ (T09 similarity regression).
+#     We start an ollama/ollama service container for the attempt.
+#     NOTE: model pulls (gemma4:e4b, bge-m3:latest, qwen2.5:9b) are large
+#     and impractical on standard ubuntu-latest runners; without a loaded
+#     model the tests skip via their built-in t.Skip guards.  The job runs
+#     anyway so that (a) the binary compiles with the tag and (b) any
+#     future model-pull infrastructure wired in here immediately runs the
+#     real coverage.  continue-on-error: true — a skip-only run is not a
+#     failure, but a compile error or panic IS surfaced and logged.
+#     Do NOT add `|| true` to test invocations; a red nightly is information.
+
+name: Nightly Integration Tests
+
+on:
+  schedule:
+    # 09:00 UTC daily
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Self-contained integration tests
+  # Packages: ./internal/engine/  ./sdk/
+  #
+  # ./internal/engine/integration_test.go — uses httptest + t.TempDir(), fully
+  #   hermetic.
+  # ./internal/engine/provider_ollama_integration_test.go — skips when Ollama
+  #   is not reachable (built-in t.Skip).
+  # ./internal/engine/provider_openai_integration_test.go — skips when no
+  #   OpenAI-compat server is reachable (built-in t.Skip).
+  # ./sdk/integration_test.go — skips when no .cog workspace dir is present
+  #   (built-in t.Skip).
+  # ---------------------------------------------------------------------------
+  integration-selfcontained:
+    name: Integration (self-contained)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install ripgrep
+        run: timeout 120 sudo apt-get install -y ripgrep
+
+      - name: Run self-contained integration tests
+        run: |
+          go test -tags integration -race -count=1 -v -timeout 120s \
+            ./internal/engine/ \
+            ./sdk/
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Ollama-dependent integration tests  [EXPERIMENTAL]
+  #
+  # Packages: . (root)  ./pkg/cogdoc_review/
+  #
+  # An ollama/ollama service container is started so that if a future CI
+  # configuration pre-loads models (via `ollama pull` in a setup step), the
+  # tests will run for real.  Without a loaded model the tests skip via their
+  # built-in t.Skip/Skipf guards — that is expected behaviour on standard
+  # ubuntu-latest runners.
+  #
+  # NOTICE: Standard GitHub-hosted ubuntu-latest runners have no GPU and
+  # limited RAM.  Pulling the models required by these tests (gemma4:e4b,
+  # bge-m3:latest, qwen2.5:9b) is impractical in the standard runner
+  # environment.  Tests will be skipped rather than run until a self-hosted
+  # runner with adequate resources and pre-loaded models is configured.
+  # To enable full execution: wire `ollama pull <model>` steps below and
+  # point this job at an appropriate runner label.
+  # ---------------------------------------------------------------------------
+  integration-ollama:
+    name: Integration (Ollama-dependent) [experimental]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    services:
+      ollama:
+        image: ollama/ollama:latest
+        ports:
+          - 11434:11434
+
+    env:
+      OLLAMA_HOST: http://localhost:11434
+      COGOS_OLLAMA_ENDPOINT: http://localhost:11434
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install ripgrep
+        run: timeout 120 sudo apt-get install -y ripgrep
+
+      - name: Wait for Ollama service
+        # Give the container time to start its HTTP listener before tests probe it.
+        run: |
+          echo "Waiting for Ollama service at $OLLAMA_HOST ..."
+          for i in $(seq 1 20); do
+            if curl -sf "$OLLAMA_HOST/api/tags" > /dev/null 2>&1; then
+              echo "Ollama is up after ${i} attempts."
+              break
+            fi
+            echo "  attempt $i: not ready yet, sleeping 3s"
+            sleep 3
+          done
+          # Report whatever state the service is in; tests have their own Skip guards.
+          curl -sf "$OLLAMA_HOST/api/tags" && echo "Ollama responding." || echo "Ollama not responding — tests will skip via built-in guards."
+
+      # NOTE: Model pull steps are intentionally omitted.  Standard
+      # ubuntu-latest runners lack the RAM and storage to pull multi-GB
+      # quantised models in a reasonable CI window.  The integration tests
+      # detect a missing model via Available()/Ping() and call t.Skip.
+      # To enable real model execution, add steps like:
+      #   - name: Pull qwen2.5:9b
+      #     run: curl -sf "$OLLAMA_HOST/api/pull" -d '{"name":"qwen2.5:9b"}' | tail -1
+      # on a self-hosted runner with adequate resources.
+
+      - name: Run Ollama-dependent integration tests
+        run: |
+          go test -tags integration -race -count=1 -v -timeout 300s \
+            . \
+            ./pkg/cogdoc_review/
