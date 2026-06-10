@@ -202,8 +202,15 @@ func (a *ingestAccumulator) ConsumeFile(r io.Reader) error {
 			}
 
 			// Mapping present — record coverage.
+			// Check whether this record matches a degenerate rule in the L2
+			// mapping (e.g. role='tool' rows in hermes-statedb mapped to
+			// session.turn instead of tool.result per text_tool_degenerate).
 			if a.Coverage != nil {
-				a.Coverage.RecordMapped(rec.Source)
+				if a.Ontology.IsDegenerateRecord(rec.Source, rec.Role) {
+					a.Coverage.RecordDegenerate(rec.Source)
+				} else {
+					a.Coverage.RecordMapped(rec.Source)
+				}
 				a.Coverage.SetRefs(rec.Source, ontRef, mappingRef)
 			}
 		}

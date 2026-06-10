@@ -317,13 +317,18 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 			plan.Summary.Updates++
 
 		default:
+			// Include is_ingest + ingest_files in skip actions so that
+			// ApplyPlan can re-accumulate coverage for unchanged sources
+			// (coverage must be recomputed every cycle, not accumulated).
 			plan.Actions = append(plan.Actions, reconcile.Action{
 				Action:       reconcile.ActionSkip,
 				ResourceType: "conversations",
 				Name:         src.Source,
 				Details: map[string]any{
-					"reason":   "in sync",
-					"sessions": len(indexed),
+					"reason":       "in sync",
+					"sessions":     len(indexed),
+					"is_ingest":    true,
+					"ingest_files": src.Files,
 				},
 			})
 			plan.Summary.Skipped++
@@ -396,11 +401,27 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 		return nil, fmt.Errorf("conversations: index not initialised (LoadConfig not called)")
 	}
 
+	// Reset coverage at the start of each reconcile cycle so counts reflect
+	// the current corpus state rather than accumulating across cycles.
+	// Skipped ingest sources are re-accumulated via a coverage-only parse pass
+	// immediately below so all sources appear in the output regardless of drift.
+	if cov != nil {
+		cov.Reset()
+	}
+
 	var results []reconcile.Result
 	var errs []string
 
 	for _, action := range plan.Actions {
 		if action.Action == reconcile.ActionSkip {
+			// For skipped ingest sources, re-accumulate coverage without
+			// touching the index (the data hasn't changed, but we need counts).
+			if isIngest, _ := action.Details["is_ingest"].(bool); isIngest && cov != nil {
+				if covErr := accumulateCoverage(action, ont, cov); covErr != nil {
+					// Non-fatal: log but don't fail the action.
+					errs = append(errs, fmt.Sprintf("coverage-only pass for %s: %v", action.Name, covErr))
+				}
+			}
 			continue
 		}
 
@@ -970,6 +991,39 @@ func applyIngestSource(idx *Index, action reconcile.Action, ont *LoadedOntology,
 		}
 	}
 
+	return nil
+}
+
+// accumulateCoverage parses the ingest files for the given action's source and
+// accumulates coverage metrics into cov without touching the index.  Used on
+// ActionSkip to ensure coverage is recomputed every cycle even when the source
+// data has not changed.
+//
+// ont may be nil (returns without error when nil — no coverage to accumulate).
+func accumulateCoverage(action reconcile.Action, ont *LoadedOntology, cov *CoverageTracker) error {
+	if ont == nil || cov == nil {
+		return nil
+	}
+	files := stringSliceDetail(action.Details["ingest_files"])
+	if len(files) == 0 {
+		return nil
+	}
+	acc := newIngestAccumulator(defaultMaxTurnLen)
+	acc.Ontology = ont
+	acc.Coverage = cov
+	// Quarantine is intentionally nil — we are not writing quarantine records,
+	// only re-counting coverage metrics.
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", path, err)
+		}
+		consumeErr := acc.ConsumeFile(f)
+		f.Close()
+		if consumeErr != nil {
+			return fmt.Errorf("parse %s: %w", path, consumeErr)
+		}
+	}
 	return nil
 }
 

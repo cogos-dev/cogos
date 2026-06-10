@@ -134,14 +134,40 @@ func ParseL1Ontology(data []byte) (*OntologyDoc, error) {
 type MappingDoc struct {
 	Mapping MappingMeta `yaml:"mapping"`
 
-	// Rules is the list of declared mapping rules.
+	// Rules is the list of declared mapping rules (top-level, as in
+	// claude-code-jsonl.v1.yaml).
 	Rules []MappingRule `yaml:"rules,omitempty"`
+
+	// CurrentMapping carries mapping metadata and rules nested under a
+	// current_mapping: key (as in hermes-statedb.v1.yaml).
+	// When Rules is empty, EffectiveRules() returns CurrentMapping.Rules.
+	CurrentMapping *CurrentMappingSection `yaml:"current_mapping,omitempty"`
 
 	// Unmapped is the list of explicitly unmapped source components.
 	Unmapped []UnmappedEntry `yaml:"unmapped,omitempty"`
 
 	// CoverageBaseline carries the day-one metric snapshot.
 	CoverageBaseline *CoverageBaseline `yaml:"coverage_baseline,omitempty"`
+}
+
+// CurrentMappingSection represents the nested current_mapping: block used by
+// the hermes-statedb mapping spec.
+type CurrentMappingSection struct {
+	Description string        `yaml:"description,omitempty"`
+	Rules       []MappingRule `yaml:"rules,omitempty"`
+}
+
+// EffectiveRules returns the mapping rules regardless of whether they are
+// declared at the top level (Rules) or nested under current_mapping (Rules is
+// empty and CurrentMapping.Rules is non-empty).
+func (md *MappingDoc) EffectiveRules() []MappingRule {
+	if len(md.Rules) > 0 {
+		return md.Rules
+	}
+	if md.CurrentMapping != nil {
+		return md.CurrentMapping.Rules
+	}
+	return nil
 }
 
 // MappingMeta carries the mapping header fields.
@@ -344,7 +370,7 @@ func LoadOntologyDir(ontologyDir string) (*LoadedOntology, error) {
 		}
 
 		// Accumulate mapped L1 component names from declared rules.
-		for _, rule := range mdoc.Rules {
+		for _, rule := range mdoc.EffectiveRules() {
 			// claude-code-jsonl rules use emit.component; hermes uses target_class.
 			if emitMap, ok := rule.Emit["component"].(string); ok && emitMap != "" {
 				lo.MappedComponents[emitMap] = struct{}{}
@@ -427,4 +453,36 @@ func (lo *LoadedOntology) MappingVersionRef(source string) string {
 		return ""
 	}
 	return md.Mapping.ID + "@" + md.Mapping.Version
+}
+
+// IsDegenerateRecord reports whether a record from source with the given role
+// matches a degenerate mapping rule in the L2 spec.
+//
+// A rule is degenerate when MappingRule.Quality == "degenerate".  Role
+// matching is derived from the rule's SourceCondition: we look for the pattern
+// role = '<role>' anywhere in the condition string (case-sensitive, single
+// quotes, exact role value).  This covers all current mapping rules whose
+// degenerate classification is role-keyed (e.g. hermes-statedb text_tool_degenerate:
+// source_condition = "role = 'tool' AND content IS NOT NULL AND content != ''").
+//
+// Returns false when no mapping is loaded for source, or when no degenerate
+// rule matches the given role.
+func (lo *LoadedOntology) IsDegenerateRecord(source, role string) bool {
+	if lo == nil {
+		return false
+	}
+	md, ok := lo.L2[source]
+	if !ok {
+		return false
+	}
+	needle := "role = '" + role + "'"
+	for _, rule := range md.EffectiveRules() {
+		if rule.Quality != "degenerate" {
+			continue
+		}
+		if strings.Contains(rule.SourceCondition, needle) {
+			return true
+		}
+	}
+	return false
 }
