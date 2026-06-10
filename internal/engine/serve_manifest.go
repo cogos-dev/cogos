@@ -61,6 +61,12 @@ func (s *Server) route(mux *http.ServeMux, pattern string, handler http.HandlerF
 	s.recordRoute(pattern)
 }
 
+// Route is the exported variant of route for use by RegisterHTTPExtensions
+// callbacks (which live outside the engine package).
+func (s *Server) Route(mux *http.ServeMux, pattern string, handler http.HandlerFunc) {
+	s.route(mux, pattern, handler)
+}
+
 // routeH is like route but takes an http.Handler (used for /mcp which is
 // backed by the streamable HTTP handler from the MCP library).
 func (s *Server) routeH(mux *http.ServeMux, pattern string, handler http.Handler) {

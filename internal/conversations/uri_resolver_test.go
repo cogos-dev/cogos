@@ -314,18 +314,20 @@ func TestParseConversationURI_QueryParams(t *testing.T) {
 	}
 }
 
-// ─── Reserved param tests ─────────────────────────────────────────────────────
+// ─── component= and ontology= are now active (not reserved) ─────────────────
+//
+// v0.2 groundwork activated these params. The old "reserved" check was removed
+// so these tests now verify that the params parse without error.
 
 func TestParseConversationURI_ReservedParams(t *testing.T) {
-	for _, reserved := range []string{"component", "ontology"} {
-		t.Run("reserved="+reserved, func(t *testing.T) {
-			uri := fmt.Sprintf("cog:conversations?%s=foo", reserved)
+	// component= and ontology= were previously reserved but are now active params
+	// as of v0.2 ontology-as-class enforcement. Verify they no longer error.
+	for _, param := range []string{"component", "ontology"} {
+		t.Run("now-active="+param, func(t *testing.T) {
+			uri := fmt.Sprintf("cog:conversations?%s=foo", param)
 			_, err := ParseConversationURI(uri)
-			if err == nil {
-				t.Fatalf("want error for reserved param %q, got nil", reserved)
-			}
-			if !strings.Contains(err.Error(), "reserved") {
-				t.Errorf("error should mention 'reserved', got %q", err.Error())
+			if err != nil {
+				t.Errorf("param %q should be accepted (v0.2 active), got error: %v", param, err)
 			}
 		})
 	}

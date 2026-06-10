@@ -61,9 +61,11 @@ func TestConversationsResolverDelegatesToProvider(t *testing.T) {
 		t.Fatalf("want unknown-param error through the wired resolver, got: %v", err)
 	}
 
-	// Reserved-param rejection likewise.
-	_, err = r.ResolveURI(ctx, "cog:conversations?component=tool.call")
-	if err == nil || !strings.Contains(err.Error(), "reserved") {
-		t.Fatalf("want reserved-param error through the wired resolver, got: %v", err)
+	// component= is now an active param (v0.2 ontology-as-class enforcement);
+	// it should resolve without a "reserved" error (the empty index returns
+	// an empty slice, not an error).
+	_, err = r.ResolveURI(ctx, "cog:conversations?component=session.turn")
+	if err != nil {
+		t.Fatalf("component= param should be accepted (v0.2 active), got: %v", err)
 	}
 }

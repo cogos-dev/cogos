@@ -103,6 +103,18 @@ type Turn struct {
 
 	// ParentUUID links this turn to its parent in the conversation tree.
 	ParentUUID string `json:"parent_uuid,omitempty"`
+
+	// Component is the L1 component class for this record (e.g. "session.turn").
+	// Set on newly-ingested L3 records; empty for records ingested before v0.2.
+	Component string `json:"component,omitempty"`
+
+	// OntologyVersion is the L1 ontology reference used when this record was
+	// indexed (e.g. "cogos.conversations@1.0.0"). Empty for pre-v0.2 records.
+	OntologyVersion string `json:"ontology_version,omitempty"`
+
+	// MappingVersion is the L2 mapping reference used when this record was
+	// indexed (e.g. "claude-code-jsonl@1.0.0"). Empty for pre-v0.2 records.
+	MappingVersion string `json:"mapping_version,omitempty"`
 }
 
 // SearchHit is one result returned by cog_search_conversations.
@@ -165,6 +177,11 @@ type ObservatoryConfig struct {
 
 	// Identity tags to apply to all sessions from this config.
 	DefaultIdentity string `yaml:"default_identity" json:"default_identity,omitempty"`
+
+	// OntologyDir is the directory containing L1 + L2 ontology YAML files.
+	// Defaults to <workspace>/.cog/observatory/ontology when present.
+	// Set to an empty string to disable ontology enforcement entirely.
+	OntologyDir string `yaml:"ontology_dir" json:"ontology_dir,omitempty"`
 }
 
 // providerConfig is the internal config bundle built by LoadConfig.
@@ -173,6 +190,7 @@ type providerConfig struct {
 	Observatory   ObservatoryConfig
 	SourceFiles   []sourceFileInfo   // CC UUID JSONLs expanded from SourceDirs
 	IngestSources []ingestSourceInfo // normalized ingest sources expanded from IngestDirs
+	Ontology      *LoadedOntology    // nil when ontology enforcement is disabled
 }
 
 // sourceFileInfo is metadata about one discovered Claude Code source JSONL.

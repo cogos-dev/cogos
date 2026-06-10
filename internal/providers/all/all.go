@@ -40,6 +40,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -238,6 +239,16 @@ func RegisterConversations(provider *conversations.Provider) {
 
 	// Wire conversations URI resolver.
 	engine.SetConversationsResolver(&conversationsURIResolver{p: provider})
+
+	// Wire GET /v1/observatory/coverage (v0.2 coverage metric surface).
+	prevHTTP := engine.RegisterHTTPExtensions
+	engine.RegisterHTTPExtensions = func(s *engine.Server, mux *http.ServeMux) {
+		if prevHTTP != nil {
+			prevHTTP(s, mux)
+		}
+		s.Route(mux, "GET /v1/observatory/coverage",
+			conversations.CoverageHTTPHandler(provider))
+	}
 }
 
 // conversationsURIResolver adapts conversations.Provider to

@@ -92,6 +92,20 @@ type ingestAccumulator struct {
 
 	// RejectedSchemas counts records rejected for an unknown schema value.
 	RejectedSchemas int
+
+	// Quarantined counts records routed to the quarantine surface.
+	Quarantined int
+
+	// Ontology is the loaded L1+L2 ontology set. When non-nil, records whose
+	// component class no mapping speaks are quarantined instead of dropped.
+	Ontology *LoadedOntology
+
+	// Quarantine is the quarantine writer. When non-nil, quarantined records
+	// are appended to <workspace>/.cog/observatory/quarantine/<source>/.
+	Quarantine *QuarantineWriter
+
+	// Coverage accumulates per-source coverage metrics.
+	Coverage *CoverageTracker
 }
 
 // newIngestAccumulator returns an empty accumulator.
@@ -153,6 +167,55 @@ func (a *ingestAccumulator) ConsumeFile(r io.Reader) error {
 			continue
 		}
 
+		// ── v0.2 ontology enforcement ────────────────────────────────────────
+		// v0.1 records are all session.turn — the schema only carries role +
+		// text, which maps cleanly to session.turn. When a loaded mapping is
+		// present we set the component class and L3 version tags; when no
+		// mapping exists for this source, we quarantine with provenance.
+		componentClass := "session.turn" // v0.1 invariant
+		ontRef := ""
+		mappingRef := ""
+
+		if a.Ontology != nil && a.Ontology.L1 != nil {
+			ontRef = a.Ontology.OntologyRef
+			mappingRef = a.Ontology.MappingVersionRef(rec.Source)
+
+			if mappingRef == "" {
+				// No mapping speaks this source — quarantine with provenance.
+				if a.Quarantine != nil {
+					prov := QuarantineProvenance{
+						Reason:      QuarantineReasonUnmappedComponent,
+						Component:   componentClass,
+						OntologyRef: ontRef,
+						MappingRef:  "",
+					}
+					if qErr := a.Quarantine.WriteRecord(rec.Source, json.RawMessage(line), prov); qErr != nil {
+						log.Printf("conversations/ingest: quarantine write error: %v", qErr)
+					}
+				}
+				if a.Coverage != nil {
+					a.Coverage.RecordQuarantined(rec.Source, componentClass)
+					a.Coverage.SetRefs(rec.Source, ontRef, "")
+				}
+				a.Quarantined++
+				continue
+			}
+
+			// Mapping present — record coverage.
+			// Check whether this record matches a degenerate rule in the L2
+			// mapping (e.g. role='tool' rows in hermes-statedb mapped to
+			// session.turn instead of tool.result per text_tool_degenerate).
+			if a.Coverage != nil {
+				if a.Ontology.IsDegenerateRecord(rec.Source, rec.Role) {
+					a.Coverage.RecordDegenerate(rec.Source)
+				} else {
+					a.Coverage.RecordMapped(rec.Source)
+				}
+				a.Coverage.SetRefs(rec.Source, ontRef, mappingRef)
+			}
+		}
+		// ─────────────────────────────────────────────────────────────────────
+
 		key := indexKeyForIngest(rec.Source, rec.SessionID)
 		sess, ok := a.sessions[key]
 		if !ok {
@@ -198,12 +261,15 @@ func (a *ingestAccumulator) ConsumeFile(r io.Reader) error {
 		}
 
 		sess.Turns = append(sess.Turns, Turn{
-			UUID:      turnUUID,
-			SessionID: key,
-			TurnIndex: idx,
-			Role:      role,
-			Timestamp: ts,
-			Text:      text,
+			UUID:            turnUUID,
+			SessionID:       key,
+			TurnIndex:       idx,
+			Role:            role,
+			Timestamp:       ts,
+			Text:            text,
+			Component:       componentClass,
+			OntologyVersion: ontRef,
+			MappingVersion:  mappingRef,
 		})
 		sess.Meta.TurnCount = len(sess.Turns)
 	}

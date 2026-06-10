@@ -237,6 +237,11 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// ACP-client surface: list/browse Claude Code projects+sessions, spawn subprocess.
 	s.registerClaudeCodeRoutes(mux)
 
+	// Extension HTTP routes (e.g. observatory coverage).
+	if RegisterHTTPExtensions != nil {
+		RegisterHTTPExtensions(s, mux)
+	}
+
 	// Cluster / BEP transport status (Phase 2 S2). Dark by default: when
 	// cluster.enabled=false the handler returns {"enabled":false} and no
 	// engine state is inspected. The route is always registered so the
