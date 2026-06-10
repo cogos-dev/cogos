@@ -53,6 +53,21 @@ func NewProvider() *Provider {
 // Type returns the resource type identifier.
 func (p *Provider) Type() string { return "conversations" }
 
+// ResolveURI resolves a cog:conversations/… URI against the live index.
+// Returns ErrURIUnknownParam (or a parse error) when the URI is invalid.
+// Returns an error when the index is not yet initialised.
+// This method is the entry point used by engine.ConversationsResolver.
+func (p *Provider) ResolveURI(uri string) (*ResolvedSlice, error) {
+	p.mu.Lock()
+	idx := p.index
+	p.mu.Unlock()
+
+	if idx == nil {
+		return nil, fmt.Errorf("conversations index not initialised — run cog reconcile conversations first")
+	}
+	return ResolveConversationURI(uri, idx)
+}
+
 // ─── LoadConfig ──────────────────────────────────────────────────────────────
 
 // LoadConfig reads .cog/config/observatory.yaml (if present), discovers JSONL

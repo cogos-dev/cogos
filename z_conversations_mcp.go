@@ -25,6 +25,6 @@ func init() {
 		if prev != nil {
 			prev(srv)
 		}
-		conversations.RegisterConversationTools(srv.Server(), conversationsProviderInstance)
+		conversations.RegisterConversationTools(srv.Server(), srv.TrackTool, conversationsProviderInstance)
 	}
 }

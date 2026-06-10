@@ -50,6 +50,6 @@ func init() {
 		if prev != nil {
 			prev(srv)
 		}
-		conversations.RegisterConversationTools(srv.Server(), daemonConversationsProvider)
+		conversations.RegisterConversationTools(srv.Server(), srv.TrackTool, daemonConversationsProvider)
 	}
 }

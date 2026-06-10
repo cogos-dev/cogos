@@ -169,6 +169,16 @@ func (m *MCPServer) trackTool(t *mcp.Tool) *mcp.Tool {
 	return t
 }
 
+// TrackTool is the exported equivalent of trackTool for use by extension
+// packages (e.g. conversations, eval) that register tools via
+// RegisterMCPExtensions. It records the tool in the manifest registry and
+// returns the pointer unchanged, so callers can write:
+//
+//	mcp.AddTool(srv.Server(), srv.TrackTool(&mcp.Tool{...}), handler)
+func (m *MCPServer) TrackTool(t *mcp.Tool) *mcp.Tool {
+	return m.trackTool(t)
+}
+
 // handleManifest returns the kernel self-describing manifest as JSON. Read-
 // only, side-effect-free. Enumeration is cheap (a couple of slice copies plus
 // a sort) so we recompute per request rather than caching — this keeps the
