@@ -128,6 +128,7 @@ func makeSearchConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFo
 
 		p.mu.Lock()
 		idx := p.index
+		ont := p.ontology
 		p.mu.Unlock()
 		if idx == nil {
 			return convErrorResult("index not yet initialised — run cog reconcile conversations first"), nil, nil
@@ -142,7 +143,7 @@ func makeSearchConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFo
 				return convErrorResult(ErrURIMixedParams.Error()), nil, nil
 			}
 
-			slice, err := ResolveConversationURI(input.URI, idx)
+			slice, err := ResolveConversationURIWithOntology(input.URI, idx, ont)
 			if err != nil {
 				return convErrorResult(fmt.Sprintf("resolve uri %q: %v", input.URI, err)), nil, nil
 			}
@@ -243,6 +244,7 @@ func makeGetConversationTurnHandler(p *Provider, maxBytes int) mcp.ToolHandlerFo
 
 		p.mu.Lock()
 		idx := p.index
+		ont := p.ontology
 		p.mu.Unlock()
 		if idx == nil {
 			return convErrorResult("index not yet initialised — run cog reconcile conversations first"), nil, nil
@@ -255,7 +257,7 @@ func makeGetConversationTurnHandler(p *Provider, maxBytes int) mcp.ToolHandlerFo
 				return convErrorResult(ErrURIMixedParams.Error()), nil, nil
 			}
 
-			slice, err := ResolveConversationURI(input.URI, idx)
+			slice, err := ResolveConversationURIWithOntology(input.URI, idx, ont)
 			if err != nil {
 				return convErrorResult(fmt.Sprintf("resolve uri %q: %v", input.URI, err)), nil, nil
 			}
