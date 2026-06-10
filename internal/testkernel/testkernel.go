@@ -4,8 +4,9 @@
 // ADR-101 Phase 1: thin wrapper over engine.Boot.
 // ADR-101 Phase 2: WithIsolatedRegistry injects an explicit provider list so
 // tests can exercise real plan/apply without touching the global registry.
-// Phase 3 will add CallTool/HTTPClient; Phase 4 will add goroutine-leak
-// detection.
+// ADR-101 Phase 3: ListTools queries the live MCP surface via the wire
+// protocol, enabling binary-assembly tests. CallTool is the Phase-3b follow-up.
+// Phase 4 will add goroutine-leak detection.
 //
 // Typical usage:
 //
@@ -31,10 +32,14 @@ package testkernel
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +113,120 @@ func (k *Kernel) ReconcileDaemon() *engine.ReconcileDaemon {
 // Safe to call multiple times.
 func (k *Kernel) Stop() error {
 	return k.kernel.Stop()
+}
+
+// ListTools performs an MCP initialize→notifications/initialized→tools/list
+// sequence over HTTP and returns the sorted list of tool names registered on
+// this kernel's MCP server.
+//
+// This is a Phase-3 helper that exercises the actual MCP wire protocol rather
+// than going through internal Go types, so it catches registration gaps that
+// only show up on the live surface (the category-C gap that motivated ADR-101).
+//
+// CallTool is the natural follow-up (ADR-101 Phase 3b); this minimal addition
+// provides the assertion surface needed for TestDaemonWiring without wiring
+// the full call path.
+func (k *Kernel) ListTools(ctx context.Context, t *testing.T) ([]string, error) {
+	t.Helper()
+
+	mcpURL := k.endpoint + "/mcp"
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	doPost := func(body string, extraHeaders map[string]string) ([]byte, http.Header, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, mcpURL, strings.NewReader(body))
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		for k, v := range extraHeaders {
+			req.Header.Set(k, v)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		return b, resp.Header, err
+	}
+
+	// Step 1: initialize — acquire session ID.
+	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"testkernel","version":"1"}}}`
+	_, initHeaders, err := doPost(initBody, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListTools: initialize: %w", err)
+	}
+	sessionID := initHeaders.Get("Mcp-Session-Id")
+
+	// Step 2: notifications/initialized (fire-and-forget).
+	_, _, _ = doPost(`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		map[string]string{"Mcp-Session-Id": sessionID})
+
+	// Step 3: tools/list.
+	listBody := `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+	listResp, _, err := doPost(listBody, map[string]string{"Mcp-Session-Id": sessionID})
+	if err != nil {
+		return nil, fmt.Errorf("ListTools: tools/list: %w", err)
+	}
+
+	// The MCP Streamable HTTP transport may wrap the JSON-RPC response as an
+	// SSE event (Content-Type: text/event-stream):
+	//
+	//   event: message\ndata: {...}\n\n
+	//
+	// Strip SSE framing so we parse the raw JSON-RPC payload regardless of
+	// whether the server chose SSE or plain JSON encoding.
+	jsonPayload := extractSSEData(listResp)
+
+	// Parse the JSON-RPC response.
+	var rpc struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(jsonPayload, &rpc); err != nil {
+		return nil, fmt.Errorf("ListTools: decode response: %w (body: %s)", err, listResp)
+	}
+	if rpc.Error != nil {
+		return nil, fmt.Errorf("ListTools: JSON-RPC error: %s", rpc.Error.Message)
+	}
+
+	names := make([]string, 0, len(rpc.Result.Tools))
+	for _, tool := range rpc.Result.Tools {
+		names = append(names, tool.Name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// extractSSEData returns the JSON payload from an SSE-framed body.
+// If the body begins with "event:" or "data:" lines, it extracts and
+// concatenates all "data: ..." lines.  If the body looks like plain JSON
+// (starts with '{') it is returned unchanged.  This lets ListTools work
+// whether the server chose SSE or plain JSON encoding.
+func extractSSEData(body []byte) []byte {
+	trimmed := strings.TrimSpace(string(body))
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return body // already plain JSON
+	}
+	// SSE: scan for "data: ..." lines and concatenate.
+	var dataLines []string
+	for _, line := range strings.Split(trimmed, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, "data: ") {
+			dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
+		}
+	}
+	if len(dataLines) == 0 {
+		return body // can't parse; return original for error reporting
+	}
+	return []byte(strings.Join(dataLines, ""))
 }
 
 // Boot starts a kernel in-process with the given options.
