@@ -286,7 +286,7 @@ func TestLoadOntologyDir_MissingDir_NoError(t *testing.T) {
 		t.Errorf("expected nil error for missing dir, got %v", err)
 	}
 	if lo == nil {
-		t.Error("expected non-nil LoadedOntology even for missing dir")
+		t.Fatal("expected non-nil LoadedOntology even for missing dir")
 	}
 	if lo.L1 != nil {
 		t.Error("expected nil L1 for missing dir")
