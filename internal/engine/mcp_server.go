@@ -422,8 +422,8 @@ func (m *MCPServer) registerTools() {
 			"coord/impl chatter on bus_broadcast. Defaults: budget=500 " +
 			"tokens, window=15m, include_peers=true. Returns {packet, " +
 			"token_count, sources[]} — designed to be prepended verbatim to " +
-			"a UserPromptSubmit preamble. Fallback: curl " +
-			"http://localhost:6931/v1/peer-awareness?sid=<sid>",
+			"a UserPromptSubmit preamble. Fallback: kernel API endpoint " +
+			"/v1/peer-awareness?sid=<sid> (local port 6931)",
 	}, withToolObserver(m, "cog_render_peer_awareness_packet", m.toolRenderPeerAwarenessPacket))
 }
 
