@@ -22,6 +22,8 @@
 // binaries (which register stub providers directly) are not affected.
 package engine
 
+import "net/http"
+
 // RegisterProviders is called once at daemon boot to populate the
 // pkg/reconcile provider registry. Set by cmd/cogos/providers_wire.go.
 // Nil means "no additional providers to register" (e.g. in tests).
@@ -46,3 +48,10 @@ var RegisterMCPExtensions func(srv *MCPServer)
 // Nil means the session-register path proceeds without identity binding
 // (naked-by-default: safe, correct, no functional change for existing callers).
 var WireHarnessBackend func(s *Server)
+
+// RegisterHTTPExtensions is called once during NewServer after the built-in
+// routes are registered. Extensions receive the *Server and *http.ServeMux so
+// they can call s.route() to register additional HTTP endpoints (e.g. the
+// observatory coverage route). Set by cmd/cogos extension init() functions.
+// Nil means no additional routes are registered.
+var RegisterHTTPExtensions func(s *Server, mux *http.ServeMux)
