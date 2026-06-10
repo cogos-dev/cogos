@@ -172,14 +172,22 @@ func (idx *Index) GetTurn(sessionID string, turnIndex int) (Turn, bool) {
 	return turns[turnIndex], true
 }
 
-// Search performs a case-insensitive substring search over all indexed turns.
+// Search performs a case-insensitive multi-term search over all indexed turns.
+//
+// Query parsing rules:
+//   - Double-quoted substrings are matched as exact (case-insensitive) phrases.
+//   - Unquoted tokens separated by whitespace form an AND conjunction: a turn
+//     matches only when ALL tokens are present as substrings of its text.
+//   - A single unquoted token behaves identically to the original single-term
+//     substring match (backward-compatible).
+//
 // Filters: since/until bound timestamps; sessionID restricts to one session;
 // identity filters by session identity; limit caps results (0 = no limit).
 func (idx *Index) Search(query string, since, until time.Time, sessionID, identity string, limit int) []SearchHit {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	lq := strings.ToLower(query)
+	terms := parseSearchQuery(query)
 	var hits []SearchHit
 
 	// Collect sessions to search.
@@ -207,10 +215,15 @@ func (idx *Index) Search(query string, since, until time.Time, sessionID, identi
 			if !until.IsZero() && t.Timestamp.After(until) {
 				continue
 			}
-			if !strings.Contains(strings.ToLower(t.Text), lq) {
+			if !matchesAllTerms(t.Text, terms) {
 				continue
 			}
-			excerpt := makeExcerpt(t.Text, query, 300)
+			// Use the first term as the excerpt anchor for multi-term queries.
+			anchor := query
+			if len(terms) > 0 {
+				anchor = terms[0]
+			}
+			excerpt := makeExcerpt(t.Text, anchor, 300)
 			hit := SearchHit{
 				SessionID: sid,
 				TurnIndex: t.TurnIndex,
@@ -222,6 +235,7 @@ func (idx *Index) Search(query string, since, until time.Time, sessionID, identi
 			}
 			if hasMeta {
 				hit.SessionTitle = meta.Title
+				hit.Source = meta.Source
 			}
 			hits = append(hits, hit)
 			if limit > 0 && len(hits) >= limit {
@@ -232,14 +246,87 @@ func (idx *Index) Search(query string, since, until time.Time, sessionID, identi
 	return hits
 }
 
+// parseSearchQuery splits a query string into individual match terms.
+// Double-quoted substrings are extracted as single exact-match terms.
+// Remaining text is split on whitespace.
+//
+// Examples:
+//
+//	`foo bar`            → ["foo", "bar"]
+//	`"foo bar" baz`      → ["foo bar", "baz"]
+//	`"exact phrase"`     → ["exact phrase"]
+//	`hello`              → ["hello"]
+func parseSearchQuery(query string) []string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+
+	var terms []string
+	rest := query
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			break
+		}
+		if rest[0] == '"' {
+			// Find closing quote.
+			end := strings.Index(rest[1:], "\"")
+			if end < 0 {
+				// Unclosed quote: treat remainder as literal term.
+				terms = append(terms, rest[1:])
+				break
+			}
+			phrase := rest[1 : end+1]
+			if phrase != "" {
+				terms = append(terms, phrase)
+			}
+			rest = rest[end+2:]
+		} else {
+			// Take until next whitespace or quote.
+			i := strings.IndexAny(rest, " \t\r\n\"")
+			if i < 0 {
+				terms = append(terms, rest)
+				break
+			}
+			terms = append(terms, rest[:i])
+			rest = rest[i:]
+		}
+	}
+	return terms
+}
+
+// matchesAllTerms returns true when text contains ALL terms as
+// case-insensitive substrings.
+func matchesAllTerms(text string, terms []string) bool {
+	if len(terms) == 0 {
+		return true
+	}
+	ltext := strings.ToLower(text)
+	for _, term := range terms {
+		if !strings.Contains(ltext, strings.ToLower(term)) {
+			return false
+		}
+	}
+	return true
+}
+
 // ─── persistence helpers ─────────────────────────────────────────────────────
 
 func (idx *Index) metaPath() string {
 	return filepath.Join(idx.projDir, "_meta.json")
 }
 
+// turnsFilename derives a safe flat filename from sessionID. Composite keys
+// for normalized ingest sessions take the form "<source>/<session_id>"; the
+// "/" is replaced with "__" so the file stays in projDir without creating
+// subdirectories.
+func turnsFilename(sessionID string) string {
+	return strings.ReplaceAll(sessionID, "/", "__") + ".json"
+}
+
 func (idx *Index) turnsPath(sessionID string) string {
-	return filepath.Join(idx.projDir, sessionID+".json")
+	return filepath.Join(idx.projDir, turnsFilename(sessionID))
 }
 
 // writeMetaFileLocked persists the session meta index. Callers must hold
