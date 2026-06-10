@@ -24,8 +24,9 @@ import (
 )
 
 // ConversationsResolver is the minimal interface the HTTP handler needs from
-// the conversations package. Implemented by *conversations.Index via the
-// conversations.ResolveConversationURI adapter in the wiring layer.
+// the conversations package. Implemented by the daemonURIResolver adapter in
+// cmd/cogos/z_conversations_wire.go, which delegates to
+// conversations.Provider.ResolveURI on the daemon's provider singleton.
 type ConversationsResolver interface {
 	// ResolveURI parses and resolves a cog:conversations/… URI.
 	// Returns any — the concrete type is *conversations.ResolvedSlice;
@@ -38,10 +39,25 @@ type ConversationsResolver interface {
 var conversationsResolver ConversationsResolver
 
 // SetConversationsResolver wires the conversations resolver. Call once at boot
-// from the conversations wiring file (z_conversations_mcp.go or equivalent).
-// Thread-safe: the variable is written once before the server starts listening.
+// from the daemon binary's wiring file (cmd/cogos/z_conversations_wire.go).
+// Thread-safe: the variable is written once at init() before the server
+// starts listening.
+//
+// NOTE for wirers: this must be called from a package that is actually linked
+// into the binary that serves /v1/uri/resolve (the kernel daemon, cmd/cogos).
+// The repo-root package main is the legacy cog CLI and does NOT boot this
+// server — wiring placed there is silently dead in the daemon.
 func SetConversationsResolver(r ConversationsResolver) {
 	conversationsResolver = r
+}
+
+// WiredConversationsResolver returns the currently wired resolver, or nil when
+// none has been set. Exposed so binary-assembly regression tests (e.g. in
+// cmd/cogos) can assert that the standard wiring sequence actually reaches
+// this engine seam — unit tests of the resolver alone cannot catch a missing
+// SetConversationsResolver call in a given binary.
+func WiredConversationsResolver() ConversationsResolver {
+	return conversationsResolver
 }
 
 // handleURIResolve resolves a cog: URI.

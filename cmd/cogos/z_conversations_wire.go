@@ -17,12 +17,31 @@
 package main
 
 import (
+	"context"
+
 	"github.com/myrgic/cogos/internal/conversations"
 	"github.com/myrgic/cogos/internal/engine"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 var daemonConversationsProvider = conversations.NewProvider()
+
+// daemonURIResolver adapts the conversations provider to the
+// engine.ConversationsResolver interface backing GET /v1/uri/resolve.
+//
+// Placement matters: this wiring MUST live in cmd/cogos (the kernel daemon
+// binary), not in the repo-root package main. The root package is the legacy
+// cog CLI monolith mid-decomposition; it never boots engine.Server, so any
+// SetConversationsResolver call placed there never runs in the daemon and
+// /v1/uri/resolve answers "resolver not wired" — the exact bug this comment
+// guards against (caught by real-data e2e review of PR #370).
+type daemonURIResolver struct {
+	p *conversations.Provider
+}
+
+func (r *daemonURIResolver) ResolveURI(_ context.Context, uri string) (any, error) {
+	return r.p.ResolveURI(uri)
+}
 
 func init() {
 	// Register the conversations provider with the reconcile registry so the
@@ -52,4 +71,9 @@ func init() {
 		}
 		conversations.RegisterConversationTools(srv.Server(), srv.TrackTool, daemonConversationsProvider)
 	}
+
+	// Wire the cog:conversations URI resolver behind GET /v1/uri/resolve.
+	// Shares the same provider singleton as the MCP tools so both surfaces
+	// see the same live index.
+	engine.SetConversationsResolver(&daemonURIResolver{p: daemonConversationsProvider})
 }
