@@ -251,7 +251,7 @@ func (m *MCPServer) registerTools() {
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_get_state",
-		Description: "Get kernel state: process status, uptime, trust, node health (sibling services), field size, and heartbeat info. Includes identity and coherence metadata. Fallback: curl http://localhost:6931/health",
+		Description: "Get kernel state: process status, uptime, trust, node health (sibling services), field size, and heartbeat info. Includes identity and coherence metadata. Fallback: kernel API endpoint /health (local port 6931)",
 	}), withToolObserver(m, "cog_get_state", m.toolGetState))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
@@ -286,7 +286,7 @@ func (m *MCPServer) registerTools() {
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_tail_events",
-		Description: "Tail kernel events as they are appended to the ledger, like 'tail -f'. Blocks until max_events or max_duration reached. Same filters as cog_read_events plus since= for replay before going live. Bounded by max_events (default 100, max 1000) and max_duration (default 60s, max 10m). Fallback: curl -N http://localhost:6931/v1/events/stream",
+		Description: "Tail kernel events as they are appended to the ledger, like 'tail -f'. Blocks until max_events or max_duration reached. Same filters as cog_read_events plus since= for replay before going live. Bounded by max_events (default 100, max 1000) and max_duration (default 60s, max 10m). Fallback: kernel API streaming endpoint /v1/events/stream (local port 6931)",
 	}), m.toolTailEvents)
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
@@ -310,17 +310,17 @@ func (m *MCPServer) registerTools() {
 	// Agent state / loop control — closes Agent F gap #8 per Agent T's design.
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_list_agents",
-		Description: "Enumerate active agent harness instances inside the kernel. Each entry summarises identity, state, and recent activity. Today returns one element (\"primary\") reflecting the ServeAgent singleton; forward-compatible for future multi-agent deployment. Fallback: curl http://localhost:6931/v1/agents",
+		Description: "Enumerate active agent harness instances inside the kernel. Each entry summarises identity, state, and recent activity. Today returns one element (\"primary\") reflecting the ServeAgent singleton; forward-compatible for future multi-agent deployment. Fallback: kernel API endpoint /v1/agents (local port 6931)",
 	}), m.toolListAgents)
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_get_agent_state",
-		Description: "Full state snapshot of one agent instance — status summary, activity awareness, rolling cycle memory, pending proposals, inbox queue, and optionally the most recent cycle traces. Matches the shape of GET /v1/agents/{id}. Fallback: curl http://localhost:6931/v1/agents/primary",
+		Description: "Full state snapshot of one agent instance — status summary, activity awareness, rolling cycle memory, pending proposals, inbox queue, and optionally the most recent cycle traces. Matches the shape of GET /v1/agents/{id}. Fallback: kernel API endpoint /v1/agents/primary (local port 6931)",
 	}), m.toolGetAgentState)
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_trigger_agent_loop",
-		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: curl -X POST http://localhost:6931/v1/agents/primary/tick",
+		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: kernel API POST /v1/agents/primary/tick (local port 6931)",
 	}), m.toolTriggerAgentLoop)
 
 	mcp.AddTool(m.server, &mcp.Tool{

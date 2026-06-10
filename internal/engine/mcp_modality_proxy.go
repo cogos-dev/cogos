@@ -163,14 +163,14 @@ func (m *MCPServer) registerMod3Tools() {
 		Description: "List available mod3 voices, optionally scoped to a " +
 			"session. Optional: session_id. Returns the voice catalogue mod3 " +
 			"exposes (id, name, language, gender metadata per voice). " +
-			"Fallback: curl http://localhost:7860/v1/voices",
+			"Fallback: mod3 API endpoint /v1/voices (local port 7860)",
 	}), withToolObserver(m, "mod3_voices", m.toolMod3Voices))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "mod3_status",
 		Description: "Probe mod3's /health endpoint. Returns the raw health " +
 			"payload (model_loaded, engine info, queue_depth, etc). 502 if " +
-			"mod3 is unreachable. Fallback: curl http://localhost:7860/health",
+			"mod3 is unreachable. Fallback: mod3 API endpoint /health (local port 7860)",
 	}), withToolObserver(m, "mod3_status", m.toolMod3Status))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{

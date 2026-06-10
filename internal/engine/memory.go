@@ -30,7 +30,13 @@ func MemorySearch(workspaceRoot, query string) ([]string, error) {
 	lq := strings.ToLower(query)
 
 	_ = filepath.Walk(memDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if skipProtectedDir(info.Name()) {
+				return filepath.SkipDir // archived/attic regions stay frozen (R-1)
+			}
 			return nil
 		}
 		if strings.Contains(strings.ToLower(filepath.Base(path)), lq) {

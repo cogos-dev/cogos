@@ -322,6 +322,10 @@ func removeMemoryFrontmatterField(fm, field string) string {
 // 2026-04-16-cogdoc-truncation.md for the truncation incident that made
 // the empty-content guard load-bearing.
 func atomicWriteMemoryFile(path string, data []byte, perm os.FileMode) error {
+	// Guard: never write into archived/attic regions (R-1, 2026-06-09).
+	if IsProtectedArchivePath(path) {
+		return fmt.Errorf("refusing write into protected archive path: %s", path)
+	}
 	// Guard: refuse to truncate a non-empty file to zero bytes.
 	if len(data) == 0 {
 		if info, err := os.Stat(path); err == nil && info.Size() > 0 {

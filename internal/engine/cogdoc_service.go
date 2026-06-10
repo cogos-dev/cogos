@@ -100,7 +100,10 @@ func (s *CogDocService) PatchAndSync(uri string, patches cogdocFrontmatterPatch)
 		return nil, fmt.Errorf("patch frontmatter: %w", err)
 	}
 
-	// 3. Write patched file.
+	// 3. Write patched file (never into archived/attic regions — R-1).
+	if IsProtectedArchivePath(res.Path) {
+		return nil, fmt.Errorf("refusing write into protected archive path: %s", res.Path)
+	}
 	if err := os.WriteFile(res.Path, []byte(updated), 0o644); err != nil {
 		return nil, fmt.Errorf("write %q: %w", res.Path, err)
 	}
