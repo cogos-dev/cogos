@@ -778,6 +778,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	defer span.End()
 	r = r.WithContext(ctx)
 
+	// Check for a configured router before spending cycles on body parsing so
+	// that a nil router always yields 501 regardless of the request body.
+	if s.router == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]string{
+				"type":    "not_implemented",
+				"message": "no inference router configured; run with a providers.yaml",
+			},
+		})
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20)) // 4 MB limit
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
@@ -828,18 +842,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Notify the process of the incoming interaction.
 	s.process.Send(NewGateEventFromBlock(block, "user.message", query))
-
-	if s.router == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotImplemented)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]string{
-				"type":    "not_implemented",
-				"message": "no inference router configured; run with a providers.yaml",
-			},
-		})
-		return
-	}
 
 	// Assemble foveated context — engine owns the full window.
 	// It decomposes client messages, scores them alongside CogDocs,
