@@ -12,8 +12,10 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -192,13 +194,15 @@ func TestToolReadFile_MinifiedOneLineBlobCapped(t *testing.T) {
 	t.Parallel()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
-	// 32 KiB cap. Write a single minified line of 200 KiB.
+	// 32 KiB cap. Single minified line of 5,000,009 bytes — strictly larger
+	// than ANY internal read buffer (mirrors the /tmp/caps-sandbox/blob.json
+	// e2e fixture). This is the exact case that previously returned
+	// "bufio.Scanner: token too long" instead of capped content.
 	cfg.MaxToolOutputBytes = DefaultMaxToolOutputBytes
 	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
 	server := NewMCPServer(cfg, makeNucleus("Cog", "tester"), process)
 
-	// Minified file: one giant line (200 KiB).
-	bigLine := strings.Repeat("a", 200*1024)
+	bigLine := strings.Repeat("A", 5_000_009)
 	path := filepath.Join(root, "minified.js")
 	writeTestFile(t, path, bigLine)
 
@@ -207,10 +211,12 @@ func TestToolReadFile_MinifiedOneLineBlobCapped(t *testing.T) {
 		t.Fatalf("toolReadFile on minified blob: %v", err)
 	}
 
-	// The full JSON response must not exceed a reasonable multiple of the cap.
-	// (JSON encoding adds some overhead for the struct, but the content field
-	// itself must not be 200 KiB.)
 	text := result.Content[0].(*mcp.TextContent).Text
+	// MUST be capped content, never a scanner error.
+	if strings.Contains(text, "token too long") {
+		t.Fatalf("scanner cliff still present: %q", text)
+	}
+	// The full JSON response must not exceed a reasonable multiple of the cap.
 	if len(text) > 2*DefaultMaxToolOutputBytes {
 		t.Errorf("response too large: %d bytes (cap=%d); minified-blob not capped",
 			len(text), DefaultMaxToolOutputBytes)
@@ -219,7 +225,178 @@ func TestToolReadFile_MinifiedOneLineBlobCapped(t *testing.T) {
 	decodeMCPJSON(t, result, &decoded)
 	truncated, _ := decoded["truncated"].(bool)
 	if !truncated {
-		t.Error("expected truncated=true for 200 KiB minified blob with 32 KiB cap")
+		t.Error("expected truncated=true for 5 MB minified blob with 32 KiB cap")
+	}
+	content, _ := decoded["content"].(string)
+	if !strings.Contains(content, "[output truncated:") {
+		t.Error("expected explicit truncation marker in content")
+	}
+	// file_size_bytes reports the true source size (the marker's Y counts
+	// the rendered buffer, which stops at cap+ε by design).
+	if size, ok := decoded["file_size_bytes"].(float64); !ok || int64(size) != 5_000_009 {
+		t.Errorf("file_size_bytes = %v; want 5000009", decoded["file_size_bytes"])
+	}
+	// The mid-line cut must be flagged so the agent knows line numbering
+	// beyond the truncation point was not scanned.
+	if note, _ := decoded["note"].(string); !strings.Contains(note, "cut mid-line") {
+		t.Errorf("note = %q; want mid-line cut explanation", note)
+	}
+}
+
+func TestToolReadFile_OffsetSkipsOverLongLines(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewMCPServer(cfg, makeNucleus("Cog", "tester"), process)
+
+	// Line 1 is a 300 KiB blob (over the 64 KiB read buffer); line 2 is
+	// short. offset=1 must skip the blob without erroring and return line 2
+	// with the correct line number.
+	contents := strings.Repeat("z", 300*1024) + "\n" + "short line two\n"
+	path := filepath.Join(root, "mixed.txt")
+	writeTestFile(t, path, contents)
+
+	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path, Offset: 1})
+	if err != nil {
+		t.Fatalf("toolReadFile with offset over long line: %v", err)
+	}
+	var decoded map[string]any
+	decodeMCPJSON(t, result, &decoded)
+	content, _ := decoded["content"].(string)
+	if !strings.Contains(content, "   2\tshort line two") {
+		t.Errorf("expected line 2 with correct numbering; got %q", content)
+	}
+}
+
+func TestToolReadFile_RelativePathResolvesAgainstWorkspaceRoot(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewMCPServer(cfg, makeNucleus("Cog", "tester"), process)
+
+	writeTestFile(t, filepath.Join(root, "rel.txt"), "relative content\n")
+
+	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: "rel.txt"})
+	if err != nil {
+		t.Fatalf("toolReadFile relative path: %v", err)
+	}
+	var decoded map[string]any
+	decodeMCPJSON(t, result, &decoded)
+	content, _ := decoded["content"].(string)
+	if !strings.Contains(content, "relative content") {
+		t.Errorf("relative path did not resolve against workspace root; got %q", content)
+	}
+}
+
+// ─── readLineCapped tests ────────────────────────────────────────────────────
+
+func TestReadLineCapped(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		input    string
+		keep     int
+		wantLine string
+		wantOver bool
+	}{
+		{name: "short line", input: "hello\n", keep: 100, wantLine: "hello"},
+		{name: "exact keep", input: "abcde\n", keep: 5, wantLine: "abcde"},
+		{name: "over keep", input: "abcdef\n", keep: 5, wantLine: "abcde", wantOver: true},
+		{name: "no trailing newline", input: "tail", keep: 100, wantLine: "tail"},
+		{name: "empty line", input: "\n", keep: 100, wantLine: ""},
+		{name: "keep zero skip", input: "anything here\n", keep: 0, wantLine: "", wantOver: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := bufio.NewReaderSize(strings.NewReader(tc.input), 16)
+			line, over, err := readLineCapped(r, tc.keep, true)
+			if err != nil {
+				t.Fatalf("readLineCapped: %v", err)
+			}
+			if string(line) != tc.wantLine {
+				t.Errorf("line = %q; want %q", line, tc.wantLine)
+			}
+			if over != tc.wantOver {
+				t.Errorf("overflow = %v; want %v", over, tc.wantOver)
+			}
+		})
+	}
+}
+
+func TestReadLineCapped_LongLineSmallBuffer(t *testing.T) {
+	t.Parallel()
+	// A 1 MB line through a 64-byte buffer: must never error, retain keep
+	// bytes, and (drain=true) leave the reader at the start of the next line.
+	long := strings.Repeat("x", 1024*1024)
+	r := bufio.NewReaderSize(strings.NewReader(long+"\nnext\n"), 64)
+
+	line, over, err := readLineCapped(r, 100, true)
+	if err != nil {
+		t.Fatalf("readLineCapped on 1MB line: %v", err)
+	}
+	if len(line) != 100 || !over {
+		t.Errorf("len=%d over=%v; want 100/true", len(line), over)
+	}
+
+	next, over2, err := readLineCapped(r, 100, true)
+	if err != nil {
+		t.Fatalf("second line: %v", err)
+	}
+	if string(next) != "next" || over2 {
+		t.Errorf("next = %q over=%v; want \"next\"/false", next, over2)
+	}
+
+	if _, _, err := readLineCapped(r, 100, true); err != io.EOF {
+		t.Errorf("expected io.EOF at end, got %v", err)
+	}
+}
+
+func TestReadLineCapped_NoDrainStopsEarly(t *testing.T) {
+	t.Parallel()
+	// drain=false: after retaining keep bytes the rest of the line stays
+	// unread — cog_read_file's guarantee that at most cap+ε is read from disk.
+	long := strings.Repeat("y", 1024*1024)
+	sr := strings.NewReader(long)
+	r := bufio.NewReaderSize(sr, 64)
+
+	line, over, err := readLineCapped(r, 100, false)
+	if err != nil {
+		t.Fatalf("readLineCapped: %v", err)
+	}
+	if len(line) != 100 || !over {
+		t.Errorf("len=%d over=%v; want 100/true", len(line), over)
+	}
+	// Almost all of the 1 MB must remain unread in the source.
+	if sr.Len() < 1024*1024-1024 {
+		t.Errorf("reader consumed too much: %d bytes remain (want ~1MB)", sr.Len())
+	}
+}
+
+func TestToolGrepFiles_LongLineDoesNotAbortScan(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewMCPServer(cfg, makeNucleus("Cog", "tester"), process)
+
+	// One file: 200 KiB first line (over the old 64 KiB scanner limit),
+	// then a matching short line AFTER it. The old scanner silently stopped
+	// at the long line and missed the later match.
+	path := filepath.Join(root, "longline.txt")
+	writeTestFile(t, path, strings.Repeat("f", 200*1024)+"\nNEEDLE here\n")
+
+	result, _, err := server.toolGrepFiles(context.Background(), nil, grepFilesInput{
+		Pattern: "NEEDLE",
+		Path:    root,
+	})
+	if err != nil {
+		t.Fatalf("toolGrepFiles: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "NEEDLE here") {
+		t.Errorf("match after long line was missed: %s", text)
 	}
 }
 

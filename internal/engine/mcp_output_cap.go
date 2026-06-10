@@ -25,7 +25,9 @@
 package engine
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -40,6 +42,12 @@ const (
 	// MinToolOutputBytes is the hard floor for max_tool_output_bytes.
 	// Below this the cap becomes so aggressive that tools are useless.
 	MinToolOutputBytes = 4 * 1024 // 4 KiB
+
+	// grepLineKeep is the per-line retention budget for cog_grep_files.
+	// Matches the old bufio.Scanner default token size so match coverage is
+	// unchanged for lines that previously worked, while lines beyond it are
+	// now truncated-and-drained instead of silently aborting the scan.
+	grepLineKeep = 64 * 1024 // 64 KiB
 )
 
 // capToolOutput truncates s to at most maxBytes, cutting at the last valid
@@ -145,4 +153,71 @@ func (m *MCPServer) MaxToolOutputBytes() int {
 		return DefaultMaxToolOutputBytes
 	}
 	return m.cfg.EffectiveMaxToolOutputBytes()
+}
+
+// readLineCapped reads one line from r (terminated by '\n' or EOF), retaining
+// at most keep bytes of line content (excluding the trailing newline). Unlike
+// bufio.Scanner, it can NEVER fail because a line is longer than a buffer —
+// over-long lines are truncated, not errored. This is the fix for the
+// "bufio.Scanner: token too long" cliff on minified one-line blobs.
+//
+// When drain is true the remainder of an over-long line is consumed so the
+// reader is positioned at the start of the next line (needed when the caller
+// wants subsequent lines, e.g. grep output parsing). When drain is false the
+// function returns as soon as keep bytes have been retained, leaving the rest
+// of the line unread — cog_read_file uses this so it never reads more than
+// ~maxBytes+ε from disk regardless of file size.
+//
+// Returns:
+//
+//	line     — up to keep bytes of line content, no trailing '\n'
+//	overflow — true when the line content was longer than keep
+//	err      — io.EOF only when no bytes remained at the start of the call;
+//	           any other error is a real read failure.
+func readLineCapped(r *bufio.Reader, keep int, drain bool) (line []byte, overflow bool, err error) {
+	first := true
+	for {
+		chunk, rerr := r.ReadSlice('\n')
+		if len(chunk) == 0 && rerr == io.EOF {
+			if first {
+				return nil, false, io.EOF
+			}
+			// EOF after accumulating a final unterminated line.
+			return line, overflow, nil
+		}
+		first = false
+
+		content := chunk
+		complete := rerr == nil // found the '\n'
+		if complete {
+			content = content[:len(content)-1] // strip '\n'
+		}
+
+		if len(line) < keep {
+			take := content
+			if len(line)+len(take) > keep {
+				take = take[:keep-len(line)]
+				overflow = true
+			}
+			// append copies — chunk is only valid until the next ReadSlice.
+			line = append(line, take...)
+		} else if len(content) > 0 {
+			overflow = true
+		}
+
+		switch {
+		case complete:
+			return line, overflow, nil
+		case rerr == bufio.ErrBufferFull:
+			if overflow && !drain {
+				// Caller doesn't need the rest of this line; stop reading.
+				return line, overflow, nil
+			}
+			continue
+		case rerr == io.EOF:
+			return line, overflow, nil
+		default:
+			return line, overflow, rerr
+		}
+	}
 }
