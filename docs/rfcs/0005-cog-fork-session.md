@@ -35,10 +35,10 @@ The substrate already provides the primitives this RFC assembles:
 A fork event is therefore a small addition: a new `session.fork` CogBlock Kind, a body
 declaring the parent hash and overlay manifest, and downstream consumers interpreting it.
 
-The SRC reading: the session's state-at-T, observed from its own perspective, hashes to
-a canonical reference — `φ(s*) = s*` applied to sessions. A fork is publishing a marker
-that says "this point is now reference-able." The substrate needs no separate fork-table
-or snapshot store; the ledger is already hash-chained.
+The session's state-at-T, observed from its own perspective, hashes to a canonical
+reference. A fork is publishing a marker that says "this point is now reference-able."
+The substrate needs no separate fork-table or snapshot store; the ledger is already
+hash-chained.
 
 ## `session.fork` CogBlock Kind
 

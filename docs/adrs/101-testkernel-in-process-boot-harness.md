@@ -1,38 +1,35 @@
 ---
-cog:
-  version: "1.0.0"
-  type: adr
-  id: ADR-101
-  layer: spec
-
+type: adr
+id: ADR-101
+layer: spec
 title: "ADR-101: testkernel — In-Process Boot Harness for Daemon-Level Integration Testing"
 created: 2026-05-19
 status: accepted
 tags: [adr, kernel, testing, testkernel, reconcile, mcp, integration-testing]
 author: chaz
 refs:
-  - uri: cog://adr/092
-    rel: composes-with
+  - rel: composes-with
+    target: "[ADR-092](092-substrate-contracts-and-concurrency.md)"
     description: >
       ADR-092 specifies the Reconcilable contract (LoadConfig → FetchLive →
       ComputePlan → ApplyPlan → BuildState → WriteState) and the single-writer
       concurrency invariant. testkernel must not break either.
-  - uri: cog://adr/095
-    rel: composes-with
+  - rel: composes-with
+    target: "[ADR-095](095-daemon-reconcile-loop-driver.md)"
     description: >
       ADR-095 specifies ReconcileDaemon — the running loop that testkernel
       wraps. The Trigger/WaitForReconcile API in testkernel aligns with
       ReconcileDaemon.Trigger. PollInterval=0 semantics are specified here.
-  - uri: cog://adr/091
-    rel: composes-with
+  - rel: composes-with
+    target: "[ADR-091](091-substrate-as-named-architectural-layer.md)"
     description: >
       ADR-091 named the Substrate/Kernel/Module trichotomy. testkernel lives
       at the Kernel layer: it wraps the running engine, not the substrate
       libraries. Downstream modules (constellation, mod3) that need to
       integration-test against a real kernel instance access it through
       testkernel's exported API.
-  - uri: cog://adr/100
-    rel: composes-with
+  - rel: composes-with
+    target: "[ADR-100](100-substrate-library-extraction.md)"
     description: >
       ADR-100 is extracting the substrate library from internal/engine/. The
       testkernel package shape must be stable against that extraction: it depends
@@ -622,8 +619,7 @@ func TestIdentityProvider_MCPRoundTrip(t *testing.T) {
 
 The package is named `testkernel`. This is a plain descriptive name for a test
 helper that boots a kernel. No Eigen, EigSight, HyperCycle, or other
-research-vocabulary terms appear in this package name or its API per the
-standing rule on substrate naming (`feedback_substrate_naming_forward_direction.md`).
-The API surface uses Go-idiomatic names: `Boot`, `Stop`, `CallTool`,
-`TriggerReconcile`, `WaitForReconcile`. None of these encode framework
-terminology.
+research-vocabulary terms appear in this package name or its API — the standing
+rule on substrate naming prohibits them. The API surface uses Go-idiomatic names:
+`Boot`, `Stop`, `CallTool`, `TriggerReconcile`, `WaitForReconcile`. None of these
+encode framework terminology.

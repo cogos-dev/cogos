@@ -1,61 +1,56 @@
 ---
-cog:
-  version: "1.0.0"
-  type: adr
-  id: ADR-100
-  layer: spec
-
+type: adr
+id: ADR-100
+layer: spec
 title: "ADR-100: Substrate Library Extraction From Current Package Structure"
 created: 2026-05-19
 status: accepted
 tags: [adr, substrate, kernel, library-extraction, decomposition, supersedes-085]
 author: chaz
 refs:
-  - uri: cog://rfc/034
-    rel: implements
+  - rel: implements
     description: >
       The categorical cut; substrate-vs-kernel boundary; library extraction
-      is RFC-034 Phase 2. This ADR specifies the decomposition that Phase 2
-      executes. RFC-034 §13 named "ADR-085 advances to accepted" as the
-      implementation gate; this ADR supersedes that gate.
-  - uri: cog://adr/085
-    rel: supersedes
+      is the Phase 2 substrate-kernel split RFC. This ADR specifies the
+      decomposition that Phase 2 executes. That RFC's §13 named "ADR-085
+      advances to accepted" as the implementation gate; this ADR supersedes
+      that gate. (internal reference omitted)
+  - rel: supersedes
     description: >
       ADR-085 prescribed a per-provider decomposition into
       internal/providers/<name>/ subpackages. The actual architecture went to
       internal/engine/ as the primary dispatch core (250+ files). This ADR
       captures the current state and specifies the substrate-extraction path
-      forward from where the code actually is.
-  - uri: cog://rfc/035
-    rel: composes-with
+      forward from where the code actually is. (internal reference omitted)
+  - rel: composes-with
     description: >
       RFC-035 BlockClass — specifies the CogBlock/EventEnvelope unification
       (block.go:11-45 + ledger.go:23+ merge into a single ledger-entry type).
       The unified CogBlock is the canonical substrate atom. RFC-035 must land
       before Step 2 of the migration (pkg/substrate/block/ stabilization).
-  - uri: cog://rfc/036
-    rel: composes-with
+      (internal reference omitted)
+  - rel: composes-with
     description: >
       RFC-036 WorkspaceClass — specifies Workspace as a Binding Pattern
       instance. The WorkspaceClaim schema lives in the substrate library;
       the WorkspaceReconciler lives in the kernel. Step 3 coordinates with
-      RFC-036's schema landing.
-  - uri: cog://rfc/037
-    rel: composes-with
+      RFC-036's schema landing. (internal reference omitted)
+  - rel: composes-with
     description: >
       RFC-037 ChannelClass — specifies Channel as a Binding Pattern instance.
       Channel schema (channel_config.go, channel_types.go) moves to substrate;
       routing logic stays kernel. Step 3 coordinates with RFC-037.
-  - uri: cog://adr/091
-    rel: composes-with
+      (internal reference omitted)
+  - rel: composes-with
+    target: "[ADR-091](091-substrate-as-named-architectural-layer.md)"
     description: >
       ADR-091 named the Substrate/Kernel/Module trichotomy and established
       that pkg/cogblock, pkg/reconcile, pkg/uri, pkg/bep, pkg/cogfield are
       already separately-versioned Go modules. ADR-100 operationalizes
       ADR-091's trichotomy as a concrete migration plan from the current
       package state.
-  - uri: cog://adr/092
-    rel: composes-with
+  - rel: composes-with
+    target: "[ADR-092](092-substrate-contracts-and-concurrency.md)"
     description: >
       ADR-092 specified the ledger-writer concurrency contract and boot-order
       semantics. The substrate library migration must preserve the
@@ -191,17 +186,17 @@ kernel. Apply this check to any ambiguous case before filing a PR.
 
 ### Step 0: Mark ADR-085 `superseded`
 
-Update `~/workspaces/cog/.cog/adr/085-cogos-subpackage-decomposition.cog.md`
-frontmatter: `status: superseded`. Add forward-reference to ADR-100.
-Update RFC-034 §13 gate reference from "ADR-085 advances to accepted" to
-"ADR-100 advances to accepted."
+Update the ADR-085 document frontmatter: `status: superseded`. Add
+forward-reference to ADR-100. Update the substrate-kernel split RFC §13 gate
+reference from "ADR-085 advances to accepted" to "ADR-100 advances to
+accepted."
 
 This is a documentation-only change. No code moves. Gate: doc references
 consistent.
 
 ### Step 1: Create `pkg/substrate/` as empty Go module
 
-Create `~/workspaces/myrgic/cogos/pkg/substrate/go.mod` with module path
+Create `pkg/substrate/go.mod` with module path
 `github.com/myrgic/cogos/pkg/substrate`. Add to `go.work`. No code yet — just
 the module scaffold with a `doc.go` naming the layer.
 
@@ -324,10 +319,10 @@ Step 6 is a clean cut rather than a heroic refactor.
 
 | Document | Relationship |
 |---|---|
-| RFC-034 (Substrate-Kernel Categorical Split) | Parent RFC; this ADR is its decomposition prerequisite |
-| RFC-035 (BlockClass) | Unification prerequisite for Step 4; must ratify before Step 4 begins |
-| RFC-036 (WorkspaceClass) | Coordinates with Step 3 WorkspaceClaim schema extraction |
-| RFC-037 (ChannelClass) | Coordinates with Step 3 Channel schema extraction |
+| Substrate-Kernel Categorical Split RFC (internal reference omitted) | Parent RFC; this ADR is its decomposition prerequisite |
+| BlockClass RFC (internal reference omitted) | Unification prerequisite for Step 4; must ratify before Step 4 begins |
+| WorkspaceClass RFC (internal reference omitted) | Coordinates with Step 3 WorkspaceClaim schema extraction |
+| ChannelClass RFC (internal reference omitted) | Coordinates with Step 3 Channel schema extraction |
 | ADR-085 (superseded) | Historical record of the decomposition plan that diverged; this ADR is its replacement |
-| ADR-091 (Substrate as Named Architectural Layer) | Establishes the trichotomy; names the forcing functions that gate Step 6 |
-| ADR-092 (Substrate Contracts and Concurrency) | Specifies the ledger-writer contract that Step 4 must satisfy |
+| [ADR-091 (Substrate as Named Architectural Layer)](091-substrate-as-named-architectural-layer.md) | Establishes the trichotomy; names the forcing functions that gate Step 6 |
+| [ADR-092 (Substrate Contracts and Concurrency)](092-substrate-contracts-and-concurrency.md) | Specifies the ledger-writer contract that Step 4 must satisfy |

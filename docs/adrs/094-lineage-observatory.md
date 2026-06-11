@@ -14,8 +14,8 @@
 CogOS accumulates research insights across multiple intellectual lineage threads —
 connections between established science (Spencer-Brown, Maturana/Varela, Pattee,
 Rosen, Friston, von Foerster, L. Kauffman) and the working theoretical claims
-of the SRC/CogOS framework. These connections live in `~/workspaces/cog/.cog/mem/semantic/`
-as individual cogdocs, but there is no coherent mechanism for:
+of the broader research framework. These connections live in the substrate's
+semantic memory sector as individual cogdocs, but there is no coherent mechanism for:
 
 1. **Maintaining tier labels** (Tier 1 = established science → Tier 4 = speculative cosmological claims)
 2. **Tracking public exposure risk** for each node before external communication
@@ -132,7 +132,7 @@ When a corpus document contains a factual error:
 2. If the source document (outside lineage/) needs patching, patch in-place with the same frontmatter flag.
 3. The ProjectionReconciler will pick up the correction on the next reconcile cycle.
 
-**Canonical correction (2026-05-16):** ΔF = 0.7316 nats (NOT ln(2) = 0.6931) for the FEP cost at the eigenform operating point. τ₁ = ln(2) is correct and refers to the eigenform threshold radius — a distinct quantity. Correction sweep found no documents incorrectly conflating these values; the `self-reference-cost-synthesis.cog.md` canonical document is correct.
+**Canonical correction (2026-05-16):** A correction sweep validated the canonical values in the lineage node corpus for the FEP cost at the eigenform operating point. No documents were found incorrectly conflating the distinct quantities involved. The canonical node document is correct.
 
 ### §7 — What this ADR does NOT do
 

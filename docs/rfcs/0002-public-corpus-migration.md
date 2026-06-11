@@ -11,7 +11,7 @@
 
 ## Summary
 
-There is a substantial private design corpus — 89 ADRs and 25 RFCs in `~/workspaces/cog/.cog/` — that predates this repository's first public RFC and that the public source code already cites by ID. None of those documents have been ported to the public repo. Twenty-two ADRs and three RFCs are referenced from `.go`, `.md`, and `.yaml` files in this tree and resolve to nothing.
+There is a substantial private design corpus — 89 ADRs and 25 RFCs — that predates this repository's first public RFC and that the public source code already cites by ID. None of those documents have been ported to the public repo. Twenty-two ADRs and three RFCs are referenced from `.go`, `.md`, and `.yaml` files in this tree and resolve to nothing.
 
 This RFC is the canonical mirror-workflow doc. It does three things:
 
@@ -38,8 +38,8 @@ The forcing function created by PR #141 — "the first public RFC" — is the ri
 
 | Corpus | Location | Files | Status breakdown |
 |---|---|---|---|
-| Private ADRs | `~/workspaces/cog/.cog/adr/` | 89 | accepted: 56, proposed: 29, superseded: 4 |
-| Private RFCs | `~/workspaces/cog/.cog/conf/spec/rfc/` | 25 | draft: 25 (all) |
+| Private ADRs | private substrate workspace | 89 | accepted: 56, proposed: 29, superseded: 4 |
+| Private RFCs | private substrate workspace | 25 | draft: 25 (all) |
 | Public ADRs (today) | `docs/adrs/` (does not exist) | 0 | — |
 | Public RFCs (today) | `docs/rfcs/` (PR #141 creates) | 0 → 1 | RFC-0001 draft |
 
@@ -114,7 +114,7 @@ status: draft         # draft | accepted | superseded | rejected
 created: 2026-05-01
 authors: [chazmaniandinkle]
 mirrors:              # OPTIONAL; required only when this is a port
-  - source: cog://rfc/006
+  - source: cog://example/rfc/006
     rel: primary-source
     private_status: draft
     note: |
@@ -283,7 +283,7 @@ The third role of this document. Once Wave 0 lands, this section governs new des
 ### Mirroring a private precursor (Wave 1/2/3 work)
 
 1. **Confirm wave.** Wave 1 is bulk migration. Wave 3 is on-demand: only port a document when something new cites it.
-2. **Read the private source** (`~/workspaces/cog/.cog/adr/NNN-...cog.md` or RFC). Note the private status at this snapshot.
+2. **Read the private source** (ADR or RFC from the private substrate corpus). Note the private status at this snapshot.
 3. **Allocate the next public ID.**
 4. **Copy and adapt.** Public document is a derivative, not a verbatim copy. Adaptations:
    - Strip iteration history sections (Discussion Log, Simmer criteria, anything labeled "private" or that references private memory cogdocs).
@@ -470,7 +470,7 @@ A starting point for sub-wave PRs. Not run in CI; a one-shot the porting maintai
 """Skeleton: read a private ADR/RFC, emit a draft public mirror."""
 import re, sys, pathlib
 
-PRIVATE_ROOT = pathlib.Path("~/workspaces/cog/.cog").expanduser()
+PRIVATE_ROOT = pathlib.Path("~/.cog").expanduser()  # adjust to your private substrate path
 PUBLIC_ROOT = pathlib.Path(".")  # run from repo root
 
 def port(private_id: str, public_id: str, kind: str):
@@ -529,9 +529,9 @@ Use it as a draft-emitter; the maintainer hand-edits before opening the PR.
 ## References
 
 - [PR #141](https://github.com/cogos-dev/cogos/pull/141): RFC-0001, the first public RFC, drafted under the assumption no prior corpus existed; this RFC is the corrective.
-- Private RFC-006 (`cog://rfc/006`): Public-Class ADR Corpus and Mirror Workflow. The substrate ancestor of this RFC. Most decisions here adapt RFC-006's frontmatter and lifecycle conventions to the public corpus's realities.
-- Private RFC-004 (`cog://rfc/004`): ADR In-Review Status and Reshape Workflow. The private workflow doc CONTRIBUTING.md currently cites; replaced for public purposes by RFC-0002.
-- Private RFC-005 (`cog://rfc/005`): ADR Implementation-Tracking Frontmatter. A candidate for future public adoption (Open Question 3).
-- Private ADR-027 (`cog://adr/027`): RFC Process Adoption. Defines the private RFC lifecycle this RFC mirrors.
-- Private ADR-085 (`cog://adr/085`): CogOS Kernel Subpackage Decomposition. The load-bearing source for PR #141; will be ported as a public ADR in Wave 1c.
+- Private RFC-006: Public-Class ADR Corpus and Mirror Workflow. The substrate ancestor of this RFC. Most decisions here adapt RFC-006's frontmatter and lifecycle conventions to the public corpus's realities. (internal reference omitted)
+- Private RFC-004: ADR In-Review Status and Reshape Workflow. The private workflow doc CONTRIBUTING.md currently cites; replaced for public purposes by RFC-0002. (internal reference omitted)
+- Private RFC-005: ADR Implementation-Tracking Frontmatter. A candidate for future public adoption (Open Question 3). (internal reference omitted)
+- Private ADR-027: RFC Process Adoption. Defines the private RFC lifecycle this RFC mirrors. (internal reference omitted)
+- Private ADR-085: CogOS Kernel Subpackage Decomposition. The load-bearing source for PR #141; will be ported as a public ADR in Wave 1c. (internal reference omitted)
 - [CONTRIBUTING.md](../../CONTRIBUTING.md): currently cites private RFC-004; needs amendment as part of Wave 0.
