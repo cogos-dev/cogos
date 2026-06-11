@@ -6,7 +6,7 @@
 | Author   | @chazmaniandinkle                                                                              |
 | Tracking | [#TBD](https://github.com/myrgic/cogos/issues/) (Layer 2 + 3 follow-ups)                       |
 | Target   | `v0.7.0` (Layer 1, this RFC) · later releases (Layers 2 + 3)                                   |
-| Relates  | [RFC-0006 vLLM provider](0006-vllm-pagedattention-provider.md), `cog://rfc/027` (bus peering)  |
+| Relates  | [RFC-0006 vLLM provider](0006-vllm-pagedattention-provider.md), bus peering RFC (internal reference omitted) |
 
 ## Summary
 
