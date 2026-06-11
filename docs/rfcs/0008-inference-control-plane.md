@@ -54,11 +54,11 @@ Per RFC-034 (Observer-as-Reconciler vocabulary): an **Observer** is a Reconcilab
 
 Concretely: the `NodeStateObserver` is a Reconcilable instance (per RFC-034's Reconcilable Binding Pattern) with:
 - Read-only external authority over runtime processes and endpoints
-- An `ApplyPlan` that writes observation results to `cog://mem/semantic/observations/node-state/`
+- An `ApplyPlan` that writes observation results to `{workspace}/.cog/mem/semantic/observations/node-state/`
 - A reconcile interval (default 30s) driven by the standard Reconcilable scheduler
 
 This framing unifies Observatory with the rest of the substrate's reconciler hierarchy: the
-Observatory endpoint at `cog://mem/semantic/observations/node-state/` is written by the
+Observatory endpoint at `{workspace}/.cog/mem/semantic/observations/node-state/` is written by the
 NodeStateObserver instance, readable by the router at zero-copy cost.
 
 A Registry knows what providers are configured. A Reconciler knows what providers *should* be running and can restart them. An Observer (Reconcilable instance) knows what providers *are* running right now and writes that view to an Observatory endpoint. The router reads the endpoint; it does not poll the observer directly.
@@ -79,7 +79,7 @@ This RFC introduces the Observatory endpoint concept and the Observer-as-Reconci
 
 The **NodeStateObserver** is a Reconcilable instance (per RFC-034's Observer-as-Reconciler
 pattern) that probes inference runtime state on the local node and writes its observations
-to the **NodeStateObservatory** substrate endpoint at `cog://mem/semantic/observations/node-state/`.
+to the **NodeStateObservatory** substrate endpoint at `{workspace}/.cog/mem/semantic/observations/node-state/`.
 
 The distinction matters:
 - **NodeStateObserver** = the Reconcilable instance doing the probing. It has read-only
@@ -93,7 +93,7 @@ The distinction matters:
 
 - **Observer package**: `internal/observatory`
 - **Observer interface**: `NodeStateObserver` (Reconcilable; per RFC-034)
-- **Observatory endpoint**: `cog://mem/semantic/observations/node-state/`
+- **Observatory endpoint**: `{workspace}/.cog/mem/semantic/observations/node-state/`
 - **Scope**: local node only. Cross-node inference federation is future scope (§10).
 - **Source of truth**: direct process probes, HTTP health checks, `sysctl`/`vm_stat` for memory pressure, `diskutil`/`lsblk` for storage tier classification.
 
@@ -625,7 +625,7 @@ Remote endpoints (Anthropic API, OpenAI API, desktop machine at 192.168.x.x).
 
 The following are explicitly on the roadmap but out of scope for this RFC:
 
-**Cross-node inference federation**: extending the Observatory to observe InferenceChannels on peer nodes in a constellation. Today the Observatory is node-local. A multi-node extension would require the bus-peering layer (`cog://rfc/027`) and a distributed view-merge protocol. This is a natural follow-on once the local Observatory is stable.
+**Cross-node inference federation**: extending the Observatory to observe InferenceChannels on peer nodes in a constellation. Today the Observatory is node-local. A multi-node extension would require the bus-peering layer (bus-peering RFC; internal reference omitted) and a distributed view-merge protocol. This is a natural follow-on once the local Observatory is stable.
 
 **Predictive model preloading**: using access-pattern history from the Observatory's cold-start log to predict which model will be needed next and issue a background warm-up. The Observatory already records `LastInferenceAt` per model; a scheduler could use this to preload during idle periods.
 
@@ -640,4 +640,4 @@ The following are explicitly NOT in this RFC:
 - **vLLM block-API integration**. RFC-0006 covers the vLLM provider with PagedAttention block access. RFC-0008 classifies a vLLM channel as `cog-native` with `block_primitive: pagedattention`; the block-API wiring is RFC-0006's scope.
 - **ADR formalizing Observatory as a substrate primitive**. RFC-0008 introduces the term; the ADR is follow-on work.
 - **Layer 2 and Layer 3 of RFC-0007** (agent-card provider preference; router-aware autonomic loop). Those layers build on top of the provider resolution work; the Observatory feeds into Layer 3 when it lands.
-- **Bus-peering / cross-node events**. `cog://rfc/027` covers bus peering. Observatory events are node-local until that RFC's scope is resolved.
+- **Bus-peering / cross-node events**. The bus-peering RFC (internal reference omitted) covers bus peering. Observatory events are node-local until that RFC's scope is resolved.
