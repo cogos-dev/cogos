@@ -1,14 +1,19 @@
-# ADR-099: Node Identity Layering — Three-Layer Clarification and Canonical Path Forward
+---
+type: adr
+id: ADR-099
+title: "ADR-099: Node Identity Layering — Three-Layer Clarification and Canonical Path Forward"
+status: accepted
+created: 2026-05-18
+refs: "ADR-062, ADR-073"
+---
 
-**Status:** Accepted  
-**Date:** 2026-05-18  
-**Context:** Wave 6b audit surfaced two `NodeIdentity` implementations using different cryptographic schemes. This ADR investigates, names each layer, documents its scope, and specifies the canonical path forward.
+# ADR-099: Node Identity Layering — Three-Layer Clarification and Canonical Path Forward
 
 ---
 
 ## Problem statement
 
-A Wave 6b audit (see `project_substrate_implementation_state_2026-05-18.md`) reported a "node-identity schism" between two implementations:
+A Wave 6b audit reported a "node-identity schism" between two implementations:
 
 - `cog/.cog/node_identity.go` — Ed25519, with `NodeID = sha256(public_key_bytes + role + genesis_timestamp)` prefix `"sha256:"`
 - `constellation/identity.go` — ECDSA P-256, with `NodeID = hex(sha256(DER(pubkey)))`
@@ -31,7 +36,7 @@ The proposed resolution was to retire the former in favour of the latter, since 
 
 ### Layer 2 — Workspace operational identity (`cog/.cog/node_identity.go`)
 
-- **Package:** `package main` inside `~/workspaces/cog/.cog/` (the cog workspace CLI — NOT part of the cogos kernel repo)
+- **Package:** `package main` inside the cog workspace CLI (NOT part of the cogos kernel repo)
 - **Crypto:** Ed25519 (via `crypto.go:EnsureKeypair`)
 - **NodeID derivation:** `"sha256:" + hex(sha256(pubkey_bytes + role_bytes + genesis_timestamp_bytes))`
 - **Purpose:** Workspace-scoped stable identity for the cog workspace CLI (`serve.go`, `registration.go`, `cmd_signal.go`). Seeds the ledger genesis event and is referenced in workspace signals.
@@ -62,13 +67,13 @@ The audit characterised Layer 2 as a "drift" from Layer 1. The characterisation 
 | Crypto | ECDSA P-256 | Ed25519 | None |
 | Imported by cogos kernel? | No | No | Yes (cmd_node.go) |
 
-No code currently bridges Layer 1 and Layer 2. The cogos kernel does not import `github.com/myrgic/constellation`. The cog workspace CLI does not import `github.com/myrgic/constellation` either (it is a separate binary in `~/workspaces/cog/.cog/`).
+No code currently bridges Layer 1 and Layer 2. The cogos kernel does not import `github.com/myrgic/constellation`. The cog workspace CLI does not import `github.com/myrgic/constellation` either (it is a separate binary).
 
 ---
 
 ## The canonical path forward (decided)
 
-The design spec (`project_cogos_identity_as_crd.md`, Layer definitions) specifies:
+The three-layer identity design spec (Layer definitions) specifies:
 
 > L1 — Node: `kind: Node` (already exists), ECDSA P-256, NodeID = hex(SHA-256(DER(pubkey))), git-backed hash-chained ledger
 
@@ -122,8 +127,8 @@ When Layer 2 retirement is attempted, the migration procedure is:
 
 ## References
 
-- `project_cogos_identity_as_crd.md` — three-layer identity model (L1/L2/L3)
-- `project_substrate_implementation_state_2026-05-18.md` — audit that surfaced the gap
+- Three-layer identity model (L1/L2/L3) — (internal reference omitted)
+- Wave 6b implementation-state audit that surfaced the gap — (internal reference omitted)
 - `constellation/identity.go` — L1 canonical implementation
 - `cog/.cog/node_identity.go` — L2 workspace operational implementation
 - ADR-062 — Recursive Node Architecture (L3 node registration)
