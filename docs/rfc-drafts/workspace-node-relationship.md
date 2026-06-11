@@ -1,9 +1,13 @@
-# RFC Draft: workspace ⟷ node relationship (N:M)
+---
+type: rfc-draft
+title: "workspace ⟷ node relationship (N:M)"
+status: draft
+closes: "myrgic/cogos#160"
+companion: "myrgic/cogos#161"
+scope: "Design only — no implementation in this document"
+---
 
-**Status:** Draft — awaiting review and RFC number assignment
-**Closes:** myrgic/cogos#160
-**Companion:** myrgic/cogos#161 (mechanical on-disk demonstration)
-**Scope:** Design only — no implementation in this document
+# RFC Draft: workspace ⟷ node relationship (N:M)
 
 ---
 

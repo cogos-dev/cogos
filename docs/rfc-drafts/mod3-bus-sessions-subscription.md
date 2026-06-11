@@ -1,9 +1,13 @@
-# RFC Draft: mod3 subscribes to bus_sessions for cross-session voice presence
+---
+type: rfc-draft
+title: "mod3 subscribes to bus_sessions for cross-session voice presence"
+status: draft
+closes: "myrgic/cogos#156"
+depends_on: "myrgic/cogos#154"
+scope: "Design only — no implementation in this document"
+---
 
-**Status:** Draft — awaiting review and RFC number assignment  
-**Closes:** myrgic/cogos#156  
-**Depends on:** myrgic/cogos#154 (bus_sessions read path must be live before this data path is useful)  
-**Scope:** Design only — no implementation in this document
+# RFC Draft: mod3 subscribes to bus_sessions for cross-session voice presence
 
 ---
 
