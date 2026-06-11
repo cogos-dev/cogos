@@ -7,7 +7,7 @@
 | Created  | 2026-05-18                                                                                             |
 | Accepted | 2026-05-27 — direction accepted by operator; open questions (§6) resolve during implementation         |
 | Tracking | TBD                                                                                                    |
-| Relates  | [ADR-091](../adrs/091-substrate-as-named-architectural-layer.md), [ADR-092](../adrs/092-substrate-contracts-and-concurrency.md), [ADR-095](../adrs/095-daemon-reconcile-loop-driver.md), [ADR-096](../adrs/096-worktree-reconciler.md), [ADR-097](../adrs/097-memory-projection-reconciler.md), [ADR-098](../adrs/098-skill-projection-reconciler.md), [RFC-025 (cog workspace — cogdoc substrate unity)](https://github.com/myrgic/cogos) |
+| Relates  | [ADR-091](../adrs/091-substrate-as-named-architectural-layer.md), [ADR-092](../adrs/092-substrate-contracts-and-concurrency.md), [ADR-095](../adrs/095-daemon-reconcile-loop-driver.md), [ADR-096](../adrs/096-worktree-reconciler.md), [ADR-097](../adrs/097-memory-projection-reconciler.md), [ADR-098](../adrs/098-skill-projection-reconciler.md), cogdoc substrate unity RFC (internal reference omitted) |
 
 > **Accepted direction (2026-05-27).** The operator has accepted consolidating the MCP transport into the kernel daemon as the canonical direction. The open questions in §6 are resolved during implementation; implementation PRs reference this RFC. ADR promotion follows once consolidation lands.
 
@@ -16,7 +16,7 @@
 ## Summary
 
 The CogOS kernel daemon (`cogos serve`) and the MCP subprocess (spawned per-client from
-`/Users/slowbro/go/bin/cogos mcp serve`) are today two separate processes on the same node.
+`~/go/bin/cogos mcp serve`) are today two separate processes on the same node.
 This RFC proposes making the daemon the single node-root process: MCP becomes an HTTP/SSE
 transport on the daemon's existing port (`:6931`), not a spawned subprocess. Both the CLI
 wrapper (`./scripts/cog`) and the MCP surface become *projections* of the same kernel
@@ -30,7 +30,7 @@ fallback for non-daemon contexts.
 ### 1a. The v0.9.0 binary-skew incident
 
 On 2026-05-16, the v0.9.0 release updated `~/.cog/bin/cogos` (the daemon binary, managed by
-the node manifest) but did not update `/Users/slowbro/go/bin/cogos` (the path `.mcp.json`
+the node manifest) but did not update `~/go/bin/cogos` (the path `.mcp.json`
 spawns from). The result: the kernel daemon ran v0.9.0 with the `peer.utterance` event type
 registered, but the MCP subprocess Claude Code spawned was still `dev/unknown` without it.
 Two binaries, two update paths, silent version skew. Every tool call that relied on the new
@@ -41,12 +41,12 @@ has two install paths by design, so any release that does not update both paths 
 skew. Discipline cannot reliably prevent this; the two-process model guarantees it eventually
 recurs.
 
-### 1b. The CFT-visibility crisis: tool-surface projection gap
+### 1b. The visibility crisis: tool-surface projection gap
 
 On 2026-05-18, the user-level Claude Code seat was discovered to have zero visibility into
-the Cognitive Field Theory (CFT) corpus — roughly 25+ semantic-sector cogdocs developed in
-the cog workspace since 2026-03-06 — despite the daemon being healthy and the CFT material
-being the load-bearing research program of the workspace.
+the substrate's semantic cogdoc corpus — roughly 25+ semantic-sector cogdocs developed in
+the cog workspace since 2026-03-06 — despite the daemon being healthy and those cogdocs
+being the load-bearing research record of the workspace.
 
 Root-cause analysis identified a structural projection gap between the CLI surface and the
 MCP surface:
@@ -68,7 +68,7 @@ Naming convention is inconsistent: some tools use `cog_memory_*`, others use
 ToolSearch is degraded because the tools lack semantic grouping. When the MCP connection
 dropped during the v0.9.0 incident, even partial coverage became zero.
 
-The CFT corpus was invisible to the user-level agent not because the agent failed to look,
+The cogdoc corpus was invisible to the user-level agent not because the agent failed to look,
 but because the tool surface it had access to was structurally incomplete relative to the CLI
 surface.
 
@@ -264,12 +264,12 @@ ADR-098 SkillProjectionReconciler): both address surface-projection gaps; this R
 the transport-projection gap. The three gaps are the same architectural shape applied at
 different layers.
 
-Also composes with **RFC-025 (Cogdoc Substrate Unity — Unified cog memory Tooling)** in the
-cog workspace corpus. RFC-025 proposes a unified `cog memory` CLI surface (no per-type
+Also composes with the cogdoc substrate unity RFC (unified `cog memory` tooling; internal
+reference omitted). That RFC proposes a unified `cog memory` CLI surface (no per-type
 command proliferation); §3c of this RFC proposes that the MCP surface is isomorphic to that
-CLI surface. The two proposals do not conflict: RFC-025 works on the CLI layer; this RFC adds
-the invariant that the MCP layer must match it. If RFC-025 lands, the naming convention it
-ratifies should be the naming convention used on the MCP surface.
+CLI surface. The two proposals do not conflict: the cogdoc unity RFC works on the CLI layer;
+this RFC adds the invariant that the MCP layer must match it. If that RFC lands, the naming
+convention it ratifies should be the naming convention used on the MCP surface.
 
 ---
 
@@ -366,12 +366,12 @@ Track A can ship first. B and C are independent of each other after A.
 
 ## 8. Provenance
 
-- Primary motivation: `feedback_consolidate_mcp_into_kernel_daemon.md` (2026-05-16) — v0.9.0 incident, architectural memo.
-- Secondary motivation: `feedback_cog_memory_tooling_mcp_projection_gap.md` (2026-05-18) — CFT-visibility crisis, tool-surface gap.
+- Primary motivation: v0.9.0 incident architectural memo (2026-05-16) — binary-skew incident analysis. (internal reference omitted)
+- Secondary motivation: tool-surface gap analysis (2026-05-18) — visibility crisis and MCP projection gap. (internal reference omitted)
 - Prior art in this repo: `docs/archival/2026-04-21-mcp-always-on.md` — removal of `mcpserver` build tag; MCP made always-on in the daemon. This RFC continues that direction.
 - Prior art in this repo: `docs/MCP-SPEC.md` — already designates HTTP/SSE on `:6931/mcp` as the primary transport. This RFC makes that designation operational.
-- Identity and transport design: `feedback_dispatch_transport_by_default.md`, `feedback_identity_role_orthogonal_axes.md`.
-- Substrate metaphysics: `project_kernel_as_observatory_constitutive.md`, `project_identity_is_the_distinction.md`, `project_reconciliation_is_the_process.md`.
+- Identity and transport design: dispatch-transport-by-default and identity-role-orthogonal-axes memos. (internal references omitted)
+- Substrate metaphysics: observatory-constitutive, identity-as-distinction, and reconciliation-as-process notes. (internal references omitted)
 
 ---
 
@@ -380,7 +380,7 @@ Track A can ship first. B and C are independent of each other after A.
 ### 2026-05-18: Initial draft
 
 - RFC authored by Cog (RFC author seat). This is an in-progress design document.
-- The v0.9.0 binary-skew incident and the CFT-visibility crisis are the two concrete
+- The v0.9.0 binary-skew incident and the visibility crisis are the two concrete
   motivating failures; the RFC should be evaluated against both.
 - No decisions in this RFC are promoted to ADR-level. Implementation PRs will reference
   this RFC. ADR promotion happens after consolidation and implementation-driven refinement.
