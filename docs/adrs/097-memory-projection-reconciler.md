@@ -28,7 +28,7 @@ CogOS operators maintain two structurally distinct memory surfaces:
 - Cross-session, cross-workspace coherent — the substrate-canonical memory layer
 - Section-aware reads via `cog_memory_toc` / `--section` for large documents
 
-As of 2026-05-17, the operator's Claude Code memories at `~/.claude/projects/-Users-slowbro/memory/` contain dozens of active records — feedback memories, session summaries, project state, user profile — none of which appear as cogdocs in `.cog/mem/`. The substrate's kernel cannot search these memories using `cog_memory_search`. Conversely, the substrate's cogdocs at `cog://mem/semantic/insights/` (a corpus of hundreds of research documents) are not visible to in-session Claude Code reads, which rely on MEMORY.md for context.
+As of 2026-05-17, the operator's Claude Code memories at `~/.claude/projects/*/memory/` contain dozens of active records — feedback memories, session summaries, project state, user profile — none of which appear as cogdocs in `.cog/mem/`. The substrate's kernel cannot search these memories using `cog_memory_search`. Conversely, the substrate's cogdocs in the semantic sector (a corpus of hundreds of research documents) are not visible to in-session Claude Code reads, which rely on MEMORY.md for context.
 
 The two surfaces drift apart by construction. Every Claude Code memory written after the last manual sync widens the gap. Without a reconciliation mechanism, the operator's memory infrastructure bifurcates: operator-personal knowledge in one surface, substrate-indexed knowledge in another, with no automated path between them.
 
@@ -292,7 +292,7 @@ The Claude Code memory filename encodes the slug but not the semantic category. 
 
 - Existing Claude Code memories that have never been projected classify as `claude-code-only-needs-projection` with an empty ledger. This is the legitimate starting state: the empty ledger means no prior projection state exists; all memories classify as needing a first projection. This is not an error condition; it is the expected first-run state (same reasoning as ADR-096 §7).
 - Substrate cogdocs that are not memory projections and do not carry `projection.target: claude-code` are unaffected by this Reconcilable. The reconciler only manages cogdocs it created or that have opted in via projection frontmatter.
-- The reconciler does not touch `cog://mem/semantic/lineage/` (managed by `ProjectionReconciler` per ADR-094) or any cogdoc managed by another Reconcilable. Domain isolation is enforced by the `projection.origin` frontmatter field.
+- The reconciler does not touch the lineage sector (managed by `ProjectionReconciler` per ADR-094) or any cogdoc managed by another Reconcilable. Domain isolation is enforced by the `projection.origin` frontmatter field.
 
 ## Implementation
 
@@ -319,7 +319,7 @@ A `MemoryProjectionReconciler` prototype MUST be able to classify each memory pa
 | Both files exist; one modified since last hash | `paired-drift` |
 | Both files exist; both modified since last hash | `conflict-both-modified` |
 
-With an empty ledger, all operator-personal Claude Code memories at `~/.claude/projects/-Users-slowbro/memory/` classify as `claude-code-only-needs-projection` and all substrate cogdocs with `projection.target: claude-code` (if any) classify as `substrate-only-needs-projection`. This is the correct and expected starting classification — it is the first-run state.
+With an empty ledger, all operator-personal Claude Code memories at `~/.claude/projects/*/memory/` classify as `claude-code-only-needs-projection` and all substrate cogdocs with `projection.target: claude-code` (if any) classify as `substrate-only-needs-projection`. This is the correct and expected starting classification — it is the first-run state.
 
 Integration test cases to add:
 
@@ -344,4 +344,4 @@ Integration test cases to add:
 
 4. **Index ownership when both surfaces grow independently.** If the operator writes new Claude Code memories and new substrate cogdocs between ticks, both MEMORY.md and the substrate index grow independently. The reconciler's index merge (§3, Index reconciliation) adds new entries from each side to the other. This additive-only merge means duplicate-topic entries may accumulate if the operator creates parallel documents on both sides without pairing them. A future ADR should define a deduplication policy for the merged index.
 
-5. **Migration of existing operator-personal memories.** This ADR specifies the projection contract, not a migration plan. Projecting the operator's existing Claude Code memories (`~/.claude/projects/-Users-slowbro/memory/`) into substrate cogdocs is an operator-decided operation: the reconciler will classify all existing memories as `claude-code-only-needs-projection` on first run and will project them outward on the next apply cycle. Whether the operator wants this to happen automatically or wants to review and approve projections before they land in the substrate is a configuration decision outside this ADR's scope. A `dry-run` mode for the first apply cycle (producing a classification report without writing any cogdocs) is recommended as implementation guidance but not specified as a contract here.
+5. **Migration of existing operator-personal memories.** This ADR specifies the projection contract, not a migration plan. Projecting the operator's existing Claude Code memories (`~/.claude/projects/*/memory/`) into substrate cogdocs is an operator-decided operation: the reconciler will classify all existing memories as `claude-code-only-needs-projection` on first run and will project them outward on the next apply cycle. Whether the operator wants this to happen automatically or wants to review and approve projections before they land in the substrate is a configuration decision outside this ADR's scope. A `dry-run` mode for the first apply cycle (producing a classification report without writing any cogdocs) is recommended as implementation guidance but not specified as a contract here.
