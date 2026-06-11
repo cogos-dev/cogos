@@ -194,7 +194,7 @@ No Go code changes in this refinement. The theorem candidate does not gate imple
 
 - Issue #208
 - Kauffman (2009) §V, "Reflexivity and Eigenform"; eigenform lineage (von Foerster 1981, Spencer-Brown 1969); Lambek's lemma; ADR-059
-- Council cogdocs: `cog://mem/semantic/council/2026-05-05/` (private; verbatim not reproduced here)
+- Council cogdocs: 2026-05-05 deliberation record (private; verbatim not reproduced here)
 
 ---
 
