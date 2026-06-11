@@ -39,7 +39,7 @@ The workspace-wins override is silent: if `~/.claude/skills/my-skill/SKILL.md` a
 
 ### Why this is the worst provenance offender in the projection audit
 
-The three-field provenance audit (see `feedback_projection_provenance_three_field_minimality.md`, surfaced in ADR-097 §8) graded existing projection mechanisms against the three-field test:
+The three-field provenance audit (surfaced in ADR-097 §8) graded existing projection mechanisms against the three-field test:
 
 | Mechanism | `projection.source-path` | `projection.origin` | `projection.last-hash` | Grade |
 |---|---|---|---|---|
@@ -138,7 +138,7 @@ Per ADR-092 §3, `ApplyPlan` is idempotent: writing the same projection content 
 
 ### §3 — Three-field provenance contract on projected artifacts
 
-Every skill projection written by this reconciler carries the minimum three-field provenance contract (per `feedback_projection_provenance_three_field_minimality.md`):
+Every skill projection written by this reconciler carries the minimum three-field provenance contract (per the three-field provenance minimality memo; internal reference omitted):
 
 ```yaml
 ---
