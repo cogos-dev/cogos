@@ -144,12 +144,12 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
 
 ```json
 {
-  "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
+  "uri": "cog://mem/semantic/architecture/example-design-spec",
   "resolved": true,
-  "filesystem_path": "$COG_WORKSPACE/.cog/mem/semantic/architecture/cogos-v3-design-spec.cog.md",
+  "filesystem_path": "$COG_WORKSPACE/.cog/mem/semantic/architecture/example-design-spec.cog.md",
   "metadata": {
     "type": "architecture",
-    "title": "CogOS v3 Design Specification",
+    "title": "Example Design Specification",
     "created": "2026-03-19T00:00:00Z",
     "modified": "2026-03-19T18:30:00Z",
     "status": "active",
@@ -168,7 +168,7 @@ This is useful for `.mcp.json` configurations that launch the server as a subpro
 
 ```
 Tool: cog_resolve_uri
-Input: { "uri": "cog://mem/episodic/2026-03-19/session-01" }
+Input: { "uri": "cog://mem/episodic/2026-03-19/example-session" }
 → Returns path, type, tags, timestamps for that session CogDoc.
 ```
 
@@ -219,14 +219,14 @@ Input: { "uri": "cog://mem/episodic/2026-03-19/session-01" }
   "query_sector": "all",
   "results": [
     {
-      "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
+      "uri": "cog://mem/semantic/architecture/example-design-spec",
       "salience": 0.97,
       "sector": "semantic",
-      "title": "CogOS v3 Design Specification",
+      "title": "Example Design Specification",
       "last_accessed": "2026-03-19T18:30:00Z"
     },
     {
-      "uri": "cog://mem/episodic/2026-03-19/von-foerster-session",
+      "uri": "cog://mem/episodic/2026-03-19/example-design-session",
       "salience": 0.91,
       "sector": "episodic",
       "title": "Von Foerster Architecture Session",
@@ -298,7 +298,7 @@ Input: { "limit": 5, "min_score": 0.8, "sector": "semantic" }
       "tokens": 4500,
       "items": [
         {
-          "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
+          "uri": "cog://mem/semantic/architecture/example-design-spec",
           "salience": 0.97,
           "tokens": 2800,
           "excerpt": "... trimmed content ..."
@@ -324,7 +324,7 @@ Input: { "limit": 5, "min_score": 0.8, "sector": "semantic" }
 
 ```
 Tool: cog_assemble_context
-Input: { "token_budget": 4000, "focus_uri": "cog://mem/semantic/architecture/cogos-v3-design-spec" }
+Input: { "token_budget": 4000, "focus_uri": "cog://mem/semantic/architecture/example-design-spec" }
 → Returns a compact context package biased toward the v3 design spec.
 ```
 
@@ -520,8 +520,8 @@ Input: {}
   "total_matches": 3,
   "results": [
     {
-      "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
-      "title": "CogOS v3 Design Specification",
+      "uri": "cog://mem/semantic/architecture/example-design-spec",
+      "title": "Example Design Specification",
       "score": 0.94,
       "sector": "semantic",
       "tags": ["v3", "architecture"],
@@ -633,17 +633,17 @@ Input: { "format": "summary" }
 
 ```json
 {
-  "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
-  "filesystem_path": "$COG_WORKSPACE/.cog/mem/semantic/architecture/cogos-v3-design-spec.cog.md",
+  "uri": "cog://mem/semantic/architecture/example-design-spec",
+  "filesystem_path": "$COG_WORKSPACE/.cog/mem/semantic/architecture/example-design-spec.cog.md",
   "frontmatter": {
-    "title": "CogOS v3 Design Specification",
+    "title": "Example Design Specification",
     "type": "architecture",
     "created": "2026-03-19",
     "tags": ["v3", "architecture"],
     "memory_sector": "semantic",
     "salience": "critical"
   },
-  "body": "# CogOS v3 Design Specification\n\n> **Origin:** Derived 2026-03-19...",
+  "body": "# Example Design Specification\n\n> **Origin:** Derived 2026-03-19...",
   "section": null,
   "tokens": 4500,
   "truncated": false
@@ -654,7 +654,7 @@ Input: { "format": "summary" }
 
 ```json
 {
-  "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec#the-continuous-process",
+  "uri": "cog://mem/semantic/architecture/example-design-spec#the-continuous-process",
   "section": {
     "anchor": "the-continuous-process",
     "title": "The Continuous Process",
@@ -669,7 +669,7 @@ Input: { "format": "summary" }
 
 ```
 Tool: cog_read_cogdoc
-Input: { "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec#two-axioms" }
+Input: { "uri": "cog://mem/semantic/architecture/example-design-spec#two-axioms" }
 → Returns just the "Two Axioms" section from the v3 design spec.
 ```
 
@@ -858,14 +858,14 @@ Input: {
   },
   "index": [
     {
-      "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec",
+      "uri": "cog://mem/semantic/architecture/example-design-spec",
       "type": "architecture",
       "tags": ["v3", "architecture", "design-spec"]
     }
   ],
   "refs": {
-    "cog://mem/semantic/architecture/cogos-v3-design-spec": [
-      "cog://mem/semantic/project/cogos-v2-overview",
+    "cog://mem/semantic/architecture/example-design-spec": [
+      "cog://mem/semantic/project/example-overview",
       "cog://identity"
     ]
   }
@@ -916,7 +916,7 @@ MCP resources provide read-only, subscription-capable snapshots of runtime state
   "total_items": 847,
   "above_threshold": 23,
   "items": [
-    { "uri": "cog://mem/semantic/architecture/cogos-v3-design-spec", "salience": 0.97 }
+    { "uri": "cog://mem/semantic/architecture/example-design-spec", "salience": 0.97 }
   ]
 }
 ```
@@ -1243,7 +1243,7 @@ Start the full HTTP server on a random port, connect an SSE client, and verify t
 
 ## References
 
-- [CogOS v3 Design Specification](../../.cog/mem/semantic/architecture/cogos-v3-design-spec.cog.md) — The first-principles architecture this spec implements
+- [Example Design Specification](../../.cog/mem/semantic/architecture/example-design-spec.cog.md) — The first-principles architecture this spec implements
 - [CogOS v2 MCP Tools](../../services/cogos-api/README-MCP.md) — The 45-tool v2 server this replaces
 - [Official Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk) — v1.4.1, maintained by MCP org + Google
 - [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go) — Community Go MCP library (alternative)
