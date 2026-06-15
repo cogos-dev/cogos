@@ -95,6 +95,43 @@ jobs:
           go build $tagflag -ldflags="${LDFLAGS}" -o "$output" ./cmd/cogos/
           ls -lh "$output"
 
+      # Guard against the CGO_ENABLED=0 / missing -tags fts5 regression recurring
+      # silently. A real FTS5 build embeds the fts5 module and omits the
+      # mattn/go-sqlite3 CGO stub string; a stubbed build is the inverse. We assert
+      # the artifact's actual contents rather than trusting the matrix flags, so the
+      # build path can't drift away from the Makefile (BUILD_TAGS=fts5 + host CGO)
+      # without failing the release loudly.
+      - name: Verify FTS5 is compiled in
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          BUILD_TAGS: ${{ matrix.tags }}
+        run: |
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          output="dist/cogos-${GOOS}-${GOARCH}${ext}"
+          fts5_count="$(strings "$output" | grep -c fts5 || true)"
+          stub_count="$(strings "$output" | grep -c 'go-sqlite3 requires cgo to work' || true)"
+          echo "fts5 symbols: $fts5_count ; go-sqlite3 cgo-stub: $stub_count"
+          case "$BUILD_TAGS" in
+            *fts5*)
+              if [ "$fts5_count" -lt 1 ]; then
+                echo "::error::$output has no fts5 symbols — FTS5 not compiled in (CGO/-tags fts5 regression)"
+                exit 1
+              fi
+              if [ "$stub_count" -ne 0 ]; then
+                echo "::error::$output contains the go-sqlite3 CGO stub — built without CGO"
+                exit 1
+              fi
+              echo "OK: real FTS5 module present, no CGO stub."
+              ;;
+            *)
+              # Windows (CGO_ENABLED=0): FTS5 is intentionally unavailable. Record,
+              # don't assert — this target is not a kernel-daemon host.
+              echo "NOTE: $output is a non-CGO build (Windows); FTS5 intentionally absent."
+              ;;
+          esac
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
