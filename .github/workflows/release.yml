@@ -12,9 +12,60 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
-  release:
+  # Build each artifact natively on its own runner. The kernel's FTS5 search
+  # engine reaches sqlite through github.com/mattn/go-sqlite3, which is a CGO
+  # binding: it requires BOTH `-tags fts5` AND CGO_ENABLED=1 to compile a real
+  # sqlite/fts5 module. With CGO_ENABLED=0 the driver links a non-functional
+  # stub and every query fails with "no such module: fts5" — cog_search_memory
+  # returns zero rows on a healthy, FTS-populated DB ("dark search").
+  #
+  # We build natively (not cross-compile) because CGO cross-compilation needs a
+  # C toolchain per target triple; a single Linux runner cannot produce a CGO
+  # darwin or windows binary without extra cross toolchains. Native per-OS
+  # runners give each target its own host C compiler for free. This mirrors the
+  # Makefile, which builds darwin/linux with host CGO + BUILD_TAGS=fts5 and only
+  # drops CGO for Windows (tree-sitter's CGO path is avoided there; Windows is
+  # not a kernel-daemon target).
+  build:
     needs: ci
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            cgo: '1'
+            tags: 'fts5'
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            cgo: '1'
+            tags: 'fts5'
+          - goos: darwin
+            goarch: arm64
+            runner: macos-14
+            cgo: '1'
+            tags: 'fts5'
+          - goos: darwin
+            goarch: amd64
+            runner: macos-13
+            cgo: '1'
+            tags: 'fts5'
+          # Windows: CGO_ENABLED=0 matches the Makefile (avoids tree-sitter's
+          # CGO path). FTS5 is unavailable in this build; Windows is not a
+          # kernel-daemon target, so dark-search does not apply to it.
+          - goos: windows
+            goarch: amd64
+            runner: ubuntu-latest
+            cgo: '0'
+            tags: ''
+          - goos: windows
+            goarch: arm64
+            runner: ubuntu-latest
+            cgo: '0'
+            tags: ''
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,21 +75,45 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build binaries
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+          BUILD_TAGS: ${{ matrix.tags }}
         run: |
           mkdir -p dist
           VERSION="${GITHUB_REF_NAME}"
           BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           LDFLAGS="-s -w -X github.com/myrgic/cogos/internal/engine.Version=${VERSION} -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME}"
-          for GOOS in linux darwin windows; do
-            for GOARCH in amd64 arm64; do
-              ext=""
-              if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-              output="dist/cogos-${GOOS}-${GOARCH}${ext}"
-              echo "Building $output..."
-              CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o "$output" ./cmd/cogos/
-            done
-          done
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          output="dist/cogos-${GOOS}-${GOARCH}${ext}"
+          tagflag=""
+          if [ -n "$BUILD_TAGS" ]; then tagflag="-tags $BUILD_TAGS"; fi
+          echo "Building $output (CGO_ENABLED=$CGO_ENABLED tags='$BUILD_TAGS')..."
+          go build $tagflag -ldflags="${LDFLAGS}" -o "$output" ./cmd/cogos/
+          ls -lh "$output"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cogos-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
           cd dist && sha256sum cogos-* > checksums.txt
           ls -lh
 
