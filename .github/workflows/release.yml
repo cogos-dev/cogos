@@ -12,9 +12,60 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
-  release:
+  # Build each artifact natively on its own runner. The kernel's FTS5 search
+  # engine reaches sqlite through github.com/mattn/go-sqlite3, which is a CGO
+  # binding: it requires BOTH `-tags fts5` AND CGO_ENABLED=1 to compile a real
+  # sqlite/fts5 module. With CGO_ENABLED=0 the driver links a non-functional
+  # stub and every query fails with "no such module: fts5" — cog_search_memory
+  # returns zero rows on a healthy, FTS-populated DB ("dark search").
+  #
+  # We build natively (not cross-compile) because CGO cross-compilation needs a
+  # C toolchain per target triple; a single Linux runner cannot produce a CGO
+  # darwin or windows binary without extra cross toolchains. Native per-OS
+  # runners give each target its own host C compiler for free. This mirrors the
+  # Makefile, which builds darwin/linux with host CGO + BUILD_TAGS=fts5 and only
+  # drops CGO for Windows (tree-sitter's CGO path is avoided there; Windows is
+  # not a kernel-daemon target).
+  build:
     needs: ci
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            cgo: '1'
+            tags: 'fts5'
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            cgo: '1'
+            tags: 'fts5'
+          - goos: darwin
+            goarch: arm64
+            runner: macos-14
+            cgo: '1'
+            tags: 'fts5'
+          - goos: darwin
+            goarch: amd64
+            runner: macos-13
+            cgo: '1'
+            tags: 'fts5'
+          # Windows: CGO_ENABLED=0 matches the Makefile (avoids tree-sitter's
+          # CGO path). FTS5 is unavailable in this build; Windows is not a
+          # kernel-daemon target, so dark-search does not apply to it.
+          - goos: windows
+            goarch: amd64
+            runner: ubuntu-latest
+            cgo: '0'
+            tags: ''
+          - goos: windows
+            goarch: arm64
+            runner: ubuntu-latest
+            cgo: '0'
+            tags: ''
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,21 +75,82 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build binaries
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+          BUILD_TAGS: ${{ matrix.tags }}
         run: |
           mkdir -p dist
           VERSION="${GITHUB_REF_NAME}"
           BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           LDFLAGS="-s -w -X github.com/myrgic/cogos/internal/engine.Version=${VERSION} -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME}"
-          for GOOS in linux darwin windows; do
-            for GOARCH in amd64 arm64; do
-              ext=""
-              if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-              output="dist/cogos-${GOOS}-${GOARCH}${ext}"
-              echo "Building $output..."
-              CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="${LDFLAGS}" -o "$output" ./cmd/cogos/
-            done
-          done
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          output="dist/cogos-${GOOS}-${GOARCH}${ext}"
+          tagflag=""
+          if [ -n "$BUILD_TAGS" ]; then tagflag="-tags $BUILD_TAGS"; fi
+          echo "Building $output (CGO_ENABLED=$CGO_ENABLED tags='$BUILD_TAGS')..."
+          go build $tagflag -ldflags="${LDFLAGS}" -o "$output" ./cmd/cogos/
+          ls -lh "$output"
+
+      # Guard against the CGO_ENABLED=0 / missing -tags fts5 regression recurring
+      # silently. A real FTS5 build embeds the fts5 module and omits the
+      # mattn/go-sqlite3 CGO stub string; a stubbed build is the inverse. We assert
+      # the artifact's actual contents rather than trusting the matrix flags, so the
+      # build path can't drift away from the Makefile (BUILD_TAGS=fts5 + host CGO)
+      # without failing the release loudly.
+      - name: Verify FTS5 is compiled in
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          BUILD_TAGS: ${{ matrix.tags }}
+        run: |
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          output="dist/cogos-${GOOS}-${GOARCH}${ext}"
+          fts5_count="$(strings "$output" | grep -c fts5 || true)"
+          stub_count="$(strings "$output" | grep -c 'go-sqlite3 requires cgo to work' || true)"
+          echo "fts5 symbols: $fts5_count ; go-sqlite3 cgo-stub: $stub_count"
+          case "$BUILD_TAGS" in
+            *fts5*)
+              if [ "$fts5_count" -lt 1 ]; then
+                echo "::error::$output has no fts5 symbols — FTS5 not compiled in (CGO/-tags fts5 regression)"
+                exit 1
+              fi
+              if [ "$stub_count" -ne 0 ]; then
+                echo "::error::$output contains the go-sqlite3 CGO stub — built without CGO"
+                exit 1
+              fi
+              echo "OK: real FTS5 module present, no CGO stub."
+              ;;
+            *)
+              # Windows (CGO_ENABLED=0): FTS5 is intentionally unavailable. Record,
+              # don't assert — this target is not a kernel-daemon host.
+              echo "NOTE: $output is a non-CGO build (Windows); FTS5 intentionally absent."
+              ;;
+          esac
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cogos-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
           cd dist && sha256sum cogos-* > checksums.txt
           ls -lh
 
