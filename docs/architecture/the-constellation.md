@@ -35,7 +35,7 @@ A node in the Constellation is anything the ledger can refer to by a stable iden
 
 - **Cogdocs** — `.cog.md` files under `.cog/mem/`, indexed in `constellation.db`. The oldest and most numerous population. Already production.
 - **Identities** — keyed by NodeID (SHA-256 of pubkey DER in the trust-node projection). Today's kernel tracks a subset via session records; the trust-node projection specifies the full node lifecycle.
-- **Channels** — first-class node type proposed by the channel-provider-interface RFC (`${COGOS_WORKSPACE:-$HOME/workspaces/cog}/.cog/mem/semantic/designs/channel-provider-interface.cog.md`). Storage: cogdocs under `.cog/mem/procedural/channels/`. Not yet implemented.
+- **Channels** — first-class node type proposed by the channel-provider-interface RFC. Storage: cogdocs under `.cog/mem/procedural/channels/`. Not yet implemented.
 - **Sessions** — currently tracked by kernel session records; not yet canonicalized as Constellation nodes. Candidate for promotion.
 - **Agents** — partially represented (identity cards in `cog://agents/`, session records). No canonical node form yet; would compose from identity + session populations.
 - **Peer nodes** — remote CogOS instances federated via the trust-node projection. Today only present in the `myrgic/constellation` reference implementation; not yet integrated into the kernel's memory-graph.
@@ -174,7 +174,7 @@ To avoid overclaiming: this doc unifies the **architecture**, not the **code**.
 
 Two concrete tracks follow from this framing.
 
-**Near-term (design landed, code pending).** The channel-provider RFC at `${COGOS_WORKSPACE:-$HOME/workspaces/cog}/.cog/mem/semantic/designs/channel-provider-interface.cog.md` is the first adoption of this framing at the code level. It treats channels as a new node population in the Constellation, with attendance as the edge type and an attention-EMA as the signal — exactly the shape this doc makes generic. Adopting the RFC and prototyping the first `audio`-kind provider (mod3) validates whether the unified framing holds under implementation pressure.
+**Near-term (design landed, code pending).** The channel-provider RFC is the first adoption of this framing at the code level. It treats channels as a new node population in the Constellation, with attendance as the edge type and an attention-EMA as the signal — exactly the shape this doc makes generic. Adopting the RFC and prototyping the first `audio`-kind provider (mod3) validates whether the unified framing holds under implementation pressure.
 
 **Medium-term (convergence).** The larger work is running the trust-node projection's semantics natively in the kernel over the same `constellation.db` the memory-graph uses. Concretely: promote the kernel's session-record surface into a first-class identity-node table (with the columns the trust-node projection specifies); wire the 5-second heartbeat loop into the kernel's process state; teach the memory-graph indexer to emit events into the same `events/{seq:08d}.json` ledger shape the trust-node projection already uses; keep the public `myrgic/constellation` repo as the specification the kernel implements. When that lands, "the Constellation" stops being an architectural claim layered over two implementations and becomes one running system. The bridge interface at `internal/engine/constellation_bridge.go` is the seam where that convergence will happen.
 

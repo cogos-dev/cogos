@@ -15,18 +15,18 @@
 On 2026-05-13 a wave of dispatch operations created five parallel worktrees in the `mod3` repository to implement a modality schema wave. As of 2026-05-17 those worktrees remain on disk:
 
 ```
-/Users/slowbro/workspaces/myrgic/mod3/.claude/worktrees/mod3-modality-rfc        [wave/2026-05-13-mod3/modality-rfc]
-/Users/slowbro/workspaces/myrgic/mod3/.claude/worktrees/mod3-modality-schemas    [worktree-mod3-modality-schemas]
-/Users/slowbro/workspaces/myrgic/mod3/.claude/worktrees/mod3-pipecat             [wave/2026-05-13-mod3/pipecat]
-/Users/slowbro/workspaces/myrgic/mod3/.claude/worktrees/mod3-sidecar-doc         [wave/2026-05-13-mod3/sidecar-doc]
-/Users/slowbro/workspaces/myrgic/mod3/.claude/worktrees/mod3-worker-cli          [wave/2026-05-13-mod3/worker-cli]
+/Users/dev/workspaces/myrgic/mod3/.claude/worktrees/mod3-modality-rfc        [wave/2026-05-13-mod3/modality-rfc]
+/Users/dev/workspaces/myrgic/mod3/.claude/worktrees/mod3-modality-schemas    [worktree-mod3-modality-schemas]
+/Users/dev/workspaces/myrgic/mod3/.claude/worktrees/mod3-pipecat             [wave/2026-05-13-mod3/pipecat]
+/Users/dev/workspaces/myrgic/mod3/.claude/worktrees/mod3-sidecar-doc         [wave/2026-05-13-mod3/sidecar-doc]
+/Users/dev/workspaces/myrgic/mod3/.claude/worktrees/mod3-worker-cli          [wave/2026-05-13-mod3/worker-cli]
 ```
 
 Each holds real unmerged commits against `main`. The `cogos` repository has two additional agent-locked worktrees from in-flight or completed dispatch sessions:
 
 ```
-/Users/slowbro/workspaces/myrgic/cogos/.claude/worktrees/agent-a5647032c84cb9e61  [worktree-agent-a5647032c84cb9e61] locked
-/Users/slowbro/workspaces/myrgic/cogos/.claude/worktrees/agent-a8c054cc717aa7cb4  [(detached HEAD)] locked
+/Users/dev/workspaces/myrgic/cogos/.claude/worktrees/agent-a5647032c84cb9e61  [worktree-agent-a5647032c84cb9e61] locked
+/Users/dev/workspaces/myrgic/cogos/.claude/worktrees/agent-a8c054cc717aa7cb4  [(detached HEAD)] locked
 ```
 
 The substrate cannot safely automate cleanup of any of these seven worktrees because **no ledger entry exists that binds them to the dispatch identities that created them**. The substrate has no way to answer:
