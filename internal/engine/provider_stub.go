@@ -12,6 +12,7 @@ import (
 // StubProvider is an in-memory Provider for testing.
 type StubProvider struct {
 	name         string
+	model        string // reported by Model(); empty by default
 	response     string
 	err          error
 	latency      time.Duration
@@ -45,7 +46,7 @@ func NewStubProvider(name, response string) *StubProvider {
 }
 
 func (s *StubProvider) Name() string                       { return s.name }
-func (s *StubProvider) Model() string                      { return "" }
+func (s *StubProvider) Model() string                      { return s.model }
 func (s *StubProvider) Available(_ context.Context) bool   { return s.available }
 func (s *StubProvider) Capabilities() ProviderCapabilities { return s.capabilities }
 

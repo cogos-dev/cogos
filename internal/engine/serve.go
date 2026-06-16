@@ -926,6 +926,34 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// the gateway and dispatch tool share a single source of truth. The
 	// InjectKernelTools flag is handled below (kernel-agent / ollama path).
 	{
+		// Kernel-boundary admission: reject a non-empty model id that resolves
+		// to no known routing target (alias / "local" / provider name /
+		// provider-served model) with HTTP 400 + the available menu. Without
+		// this guard an unknown id (e.g. "gpt-4") falls through to the default
+		// provider, which POSTs the bogus id upstream and surfaces an opaque
+		// 500-wrapped 404. "" (default routing) and all known ids pass through.
+		if !IsKnownModel(s.router, req.Model) {
+			menu := AvailableModelIDs(s.router)
+			slog.Warn("chat: rejected unknown model id at kernel boundary",
+				"request_id", creq.Metadata.RequestID,
+				"model", req.Model,
+			)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"type": "invalid_request_error",
+					"message": fmt.Sprintf(
+						"unknown model %q; available models: %s",
+						req.Model, strings.Join(menu, ", "),
+					),
+					"param":            "model",
+					"available_models": menu,
+				},
+			})
+			return
+		}
+
 		mres := ResolveModelRequest(s.router, req.Model, creq.Metadata.RequestID)
 		creq.Metadata.PreferProvider = mres.PreferProvider
 		creq.ModelOverride = mres.ModelOverride

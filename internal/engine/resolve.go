@@ -130,3 +130,81 @@ func ResolveModelRequest(router Router, model string, requestID string) ModelRes
 	}
 	return res
 }
+
+// IsKnownModel reports whether a non-empty model string resolves to a real
+// routing target: an intent alias, the dynamic "local" alias, a registered
+// provider name, or a model served by some registered provider. It is the
+// kernel-boundary admission check used by the gateway to reject unknown model
+// ids with HTTP 400 instead of forwarding them to the default provider (which
+// would POST a bogus id upstream and surface an opaque 500-wrapped 404).
+//
+// The empty string is treated as KNOWN (it means "default routing", which is a
+// valid request — see ResolveModelRequest). A nil router can only validate the
+// static alias table; callers on the nil-router path (dispatch) must not use
+// this as a hard gate, because provider-name / provider-model matches require a
+// live router. The gateway always passes a live router.
+//
+// Like ResolveModelRequest, this function is side-effect-free.
+func IsKnownModel(router Router, model string) bool {
+	if model == "" {
+		return true // default routing is always valid
+	}
+	if _, ok := intentAliases[model]; ok {
+		return true
+	}
+	if model == "local" {
+		// "local" is a valid alias; whether a local provider is actually
+		// registered is handled by ResolveModelRequest's fallback-to-default
+		// behaviour, so do not reject it here.
+		return true
+	}
+	if router == nil {
+		// Without a live router only the static alias table is knowable.
+		return false
+	}
+	if _, ok := router.ProviderForName(model); ok {
+		return true
+	}
+	if _, ok := router.ProviderForModel(model); ok {
+		return true
+	}
+	return false
+}
+
+// AvailableModelIDs returns the menu of model ids the kernel accepts, in a
+// stable order: the intent aliases ("local" included), the raw frontier model
+// ids exposed at GET /v1/models, then any registered provider names not already
+// listed. Used to build the 400 response body when an unknown model is
+// rejected so the caller sees exactly what they may request. Side-effect-free.
+func AvailableModelIDs(router Router) []string {
+	// Intent aliases + the dynamic "local" alias, in a deterministic order
+	// that mirrors the /v1/models menu's intent-first layout.
+	ids := []string{
+		"foreground", "deliberation", "local",
+		"claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001",
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		seen[id] = true
+	}
+	// Append remaining static intent aliases (claude, codex, ollama, etc.)
+	// that are not already in the menu, for completeness.
+	for alias := range intentAliases {
+		if !seen[alias] {
+			ids = append(ids, alias)
+			seen[alias] = true
+		}
+	}
+	// Append registered provider names (e.g. claude-oauth, ollama, lmstudio).
+	if sr, ok := router.(*SimpleRouter); ok && sr != nil {
+		sr.mu.RLock()
+		for _, p := range sr.providers {
+			if name := p.Name(); name != "" && !seen[name] {
+				ids = append(ids, name)
+				seen[name] = true
+			}
+		}
+		sr.mu.RUnlock()
+	}
+	return ids
+}
