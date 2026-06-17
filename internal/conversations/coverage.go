@@ -116,6 +116,24 @@ func (t *CoverageTracker) All() map[string]SourceCoverage {
 	return out
 }
 
+// SetSource wholesale-replaces the stored coverage for source with a deep copy
+// of sc. Any existing coverage for source is discarded. Used to restore cached
+// coverage for an unchanged source without re-parsing it. Thread-safe.
+func (t *CoverageTracker) SetSource(source string, sc SourceCoverage) {
+	// Deep-copy the unmapped component counts so the caller's map (and the
+	// stored copy) cannot alias, mirroring All().
+	sc2 := sc
+	if sc.UnmappedComponentCounts != nil {
+		sc2.UnmappedComponentCounts = make(map[string]int, len(sc.UnmappedComponentCounts))
+		for k, v := range sc.UnmappedComponentCounts {
+			sc2.UnmappedComponentCounts[k] = v
+		}
+	}
+	t.mu.Lock()
+	t.sources[source] = &sc2
+	t.mu.Unlock()
+}
+
 // Reset clears all counters (used between reconcile runs if desired).
 func (t *CoverageTracker) Reset() {
 	t.mu.Lock()

@@ -50,14 +50,21 @@ type Provider struct {
 
 	// coverage accumulates per-source coverage metrics across reconcile runs.
 	coverage *CoverageTracker
+
+	// coverageCache holds the last computed coverage per ingest source so that
+	// unchanged (ActionSkip) sources can be served from cache instead of being
+	// re-parsed every reconcile cycle. Guarded by p.mu. ActionSkip is itself the
+	// drift-free signal, so a cached entry is valid whenever present.
+	coverageCache map[string]SourceCoverage
 }
 
 // NewProvider constructs a ConversationsProvider. The root workspace path
 // is set by LoadConfig. Tests may call LoadConfig directly with a temp dir.
 func NewProvider() *Provider {
 	return &Provider{
-		operation: reconcile.OperationIdle,
-		coverage:  NewCoverageTracker(),
+		operation:     reconcile.OperationIdle,
+		coverage:      NewCoverageTracker(),
+		coverageCache: make(map[string]SourceCoverage),
 	}
 }
 
@@ -145,6 +152,9 @@ func (p *Provider) LoadConfig(root string) (any, error) {
 	p.quarantine = NewQuarantineWriter(quarantineDir)
 	if p.coverage == nil {
 		p.coverage = NewCoverageTracker()
+	}
+	if p.coverageCache == nil {
+		p.coverageCache = make(map[string]SourceCoverage)
 	}
 	p.mu.Unlock()
 
@@ -411,15 +421,41 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 
 	var results []reconcile.Result
 	var errs []string
+	// liveSources collects ingest source names present this cycle, used to
+	// prune coverageCache for removed sources after the action loop.
+	liveSources := make(map[string]struct{})
 
 	for _, action := range plan.Actions {
 		if action.Action == reconcile.ActionSkip {
-			// For skipped ingest sources, re-accumulate coverage without
-			// touching the index (the data hasn't changed, but we need counts).
-			if isIngest, _ := action.Details["is_ingest"].(bool); isIngest && cov != nil {
-				if covErr := accumulateCoverage(action, ont, cov); covErr != nil {
-					// Non-fatal: log but don't fail the action.
-					errs = append(errs, fmt.Sprintf("coverage-only pass for %s: %v", action.Name, covErr))
+			// For skipped ingest sources the data has NOT drifted (ActionSkip is
+			// itself the drift-free signal — ComputePlan already verified the
+			// index matches the source). Serve coverage from cache to avoid a
+			// full re-parse of every file each cycle (the CPU hot-loop fix).
+			if isIngest, _ := action.Details["is_ingest"].(bool); isIngest {
+				// Always record the source as live, even when cov is nil, so the
+				// prune pass below never evicts a source that is still configured.
+				liveSources[action.Name] = struct{}{}
+				if cov != nil {
+					p.mu.Lock()
+					cached, warm := p.coverageCache[action.Name]
+					p.mu.Unlock()
+
+					if warm {
+						// Cache hit: restore without parsing.
+						cov.SetSource(action.Name, cached)
+					} else {
+						// Cold cache (e.g. first cycle after a restart): fall back to
+						// a one-time coverage-only parse, then prime the cache.
+						if covErr := accumulateCoverage(action, ont, cov); covErr != nil {
+							// Non-fatal: log but don't fail the action.
+							errs = append(errs, fmt.Sprintf("coverage-only pass for %s: %v", action.Name, covErr))
+						} else {
+							snap := cov.All()[action.Name]
+							p.mu.Lock()
+							p.coverageCache[action.Name] = snap
+							p.mu.Unlock()
+						}
+					}
 				}
 			}
 			continue
@@ -436,12 +472,25 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 			if isIngest, _ := action.Details["is_ingest"].(bool); isIngest {
 				// Normalized ingest: action.Name is the SOURCE; re-parse all
 				// of its files and rebuild every session of that source.
+				// Record the source as live before parsing so a transient parse
+				// error does not drop it from liveSources and cause a spurious
+				// cache eviction on the same cycle.
+				liveSources[action.Name] = struct{}{}
 				if applyErr := applyIngestSource(idx, action, ont, qw, cov); applyErr != nil {
 					res.Status = reconcile.ApplyFailed
 					res.Error = fmt.Sprintf("index ingest source %s: %v", action.Name, applyErr)
 					results = append(results, res)
 					errs = append(errs, res.Error)
 					continue
+				}
+				// applyIngestSource parsed + populated cov for this source;
+				// snapshot it into the cache so subsequent skip cycles can
+				// serve it without re-parsing.
+				if cov != nil {
+					snap := cov.All()[action.Name]
+					p.mu.Lock()
+					p.coverageCache[action.Name] = snap
+					p.mu.Unlock()
 				}
 				res.Status = reconcile.ApplySucceeded
 				res.CreatedID = action.Name
@@ -496,6 +545,13 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 	}
 
 	p.mu.Lock()
+	// Removed ingest sources emit no create/update/skip action this cycle, so
+	// any cache key absent from liveSources is a source that is gone.
+	for src := range p.coverageCache {
+		if _, ok := liveSources[src]; !ok {
+			delete(p.coverageCache, src)
+		}
+	}
 	p.lastErrors = errs
 	p.mu.Unlock()
 
