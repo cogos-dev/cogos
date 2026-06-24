@@ -40,33 +40,33 @@ var systemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*?</system-remi
 // rawRecord is the outermost envelope of every JSONL line.
 // We decode into this first and then dispatch on Type.
 type rawRecord struct {
-	Type        string          `json:"type"`
-	UUID        string          `json:"uuid"`
-	ParentUUID  string          `json:"parentUuid"`
-	SessionID   string          `json:"sessionId"`
-	Timestamp   string          `json:"timestamp"`
-	Message     json.RawMessage `json:"message"`
-	Content     string          `json:"content"` // system records use content string
-	UserType    string          `json:"userType"`
-	Entrypoint  string          `json:"entrypoint"`
-	IsSidechain bool            `json:"isSidechain"`
-	Level       string          `json:"level"`
+	Type       string          `json:"type"`
+	UUID       string          `json:"uuid"`
+	ParentUUID string          `json:"parentUuid"`
+	SessionID  string          `json:"sessionId"`
+	Timestamp  string          `json:"timestamp"`
+	Message    json.RawMessage `json:"message"`
+	Content    string          `json:"content"` // system records use content string
+	UserType   string          `json:"userType"`
+	Entrypoint string          `json:"entrypoint"`
+	IsSidechain bool           `json:"isSidechain"`
+	Level      string          `json:"level"`
 }
 
 // rawMessage is message.* within a user or assistant record.
 type rawMessage struct {
-	Role    string          `json:"role"`
-	Model   string          `json:"model"`
-	Content json.RawMessage `json:"content"`
+	Role    string             `json:"role"`
+	Model   string             `json:"model"`
+	Content json.RawMessage    `json:"content"`
 }
 
 // rawContentBlock is one element of message.content when it is an array.
 type rawContentBlock struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text"`
-	Thinking string          `json:"thinking"`
-	Input    json.RawMessage `json:"input,omitempty"`   // tool_use
-	Content  json.RawMessage `json:"content,omitempty"` // tool_result nested
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
+	Input     json.RawMessage `json:"input,omitempty"`    // tool_use
+	Content   json.RawMessage `json:"content,omitempty"`  // tool_result nested
 }
 
 // rawAITitle is the ai-title record type.
@@ -161,155 +161,6 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 	}
 
 	return scanner.Err()
-}
-
-// ParseSessionIncremental parses only the records found at or after the
-// reader's current position, assigning turn indexes starting at startTurnIndex.
-// It is the append-only counterpart to ParseSession: the caller seeks the
-// underlying file to meta.LastParsedByteOffset before calling, so only the
-// freshly-appended tail is scanned. Each emitted Turn is passed to callback;
-// callback may return false to abort early.
-//
-// startOffset is the absolute file offset the reader is positioned at (i.e.
-// meta.LastParsedByteOffset). The returned committedOffset is the absolute
-// offset just past the last NEWLINE-TERMINATED line consumed — the caller
-// persists it as the new cursor so the next cycle resumes there.
-//
-// Tail-line handling: a final line WITHOUT a trailing newline may be either a
-// complete record the writer has not yet newline-terminated, or a half-written
-// record. We parse it (so a complete record's turn is not delayed a cycle) but
-// do NOT advance committedOffset past it. The cursor therefore stays at the
-// start of that line, so the next cycle re-reads it; UUID dedup makes the
-// re-read idempotent, and a genuinely partial line simply fails to parse and
-// emits nothing. This guarantees no record is ever skipped or double-counted.
-//
-// Unlike ParseSession this uses bufio.Reader.ReadBytes so per-line byte
-// accounting is exact (bufio.Scanner buffers ahead and cannot report line
-// boundaries). The parsing/dedup/field-extraction rules are otherwise
-// identical to ParseSession.
-//
-// seenUUIDs may be supplied by the caller (UUIDs already present in the
-// session) so that re-appended historical records — common in resumed or
-// compacted JSONL — are deduplicated against the existing turn set, not just
-// within this tail. Pass nil for an empty set.
-func ParseSessionIncremental(r io.Reader, sessionID string, startTurnIndex int, startOffset int64, maxTurnLen int, meta *SessionMeta, seenUUIDs map[string]struct{}, callback func(turn Turn) bool) (committedOffset int64, err error) {
-	if maxTurnLen <= 0 {
-		maxTurnLen = 8192
-	}
-	if seenUUIDs == nil {
-		seenUUIDs = make(map[string]struct{})
-	}
-
-	br := bufio.NewReaderSize(r, 1024*1024)
-	turnIndex := startTurnIndex
-	committedOffset = startOffset
-	var consumed int64 // bytes consumed from the reader since startOffset
-
-	for {
-		line, readErr := br.ReadBytes('\n')
-		consumed += int64(len(line))
-		hasNewline := len(line) > 0 && line[len(line)-1] == '\n'
-		trimmed := trimLineEnd(line)
-
-		if len(trimmed) != 0 {
-			cont := consumeIncrementalRecord(trimmed, sessionID, &turnIndex, maxTurnLen, meta, seenUUIDs, callback)
-			// Advance the durable cursor only past newline-terminated lines.
-			// A trailing newline-less line is parsed (above) but its offset is
-			// withheld so the next cycle safely re-reads it.
-			if hasNewline {
-				committedOffset = startOffset + consumed
-			}
-			if !cont {
-				return committedOffset, nil
-			}
-		} else if hasNewline {
-			// Blank/whitespace-only line that is newline-terminated: nothing to
-			// emit, but the cursor still advances past it.
-			committedOffset = startOffset + consumed
-		}
-
-		if readErr != nil {
-			if readErr == io.EOF {
-				return committedOffset, nil
-			}
-			return committedOffset, readErr
-		}
-	}
-}
-
-// consumeIncrementalRecord decodes one JSONL line and, when it yields a Turn,
-// invokes callback. Returns false when the callback asks to abort. turnIndex is
-// advanced in place on a successful emit. This mirrors the per-record switch in
-// ParseSession exactly.
-func consumeIncrementalRecord(line []byte, sessionID string, turnIndex *int, maxTurnLen int, meta *SessionMeta, seenUUIDs map[string]struct{}, callback func(Turn) bool) bool {
-	var rec rawRecord
-	if err := json.Unmarshal(line, &rec); err != nil {
-		// Skip unparseable lines — consistent with ParseSession.
-		return true
-	}
-
-	if rec.Entrypoint != "" && meta.Entrypoint == "" {
-		meta.Entrypoint = rec.Entrypoint
-	}
-
-	switch rec.Type {
-	case "ai-title":
-		var t rawAITitle
-		if err := json.Unmarshal(line, &t); err == nil && t.Title != "" {
-			meta.Title = t.Title
-		}
-
-	case "user":
-		if rec.UUID != "" {
-			if _, dup := seenUUIDs[rec.UUID]; dup {
-				return true
-			}
-			seenUUIDs[rec.UUID] = struct{}{}
-		}
-		turn, ok := parseUserRecord(&rec, sessionID, *turnIndex, maxTurnLen)
-		if !ok {
-			return true
-		}
-		updateTimeBounds(meta, turn.Timestamp)
-		if !callback(turn) {
-			return false
-		}
-		*turnIndex++
-		meta.TurnCount = *turnIndex
-
-	case "assistant":
-		if rec.UUID != "" {
-			if _, dup := seenUUIDs[rec.UUID]; dup {
-				return true
-			}
-			seenUUIDs[rec.UUID] = struct{}{}
-		}
-		turn, ok := parseAssistantRecord(&rec, sessionID, *turnIndex, maxTurnLen)
-		if !ok {
-			return true
-		}
-		updateTimeBounds(meta, turn.Timestamp)
-		if !callback(turn) {
-			return false
-		}
-		*turnIndex++
-		meta.TurnCount = *turnIndex
-	}
-	return true
-}
-
-// trimLineEnd strips a trailing \n and optional \r from a raw line read by
-// bufio.Reader.ReadBytes, returning the record bytes. It does not allocate
-// when there is nothing to trim.
-func trimLineEnd(line []byte) []byte {
-	n := len(line)
-	if n > 0 && line[n-1] == '\n' {
-		n--
-		if n > 0 && line[n-1] == '\r' {
-			n--
-		}
-	}
-	return line[:n]
 }
 
 // parseUserRecord extracts a Turn from a type="user" raw record.
