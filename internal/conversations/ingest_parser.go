@@ -40,10 +40,11 @@ var knownIngestSchemas = map[string]bool{
 
 // validIngestRoles is the allowed set of role values per the schema contract.
 var validIngestRoles = map[string]Role{
-	"user":      RoleUser,
-	"assistant": RoleAssistant,
-	"tool":      RoleTool,
-	"system":    RoleSystem,
+	"user":       RoleUser,
+	"assistant":  RoleAssistant,
+	"tool":       RoleTool,
+	"system":     RoleSystem,
+	"user-draft": RoleUserDraft,
 }
 
 // ingestRecord is the decoded form of one line in a normalized ingest JSONL.
@@ -164,6 +165,29 @@ func (a *ingestAccumulator) ConsumeFile(r io.Reader) error {
 		role, roleOK := validIngestRoles[rec.Role]
 		if !roleOK {
 			log.Printf("conversations/ingest: rejected record with unknown role %q (source=%q session_id=%q)", rec.Role, rec.Source, rec.SessionID)
+			continue
+		}
+
+		// Draft roles are recognized but are NOT conversation turns: an unsent
+		// composer draft is not something the user actually said, so it must
+		// never become a session.turn. Route it to the quarantine surface with
+		// provenance and count it toward coverage, so the source reaches a
+		// fully-accounted, converged state instead of re-surfacing the same
+		// records — logging a rejection for each — on every reconcile cycle.
+		if role == RoleUserDraft {
+			if a.Quarantine != nil {
+				prov := QuarantineProvenance{
+					Reason:    QuarantineReasonDraftRole,
+					Component: "session.turn",
+				}
+				if qErr := a.Quarantine.WriteRecord(rec.Source, json.RawMessage(line), prov); qErr != nil {
+					log.Printf("conversations/ingest: quarantine write error: %v", qErr)
+				}
+			}
+			if a.Coverage != nil {
+				a.Coverage.RecordQuarantined(rec.Source, "session.turn")
+			}
+			a.Quarantined++
 			continue
 		}
 
