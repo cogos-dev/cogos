@@ -445,3 +445,62 @@ func TestProjectionCompiler_HealthInitiallyProgressing(t *testing.T) {
 		t.Errorf("initial Health = %q, want %q", got, reconcile.HealthProgressing)
 	}
 }
+
+// TestProjectionCompiler_FetchLiveParseCache verifies FetchLive memoizes the
+// (expensive) cogblock.py parse: an unchanged source is served from cache (same
+// *sourceCogdoc pointer, no python re-spawn), and a changed source is re-parsed
+// (new pointer). This is the fix for the ~1.5s/cycle FetchLive cost from
+// re-spawning python for every source on every reconcile cycle.
+func TestProjectionCompiler_FetchLiveParseCache(t *testing.T) {
+	skipIfNoPython(t)
+	root := stageRoot(t)
+	c := NewProjectionCompiler()
+
+	// Copy a fixture cogdoc into a writable source we can mutate.
+	orig, err := os.ReadFile(fixturePath(t, "2026-05-19-chaz-substrate-physics-sequence.cog.md"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	srcPath := filepath.Join(root, ".cog", "mem", "reflective", "cache_test.cog.md")
+	if err := os.WriteFile(srcPath, orig, 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	cfgAny, err := c.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cfg := cfgAny.(*CompilerConfig)
+	cfg.SourceFiles = []string{srcPath}
+	ctx := context.Background()
+
+	docs1 := mustFetchOne(t, c, ctx, cfg)
+
+	// Unchanged → cache hit → identical pointer (no re-parse).
+	docs2 := mustFetchOne(t, c, ctx, cfg)
+	if docs2[0] != docs1[0] {
+		t.Errorf("unchanged source re-parsed; want cache hit (same *sourceCogdoc pointer)")
+	}
+
+	// Changed → cache miss → re-parsed → new pointer.
+	if err := os.WriteFile(srcPath, append(append([]byte{}, orig...), "\n\n## Coda\n\nappended.\n"...), 0o644); err != nil {
+		t.Fatalf("modify source: %v", err)
+	}
+	docs3 := mustFetchOne(t, c, ctx, cfg)
+	if docs3[0] == docs1[0] {
+		t.Errorf("changed source served from stale cache; want re-parse (new pointer)")
+	}
+}
+
+func mustFetchOne(t *testing.T, c *ProjectionCompiler, ctx context.Context, cfg *CompilerConfig) []*sourceCogdoc {
+	t.Helper()
+	live, err := c.FetchLive(ctx, cfg)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	docs := live.([]*sourceCogdoc)
+	if len(docs) != 1 {
+		t.Fatalf("want 1 doc, got %d", len(docs))
+	}
+	return docs
+}
