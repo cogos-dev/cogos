@@ -15,6 +15,8 @@
 package conversations
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -46,6 +48,16 @@ type Index struct {
 
 	// turns maps session_id → []Turn (in turn-index order).
 	turns map[string][]Turn
+
+	// lastMeta{Mtime,Size,Hash} record the (mtime, size, content hash) of
+	// _meta.json as of the last Load or local write. LoadIfChanged uses them to
+	// skip the full reload when the on-disk index is unchanged since this process
+	// last touched it. (mtime, size) is a cheap pre-filter; the content hash is
+	// the authoritative check, catching a same-size in-place rewrite by an
+	// external writer that (mtime, size) alone would miss. Guarded by mu.
+	lastMetaMtime time.Time
+	lastMetaSize  int64
+	lastMetaHash  string
 }
 
 // NewIndex creates an Index backed by projDir. projDir is created if absent.
@@ -69,8 +81,20 @@ func NewIndex(projDir string) (*Index, error) {
 // (potentially slow) file I/O off the lock while still making the visible map
 // state mutation atomic with respect to concurrent readers and other Loads.
 func (idx *Index) Load() error {
+	// Stat before reading so a write racing this load at worst causes a
+	// redundant reload next cycle (recorded mtime older than content), never a
+	// stale read (recorded mtime never newer than content).
+	var metaMtime time.Time
+	var metaSize int64
+	if fi, statErr := os.Stat(idx.metaPath()); statErr == nil {
+		metaMtime = fi.ModTime()
+		metaSize = fi.Size()
+	}
+
 	sessions := make(map[string]SessionMeta)
+	var metaHash string
 	if data, err := os.ReadFile(idx.metaPath()); err == nil {
+		metaHash = sha256Hex(data)
 		var m map[string]SessionMeta
 		if jsonErr := json.Unmarshal(data, &m); jsonErr == nil {
 			sessions = m
@@ -93,8 +117,49 @@ func (idx *Index) Load() error {
 	idx.mu.Lock()
 	idx.sessions = sessions
 	idx.turns = turns
+	idx.lastMetaMtime = metaMtime
+	idx.lastMetaSize = metaSize
+	idx.lastMetaHash = metaHash
 	idx.mu.Unlock()
 	return nil
+}
+
+// LoadIfChanged reloads the index from disk only when _meta.json has changed
+// since the last Load or local write, detected by (mtime, size). When this
+// process is the sole writer — the common case for the daemon — every change is
+// already reflected in memory by UpsertSession/DeleteSession, so the expensive
+// full reload is skipped. An external writer (e.g. the cog CLI) changes the
+// file's mtime/size and triggers a real reload. Returns whether a reload ran.
+func (idx *Index) LoadIfChanged() (bool, error) {
+	fi, err := os.Stat(idx.metaPath())
+	if err != nil {
+		// Missing/unstattable _meta.json (fresh index, or removed out from under
+		// us): fall back to a full Load, which treats a missing file as empty.
+		return true, idx.Load()
+	}
+	idx.mu.RLock()
+	mtime, size, hash := idx.lastMetaMtime, idx.lastMetaSize, idx.lastMetaHash
+	idx.mu.RUnlock()
+
+	// Cheap pre-filter: any size or mtime change is unambiguously a change.
+	if fi.Size() != size || !fi.ModTime().Equal(mtime) {
+		return true, idx.Load()
+	}
+	// Same (mtime, size) can still be an in-place same-size rewrite by an
+	// external process (the cog CLI editing fixed-width fields), which
+	// (mtime, size) alone cannot detect. Confirm by content hash before trusting
+	// the in-memory copy. Reading+hashing the single _meta.json file is far
+	// cheaper than the full reload it guards (which re-reads every per-session
+	// turns file). A torn/partial read hashes differently and falls through to a
+	// reload, so it self-heals rather than sticking.
+	data, readErr := os.ReadFile(idx.metaPath())
+	if readErr != nil {
+		return true, idx.Load()
+	}
+	if sha256Hex(data) == hash {
+		return false, nil
+	}
+	return true, idx.Load()
 }
 
 // UpsertSession writes session meta + turns to memory and to disk.
@@ -317,6 +382,12 @@ func (idx *Index) metaPath() string {
 	return filepath.Join(idx.projDir, "_meta.json")
 }
 
+// sha256Hex returns the hex-encoded SHA-256 of b.
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 // turnsFilename derives a safe flat filename from sessionID. Composite keys
 // for normalized ingest sessions take the form "<source>/<session_id>"; the
 // "/" is replaced with "__" so the file stays in projDir without creating
@@ -336,7 +407,19 @@ func (idx *Index) writeMetaFileLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(idx.metaPath(), b, 0o644)
+	if err := os.WriteFile(idx.metaPath(), b, 0o644); err != nil {
+		return err
+	}
+	// Record our own write — hash of the exact bytes we wrote, plus the
+	// post-write stat — so the next LoadIfChanged recognises the file as
+	// unchanged-by-others and skips the full reload. Called under idx.mu (the
+	// "Locked" suffix), so these fields are mutated under the write lock.
+	idx.lastMetaHash = sha256Hex(b)
+	if fi, statErr := os.Stat(idx.metaPath()); statErr == nil {
+		idx.lastMetaMtime = fi.ModTime()
+		idx.lastMetaSize = fi.Size()
+	}
+	return nil
 }
 
 func (idx *Index) writeTurnsFile(sessionID string, turns []Turn) error {
