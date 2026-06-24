@@ -126,3 +126,56 @@ func TestProcMgrConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestProcMgrKillVsReaders is the targeted regression for the proc.Status data
+// race: Kill writes proc.Status under proc.mu while List/Stats/KillBy* read it.
+// Before the loadStatus/snapshot fix, `go test -race` flagged this interleaving.
+// We register processes whose cmd was never started (cmd.Process == nil) so
+// Kill's escalation goroutine is skipped and no real signals are sent — only
+// the bookkeeping (and its locking) is exercised.
+func TestProcMgrKillVsReaders(t *testing.T) {
+	pm := NewProcessManager(ProcessManagerConfig{MaxGlobal: 100000})
+
+	ids := make([]string, 0, 256)
+	for i := 0; i < 256; i++ {
+		p := pm.Track(exec.Command("true"), ManagedProcessOpts{
+			Kind:     ProcessForeground,
+			Source:   "sess-a",
+			Identity: "node-1",
+		})
+		ids = append(ids, p.ID)
+	}
+
+	var wg sync.WaitGroup
+	// Killers mutate Status under proc.mu.
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(off int) {
+			defer wg.Done()
+			for i := off; i < len(ids); i += 8 {
+				pm.Kill(ids[i])
+			}
+		}(g)
+	}
+	// Source/identity sweeps also flip status via Kill on matching procs.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			_ = pm.KillBySource("sess-a")
+			_ = pm.KillByIdentity("node-1")
+		}
+	}()
+	// Readers race the killers.
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 300; i++ {
+				_ = pm.List()
+				_ = pm.Stats()
+			}
+		}()
+	}
+	wg.Wait()
+}
