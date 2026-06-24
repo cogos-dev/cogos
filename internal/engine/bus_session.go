@@ -231,6 +231,12 @@ func (m *BusSessionManager) LoadRegistry() []BusRegistryEntry {
 }
 
 // saveRegistry writes the bus registry to disk. Caller must hold m.mu.
+//
+// The write is atomic (tmp + rename): a plain truncate-before-write left
+// registry.json empty if the process was killed mid-write, and loadRegistry
+// swallows the resulting parse error and returns an empty registry — dropping
+// all bus-to-session metadata until sessions re-register. Same pattern as
+// WriteState / saveSignalField.
 func (m *BusSessionManager) saveRegistry(entries []BusRegistryEntry) error {
 	if err := os.MkdirAll(m.BusesDir(), 0755); err != nil {
 		return err
@@ -239,7 +245,15 @@ func (m *BusSessionManager) saveRegistry(entries []BusRegistryEntry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.RegistryPath(), data, 0644)
+	tmp := m.RegistryPath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, m.RegistryPath()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // AppendEvent appends a new BusBlock to a bus's event chain.
@@ -313,13 +327,18 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 		ts := time.Now().UTC().Format("2006-01-02T150405Z")
 		archivePath := filepath.Join(m.BusesDir(), busID, "events."+ts+".jsonl")
 		if renameErr := os.Rename(eventsFile, archivePath); renameErr == nil {
-			// Create a fresh empty events.jsonl for subsequent appends.
+			// Create a fresh empty events.jsonl for subsequent appends. Only
+			// reset the seq/hash cache once the new file actually exists — if
+			// Create fails (e.g. disk full) the events.jsonl is now absent, and
+			// zeroing the cache would make a concurrent ReadEvents see an empty
+			// bus until the next append's EnsureBus recreates the file.
 			if nf, createErr := os.Create(eventsFile); createErr == nil {
 				nf.Close()
+				m.lastSeq[busID] = 0
+				m.lastHash[busID] = ""
+			} else {
+				slog.Warn("bus: size-rotation create failed, retaining seq cache", "err", createErr, "bus_id", busID)
 			}
-			// Reset cache: new file starts at seq 0.
-			m.lastSeq[busID] = 0
-			m.lastHash[busID] = ""
 		} else {
 			slog.Warn("bus: size-rotation rename failed", "err", renameErr, "bus_id", busID)
 		}

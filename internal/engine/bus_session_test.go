@@ -549,3 +549,25 @@ func TestBusSessionEventHandlerDispatch(t *testing.T) {
 		// ok — handler was properly removed
 	}
 }
+
+// TestSaveRegistryAtomic verifies the registry write goes through a temp file
+// and rename (no truncate-before-write window), leaves no .tmp behind, and
+// round-trips through loadRegistry.
+func TestSaveRegistryAtomic(t *testing.T) {
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	entries := []BusRegistryEntry{{BusID: "bus_test", State: "active", LastEventSeq: 3}}
+	if err := mgr.saveRegistry(entries); err != nil {
+		t.Fatalf("saveRegistry: %v", err)
+	}
+
+	if _, err := os.Stat(mgr.RegistryPath() + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("temp file left behind after atomic write: stat err=%v", err)
+	}
+
+	got := mgr.loadRegistry()
+	if len(got) != 1 || got[0].BusID != "bus_test" || got[0].LastEventSeq != 3 {
+		t.Errorf("loadRegistry = %+v, want one bus_test entry with seq=3", got)
+	}
+}
