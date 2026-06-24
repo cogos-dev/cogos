@@ -240,6 +240,22 @@ func TestDecisionLineageReconciler_Registered(t *testing.T) {
 	}
 }
 
+// TestDecisionLineageReconciler_WrongLiveType verifies ComputePlan and
+// BuildState return an error (not panic) when a non-daemon caller passes a live
+// value of the wrong type. Previously the unchecked `live.([]Decision)`
+// assertion panicked, which would crash the whole daemon.
+func TestDecisionLineageReconciler_WrongLiveType(t *testing.T) {
+	rec := NewDecisionLineageReconciler()
+	cfg := &DecisionLineageConfig{ProjectionDir: t.TempDir()}
+
+	if _, err := rec.ComputePlan(cfg, "not-decisions", nil); err == nil {
+		t.Error("ComputePlan with wrong live type: expected error, got nil")
+	}
+	if _, err := rec.BuildState(cfg, 42, nil); err == nil {
+		t.Error("BuildState with wrong live type: expected error, got nil")
+	}
+}
+
 func TestRootDerivation(t *testing.T) {
 	// Round-trip: a corpus dir and a projection path must both derive the root.
 	root := "/tmp/ws"

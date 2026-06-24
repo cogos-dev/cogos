@@ -445,7 +445,15 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 
 	// Step 3: Load persisted state.
 	stateStart := time.Now()
-	state, _ := reconcile.LoadState(d.cfg.WorkspaceRoot, providerType)
+	state, stateErr := reconcile.LoadState(d.cfg.WorkspaceRoot, providerType)
+	if stateErr != nil {
+		// LoadState maps a missing file to (nil, nil); a non-nil error here is
+		// corruption or a permission/read fault. Surface it instead of silently
+		// resetting lineage serials, mirroring the WriteState warning below.
+		// Continue with the nil state — providers already handle a nil state.
+		slog.Warn("reconcile-daemon: LoadState failed; continuing with empty state",
+			"provider", providerType, "err", stateErr)
+	}
 	stateMs = time.Since(stateStart).Milliseconds()
 
 	// Step 4: ComputePlan — pure function, deterministic.
