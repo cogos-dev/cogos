@@ -160,6 +160,23 @@ func (idx *Index) ListSessions(since, until time.Time, identity string) []Sessio
 	return out
 }
 
+// GetTurns returns a copy of the indexed turn slice for a session (in
+// turn-index order) plus its meta and a presence flag. The returned slice is a
+// fresh copy safe to mutate/append without holding the index lock — the
+// incremental parse path appends new turns onto it before re-upserting.
+func (idx *Index) GetTurns(sessionID string) (SessionMeta, []Turn, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	meta, ok := idx.sessions[sessionID]
+	if !ok {
+		return SessionMeta{}, nil, false
+	}
+	src := idx.turns[sessionID]
+	cp := make([]Turn, len(src))
+	copy(cp, src)
+	return meta, cp, true
+}
+
 // GetTurn returns the Turn at turnIndex within session, or false.
 func (idx *Index) GetTurn(sessionID string, turnIndex int) (Turn, bool) {
 	idx.mu.RLock()
