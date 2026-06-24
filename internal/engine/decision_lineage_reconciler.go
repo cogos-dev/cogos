@@ -124,8 +124,14 @@ func (r *DecisionLineageReconciler) ComputePlan(config any, live any, state *rec
 	if config == nil {
 		return &reconcile.Plan{ResourceType: r.Type()}, nil
 	}
-	cfg := config.(*DecisionLineageConfig)
-	decisions := live.([]Decision)
+	cfg, ok := config.(*DecisionLineageConfig)
+	if !ok {
+		return nil, fmt.Errorf("decision-lineage ComputePlan: unexpected config type %T", config)
+	}
+	decisions, ok := live.([]Decision)
+	if !ok {
+		return nil, fmt.Errorf("decision-lineage ComputePlan: unexpected live type %T", live)
+	}
 
 	manifold := ComputeManifold(decisions, r.now())
 	projected := renderDecisionLineageProjection(manifold)
@@ -258,8 +264,14 @@ func (r *DecisionLineageReconciler) BuildState(config any, live any, existing *r
 	if config == nil {
 		return reconcile.NewState(r.Type()), nil
 	}
-	cfg := config.(*DecisionLineageConfig)
-	decisions := live.([]Decision)
+	cfg, ok := config.(*DecisionLineageConfig)
+	if !ok {
+		return nil, fmt.Errorf("decision-lineage BuildState: unexpected config type %T", config)
+	}
+	decisions, ok := live.([]Decision)
+	if !ok {
+		return nil, fmt.Errorf("decision-lineage BuildState: unexpected live type %T", live)
+	}
 
 	state := reconcile.NewState(r.Type())
 	if existing != nil {

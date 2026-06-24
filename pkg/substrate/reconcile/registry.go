@@ -37,7 +37,17 @@ func GetProvider(name string) (Reconcilable, error) {
 	defer providersMu.RUnlock()
 	p, ok := providers[name]
 	if !ok {
-		return nil, fmt.Errorf("unknown resource type: %s (registered: %v)", name, ListProviders())
+		// Build the name list inline rather than calling ListProviders(): that
+		// would take a second RLock, and sync.RWMutex is not reentrant — once a
+		// writer (config-reload RegisterProvider/UpsertProvider) is blocked
+		// waiting, Go's RWMutex stops admitting new readers, so the re-RLock
+		// would deadlock this goroutine permanently.
+		names := make([]string, 0, len(providers))
+		for n := range providers {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf("unknown resource type: %s (registered: %v)", name, names)
 	}
 	return p, nil
 }

@@ -141,6 +141,15 @@ func (r *CogdocReviewReconciler) FetchLive(ctx context.Context, config any) (any
 		return nil, fmt.Errorf("cogdoc_review FetchLive: expected *CogdocReviewClass, got %T", config)
 	}
 
+	// When the pipeline is disabled, skip the O(corpus) WalkDir+YAML parse and
+	// the Ollama HTTP probe entirely. ComputePlan short-circuits on !Enabled and
+	// only reads CorpusSize/OllamaReachable for plan metadata, so a zero-value
+	// liveState is sufficient. Without this guard a disabled reconciler still
+	// walked the whole corpus and made a 3s Ollama probe on every ~30s tick.
+	if !class.Enabled {
+		return &liveState{}, nil
+	}
+
 	corpus, err := walkCorpus(r.WorkspaceRoot, class.CorpusPaths)
 	if err != nil {
 		return nil, fmt.Errorf("walk corpus: %w", err)

@@ -189,6 +189,40 @@ func TestComputePlan_Disabled(t *testing.T) {
 	}
 }
 
+// TestFetchLive_DisabledSkipsCorpusWalk verifies the Enabled guard: a disabled
+// pipeline must NOT walk the corpus (the per-cycle O(corpus) cost + Ollama
+// probe we eliminated). corpus_size in the plan metadata reflects whether the
+// walk ran: 0 when disabled (walk skipped), >0 when enabled over the same docs.
+func TestFetchLive_DisabledSkipsCorpusWalk(t *testing.T) {
+	dir := makeWorkspace(t)
+	writeCogdoc(t, dir, ".cog/mem/semantic/insights/a.cog.md", "a-1", "A", true)
+	writeCogdoc(t, dir, ".cog/mem/semantic/insights/b.cog.md", "b-1", "B", false)
+	r := cogdoc_review.NewCogdocReviewReconciler(dir)
+	ctx := context.Background()
+
+	corpusSize := func(t *testing.T, enabled bool) int {
+		t.Helper()
+		class := &reconcile.CogdocReviewClass{Enabled: enabled}
+		lv, err := r.FetchLive(ctx, class)
+		if err != nil {
+			t.Fatalf("FetchLive(enabled=%v): %v", enabled, err)
+		}
+		plan, err := r.ComputePlan(class, lv, nil)
+		if err != nil {
+			t.Fatalf("ComputePlan(enabled=%v): %v", enabled, err)
+		}
+		cs, _ := plan.Metadata["corpus_size"].(int)
+		return cs
+	}
+
+	if cs := corpusSize(t, false); cs != 0 {
+		t.Errorf("disabled corpus_size = %d, want 0 (corpus walk should be skipped)", cs)
+	}
+	if cs := corpusSize(t, true); cs == 0 {
+		t.Errorf("enabled corpus_size = 0, want > 0 (corpus walk should run over the 2 docs)")
+	}
+}
+
 // TestComputePlan_EmptyCorpus verifies plan on an empty corpus.
 func TestComputePlan_EmptyCorpus(t *testing.T) {
 	dir := makeWorkspace(t)
