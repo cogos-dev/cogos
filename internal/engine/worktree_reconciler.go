@@ -200,6 +200,23 @@ type WorktreeReconciler struct {
 // via init(); the reconciler will use defaults wired in LoadConfig once the
 // workspace root is known.
 func NewWorktreeReconciler(repoRoot string, reader LedgerReader, writer LedgerWriter, git GitAdapter) *WorktreeReconciler {
+	// Default the adapters here rather than lazily in LoadConfig. The reconcile
+	// daemon and the autonomic ticker both call LoadConfig on the same instance
+	// concurrently; the lazy nil-check-then-assign there was an unsynchronized
+	// write to these interface fields (a data race, torn-read risk). Doing it
+	// once at construction means the fields are never written at runtime, so all
+	// later reads (including FetchLive's GitAdapter use) are race-free.
+	// Production registers with nil adapters (internal/providers/all), so this is
+	// the live path, not just a convenience for callers that pass their own.
+	if reader == nil {
+		reader = NewFilesystemLedgerReader(repoRoot)
+	}
+	if writer == nil {
+		writer = NewFilesystemLedgerWriter(repoRoot)
+	}
+	if git == nil {
+		git = NewCLIGitAdapter()
+	}
 	return &WorktreeReconciler{
 		RepoRoot:     repoRoot,
 		LedgerReader: reader,
@@ -235,16 +252,9 @@ type worktreeConfig struct {
 // LoadConfig reads all worktree.* ledger events for this RepoRoot and derives
 // the declared worktree set. Read-only; idempotent.
 func (r *WorktreeReconciler) LoadConfig(workspaceRoot string) (any, error) {
-	if r.LedgerReader == nil {
-		// v0 fallback: workspace-root-scoped FilesystemLedgerReader.
-		r.LedgerReader = NewFilesystemLedgerReader(workspaceRoot)
-	}
-	if r.LedgerWriter == nil {
-		r.LedgerWriter = NewFilesystemLedgerWriter(workspaceRoot)
-	}
-	if r.GitAdapter == nil {
-		r.GitAdapter = NewCLIGitAdapter()
-	}
+	// Adapters are defaulted in NewWorktreeReconciler (never written at runtime)
+	// so concurrent LoadConfig calls from the daemon and autonomic ticker can't
+	// race on these fields.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -646,6 +656,15 @@ func (r *WorktreeReconciler) ApplyPlan(ctx context.Context, plan *reconcile.Plan
 		}
 	}
 	for _, a := range plan.Actions {
+		// Only an actively-firing alarm (ActionUpdate) degrades health. An
+		// already-acknowledged alarm becomes an ActionSkip that still carries its
+		// classification in Details; counting that here pinned HealthDegraded
+		// forever, which kept the autonomic ticker's needsHeal true and re-ran a
+		// full heal cycle for this provider every tick (and continuously
+		// triggered the daemon-vs-ticker concurrent-apply race).
+		if a.Action == reconcile.ActionSkip {
+			continue
+		}
 		if cls, _ := a.Details["classification"].(string); isAlarmClassification(cls) {
 			anyAlarm = true
 		}

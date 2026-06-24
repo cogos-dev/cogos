@@ -281,6 +281,10 @@ func TestWorktreeReconcilerAlarmIdempotent(t *testing.T) {
 	if got := ledger.emitCountByKind(BlockWorktreeAlarm); got != 1 {
 		t.Fatalf("cycle 1: alarm events=%d want 1", got)
 	}
+	// An actively-firing alarm (ActionUpdate) should mark the provider Degraded.
+	if h := r.Health(); h.Health != reconcile.HealthDegraded {
+		t.Errorf("cycle 1: health=%v want Degraded (alarm actively firing)", h.Health)
+	}
 
 	// Cycles 2–4: prior alarm in ledger → skip, no re-emit.
 	for i := 2; i <= 4; i++ {
@@ -294,6 +298,29 @@ func TestWorktreeReconcilerAlarmIdempotent(t *testing.T) {
 	}
 	if got := ledger.emitCountByKind(BlockWorktreeAlarm); got != 1 {
 		t.Errorf("after 4 cycles: alarm events=%d want 1 (idempotent — no re-emit)", got)
+	}
+	// C2 regression: once the alarm is acknowledged (ActionSkip), health must
+	// return to Healthy. Before the fix it stayed Degraded forever, which kept
+	// the autonomic ticker re-healing this provider on every tick.
+	if h := r.Health(); h.Health == reconcile.HealthDegraded || h.Sync == reconcile.SyncStatusOutOfSync {
+		t.Errorf("after acknowledged alarm: health=%v sync=%v want Healthy/Synced (C2)", h.Health, h.Sync)
+	}
+}
+
+// TestNewWorktreeReconciler_DefaultsNilAdapters covers C3: adapters passed nil
+// (the production registration path) are defaulted at construction, so LoadConfig
+// never writes these fields at runtime and concurrent daemon/ticker LoadConfig
+// calls can't race on them.
+func TestNewWorktreeReconciler_DefaultsNilAdapters(t *testing.T) {
+	r := NewWorktreeReconciler("/repo/root", nil, nil, nil)
+	if r.LedgerReader == nil {
+		t.Error("LedgerReader nil; want defaulted")
+	}
+	if r.LedgerWriter == nil {
+		t.Error("LedgerWriter nil; want defaulted")
+	}
+	if r.GitAdapter == nil {
+		t.Error("GitAdapter nil; want defaulted")
 	}
 }
 
