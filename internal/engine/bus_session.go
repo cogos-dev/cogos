@@ -153,6 +153,9 @@ func computeBusBlockHash(block *BusBlock) string {
 // EnsureBus creates the bus directory + events.jsonl if they don't exist.
 // Safe to call multiple times.
 func (m *BusSessionManager) EnsureBus(busID string) error {
+	if !validPathComponent(busID) {
+		return fmt.Errorf("invalid bus_id %q", busID)
+	}
 	busDir := filepath.Join(m.BusesDir(), busID)
 	if err := os.MkdirAll(busDir, 0755); err != nil {
 		return fmt.Errorf("create bus dir: %w", err)
@@ -415,6 +418,9 @@ func (m *BusSessionManager) updateRegistrySeqLocked(busID string, seq int, ts st
 // ReadEvents reads all events from a bus. De-dups by seq (file may have
 // duplicates from crash recovery).
 func (m *BusSessionManager) ReadEvents(busID string) ([]BusBlock, error) {
+	if !validPathComponent(busID) {
+		return nil, fmt.Errorf("invalid bus_id %q", busID)
+	}
 	eventsFile := m.EventsPath(busID)
 	f, err := os.Open(eventsFile)
 	if err != nil {

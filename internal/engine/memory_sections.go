@@ -215,28 +215,41 @@ func splitFrontmatter(content string) (fmText, body string, hasFM bool) {
 // path. Handles memory-relative paths (`.cog/mem/...`), workspace-relative
 // paths, absolute paths, and memory-bare paths (e.g. `semantic/foo.md`).
 // Mirrors legacy memory.go:resolveDocPath:769.
-func resolveMemoryDocPath(path, cogRoot string) string {
+func resolveMemoryDocPath(path, cogRoot string) (string, error) {
+	// This resolver feeds both reads (cog_memory_toc) and writes
+	// (cog_memory_index) from caller-supplied paths, so an unconstrained path is
+	// an arbitrary-filesystem primitive on the MCP surface. Reject absolute input
+	// and contain every resolution branch within the workspace root (the function
+	// legitimately reaches workspace-relative files like .cog/ontology, so the
+	// boundary is cogRoot, not .cog/mem).
 	if filepath.IsAbs(path) {
-		return path
+		return "", fmt.Errorf("memory doc path %q: absolute paths not permitted", path)
 	}
+
 	memoryDir := filepath.Join(cogRoot, ".cog", "mem")
-	if strings.Contains(path, "/.cog/mem/") {
+	var candidate string
+	switch {
+	case strings.Contains(path, "/.cog/mem/"):
 		parts := strings.SplitN(path, "/.cog/mem/", 2)
-		if len(parts) == 2 {
-			return filepath.Join(memoryDir, parts[1])
+		candidate = filepath.Join(memoryDir, parts[1])
+	case strings.HasPrefix(path, ".cog/mem/"):
+		candidate = filepath.Join(memoryDir, strings.TrimPrefix(path, ".cog/mem/"))
+	default:
+		// Try workspace-relative first (some paths like
+		// `.cog/ontology/crystal.cog.md` live outside `.cog/mem/`), else
+		// fall back to memory-relative.
+		wsPath := filepath.Join(cogRoot, path)
+		if _, err := os.Stat(wsPath); err == nil {
+			candidate = wsPath
+		} else {
+			candidate = filepath.Join(memoryDir, path)
 		}
 	}
-	if after, ok := strings.CutPrefix(path, ".cog/mem/"); ok {
-		return filepath.Join(memoryDir, after)
+
+	if !pathWithin(cogRoot, candidate) {
+		return "", fmt.Errorf("memory doc path %q escapes workspace", path)
 	}
-	// Try as workspace-relative first (mirrors legacy: some paths like
-	// `.cog/ontology/crystal.cog.md` live outside `.cog/mem/`).
-	wsPath := filepath.Join(cogRoot, path)
-	if _, err := os.Stat(wsPath); err == nil {
-		return wsPath
-	}
-	// Fall back to memory-relative.
-	return filepath.Join(memoryDir, path)
+	return filepath.Clean(candidate), nil
 }
 
 // readCogDocContentV3 is the side-effect-free read used by MemoryTOC and
@@ -245,7 +258,10 @@ func resolveMemoryDocPath(path, cogRoot string) string {
 // The v3-specific suffix avoids clashing with any future kernel-wide
 // read helper.
 func readCogDocContentV3(cogRoot, path string) (string, error) {
-	fullPath := resolveMemoryDocPath(path, cogRoot)
+	fullPath, perr := resolveMemoryDocPath(path, cogRoot)
+	if perr != nil {
+		return "", perr
+	}
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
 		return "", fmt.Errorf("file not found: %s", path)
@@ -465,7 +481,10 @@ func MemoryIndex(cogRoot, path string, dryRun bool) (string, error) {
 
 	newContent := "---\n" + newFM + "---\n" + body
 
-	fullPath := resolveMemoryDocPath(path, cogRoot)
+	fullPath, perr := resolveMemoryDocPath(path, cogRoot)
+	if perr != nil {
+		return "", perr
+	}
 	if err := atomicWriteMemoryFile(fullPath, []byte(newContent), 0644); err != nil {
 		return "", fmt.Errorf("failed to write: %w", err)
 	}

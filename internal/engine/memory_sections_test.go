@@ -237,16 +237,28 @@ func TestResolveMemoryDocPath_Variants(t *testing.T) {
 	}
 
 	cases := []struct {
-		name string
-		in   string
-		want string
+		name    string
+		in      string
+		want    string
+		wantErr bool
 	}{
-		{"absolute", "/some/absolute/path.md", "/some/absolute/path.md"},
-		{"dotcog-mem-prefix", ".cog/mem/semantic/foo.md", filepath.Join(memDir, "semantic/foo.md")},
-		{"bare-memory-relative", "semantic/insights/foo.cog.md", filepath.Join(memDir, "semantic/insights/foo.cog.md")},
+		// Absolute input is now rejected (was an arbitrary-FS pass-through).
+		{"absolute-rejected", "/some/absolute/path.md", "", true},
+		{"dotcog-mem-prefix", ".cog/mem/semantic/foo.md", filepath.Join(memDir, "semantic/foo.md"), false},
+		{"bare-memory-relative", "semantic/insights/foo.cog.md", filepath.Join(memDir, "semantic/insights/foo.cog.md"), false},
 	}
 	for _, tc := range cases {
-		got := resolveMemoryDocPath(tc.in, root)
+		got, err := resolveMemoryDocPath(tc.in, root)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: got %q, want error", tc.name, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", tc.name, err)
+			continue
+		}
 		if got != tc.want {
 			t.Errorf("%s: got %q; want %q", tc.name, got, tc.want)
 		}
@@ -264,7 +276,10 @@ func TestResolveMemoryDocPath_WorkspaceRelativePreferred(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".cog", "ontology", "crystal.cog.md"), []byte("# Crystal\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got := resolveMemoryDocPath(".cog/ontology/crystal.cog.md", root)
+	got, err := resolveMemoryDocPath(".cog/ontology/crystal.cog.md", root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := filepath.Join(root, ".cog", "ontology", "crystal.cog.md")
 	if got != want {
 		t.Errorf("got %q; want %q", got, want)
