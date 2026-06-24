@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -93,4 +94,72 @@ func TestRotatingWriterConcurrent(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+// TestRotatingWriterWriteAfterClose covers the Write self-heal path: if the
+// active handle is gone (here via Close, but in production via a failed
+// post-rotation reopen that leaves w.f nil), Write must reopen rather than
+// panic on a nil/closed handle or silently drop the record.
+func TestRotatingWriterWriteAfterClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "k.log")
+	w, err := newRotatingWriter(path, 1<<30, 2) // rotation effectively off
+	if err != nil {
+		t.Fatalf("newRotatingWriter: %v", err)
+	}
+	if err := w.Close(); err != nil { // w.f -> nil
+		t.Fatalf("Close: %v", err)
+	}
+
+	n, err := w.Write([]byte("recovered\n"))
+	if err != nil {
+		t.Fatalf("Write after Close: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("Write reported 0 bytes after self-heal")
+	}
+	_ = w.Close()
+	b, _ := os.ReadFile(path)
+	if !strings.Contains(string(b), "recovered") {
+		t.Errorf("self-healed write not persisted; file=%q", string(b))
+	}
+}
+
+// TestRotatingWriterRotateWithNilHandle reproduces the post-failed-rotation
+// state — handle closed, w.f nil, size over the cap — and asserts the next
+// Write neither panics on the nil w.f.Close() in rotateLocked nor drops the
+// record. This is the regression for the closed-handle bug.
+func TestRotatingWriterRotateWithNilHandle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "k.log")
+	w, err := newRotatingWriter(path, 100, 2)
+	if err != nil {
+		t.Fatalf("newRotatingWriter: %v", err)
+	}
+
+	// Force the exact state a failed reopen leaves behind.
+	w.mu.Lock()
+	_ = w.f.Close()
+	w.f = nil
+	w.size = 1000 // > maxBytes, so the next Write triggers rotateLocked
+	w.mu.Unlock()
+
+	n, err := w.Write([]byte("after-nil\n")) // must not panic on nil w.f.Close()
+	if err != nil {
+		t.Fatalf("Write with nil handle: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("Write reported 0 bytes")
+	}
+	_ = w.Close()
+
+	found := false
+	for _, p := range []string{path, path + ".1"} {
+		if b, _ := os.ReadFile(p); strings.Contains(string(b), "after-nil") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("write after nil handle not found on disk")
+	}
 }
