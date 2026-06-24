@@ -91,6 +91,24 @@ func TestReapHardCap(t *testing.T) {
 	}
 }
 
+// TestProcessManagerShutdownClosesChannel verifies Shutdown closes shutdownCh
+// (so kill-escalation goroutines can abort) and that a repeat Shutdown does not
+// panic on a double close (guarded by shutdownOnce).
+func TestProcessManagerShutdownClosesChannel(t *testing.T) {
+	pm := NewProcessManager(ProcessManagerConfig{})
+	pm.Shutdown(10 * time.Millisecond) // no running procs → returns immediately
+
+	select {
+	case <-pm.shutdownCh:
+		// closed as expected
+	default:
+		t.Fatal("shutdownCh not closed after Shutdown")
+	}
+
+	// Idempotent: a second Shutdown must not panic on a double close.
+	pm.Shutdown(10 * time.Millisecond)
+}
+
 // TestProcMgrConcurrentAccess drives Track/Finish/Remove/List/Stats/CanSpawn
 // from many goroutines so `go test -race` flags any unsynchronized field
 // access (e.g. reading proc.Status without proc.mu).
