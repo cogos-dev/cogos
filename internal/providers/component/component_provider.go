@@ -393,10 +393,15 @@ func (c *ComponentProvider) Health() reconcile.ResourceStatus {
 	}
 
 	if LoadRegistry == nil {
-		return reconcile.ResourceStatus{
-			Sync: reconcile.SyncStatusUnknown, Health: reconcile.HealthDegraded, Operation: reconcile.OperationIdle,
-			Message: "component registry loader not wired",
-		}
+		// Daemon context: LoadRegistry is wired only through the cog CLI DI
+		// seams, so in the daemon binary this provider is intentionally inert —
+		// LoadConfig returns nil and the reconcile cycle reports "in sync" with
+		// nothing to observe (see LoadConfig/FetchLive/ComputePlan above). Health
+		// must mirror that benign state: reporting Degraded here pins the
+		// autonomic engine on a standing degraded=1 and drives a needless LLM
+		// self-heal escalation every cycle for a provider that has nothing to
+		// reconcile in this context.
+		return reconcile.NewResourceStatus(reconcile.SyncStatusSynced, reconcile.HealthHealthy)
 	}
 
 	reg, err := LoadRegistry(root)
