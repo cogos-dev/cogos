@@ -72,6 +72,10 @@ type ReconcileDaemonConfig struct {
 	// providers). When nil, the daemon uses reconcile.ListProviders() as before.
 	// Production code leaves this nil; only testkernel sets it.
 	Providers []reconcile.Reconcilable
+
+	// Convergence tunes the per-provider anomaly thresholds (cost-over-budget
+	// and persistent-degraded). Zero values fall back to sensible defaults.
+	Convergence ConvergenceConfig
 }
 
 func (c *ReconcileDaemonConfig) withDefaults() ReconcileDaemonConfig {
@@ -105,6 +109,10 @@ type ReconcileDaemon struct {
 	triggerMu sync.Mutex
 	triggered map[string]struct{}
 	triggerCh chan struct{} // notifies the loop that triggers are queued
+
+	// health self-reports per-provider reconcile anomalies (slow cycles,
+	// persistent degraded health) as WARNs and a queryable snapshot.
+	health *convergenceTracker
 }
 
 // NewReconcileDaemon creates a ReconcileDaemon with the given config.
@@ -115,7 +123,23 @@ func NewReconcileDaemon(cfg ReconcileDaemonConfig) *ReconcileDaemon {
 		state:     ReconcileDaemonStarting,
 		triggered: make(map[string]struct{}),
 		triggerCh: make(chan struct{}, 1),
+		health:    newConvergenceTracker(cfg.Convergence),
 	}
+}
+
+// ProviderConvergence returns the current per-provider reconcile anomaly
+// snapshot (cost-over-budget / persistent-degraded). It is the queryable surface
+// for operators and agents, and a test oracle: assert on observed runtime
+// behaviour after running the daemon, not just on code paths.
+func (d *ReconcileDaemon) ProviderConvergence() []ProviderConvergence {
+	return d.health.Snapshot()
+}
+
+// observeConvergence feeds one completed cycle's cost and a fresh Health() read
+// (for the degraded axis) to the anomaly tracker.
+func (d *ReconcileDaemon) observeConvergence(providerType string, provider reconcile.Reconcilable, cycleMs, fetchMs int64) {
+	degraded := provider.Health().Health == reconcile.HealthDegraded
+	d.health.Observe(providerType, cycleMs, fetchMs, degraded)
 }
 
 // State returns the current lifecycle state of the daemon.
@@ -467,6 +491,7 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 			"plan_ms", planMs,
 			"duration_ms", dur.Milliseconds(),
 		)
+		d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs)
 		return nil
 	}
 
@@ -533,6 +558,8 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		"write_ms", writeMs,
 		"duration_ms", dur.Milliseconds(),
 	)
+
+	d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs)
 
 	if applyFailed > 0 {
 		return fmt.Errorf("provider %s: %d action(s) failed during apply", providerType, applyFailed)
