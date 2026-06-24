@@ -1352,7 +1352,10 @@ func slugFromPath(path string) string {
 // WriteCogDoc writes a CogDoc to the memory filesystem with proper frontmatter.
 // This is the internal API used by the ingestion pipeline.
 func WriteCogDoc(workspaceRoot string, path string, opts CogDocWriteOpts) (string, error) {
-	fullPath := filepath.Join(workspaceRoot, ".cog", "mem", path)
+	fullPath, perr := containedJoin(filepath.Join(workspaceRoot, ".cog", "mem"), path)
+	if perr != nil {
+		return "", fmt.Errorf("write cogdoc: %w", perr)
+	}
 
 	// Ensure directory exists
 	dir := filepath.Dir(fullPath)

@@ -266,6 +266,12 @@ func ResolveURI(workspaceRoot, uri string) (*URIResolution, error) {
 
 // resolveProjection applies a Projection to produce an absolute filesystem path.
 func resolveProjection(workspaceRoot string, proj *Projection, uriPath string) (string, error) {
+	// Reject path traversal in the untrusted URI component before it reaches the
+	// filepath.Join sites below (direct/directory/glob all interpolate uriPath).
+	if strings.Contains(uriPath, "..") || filepath.IsAbs(uriPath) {
+		return "", fmt.Errorf("cog uri path %q: traversal not permitted", uriPath)
+	}
+
 	// Compute base directory.
 	var base string
 	if proj.ExtBase != "" {
