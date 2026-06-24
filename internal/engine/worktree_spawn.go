@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -144,6 +145,27 @@ func realGitAdd(ctx context.Context, repoRoot, worktreePath, branch, base string
 // `worktree.*` events. Production implementation.
 type FilesystemLedgerReader struct {
 	WorkspaceRoot string
+
+	// scanCache memoizes the parsed worktree events of each per-session
+	// events.jsonl, keyed by file path. The WorktreeReconciler runs LoadConfig
+	// (→ ReadWorktreeEvents) on every ~30s reconcile cycle; without this cache
+	// that re-reads and JSON-parses the entire ledger (hundreds of MB / hundreds
+	// of thousands of lines across thousands of session dirs) every tick just to
+	// extract a handful of worktree events. Ledger files are append-only, so a
+	// changed size+mtime reliably signals new content; unchanged files reuse
+	// their parsed events. Guarded by mu (LoadConfig can be called concurrently
+	// by the reconcile daemon and the autonomic ticker).
+	mu        sync.Mutex
+	scanCache map[string]worktreeScanEntry
+}
+
+// worktreeScanEntry is one cached file scan. repoRoot is part of the validity
+// key because scanWorktreeEventsFile filters by it.
+type worktreeScanEntry struct {
+	repoRoot string
+	size     int64
+	modTime  time.Time
+	events   []WorktreeLedgerEvent
 }
 
 func NewFilesystemLedgerReader(workspaceRoot string) *FilesystemLedgerReader {
@@ -163,7 +185,14 @@ func (r *FilesystemLedgerReader) ReadWorktreeEvents(ctx context.Context, repoRoo
 		return nil, err
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.scanCache == nil {
+		r.scanCache = make(map[string]worktreeScanEntry)
+	}
+
 	var events []WorktreeLedgerEvent
+	seen := make(map[string]struct{}, len(sessionDirs))
 	for _, d := range sessionDirs {
 		select {
 		case <-ctx.Done():
@@ -171,13 +200,44 @@ func (r *FilesystemLedgerReader) ReadWorktreeEvents(ctx context.Context, repoRoo
 		default:
 		}
 		eventsFile := filepath.Join(ledgerDir, d, "events.jsonl")
+		fi, statErr := os.Stat(eventsFile)
+		if statErr != nil {
+			// Missing/unreadable per-session ledger; skip (and let the eviction
+			// pass below drop any stale cache entry for it).
+			continue
+		}
+		seen[eventsFile] = struct{}{}
+
+		// Cache hit: same repoRoot filter and unchanged size+mtime → reuse the
+		// previously parsed events instead of re-reading and re-parsing.
+		if c, ok := r.scanCache[eventsFile]; ok && c.repoRoot == repoRoot && c.size == fi.Size() && c.modTime.Equal(fi.ModTime()) {
+			events = append(events, c.events...)
+			continue
+		}
+
 		evs, err := scanWorktreeEventsFile(eventsFile, repoRoot)
 		if err != nil {
 			// Skip unreadable per-session ledgers; do not fail the whole tick.
+			// Drop any stale cache entry so a transient error doesn't pin it.
+			delete(r.scanCache, eventsFile)
 			continue
+		}
+		r.scanCache[eventsFile] = worktreeScanEntry{
+			repoRoot: repoRoot,
+			size:     fi.Size(),
+			modTime:  fi.ModTime(),
+			events:   evs,
 		}
 		events = append(events, evs...)
 	}
+
+	// Evict cache entries for session ledgers that disappeared this tick.
+	for k := range r.scanCache {
+		if _, ok := seen[k]; !ok {
+			delete(r.scanCache, k)
+		}
+	}
+
 	return events, nil
 }
 
@@ -230,7 +290,10 @@ func readDirIfExists(dir string) ([]string, error) {
 	return names, nil
 }
 
-func scanWorktreeEventsFile(path, repoRoot string) ([]WorktreeLedgerEvent, error) {
+// scanWorktreeEventsFile reads one per-session events.jsonl and projects the
+// worktree.* events matching repoRoot. It is a var so the scan cache test can
+// wrap it to count actual (cache-miss) parses; production keeps the default.
+var scanWorktreeEventsFile = func(path, repoRoot string) ([]WorktreeLedgerEvent, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
