@@ -470,8 +470,11 @@ func BuildRouter(cfg *Config, opts ...BuildRouterOption) (Router, error) {
 		slog.Info("router: registered", "name", name, "model", pc.Model)
 	}
 
-	// Auto-discover OpenAI-compatible servers on well-known ports.
-	autoDiscoverOpenAICompat(router, pcfg)
+	// Auto-discover OpenAI-compatible servers on well-known ports. Skippable so
+	// tests don't pick up whatever LLM server happens to be live on the host.
+	if !bro.noAutoDiscover {
+		autoDiscoverOpenAICompat(router, pcfg)
+	}
 
 	// Start the background availability maintainer when a lifecycle context is
 	// provided (the long-running daemon). Short-lived callers omit it and rely
@@ -484,8 +487,9 @@ func BuildRouter(cfg *Config, opts ...BuildRouterOption) (Router, error) {
 }
 
 type buildRouterOpts struct {
-	procMgr *ProcessManager
-	ctx     context.Context
+	procMgr        *ProcessManager
+	ctx            context.Context
+	noAutoDiscover bool
 }
 
 // BuildRouterOption configures BuildRouter.
@@ -494,6 +498,14 @@ type BuildRouterOption func(*buildRouterOpts)
 // WithProcessManager provides a ProcessManager for providers that spawn subprocesses.
 func WithProcessManager(pm *ProcessManager) BuildRouterOption {
 	return func(o *buildRouterOpts) { o.procMgr = pm }
+}
+
+// WithoutAutoDiscovery disables the live probe of well-known OpenAI-compatible
+// backends (LM Studio :1234, etc.). Production leaves auto-discovery on; tests
+// pass this so router construction is hermetic and does not depend on whatever
+// local LLM servers happen to be running on the host.
+func WithoutAutoDiscovery() BuildRouterOption {
+	return func(o *buildRouterOpts) { o.noAutoDiscover = true }
 }
 
 // WithRouterContext ties the router's background availability maintainer to
