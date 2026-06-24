@@ -19,11 +19,23 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+// Retention bounds for finished processes. Without eviction the processes map
+// grew without bound: Finish marked background processes complete but never
+// deleted them, so every background dispatch leaked an entry for the kernel's
+// lifetime. Finished entries are kept briefly for observability (List/Stats)
+// then reaped; a hard cap backstops pathological bursts. Vars (not consts) so
+// tests can shrink them; production never reassigns them.
+var (
+	finishedRetention   = 15 * time.Minute
+	maxTrackedProcesses = 512
 )
 
 // ProcessKind classifies how a process is managed.
@@ -111,6 +123,34 @@ func (p *ManagedProcess) SetError(err error) {
 	}
 }
 
+// loadStatus returns Status under p.mu. Status is mutated under p.mu by
+// SetError/Finish/Kill, so every reader outside those methods must go through
+// here (or snapshot) rather than touching p.Status directly — otherwise the
+// read races the write. Immutable fields (ID, Kind, Source, Identity,
+// StartedAt, CallbackChannel) are set once in Track and safe to read directly.
+func (p *ManagedProcess) loadStatus() ProcessStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Status
+}
+
+// snapshot returns the mutable fields (Status, FinishedAt, Error) consistently
+// under p.mu. FinishedAt's pointee is written once in Finish and never mutated
+// after, so returning the pointer is safe.
+func (p *ManagedProcess) snapshot() (ProcessStatus, *time.Time, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Status, p.FinishedAt, p.Error
+}
+
+// terminal reports whether the process has reached a finished state, i.e. it is
+// no longer running. Read under p.mu.
+func (p *ManagedProcess) terminal() (bool, *time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.Status != ProcessRunning, p.FinishedAt
+}
+
 // ManagedProcessOpts configures tracking for a new process.
 type ManagedProcessOpts struct {
 	Kind            ProcessKind
@@ -186,6 +226,7 @@ func (pm *ProcessManager) Track(cmd *exec.Cmd, opts ManagedProcessOpts) *Managed
 	}
 
 	pm.processes[proc.ID] = proc
+	pm.reapLocked()
 
 	slog.Info("procmgr: tracked",
 		"id", proc.ID[:8],
@@ -197,11 +238,57 @@ func (pm *ProcessManager) Track(cmd *exec.Cmd, opts ManagedProcessOpts) *Managed
 	return proc
 }
 
-// Remove unregisters a process. Called when a foreground process completes.
+// reapLocked evicts finished processes so the map can't grow without bound.
+// Caller must hold pm.mu (write). Entries terminal longer than
+// finishedRetention are dropped; if the map is still over maxTrackedProcesses,
+// the oldest-finished entries are dropped until it fits. Running processes are
+// never evicted. Per-process state is read under proc.mu (lock order: pm.mu
+// then proc.mu, matching Finish).
+func (pm *ProcessManager) reapLocked() {
+	now := time.Now()
+	type finishedProc struct {
+		id string
+		at time.Time
+	}
+	var finished []finishedProc
+	for id, proc := range pm.processes {
+		done, at := proc.terminal()
+		if !done {
+			continue
+		}
+		when := now
+		if at != nil {
+			when = *at
+		}
+		if now.Sub(when) > finishedRetention {
+			delete(pm.processes, id)
+			continue
+		}
+		finished = append(finished, finishedProc{id: id, at: when})
+	}
+
+	if len(pm.processes) <= maxTrackedProcesses {
+		return
+	}
+	// Still over the hard cap after the age sweep — drop oldest-finished first.
+	sort.Slice(finished, func(i, j int) bool { return finished[i].at.Before(finished[j].at) })
+	for _, f := range finished {
+		if len(pm.processes) <= maxTrackedProcesses {
+			break
+		}
+		delete(pm.processes, f.id)
+	}
+}
+
+// Remove unregisters a process. Called when a foreground process completes or
+// when a background process fails to start. Deletes unconditionally — the
+// caller is asserting it no longer needs the entry tracked. (Normal background
+// completion goes through Finish, which retains the entry briefly for
+// observability before reapLocked evicts it.)
 func (pm *ProcessManager) Remove(id string) {
 	pm.mu.Lock()
 	proc, ok := pm.processes[id]
-	if ok && proc.Kind == ProcessForeground {
+	if ok {
 		delete(pm.processes, id)
 	}
 	pm.mu.Unlock()
@@ -225,6 +312,9 @@ func (pm *ProcessManager) Finish(id string) {
 		proc.FinishedAt = &now
 		proc.mu.Unlock()
 		callback = pm.onComplete
+		// Evict stale finished entries now that we've added one. The just-
+		// finished proc is within finishedRetention, so it survives this sweep.
+		pm.reapLocked()
 	}
 	pm.mu.Unlock()
 
@@ -237,7 +327,7 @@ func (pm *ProcessManager) Finish(id string) {
 		slog.Info("procmgr: finished",
 			"id", id[:8],
 			"kind", proc.Kind,
-			"status", proc.Status,
+			"status", proc.loadStatus(),
 			"duration", time.Since(proc.StartedAt).Round(time.Millisecond),
 		)
 	}
@@ -269,7 +359,12 @@ func (pm *ProcessManager) Kill(id string) {
 		_ = proc.cmd.Process.Signal(syscall.SIGTERM)
 		go func() {
 			time.Sleep(5 * time.Second)
-			if proc.cmd.ProcessState == nil || !proc.cmd.ProcessState.Exited() {
+			// Liveness probe via signal 0 instead of reading proc.cmd.ProcessState:
+			// ProcessState is written by cmd.Wait() in another goroutine, so
+			// reading it here is a data race. Signal goes through os.Process'
+			// own synchronization and returns an error once the process has been
+			// reaped, so a nil error means "still alive → escalate to SIGKILL".
+			if err := proc.cmd.Process.Signal(syscall.Signal(0)); err == nil {
 				slog.Warn("procmgr: SIGKILL escalation", "id", id[:8])
 				_ = proc.cmd.Process.Signal(os.Kill)
 			}
@@ -283,11 +378,10 @@ func (pm *ProcessManager) KillBySource(source string) int {
 	pm.mu.RLock()
 	var targets []string
 	for id, proc := range pm.processes {
-		if proc.Source == source && proc.Status == ProcessRunning {
+		// Source/Kind are immutable; Status is read under proc.mu.
+		if proc.Source == source && proc.Kind == ProcessForeground && proc.loadStatus() == ProcessRunning {
 			// Only kill foreground processes. Background processes survive.
-			if proc.Kind == ProcessForeground {
-				targets = append(targets, id)
-			}
+			targets = append(targets, id)
 		}
 	}
 	pm.mu.RUnlock()
@@ -304,7 +398,8 @@ func (pm *ProcessManager) KillByIdentity(identity string) int {
 	pm.mu.RLock()
 	var targets []string
 	for id, proc := range pm.processes {
-		if proc.Identity == identity && proc.Status == ProcessRunning && proc.Kind == ProcessForeground {
+		// Identity/Kind are immutable; Status is read under proc.mu.
+		if proc.Identity == identity && proc.Kind == ProcessForeground && proc.loadStatus() == ProcessRunning {
 			targets = append(targets, id)
 		}
 	}
@@ -324,7 +419,7 @@ func (pm *ProcessManager) CanSpawn(identity string) error {
 	running := 0
 	identityRunning := 0
 	for _, proc := range pm.processes {
-		if proc.Status == ProcessRunning {
+		if proc.loadStatus() == ProcessRunning {
 			running++
 			if proc.Identity == identity {
 				identityRunning++
@@ -364,20 +459,21 @@ func (pm *ProcessManager) List() []ProcessSummary {
 
 	result := make([]ProcessSummary, 0, len(pm.processes))
 	for _, proc := range pm.processes {
+		status, finishedAt, errStr := proc.snapshot()
 		duration := time.Since(proc.StartedAt)
-		if proc.FinishedAt != nil {
-			duration = proc.FinishedAt.Sub(proc.StartedAt)
+		if finishedAt != nil {
+			duration = finishedAt.Sub(proc.StartedAt)
 		}
 		result = append(result, ProcessSummary{
 			ID:              proc.ID[:8],
 			Kind:            proc.Kind.String(),
-			Status:          proc.Status.String(),
+			Status:          status.String(),
 			Source:          proc.Source,
 			Identity:        truncID(proc.Identity),
 			StartedAt:       proc.StartedAt.Format(time.RFC3339),
 			Duration:        duration.Round(time.Millisecond).String(),
 			CallbackChannel: proc.CallbackChannel,
-			Error:           proc.Error,
+			Error:           errStr,
 		})
 	}
 	return result
@@ -404,7 +500,7 @@ func (pm *ProcessManager) Stats() ProcessStats {
 		BySource: make(map[string]int),
 	}
 	for _, proc := range pm.processes {
-		switch proc.Status {
+		switch proc.loadStatus() {
 		case ProcessRunning:
 			stats.Running++
 		case ProcessCompleted:
@@ -430,7 +526,7 @@ func (pm *ProcessManager) Shutdown(timeout time.Duration) {
 	pm.mu.RLock()
 	var running []string
 	for id, proc := range pm.processes {
-		if proc.Status == ProcessRunning {
+		if proc.loadStatus() == ProcessRunning {
 			running = append(running, id)
 		}
 	}
@@ -461,7 +557,7 @@ func (pm *ProcessManager) Shutdown(timeout time.Duration) {
 			pm.mu.RLock()
 			stillRunning := 0
 			for _, proc := range pm.processes {
-				if proc.Status == ProcessRunning {
+				if proc.loadStatus() == ProcessRunning {
 					stillRunning++
 				}
 			}

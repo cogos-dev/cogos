@@ -26,9 +26,19 @@ package engine
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+)
+
+// Kernel log rotation bounds for the JSONL sink. Exposed as vars so tests can
+// shrink them; COG_KERNEL_LOG_MAX_MB overrides the size cap at runtime. With the
+// defaults the sink is capped at roughly maxBackups+1 × 64 MB on disk.
+var (
+	kernelLogMaxBytes   int64 = 64 * 1024 * 1024 // rotate the active file past 64 MB
+	kernelLogMaxBackups       = 5                // keep 5 rotated copies (~384 MB total)
 )
 
 // DefaultKernelLogPath returns the default per-workspace path for the kernel
@@ -75,8 +85,9 @@ func (h *teeHandler) WithGroup(name string) slog.Handler {
 
 // newTeeHandler constructs a teeHandler that writes text to textSink and JSON
 // to jsonSink at the supplied level. Exported for tests; production callers
-// use upgradeLoggerWithFileSink.
-func newTeeHandler(textSink, jsonSink *os.File, level slog.Level) *teeHandler {
+// use upgradeLoggerWithFileSink. jsonSink is an io.Writer so production can pass
+// a rotatingWriter while tests pass a bytes.Buffer or *os.File.
+func newTeeHandler(textSink, jsonSink io.Writer, level slog.Level) *teeHandler {
 	opts := &slog.HandlerOptions{Level: level}
 	return &teeHandler{
 		text: slog.NewTextHandler(textSink, opts),
@@ -93,8 +104,10 @@ func newTeeHandler(textSink, jsonSink *os.File, level slog.Level) *teeHandler {
 // the file sink is logged as a Warn via the stderr-only fallback logger and
 // the function returns without altering the default logger.
 //
-// The file handle is intentionally never Close()'d; it lives for the kernel's
-// process lifetime. Exit flushes via the OS.
+// The sink is a size-rotating writer (see rotating_writer.go): the active file
+// is capped at kernelLogMaxBytes and rotated to <path>.1..N, so the sink no
+// longer grows without bound. The writer is intentionally never Close()'d; it
+// lives for the kernel's process lifetime and the OS flushes on exit.
 func upgradeLoggerWithFileSink(cfg *Config) {
 	if cfg == nil {
 		return
@@ -110,13 +123,14 @@ func upgradeLoggerWithFileSink(cfg *Config) {
 		path = DefaultKernelLogPath(cfg.WorkspaceRoot)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		slog.Warn("kernel log: cannot create dir; continuing with stderr-only logger",
-			"path", path, "err", err)
-		return
+	maxBytes := kernelLogMaxBytes
+	if v := os.Getenv("COG_KERNEL_LOG_MAX_MB"); v != "" {
+		if mb, perr := strconv.ParseInt(v, 10, 64); perr == nil && mb > 0 {
+			maxBytes = mb * 1024 * 1024
+		}
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	w, err := newRotatingWriter(path, maxBytes, kernelLogMaxBackups)
 	if err != nil {
 		slog.Warn("kernel log: cannot open sink; continuing with stderr-only logger",
 			"path", path, "err", err)
@@ -124,7 +138,7 @@ func upgradeLoggerWithFileSink(cfg *Config) {
 	}
 	// Intentionally not closed — lives for kernel lifetime.
 
-	tee := newTeeHandler(os.Stderr, f, level)
+	tee := newTeeHandler(os.Stderr, w, level)
 	slog.SetDefault(slog.New(tee))
-	slog.Info("kernel log: file sink active", "path", path)
+	slog.Info("kernel log: file sink active", "path", path, "max_bytes", maxBytes, "max_backups", kernelLogMaxBackups)
 }
