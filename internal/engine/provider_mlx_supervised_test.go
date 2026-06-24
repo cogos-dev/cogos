@@ -465,7 +465,10 @@ routing:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	router, err := BuildRouter(cfg)
+	// WithoutAutoDiscovery keeps the test hermetic: otherwise BuildRouter live-
+	// probes LM Studio on :1234 and, when one is running on the host, registers
+	// "lmstudio" ahead of the configured mlx-gemma, breaking FirstLocalProvider.
+	router, err := BuildRouter(cfg, WithoutAutoDiscovery())
 	if err != nil {
 		t.Fatalf("BuildRouter: %v", err)
 	}
