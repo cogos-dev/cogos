@@ -16,7 +16,7 @@
 //   - index.go         — in-memory full-text index backed by flat projection files
 //   - provider.go      — Reconcilable implementation
 //   - mcp_tools.go     — cog_search_conversations, cog_get_conversation_turn,
-//     cog_list_conversations tool registrations
+//                        cog_list_conversations tool registrations
 package conversations
 
 import "time"
@@ -70,27 +70,6 @@ type SessionMeta struct {
 
 	// SourceSize records the source file size at index time (drift detection).
 	SourceSize int64 `json:"source_size"`
-
-	// ── Incremental-parse cursor (CC source_dirs path only) ──────────────────
-	// These fields let the reconcile loop parse only the appended tail of a
-	// monotonically-growing session JSONL instead of re-reading from byte 0
-	// every cycle. They are populated by both the full-parse and incremental
-	// parse paths. Ingest sessions (Source != "") do not use these.
-
-	// LastParsedByteOffset is the byte offset at the end of the last record
-	// successfully consumed from the source file. The incremental parser seeks
-	// here before scanning the tail. Zero means "no cursor — full parse".
-	LastParsedByteOffset int64 `json:"last_parsed_byte_offset,omitempty"`
-
-	// LastParsedTurnIndex is the turn_index that will be assigned to the NEXT
-	// emitted turn (i.e. one past the highest indexed turn_index). The
-	// incremental parser starts numbering from here.
-	LastParsedTurnIndex int `json:"last_parsed_turn_index,omitempty"`
-
-	// PrefixSha256 is the hex-encoded SHA-256 of the first prefixHashWindow
-	// bytes of the source file at last successful index time. A mismatch on a
-	// later cycle signals a rewrite/truncation and forces a full re-parse.
-	PrefixSha256 string `json:"prefix_sha256,omitempty"`
 
 	// Identity is the operator identity extracted from the JSONL (e.g. "slowbro").
 	// Populated from userType/sessionId/cwd fields present in the records.
@@ -152,8 +131,8 @@ type SearchHit struct {
 	UUID         string    `json:"uuid"`
 	Timestamp    time.Time `json:"timestamp"`
 	Role         Role      `json:"role"`
-	Excerpt      string    `json:"excerpt"`           // ~300-char snippet containing the match
-	Context      string    `json:"context,omitempty"` // preceding/following text
+	Excerpt      string    `json:"excerpt"`              // ~300-char snippet containing the match
+	Context      string    `json:"context,omitempty"`   // preceding/following text
 	SessionTitle string    `json:"session_title,omitempty"`
 	Identity     string    `json:"identity,omitempty"`
 	Source       string    `json:"source,omitempty"` // observer source id, empty for CC sessions
@@ -163,9 +142,9 @@ type SearchHit struct {
 type IndexDepth string
 
 const (
-	DepthFull         IndexDepth = "full"          // all turns parsed and indexed
-	DepthMetaOnly     IndexDepth = "meta_only"     // meta parsed, turns not
-	DepthNotProjected IndexDepth = "not_projected" // file seen, not yet indexed
+	DepthFull          IndexDepth = "full"           // all turns parsed and indexed
+	DepthMetaOnly      IndexDepth = "meta_only"      // meta parsed, turns not
+	DepthNotProjected  IndexDepth = "not_projected"  // file seen, not yet indexed
 )
 
 // IndexEntry describes one session's projection status.

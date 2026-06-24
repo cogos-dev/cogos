@@ -3,22 +3,18 @@
 // Implements pkg/reconcile.Reconcilable with resource type "conversations".
 //
 // Method summary:
-//
-//	Type()        — "conversations"
-//	LoadConfig()  — scan source dirs for JSONL files; load .cog/config/observatory.yaml
-//	FetchLive()   — load index from .cog/state/conversations/_meta.json
-//	ComputePlan() — diff source files vs index entries; plan create/update/delete/skip
-//	ApplyPlan()   — stream-parse new/changed sessions into the index
-//	BuildState()  — construct Terraform-style state from live index entries
-//	Health()      — Healthy/Degraded/OutOfSync based on index drift and errors
+//   Type()        — "conversations"
+//   LoadConfig()  — scan source dirs for JSONL files; load .cog/config/observatory.yaml
+//   FetchLive()   — load index from .cog/state/conversations/_meta.json
+//   ComputePlan() — diff source files vs index entries; plan create/update/delete/skip
+//   ApplyPlan()   — stream-parse new/changed sessions into the index
+//   BuildState()  — construct Terraform-style state from live index entries
+//   Health()      — Healthy/Degraded/OutOfSync based on index drift and errors
 package conversations
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,13 +26,6 @@ import (
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 	"gopkg.in/yaml.v3"
 )
-
-// prefixHashWindow is the number of leading bytes of a source JSONL hashed to
-// detect truncation / in-place rewrite. A growing append-only file keeps this
-// prefix byte-identical; any edit to the head (compaction, resume-rewrite)
-// changes it and forces a full re-parse. 64 KiB comfortably covers many CC
-// session header + first-turns records.
-const prefixHashWindow int64 = 64 * 1024
 
 // Provider implements reconcile.Reconcilable for the Conversations Observatory.
 type Provider struct {
@@ -260,10 +249,6 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 	// ── CC source files ──────────────────────────────────────────────────────
 	for _, f := range cfg.SourceFiles {
 		existing, indexed := ls.Entries[f.SessionID]
-		var drift driftResult
-		if indexed {
-			drift = isDrift(existing.Meta, f)
-		}
 		switch {
 		case !indexed:
 			plan.Actions = append(plan.Actions, reconcile.Action{
@@ -278,19 +263,18 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 			})
 			plan.Summary.Creates++
 
-		case drift.Drifted:
+		case isDrift(existing.Meta, f):
 			plan.Actions = append(plan.Actions, reconcile.Action{
 				Action:       reconcile.ActionUpdate,
 				ResourceType: "conversations",
 				Name:         f.SessionID,
 				Details: map[string]any{
-					"source_path":    f.Path,
-					"mtime":          f.Mtime.Format(time.RFC3339),
-					"size":           f.Size,
-					"prev_mtime":     existing.Meta.SourceMtime.Format(time.RFC3339),
-					"prev_size":      existing.Meta.SourceSize,
-					"prev_turns":     existing.Meta.TurnCount,
-					"is_append_only": drift.IsAppendOnly,
+					"source_path": f.Path,
+					"mtime":       f.Mtime.Format(time.RFC3339),
+					"size":        f.Size,
+					"prev_mtime":  existing.Meta.SourceMtime.Format(time.RFC3339),
+					"prev_size":   existing.Meta.SourceSize,
+					"prev_turns":  existing.Meta.TurnCount,
 				},
 			})
 			plan.Summary.Updates++
@@ -523,38 +507,7 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				continue
 			}
 
-			// Append-only fast path: when ComputePlan classified this update as a
-			// pure append (file grew, head prefix unchanged) and a usable cursor
-			// is on record, parse only the appended tail instead of re-reading
-			// the whole file from byte 0. Falls back to a full re-parse on any
-			// inconsistency (no cursor, parse error) so correctness never depends
-			// on the cursor being right.
-			var (
-				meta  SessionMeta
-				turns []Turn
-				err   error
-			)
-			appendOnly, _ := action.Details["is_append_only"].(bool)
-			if action.Action == reconcile.ActionUpdate && appendOnly {
-				prevMeta, existingTurns, ok := idx.GetTurns(action.Name)
-				if ok && prevMeta.LastParsedByteOffset > 0 && prevMeta.PrefixSha256 != "" {
-					m, merged, _, incErr := indexSessionIncremental(sourcePath, action.Name, prevMeta, existingTurns, defaultMaxTurnLen)
-					if incErr == nil {
-						meta, turns = m, merged
-					} else {
-						// Incremental parse failed (e.g. file rewritten between
-						// plan and apply). Fall back to a safe full re-parse.
-						errs = append(errs, fmt.Sprintf("incremental %s fell back to full: %v", action.Name, incErr))
-						meta, turns, err = indexSession(sourcePath, action.Name, defaultMaxTurnLen)
-					}
-				} else {
-					// Flagged append-only but no usable cursor in the index
-					// (cold start, pre-cursor meta) — full re-parse seeds it.
-					meta, turns, err = indexSession(sourcePath, action.Name, defaultMaxTurnLen)
-				}
-			} else {
-				meta, turns, err = indexSession(sourcePath, action.Name, defaultMaxTurnLen)
-			}
+			meta, turns, err := indexSession(sourcePath, action.Name, defaultMaxTurnLen)
 			if err != nil {
 				res.Status = reconcile.ApplyFailed
 				res.Error = fmt.Sprintf("index session %s: %v", action.Name, err)
@@ -679,10 +632,9 @@ func (p *Provider) BuildState(_ any, live any, existing *reconcile.State) (*reco
 // ─── Health ───────────────────────────────────────────────────────────────────
 
 // Health returns three-axis status:
-//
-//	Sync      — Synced when last plan had no non-skip actions
-//	Health    — Degraded when ApplyPlan had errors; Healthy otherwise
-//	Operation — Syncing while ApplyPlan is running
+//   Sync      — Synced when last plan had no non-skip actions
+//   Health    — Degraded when ApplyPlan had errors; Healthy otherwise
+//   Operation — Syncing while ApplyPlan is running
 func (p *Provider) Health() reconcile.ResourceStatus {
 	p.mu.Lock()
 	summary := p.lastPlanSummary
@@ -952,96 +904,26 @@ func expandHome(path string) string {
 	return filepath.Join(home, path[1:])
 }
 
-// driftResult is the outcome of a CC source drift check.
-type driftResult struct {
-	// Drifted is true when the indexed meta is stale compared to the source.
-	Drifted bool
-	// IsAppendOnly is true when the only change is appended content: the file
-	// grew and its hashed prefix is byte-identical to the last-indexed prefix.
-	// Only meaningful when Drifted is true. When false on a drifted source, the
-	// caller must full re-parse (truncation/rewrite or no usable cursor).
-	IsAppendOnly bool
-}
-
-// isDrift reports whether the indexed meta is stale compared to f, and if so
-// whether the change is a pure append (so the caller can parse only the tail).
+// isDrift returns true when the indexed meta is stale compared to f.
+// Primary signal: size change (definitive — any content change changes size).
+// Secondary signal: mtime difference > 1s (guards against same-size rewrites).
 //
-// Drift detection (unchanged semantics):
-//   - size change is the definitive fast path
-//   - mtime difference > 2s (filesystem-granularity tolerance) for same-size
-//     rewrites
-//
-// Append-only classification (new):
-//   - the file must have GROWN (f.Size > meta.SourceSize), and
-//   - a valid cursor must exist (meta.PrefixSha256 set, meta.LastParsedByteOffset
-//     <= f.Size), and
-//   - the freshly-hashed prefix must equal meta.PrefixSha256.
-//
-// The hashed window is bounded by the LAST-PARSED offset, never the current
-// file size, so the hashed region only ever covers bytes that were already
-// present at index time. Appends land strictly after that offset and therefore
-// can never perturb the hash — without this bound, a small file (< window)
-// would re-hash the appended bytes and spuriously look like a rewrite.
-//
-// Any prefix-hash mismatch, size decrease, or missing cursor classifies the
-// drift as NOT append-only → full re-parse. A prefix hash that cannot be
-// computed (I/O error) is treated conservatively as not-append-only.
-func isDrift(meta SessionMeta, f sourceFileInfo) driftResult {
-	sizeChanged := meta.SourceSize != f.Size
-	mtimeDiff := meta.SourceMtime.Sub(f.Mtime)
-	if mtimeDiff < 0 {
-		mtimeDiff = -mtimeDiff
+// mtime is compared with 2-second tolerance to guard against filesystem mtime
+// resolution differences between `os.ReadDir` calls on fast-write filesystems
+// (e.g. Linux tmpfs in CI runners). A 1-byte change always changes size, so
+// the 2s tolerance only matters for truly same-size content changes (rare in
+// practice for session JSONLs, which grow monotonically).
+func isDrift(meta SessionMeta, f sourceFileInfo) bool {
+	// Size change is the definitive fast path.
+	if meta.SourceSize != f.Size {
+		return true
 	}
-	mtimeChanged := mtimeDiff > 2*time.Second
-
-	if !sizeChanged && !mtimeChanged {
-		return driftResult{Drifted: false}
+	// mtime with 2s tolerance for filesystem-level mtime granularity jitter.
+	diff := meta.SourceMtime.Sub(f.Mtime)
+	if diff < 0 {
+		diff = -diff
 	}
-
-	// Drifted. Decide whether it is a safe append.
-	grew := f.Size > meta.SourceSize
-	hasCursor := meta.PrefixSha256 != "" &&
-		meta.LastParsedByteOffset > 0 &&
-		meta.LastParsedByteOffset <= f.Size
-	if !grew || !hasCursor {
-		return driftResult{Drifted: true, IsAppendOnly: false}
-	}
-
-	prefix, err := computeFilePrefixHash(f.Path, prefixHashLen(meta.LastParsedByteOffset))
-	if err != nil || prefix != meta.PrefixSha256 {
-		// I/O error or rewrite of the head → fall back to full re-parse.
-		return driftResult{Drifted: true, IsAppendOnly: false}
-	}
-	return driftResult{Drifted: true, IsAppendOnly: true}
-}
-
-// prefixHashLen returns the number of leading bytes to hash for a source whose
-// last-parsed offset is offset: the prefix window, clamped so it never exceeds
-// the bytes that were already indexed. Hashing only already-seen bytes makes
-// the hash invariant under append.
-func prefixHashLen(offset int64) int64 {
-	if offset < prefixHashWindow {
-		return offset
-	}
-	return prefixHashWindow
-}
-
-// computeFilePrefixHash returns the hex-encoded SHA-256 of up to prefixSize
-// leading bytes of the file at path. Files shorter than prefixSize are hashed
-// in full. The hash is over the raw bytes, so it is stable across reads of an
-// unchanged prefix and changes the moment any leading byte changes.
-func computeFilePrefixHash(path string, prefixSize int64) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.CopyN(h, f, prefixSize); err != nil && err != io.EOF {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return diff > 2*time.Second
 }
 
 // indexSession opens sourcePath, streams turns, and returns the resulting
@@ -1066,14 +948,8 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 		SourceSize:  fi.Size(),
 	}
 
-	// Drive the full parse through the incremental parser from offset 0 so the
-	// cursor convention (committed offset = past the last NEWLINE-TERMINATED
-	// line) is identical on both paths. This keeps a trailing newline-less
-	// (possibly partial) final record from being committed, so a later append
-	// that completes it is parsed correctly. Turn extraction is byte-identical
-	// to ParseSession — both share parseUserRecord/parseAssistantRecord.
 	var turns []Turn
-	committed, err := ParseSessionIncremental(f, sessionID, 0, 0, maxTurnLen, &meta, nil, func(t Turn) bool {
+	err = ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	})
@@ -1081,92 +957,7 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 		return meta, turns, fmt.Errorf("parse %s: %w", sourcePath, err)
 	}
 
-	// Seed the incremental-parse cursor so the next reconcile cycle can parse
-	// only the appended tail. PrefixSha256 captures the file head (bounded by
-	// the committed offset) for truncation/rewrite detection.
-	meta.LastParsedByteOffset = committed
-	meta.LastParsedTurnIndex = len(turns)
-	if prefix, hErr := computeFilePrefixHash(sourcePath, prefixHashLen(committed)); hErr == nil {
-		meta.PrefixSha256 = prefix
-	}
-
 	return meta, turns, nil
-}
-
-// indexSessionIncremental seeks to the cursor recorded in prev and parses only
-// the appended tail of sourcePath, merging the new turns onto existingTurns. It
-// returns the updated meta, the merged turn slice, and the number of new turns
-// emitted. The caller must have already classified the source as append-only
-// (grew + prefix match) via isDrift.
-//
-// existingTurns is the session's current indexed turn slice; new turns are
-// appended after deduplicating by UUID against it, preserving the FTS-relevant
-// invariant that no two turns in a session share a UUID.
-func indexSessionIncremental(sourcePath, sessionID string, prev SessionMeta, existingTurns []Turn, maxTurnLen int) (SessionMeta, []Turn, int, error) {
-	fi, err := os.Stat(sourcePath)
-	if err != nil {
-		return SessionMeta{}, nil, 0, fmt.Errorf("stat %s: %w", sourcePath, err)
-	}
-
-	f, err := os.Open(sourcePath)
-	if err != nil {
-		return SessionMeta{}, nil, 0, fmt.Errorf("open %s: %w", sourcePath, err)
-	}
-	defer f.Close()
-
-	if _, err := f.Seek(prev.LastParsedByteOffset, io.SeekStart); err != nil {
-		return SessionMeta{}, nil, 0, fmt.Errorf("seek %s: %w", sourcePath, err)
-	}
-
-	// Carry forward the existing meta and refresh drift/index bookkeeping.
-	meta := prev
-	meta.SourcePath = sourcePath
-	meta.IndexedAt = time.Now().UTC()
-	meta.SourceMtime = fi.ModTime()
-	meta.SourceSize = fi.Size()
-
-	// Seed seenUUIDs with the UUIDs already indexed so re-appended historical
-	// records (resume/compaction) are deduplicated against the full session,
-	// not merely within this tail.
-	seen := make(map[string]struct{}, len(existingTurns))
-	for _, t := range existingTurns {
-		if t.UUID != "" {
-			seen[t.UUID] = struct{}{}
-		}
-	}
-
-	merged := existingTurns
-	startIdx := prev.LastParsedTurnIndex
-	if startIdx <= 0 {
-		// Defensive: a missing/zero turn-index cursor on a session that already
-		// has turns would renumber the tail from 0 and collide. Resume from the
-		// existing count instead.
-		startIdx = len(existingTurns)
-	}
-
-	committed, err := ParseSessionIncremental(f, sessionID, startIdx, prev.LastParsedByteOffset, maxTurnLen, &meta, seen,
-		func(t Turn) bool {
-			merged = append(merged, t)
-			return true
-		})
-	if err != nil {
-		return meta, merged, 0, fmt.Errorf("incremental parse %s: %w", sourcePath, err)
-	}
-
-	newCount := len(merged) - len(existingTurns)
-
-	// Advance the cursor to the committed offset (past the last newline-
-	// terminated line; it stays at prev.LastParsedByteOffset when the tail held
-	// only a partially-written final line, so that line is re-read next cycle
-	// and deduped by UUID).
-	meta.LastParsedByteOffset = committed
-	meta.LastParsedTurnIndex = len(merged)
-	meta.TurnCount = len(merged)
-	if prefix, hErr := computeFilePrefixHash(sourcePath, prefixHashLen(committed)); hErr == nil {
-		meta.PrefixSha256 = prefix
-	}
-
-	return meta, merged, newCount, nil
 }
 
 // isIngestDrift returns true when the indexed sessions of a source are stale
