@@ -163,6 +163,9 @@ func (r *DecisionLineageReconciler) ComputePlan(config any, live any, state *rec
 				"path":           projPath,
 				"decision_count": len(decisions),
 				"kind":           string(ProjectionDecisionLineage),
+				// Carry the already-rendered projection so ApplyPlan writes it
+				// directly instead of re-loading + re-rendering the whole corpus.
+				"content": projected,
 			},
 		})
 		if action == reconcile.ActionCreate {
@@ -212,19 +215,24 @@ func (r *DecisionLineageReconciler) ApplyPlan(ctx context.Context, plan *reconci
 			continue
 		}
 
-		// Re-derive from the corpus (idempotency: generate from scratch).
-		// projPath = <root>/.cog/mem/semantic/lineage/projections/decision-lineage.md
-		// root is five dirs up from the projections dir.
-		root := deriveRootFromProjectionPath(projPath)
-		decisions, err := LoadDecisionCorpus(root)
-		if err != nil {
-			results = append(results, reconcile.Result{
-				Phase: "apply", Action: string(action.Action), Name: action.Name,
-				Status: reconcile.ApplyFailed, Error: fmt.Sprintf("reload corpus: %v", err),
-			})
-			continue
+		// Use the projection ComputePlan already rendered this cycle. Only fall
+		// back to re-loading + re-rendering the whole decision corpus (the
+		// redundant O(corpus) work FetchLive/ComputePlan already did) if a
+		// caller built the plan without content — e.g. a test or a hand-built
+		// plan. projPath = <root>/.cog/mem/semantic/lineage/projections/decision-lineage.md.
+		content, _ := action.Details["content"].(string)
+		if content == "" {
+			root := deriveRootFromProjectionPath(projPath)
+			decisions, derr := LoadDecisionCorpus(root)
+			if derr != nil {
+				results = append(results, reconcile.Result{
+					Phase: "apply", Action: string(action.Action), Name: action.Name,
+					Status: reconcile.ApplyFailed, Error: fmt.Sprintf("reload corpus: %v", derr),
+				})
+				continue
+			}
+			content = renderDecisionLineageProjection(ComputeManifold(decisions, r.now()))
 		}
-		content := renderDecisionLineageProjection(ComputeManifold(decisions, r.now()))
 
 		tmp := projPath + ".tmp"
 		if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
@@ -252,7 +260,8 @@ func (r *DecisionLineageReconciler) ApplyPlan(ctx context.Context, plan *reconci
 			Phase: "apply", Action: string(action.Action), Name: action.Name,
 			Status: reconcile.ApplySucceeded,
 		})
-		log.Printf("[decision-lineage-reconciler] wrote %s (%d decisions)", projPath, len(decisions))
+		decisionCount, _ := action.Details["decision_count"].(int)
+		log.Printf("[decision-lineage-reconciler] wrote %s (%d decisions)", projPath, decisionCount)
 	}
 
 	return results, nil

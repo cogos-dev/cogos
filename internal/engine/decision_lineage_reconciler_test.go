@@ -300,3 +300,44 @@ func TestSpineCLIViews(t *testing.T) {
 		t.Error("accretion view missing header")
 	}
 }
+
+// TestDecisionLineageApplyPlan_UsesDetailsContent verifies ApplyPlan writes the
+// projection content carried in Action.Details verbatim, rather than re-loading
+// and re-rendering the decision corpus (the per-cycle redundancy this fix
+// removes). A sentinel that no corpus would produce proves the content path is
+// taken.
+func TestDecisionLineageApplyPlan_UsesDetailsContent(t *testing.T) {
+	dir := t.TempDir()
+	projDir := filepath.Join(dir, ".cog", "mem", "semantic", "lineage", "projections")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	projPath := filepath.Join(projDir, string(ProjectionDecisionLineage)+".md")
+
+	rec := NewDecisionLineageReconciler()
+	const sentinel = "SENTINEL-PROJECTION-CONTENT\n"
+	plan := &reconcile.Plan{
+		Actions: []reconcile.Action{{
+			Action:       reconcile.ActionCreate,
+			ResourceType: rec.Type(),
+			Name:         string(ProjectionDecisionLineage),
+			Details: map[string]any{
+				"path":           projPath,
+				"decision_count": 0,
+				"content":        sentinel,
+			},
+		}},
+	}
+
+	if _, err := rec.ApplyPlan(context.Background(), plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	got, err := os.ReadFile(projPath)
+	if err != nil {
+		t.Fatalf("read projection: %v", err)
+	}
+	if string(got) != sentinel {
+		t.Errorf("ApplyPlan wrote %q, want the Details content verbatim (no corpus re-derive)", string(got))
+	}
+}
