@@ -80,6 +80,22 @@ func (w *rotatingWriter) Write(p []byte) (int, error) {
 		}
 	}
 
+	// rotateLocked guarantees w.f is either a valid handle or nil — never a
+	// closed handle. If it could not reopen the sink (e.g. disk full mid-
+	// rotation), try once to (re)open here so logging self-heals when the
+	// condition clears, and surface a real error rather than EBADF-dropping the
+	// record onto a closed/nil descriptor.
+	if w.f == nil {
+		f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return 0, fmt.Errorf("kernel log sink unavailable: %w", err)
+		}
+		w.f = f
+		if fi, statErr := f.Stat(); statErr == nil {
+			w.size = fi.Size()
+		}
+	}
+
 	n, err := w.f.Write(p)
 	w.size += int64(n)
 	return n, err
@@ -87,10 +103,20 @@ func (w *rotatingWriter) Write(p []byte) (int, error) {
 
 // rotateLocked renames the active file to "<path>.1", shifting older backups up
 // and pruning beyond maxBackups, then opens a fresh active file. Caller holds mu.
+//
+// Invariant on return: w.f is either a valid open handle OR nil — never the
+// closed handle. The earlier version returned with w.f still pointing at the
+// handle closed below whenever the post-rename reopen failed, so every
+// subsequent Write hit EBADF and silently dropped the record. Write() now
+// self-heals from a nil w.f.
 func (w *rotatingWriter) rotateLocked() error {
 	// Close the active handle so the rename releases it cleanly (matters on
-	// Windows, where an open file cannot be renamed).
-	_ = w.f.Close()
+	// Windows, where an open file cannot be renamed). Drop the reference so a
+	// later early return can't leave a closed handle visible to Write.
+	if w.f != nil {
+		_ = w.f.Close()
+	}
+	w.f = nil
 
 	// Shift existing backups upward: <path>.(N-1) -> <path>.N, dropping the
 	// oldest. Descending order avoids clobbering a not-yet-moved backup.
@@ -105,27 +131,31 @@ func (w *rotatingWriter) rotateLocked() error {
 	}
 
 	// Move the active file to the newest backup slot. If the rename fails the
-	// file is left in place; reopening O_APPEND below means we resume on it
-	// rather than losing the handle.
+	// original is left in place and the reopen below resumes on it (O_APPEND).
 	newest := w.path + ".1"
 	_ = os.Remove(newest)
-	if err := os.Rename(w.path, newest); err != nil {
-		f, openErr := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if openErr != nil {
-			return fmt.Errorf("rotate rename %s: %w (reopen also failed: %v)", w.path, err, openErr)
+	renameErr := os.Rename(w.path, newest)
+
+	// Open a fresh active handle. On rename success this creates a new empty
+	// file; on rename failure O_APPEND resumes the still-present original.
+	f, openErr := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if openErr != nil {
+		// Could not reopen (e.g. disk full after a successful rename). Leave
+		// w.f == nil; Write self-heals on a later call when the condition clears.
+		if renameErr != nil {
+			return fmt.Errorf("rotate %s: rename failed (%v) and reopen failed: %w", w.path, renameErr, openErr)
 		}
-		w.f = f
+		return fmt.Errorf("rotate %s: reopen after rename failed: %w", w.path, openErr)
+	}
+	w.f = f
+	if renameErr != nil {
+		// Resumed on the un-renamed original — preserve its size so the cap is
+		// still honored.
 		if fi, statErr := f.Stat(); statErr == nil {
 			w.size = fi.Size()
 		}
-		return fmt.Errorf("rotate rename %s: %w", w.path, err)
+		return fmt.Errorf("rotate rename %s: %w", w.path, renameErr)
 	}
-
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("rotate reopen %s: %w", w.path, err)
-	}
-	w.f = f
 	w.size = 0
 	return nil
 }
