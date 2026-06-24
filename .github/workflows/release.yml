@@ -47,11 +47,13 @@ jobs:
             runner: macos-14
             cgo: '1'
             tags: 'fts5'
-          - goos: darwin
-            goarch: amd64
-            runner: macos-13
-            cgo: '1'
-            tags: 'fts5'
+          # darwin-amd64 (Intel Mac) intentionally dropped from releases: GitHub's
+          # macos-13 runners chronically sit queued for hours, wedging the whole
+          # release (the release job needs the full build matrix) — this cancelled
+          # v0.16.1 after 24h and stalled v0.16.2. Release targets are arm64 Mac +
+          # linux. Re-add this entry when an Intel-Mac target / reliable runner is
+          # needed. (The Makefile `all` target still cross-builds darwin-amd64 for
+          # local use.)
           # Windows: CGO_ENABLED=0 matches the Makefile (avoids tree-sitter's
           # CGO path). FTS5 is unavailable in this build; Windows is not a
           # kernel-daemon target, so dark-search does not apply to it.
