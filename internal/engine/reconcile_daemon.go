@@ -392,8 +392,17 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		return err
 	}
 
+	// Per-phase timing. Each reconcile step is timed so a slow phase — e.g. an
+	// O(corpus) FetchLive index reload, or a large WriteState — is visible in
+	// the cycle-complete log and on the span, instead of only the opaque cycle
+	// total. This makes "which phase is hot?" answerable from telemetry alone,
+	// without attaching a profiler.
+	var loadMs, fetchMs, stateMs, planMs, applyMs, writeMs int64
+
 	// Step 1: LoadConfig — read-only disk operation.
+	loadStart := time.Now()
 	config, err := provider.LoadConfig(d.cfg.WorkspaceRoot)
+	loadMs = time.Since(loadStart).Milliseconds()
 	if err != nil {
 		slog.Warn("reconcile-daemon: LoadConfig failed",
 			"provider", providerType, "err", err)
@@ -401,7 +410,9 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	}
 
 	// Step 2: FetchLive — read-only observation of world state.
+	fetchStart := time.Now()
 	live, err := provider.FetchLive(spanCtx, config)
+	fetchMs = time.Since(fetchStart).Milliseconds()
 	if err != nil {
 		slog.Warn("reconcile-daemon: FetchLive failed",
 			"provider", providerType, "err", err)
@@ -409,14 +420,32 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	}
 
 	// Step 3: Load persisted state.
+	stateStart := time.Now()
 	state, _ := reconcile.LoadState(d.cfg.WorkspaceRoot, providerType)
+	stateMs = time.Since(stateStart).Milliseconds()
 
 	// Step 4: ComputePlan — pure function, deterministic.
+	planStart := time.Now()
 	plan, err := provider.ComputePlan(config, live, state)
+	planMs = time.Since(planStart).Milliseconds()
 	if err != nil {
 		slog.Warn("reconcile-daemon: ComputePlan failed",
 			"provider", providerType, "err", err)
 		return fmt.Errorf("ComputePlan %s: %w", providerType, err)
+	}
+
+	// phaseAttrs records the per-phase timings on the cycle span. Called at both
+	// exits (early "in sync" return and full cycle) so traces always carry the
+	// breakdown.
+	phaseAttrs := func() []attribute.KeyValue {
+		return []attribute.KeyValue{
+			attribute.Int64("phase.load_config_ms", loadMs),
+			attribute.Int64("phase.fetch_live_ms", fetchMs),
+			attribute.Int64("phase.load_state_ms", stateMs),
+			attribute.Int64("phase.compute_plan_ms", planMs),
+			attribute.Int64("phase.apply_plan_ms", applyMs),
+			attribute.Int64("phase.write_state_ms", writeMs),
+		}
 	}
 
 	span.SetAttributes(
@@ -430,16 +459,21 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		// No drift — log at debug level and exit early; no write needed.
 		dur := time.Since(start)
 		span.SetAttributes(attribute.Int64("cycle.duration_ms", dur.Milliseconds()))
+		span.SetAttributes(phaseAttrs()...)
 		slog.Debug("reconcile-daemon: provider in sync",
 			"provider", providerType,
 			"skipped", plan.Summary.Skipped,
+			"fetch_ms", fetchMs,
+			"plan_ms", planMs,
 			"duration_ms", dur.Milliseconds(),
 		)
 		return nil
 	}
 
 	// Step 5: ApplyPlan — idempotent per ADR-092 §3.
+	applyStart := time.Now()
 	results, err := provider.ApplyPlan(spanCtx, plan)
+	applyMs = time.Since(applyStart).Milliseconds()
 	if err != nil {
 		slog.Warn("reconcile-daemon: ApplyPlan failed",
 			"provider", providerType, "err", err)
@@ -460,7 +494,9 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		}
 	}
 
-	// Step 6: BuildState — pure function.
+	// Steps 6-7: BuildState (pure) + WriteState (atomic tmp+rename), timed
+	// together as the persist phase.
+	writeStart := time.Now()
 	newState, buildErr := provider.BuildState(config, live, state)
 	if buildErr == nil && newState != nil {
 		// Step 7: WriteState — atomic tmp+rename.
@@ -472,9 +508,11 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		slog.Warn("reconcile-daemon: BuildState failed",
 			"provider", providerType, "err", buildErr)
 	}
+	writeMs = time.Since(writeStart).Milliseconds()
 
 	dur := time.Since(start)
 	span.SetAttributes(attribute.Int64("cycle.duration_ms", dur.Milliseconds()))
+	span.SetAttributes(phaseAttrs()...)
 
 	logLevel := slog.LevelInfo
 	if applyFailed > 0 {
@@ -487,6 +525,12 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		"deletes", plan.Summary.Deletes,
 		"skipped", plan.Summary.Skipped,
 		"apply_failed", applyFailed,
+		"load_ms", loadMs,
+		"fetch_ms", fetchMs,
+		"state_ms", stateMs,
+		"plan_ms", planMs,
+		"apply_ms", applyMs,
+		"write_ms", writeMs,
 		"duration_ms", dur.Milliseconds(),
 	)
 
