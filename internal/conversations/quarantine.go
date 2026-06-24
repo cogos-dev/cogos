@@ -39,6 +39,11 @@ const (
 	// QuarantineReasonOntologyMismatch is used when a record declares an
 	// (ontology id, major version) for which no L1 instance is loaded.
 	QuarantineReasonOntologyMismatch QuarantineReason = "ontology_mismatch"
+
+	// QuarantineReasonDraftRole is used when a record carries a recognized draft
+	// role (e.g. "user-draft"): an unsent composer draft that is not a
+	// conversation turn, and so is preserved in quarantine rather than ingested.
+	QuarantineReasonDraftRole QuarantineReason = "draft_role"
 )
 
 // QuarantineProvenance is the provenance block appended to quarantined records.

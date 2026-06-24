@@ -29,6 +29,13 @@ const (
 	RoleAssistant Role = "assistant"
 	RoleSystem    Role = "system"
 	RoleTool      Role = "tool"
+
+	// RoleUserDraft marks an unsent composer draft captured by an observer
+	// (e.g. claude-ai-web). A draft is not a turn the user actually sent, so it
+	// is recognized — to keep it off the unknown-role rejection path — but is
+	// never ingested as a session.turn; the ingest parser routes draft roles to
+	// quarantine instead.
+	RoleUserDraft Role = "user-draft"
 )
 
 // SessionMeta carries per-session metadata without loading turn content.
