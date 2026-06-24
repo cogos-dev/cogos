@@ -90,6 +90,12 @@ type CompilerConfig struct {
 
 // sourceCogdoc is the parsed in-memory representation of one reflective
 // cogdoc returned by FetchLive.
+//
+// IMMUTABLE after parseCogdoc returns: FetchLive caches and shares the same
+// *sourceCogdoc pointer across reconcile cycles (see parseCache), so downstream
+// consumers (ComputePlan, extractBlocks, ApplyPlan, BuildState) MUST treat it —
+// and its Frontmatter map and Blocks slice — as read-only. Mutating it would
+// corrupt the cached entry for every subsequent cycle.
 type sourceCogdoc struct {
 	// Path is the absolute filesystem path of the source cogdoc.
 	Path string
@@ -208,6 +214,20 @@ type ProjectionCompiler struct {
 	// lastEventCount is the number of events emitted in the most recent
 	// ApplyPlan run (new + changed + pointer).
 	lastEventCount int
+
+	// parseCache memoizes parseCogdoc results keyed on the source file's content
+	// hash, so FetchLive only re-spawns cogblock.py (a python subprocess — the
+	// dominant FetchLive cost) for files whose content actually changed. Guarded
+	// by mu. ComputePlan/ApplyPlan treat the *sourceCogdoc as read-only, so
+	// sharing the cached pointer across cycles is safe.
+	parseCache map[string]cachedCogdoc
+}
+
+// cachedCogdoc pairs a parsed source cogdoc with the content hash of the file
+// it was parsed from, for the projection-compiler FetchLive parse cache.
+type cachedCogdoc struct {
+	hash string
+	doc  *sourceCogdoc
 }
 
 // NewProjectionCompiler constructs a compiler in Progressing/Unknown health.
@@ -280,16 +300,44 @@ func (c *ProjectionCompiler) FetchLive(ctx context.Context, config any) (any, er
 	}
 
 	out := make([]*sourceCogdoc, 0, len(paths))
+	seen := make(map[string]struct{}, len(paths))
 	for _, p := range paths {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
+		seen[p] = struct{}{}
+
+		// Change-detection by content hash: only re-spawn cogblock.py (the
+		// dominant cost) when the source bytes changed since we last parsed it.
+		// Reading a small .cog.md to hash it is far cheaper than the python
+		// subprocess it guards. A read failure falls through to a parse attempt
+		// (parseCogdoc surfaces its own error), preserving prior behaviour.
+		h, haveHash := "", false
+		if data, readErr := os.ReadFile(p); readErr == nil {
+			h, haveHash = sha256Hex(string(data)), true
+			c.mu.Lock()
+			cached, hit := c.parseCache[p]
+			c.mu.Unlock()
+			if hit && cached.hash == h {
+				out = append(out, cached.doc)
+				continue
+			}
+		}
+
 		doc, err := parseCogdoc(ctx, cfg.CogblockPath, p)
 		if err != nil {
 			slog.Warn("projection-compiler: parse failed", "path", p, "err", err)
 			continue
+		}
+		if haveHash {
+			c.mu.Lock()
+			if c.parseCache == nil {
+				c.parseCache = make(map[string]cachedCogdoc)
+			}
+			c.parseCache[p] = cachedCogdoc{hash: h, doc: doc}
+			c.mu.Unlock()
 		}
 		out = append(out, doc)
 	}
@@ -299,6 +347,12 @@ func (c *ProjectionCompiler) FetchLive(ctx context.Context, config any) (any, er
 
 	c.mu.Lock()
 	c.lastSourceCount = len(out)
+	// Evict cache entries for sources that no longer exist (deleted/renamed).
+	for p := range c.parseCache {
+		if _, ok := seen[p]; !ok {
+			delete(c.parseCache, p)
+		}
+	}
 	c.mu.Unlock()
 
 	return out, nil
