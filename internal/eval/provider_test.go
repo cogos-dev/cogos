@@ -1157,7 +1157,17 @@ func TestComputePlan_DispatchTriggerFromFile(t *testing.T) {
 		},
 		BaselinePins: map[string]string{},
 	}
-	ls := &EvalLiveState{Scorecards: map[string]*Scorecard{}}
+	// FetchLive drains the trigger sidecar into the live state (the read-and-
+	// clear moved here from ComputePlan to keep ComputePlan pure); ComputePlan
+	// then reads the trigger from live.
+	liveAny, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	ls := liveAny.(*EvalLiveState)
+	if _, ok := ls.DispatchTriggers["exp-001"]; !ok {
+		t.Fatalf("FetchLive did not drain the trigger into live state: %+v", ls.DispatchTriggers)
+	}
 
 	plan, err := p.ComputePlan(cfg, ls, nil)
 	if err != nil {
@@ -1168,6 +1178,11 @@ func TestComputePlan_DispatchTriggerFromFile(t *testing.T) {
 	actions := filterNonSkip(plan.Actions)
 	if len(actions) == 0 {
 		t.Errorf("expected non-skip action when trigger is set, got all skips: %v", actionSummary(plan.Actions))
+	}
+
+	// And the sidecar must be drained — a second FetchLive sees no trigger.
+	if t2 := readAndClearDispatchTriggers(dir); len(t2) != 0 {
+		t.Errorf("trigger not cleared by FetchLive: %v", t2)
 	}
 }
 

@@ -419,6 +419,11 @@ type EvalLiveState struct {
 	Scorecards map[string]*Scorecard `json:"scorecards"`
 	// FetchedAt is the ISO-8601 timestamp when this snapshot was taken.
 	FetchedAt string `json:"fetched_at"`
+	// DispatchTriggers maps experiment ID → force, drained from the
+	// eval-dispatch-triggers.json sidecar during FetchLive (the read-and-clear
+	// happens there, not in ComputePlan, so ComputePlan stays pure — each
+	// trigger is consumed exactly when it is observed into live state).
+	DispatchTriggers map[string]bool `json:"dispatch_triggers,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

@@ -251,12 +251,23 @@ func splitFrontmatter(text string) (map[string]interface{}, error) {
 // FetchLive reads all completed trial records from bus_tournament.
 // Re-materializes scorecards inline per reconcile cycle (all-time, per design memo Q2).
 func (e *EvalProvider) FetchLive(ctx context.Context, config any) (any, error) {
+	// Drain the cog_run_experiment sidecar here (the observation step), once per
+	// cycle, so ComputePlan can stay pure. Doing the read-and-clear in
+	// ComputePlan meant a discarded/re-run plan could silently consume a
+	// user-initiated trigger. (The remaining concurrent-FetchLive window between
+	// the reconcile daemon and the autonomic ticker is the separate C1 issue.)
+	var dispatchTriggers map[string]bool
+	if e.root != "" {
+		dispatchTriggers = readAndClearDispatchTriggers(e.root)
+	}
+
 	if e.busReader == nil {
 		// No reader wired — return empty live state (FetchLive degrades gracefully)
 		return &EvalLiveState{
-			Trials:     []TrialRecord{},
-			Scorecards: map[string]*Scorecard{},
-			FetchedAt:  nowISO(),
+			Trials:           []TrialRecord{},
+			Scorecards:       map[string]*Scorecard{},
+			FetchedAt:        nowISO(),
+			DispatchTriggers: dispatchTriggers,
 		}, nil
 	}
 
@@ -264,9 +275,10 @@ func (e *EvalProvider) FetchLive(ctx context.Context, config any) (any, error) {
 	if err != nil {
 		// Degrade gracefully — kernel may not be reachable during tests
 		return &EvalLiveState{
-			Trials:     []TrialRecord{},
-			Scorecards: map[string]*Scorecard{},
-			FetchedAt:  nowISO(),
+			Trials:           []TrialRecord{},
+			Scorecards:       map[string]*Scorecard{},
+			FetchedAt:        nowISO(),
+			DispatchTriggers: dispatchTriggers,
 		}, nil
 	}
 	if events == nil {
@@ -300,9 +312,10 @@ func (e *EvalProvider) FetchLive(ctx context.Context, config any) (any, error) {
 	}
 
 	return &EvalLiveState{
-		Trials:     trials,
-		Scorecards: scorecards,
-		FetchedAt:  nowISO(),
+		Trials:           trials,
+		Scorecards:       scorecards,
+		FetchedAt:        nowISO(),
+		DispatchTriggers: dispatchTriggers,
 	}, nil
 }
 
@@ -480,15 +493,13 @@ func (e *EvalProvider) ComputePlan(config any, live any, state *reconcile.State)
 		}
 	}
 
-	// Merge in triggers from the sidecar file written by cog_run_experiment.
-	// This bridges the MCP-tool invocation → reconcile-cycle gap. The file is
-	// cleared by readAndClearDispatchTriggers so each trigger fires exactly once.
-	if e.root != "" {
-		for expID, force := range readAndClearDispatchTriggers(e.root) {
-			dispatchTriggers[expID] = true
-			if force {
-				forcedExperiments[expID] = true
-			}
+	// Merge in triggers observed (and drained) by FetchLive from the
+	// cog_run_experiment sidecar. ComputePlan only reads them now — the
+	// destructive clear lives in FetchLive — so this stays a pure function.
+	for expID, force := range ls.DispatchTriggers {
+		dispatchTriggers[expID] = true
+		if force {
+			forcedExperiments[expID] = true
 		}
 	}
 
