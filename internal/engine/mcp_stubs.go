@@ -178,7 +178,13 @@ func pathToMemURI(workspaceRoot, path string) string {
 func searchMemoryGrep(workspaceRoot, query string, limit int, sector string) (map[string]any, error) {
 	memDir := filepath.Join(workspaceRoot, ".cog", "mem")
 	if sector != "" {
-		memDir = filepath.Join(memDir, sector)
+		// Caller-supplied sector becomes a path component; contain it so a value
+		// like "../../etc" can't walk the grep fallback outside the memory root.
+		contained, err := containedJoin(memDir, sector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sector %q: %w", sector, err)
+		}
+		memDir = contained
 	}
 
 	var results []map[string]any
@@ -458,7 +464,12 @@ func buildMemoryIndexFromDB(dbPath, workspaceRoot, sector string) (map[string]an
 func buildMemoryIndexFromFS(workspaceRoot, sector string) (map[string]any, error) {
 	memDir := filepath.Join(workspaceRoot, ".cog", "mem")
 	if sector != "" {
-		memDir = filepath.Join(memDir, sector)
+		// Contain the caller-supplied sector — see searchMemoryGrep.
+		contained, err := containedJoin(memDir, sector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sector %q: %w", sector, err)
+		}
+		memDir = contained
 	}
 
 	var docs []map[string]any
