@@ -173,8 +173,11 @@ type ProcessManager struct {
 	// Nil means no callbacks (results are just logged).
 	onComplete func(proc *ManagedProcess)
 
-	// Graceful shutdown signal.
-	shutdownCh chan struct{}
+	// Graceful shutdown signal. Closed once, when Shutdown() returns, so the
+	// per-kill SIGKILL-escalation goroutines abort instead of lingering past
+	// daemon teardown. shutdownOnce guards the close against repeat Shutdown calls.
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
 }
 
 // ProcessManagerConfig configures the process manager.
@@ -358,7 +361,16 @@ func (pm *ProcessManager) Kill(id string) {
 	if proc.cmd != nil && proc.cmd.Process != nil {
 		_ = proc.cmd.Process.Signal(syscall.SIGTERM)
 		go func() {
-			time.Sleep(5 * time.Second)
+			// Wait out the grace period, but abort if the manager finishes
+			// shutting down first — otherwise this goroutine outlives the daemon
+			// by up to 5s firing a pointless SIGKILL at an already-reaped PID.
+			// shutdownCh closes only when Shutdown() returns (after its own grace
+			// window), so a normal kill still escalates here as before.
+			select {
+			case <-time.After(5 * time.Second):
+			case <-pm.shutdownCh:
+				return
+			}
 			// Liveness probe via signal 0 instead of reading proc.cmd.ProcessState:
 			// ProcessState is written by cmd.Wait() in another goroutine, so
 			// reading it here is a data race. Signal goes through os.Process'
@@ -523,6 +535,12 @@ func (pm *ProcessManager) Stats() ProcessStats {
 // Shutdown gracefully terminates all running processes.
 // Sends SIGTERM to all, waits up to timeout, then SIGKILL.
 func (pm *ProcessManager) Shutdown(timeout time.Duration) {
+	// Signal escalation goroutines to stop once we return (after the grace
+	// window below). During the window shutdownCh is still open, so in-flight
+	// SIGKILL escalations fire normally; only those still pending after teardown
+	// are aborted.
+	defer pm.shutdownOnce.Do(func() { close(pm.shutdownCh) })
+
 	pm.mu.RLock()
 	var running []string
 	for id, proc := range pm.processes {
