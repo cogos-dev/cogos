@@ -3,13 +3,14 @@
 // Implements pkg/reconcile.Reconcilable with resource type "conversations".
 //
 // Method summary:
-//   Type()        — "conversations"
-//   LoadConfig()  — scan source dirs for JSONL files; load .cog/config/observatory.yaml
-//   FetchLive()   — load index from .cog/state/conversations/_meta.json
-//   ComputePlan() — diff source files vs index entries; plan create/update/delete/skip
-//   ApplyPlan()   — stream-parse new/changed sessions into the index
-//   BuildState()  — construct Terraform-style state from live index entries
-//   Health()      — Healthy/Degraded/OutOfSync based on index drift and errors
+//
+//	Type()        — "conversations"
+//	LoadConfig()  — scan source dirs for JSONL files; load .cog/config/observatory.yaml
+//	FetchLive()   — load index from .cog/state/conversations/_meta.json
+//	ComputePlan() — diff source files vs index entries; plan create/update/delete/skip
+//	ApplyPlan()   — stream-parse new/changed sessions into the index
+//	BuildState()  — construct Terraform-style state from live index entries
+//	Health()      — Healthy/Degraded/OutOfSync based on index drift and errors
 package conversations
 
 import (
@@ -193,8 +194,11 @@ func (p *Provider) FetchLive(_ context.Context, _ any) (any, error) {
 		return &liveState{Entries: make(map[string]IndexEntry)}, nil
 	}
 
-	// Reload from disk to pick up changes from other processes.
-	if err := idx.Load(); err != nil {
+	// Reload from disk only if an external process changed the index since our
+	// last load/write. When the daemon is the sole writer (the common case) the
+	// in-memory index already reflects every change via UpsertSession, so this
+	// skips the full reload that otherwise dominates the reconcile cycle.
+	if _, err := idx.LoadIfChanged(); err != nil {
 		return nil, fmt.Errorf("conversations: load index: %w", err)
 	}
 
@@ -632,9 +636,10 @@ func (p *Provider) BuildState(_ any, live any, existing *reconcile.State) (*reco
 // ─── Health ───────────────────────────────────────────────────────────────────
 
 // Health returns three-axis status:
-//   Sync      — Synced when last plan had no non-skip actions
-//   Health    — Degraded when ApplyPlan had errors; Healthy otherwise
-//   Operation — Syncing while ApplyPlan is running
+//
+//	Sync      — Synced when last plan had no non-skip actions
+//	Health    — Degraded when ApplyPlan had errors; Healthy otherwise
+//	Operation — Syncing while ApplyPlan is running
 func (p *Provider) Health() reconcile.ResourceStatus {
 	p.mu.Lock()
 	summary := p.lastPlanSummary
