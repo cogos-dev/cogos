@@ -282,6 +282,18 @@ func (m *MCPServer) toolArchitectureProject(ctx context.Context, req *mcp.CallTo
 	if in.Handle == "" || in.Target == "" {
 		return fallbackResult("handle and target are required", "")
 	}
+	// Contain the caller-supplied target: architecture_project.py writes to it,
+	// so reject any target that resolves outside the workspace root. The script
+	// runs with the kernel's CWD (the workspace), so a relative target resolves
+	// the same way here; we validate the resolved path and pass the caller's
+	// value unchanged for valid (contained) inputs.
+	resolvedTarget := filepath.Clean(in.Target)
+	if !filepath.IsAbs(resolvedTarget) {
+		resolvedTarget = filepath.Join(m.cfg.WorkspaceRoot, resolvedTarget)
+	}
+	if !pathWithin(m.cfg.WorkspaceRoot, resolvedTarget) {
+		return fallbackResult(fmt.Sprintf("target %q is outside the workspace root", in.Target), "")
+	}
 	args := []string{in.Handle, "--target=" + in.Target}
 	if len(in.Filter) > 0 {
 		filterJSON, err := json.Marshal(in.Filter)

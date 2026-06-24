@@ -41,6 +41,14 @@ func claudeProjectsDir() string {
 	return filepath.Join(home, ".claude", "projects")
 }
 
+// validClaudeProjectName reports whether p is safe to use as a single path
+// component under claudeProjectsDir(): no parent refs and no separators, so it
+// cannot escape the projects directory. Shared by the sessions and spawn
+// handlers so both reject traversal identically.
+func validClaudeProjectName(p string) bool {
+	return !strings.Contains(p, "..") && !strings.ContainsRune(p, '/')
+}
+
 // ── route registration ───────────────────────────────────────────────────────
 
 // registerClaudeCodeRoutes wires the three /v1/claude-code/* routes onto mux.
@@ -133,7 +141,7 @@ func (s *Server) handleClaudeCodeSessions(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// Sanitize: no path traversal.
-	if strings.Contains(project, "..") || strings.ContainsRune(project, '/') {
+	if !validClaudeProjectName(project) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_param", "invalid project name")
 		return
 	}
@@ -317,6 +325,14 @@ func (s *Server) handleClaudeCodeSpawn(w http.ResponseWriter, r *http.Request) {
 	var req claudeCodeSpawnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	// Sanitize: req.Project becomes the spawned process's working directory
+	// (filepath.Join(claudeProjectsDir(), req.Project)); reject traversal so the
+	// CWD can't be steered outside ~/.claude/projects. Matches the guard in
+	// handleClaudeCodeSessions. Empty Project is allowed (no WorkDir derived).
+	if req.Project != "" && !validClaudeProjectName(req.Project) {
+		writeJSONError(w, http.StatusBadRequest, "invalid_param", "invalid project name")
 		return
 	}
 

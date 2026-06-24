@@ -395,10 +395,12 @@ func (s *Server) handleMemoryRead(w http.ResponseWriter, r *http.Request) {
 		absPath = filepath.Join(s.cfg.WorkspaceRoot, ".cog", "mem", path)
 	}
 
-	// Security: ensure path is under .cog/mem/
+	// Security: ensure path is under .cog/mem/. Use pathWithin (not a bare
+	// HasPrefix) so a sibling like ".cog/mem-evil" — which textually starts with
+	// the mem root — does not pass the containment check.
 	memRoot := filepath.Join(s.cfg.WorkspaceRoot, ".cog", "mem")
 	cleanPath := filepath.Clean(absPath)
-	if !strings.HasPrefix(cleanPath, memRoot) {
+	if !pathWithin(memRoot, cleanPath) {
 		http.Error(w, "path outside memory root", http.StatusForbidden)
 		return
 	}
