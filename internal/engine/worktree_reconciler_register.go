@@ -18,8 +18,9 @@ import (
 
 // RegisterWorktreeReconciler registers a WorktreeReconciler instance for the
 // given repo root with the global reconcile registry. Adapters may be nil;
-// LoadConfig will fill them with the filesystem-backed defaults on first
-// invocation.
+// NewWorktreeReconciler fills them with the filesystem-backed defaults at
+// construction (so the fields are never written at runtime — see the data-race
+// note there).
 //
 // Safe to call multiple times for the same repo root (uses UpsertProvider).
 func RegisterWorktreeReconciler(repoRoot string, reader LedgerReader, writer LedgerWriter, git GitAdapter) *WorktreeReconciler {
