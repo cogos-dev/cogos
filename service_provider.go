@@ -61,7 +61,21 @@ type ServiceProvider struct {
 	mu      sync.Mutex
 	root    string
 	runtime *DockerClient
+
+	// Health() result cache. computeHealth issues a Docker Ping + one
+	// ContainerList per declared service; Health() is called on every
+	// /v1/infer, every autonomic tick, and after every reconcile cycle, so the
+	// live probe is memoized for serviceHealthTTL. Guarded by mu.
+	cachedHealth ResourceStatus
+	healthAt     time.Time
+	healthValid  bool
 }
+
+// serviceHealthTTL bounds how stale a cached Health() result may be. Service
+// liveness changes are picked up within this window (and at the latest by the
+// next ~30s reconcile cycle), which is well inside the Reconcilable contract's
+// "Health() must be near-zero-cost" expectation.
+const serviceHealthTTL = 15 * time.Second
 
 func init() {
 	RegisterProvider("service", &ServiceProvider{})
@@ -701,8 +715,32 @@ func (s *ServiceProvider) BuildState(config any, live any, existing *ReconcileSt
 
 // ─── Health ─────────────────────────────────────────────────────────────────────
 
-// Health returns the three-axis status of the service subsystem.
+// Health returns the three-axis status of the service subsystem, served from a
+// short-TTL cache so the live Docker probe runs at most once per
+// serviceHealthTTL no matter how many callers hit it.
 func (s *ServiceProvider) Health() ResourceStatus {
+	s.mu.Lock()
+	if s.healthValid && time.Since(s.healthAt) < serviceHealthTTL {
+		h := s.cachedHealth
+		s.mu.Unlock()
+		return h
+	}
+	s.mu.Unlock()
+
+	h := s.computeHealth()
+
+	s.mu.Lock()
+	s.cachedHealth = h
+	s.healthAt = time.Now()
+	s.healthValid = true
+	s.mu.Unlock()
+	return h
+}
+
+// computeHealth performs the live probe: a Docker Ping plus a per-service
+// container/PID-liveness check. Called by Health() at most once per
+// serviceHealthTTL.
+func (s *ServiceProvider) computeHealth() ResourceStatus {
 	s.mu.Lock()
 	root := s.root
 	s.mu.Unlock()
