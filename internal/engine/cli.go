@@ -23,6 +23,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/myrgic/cogos/internal/providers/selfupdate"
 )
 
 var (
@@ -42,6 +44,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "Commands:\n")
 	fmt.Fprintf(w, "  init        Initialize a new workspace (.cog directory)\n")
 	fmt.Fprintf(w, "  install     Post-install setup (e.g. --add-path adds ~/.cog/bin to PATH)\n")
+	fmt.Fprintf(w, "  self-update Check for and apply cogos binary updates\n")
 	fmt.Fprintf(w, "  serve       Start the kernel daemon in the foreground (--detach to background)\n")
 	fmt.Fprintf(w, "  start       Launch the kernel daemon in a container\n")
 	fmt.Fprintf(w, "  stop        Stop a running daemon\n")
@@ -149,6 +152,9 @@ func Main() {
 			return
 		case "install":
 			runInstallCmd(args[1:])
+			return
+		case "self-update":
+			runSelfUpdateCmd(args[1:], *workspace, *port)
 			return
 		}
 	}
@@ -291,6 +297,13 @@ func runServe(workspace string, port int, bindAddr string) {
 		SetProvidersWorkspace(cfg.WorkspaceRoot)
 		slog.Info("providers workspace wired", "workspace", cfg.WorkspaceRoot)
 	}
+
+	// Inject the running build version and health port into the self-update
+	// provider so it can compare against release tags and poll the right port.
+	// The provider cannot import engine (import cycle), so the engine pushes
+	// these in via setters at boot.
+	selfupdate.SetRunningVersion(Version)
+	selfupdate.SetPort(cfg.Port)
 
 	// Daemon-already-running guard. Must stay in runServe, not Boot.
 	if reuse, msg, err := planServeState(cfg, checkDaemonHealth); err != nil {

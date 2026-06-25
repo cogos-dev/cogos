@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/myrgic/cogos/internal/providers/pin"
+	"github.com/myrgic/cogos/internal/providers/selfupdate"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 
 	// Trigger internal/providers/component's init() which registers "component".
@@ -70,8 +71,17 @@ var (
 // resolves cfg.WorkspaceRoot.
 func SetWorkspaceRoot(root string) {
 	workspaceRootMu.Lock()
-	defer workspaceRootMu.Unlock()
 	workspaceRoot = root
+	// Unlock before calling into selfupdate to avoid holding workspaceRootMu
+	// across a cross-package call (selfupdate.SetWorkspaceRoot acquires its own
+	// global.mu). Do NOT replace this with `defer workspaceRootMu.Unlock()`:
+	// that would hold this lock across the cross-package acquisition and create a
+	// lock-ordering hazard if selfupdate ever reaches back into this package.
+	workspaceRootMu.Unlock()
+	// Teach the self-update provider the workspace root so LoadConfig and the
+	// updater log path resolve correctly. The full plan/apply cycle runs in the
+	// daemon (unlike the Health()-only stubs above).
+	selfupdate.SetWorkspaceRoot(root)
 }
 
 // globalPinProvider is the singleton pinProvider registered in init().
@@ -165,6 +175,7 @@ func init() {
 	reconcile.RegisterProvider("openclaw-cron", &openclawCronProvider{stubMethods: stubMethods{name: "openclaw-cron"}})
 	reconcile.RegisterProvider("openclaw-gateway", &openclawGatewayProvider{stubMethods: stubMethods{name: "openclaw-gateway"}})
 	reconcile.RegisterProvider("pin", globalPinProvider)
+	reconcile.RegisterProvider("self-update", selfupdate.Registered())
 	reconcile.RegisterProvider("service", &serviceProvider{stubMethods: stubMethods{name: "service"}})
 }
 
