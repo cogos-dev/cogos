@@ -320,9 +320,12 @@ func (r *ProjectionReconciler) ComputePlan(config any, live any, state *reconcil
 			ResourceType: r.Type(),
 			Name:         string(r.kind),
 			Details: map[string]any{
-				"path":        projPath,
-				"node_count":  len(nodes),
-				"kind":        string(r.kind),
+				"path":       projPath,
+				"node_count": len(nodes),
+				"kind":       string(r.kind),
+				// Carry the rendered projection so ApplyPlan writes it directly
+				// instead of re-reading + re-parsing the whole nodes corpus.
+				"content": projected,
 			},
 		})
 		if action == reconcile.ActionCreate {
@@ -377,43 +380,46 @@ func (r *ProjectionReconciler) ApplyPlan(ctx context.Context, plan *reconcile.Pl
 			continue
 		}
 
-		// Re-generate projection content (idempotency: generate from scratch).
-		// We need to reload nodes since ApplyPlan doesn't carry live state.
-		// The projection content was already computed in ComputePlan; we
-		// re-derive it here to satisfy the idempotency requirement.
-		nodesDir := filepath.Dir(filepath.Dir(projPath)) // projections/../ = lineage/
-		nodesDir = filepath.Join(nodesDir, "nodes")
+		// Use the projection ComputePlan already rendered this cycle. Only fall
+		// back to re-reading + re-parsing the whole nodes corpus (the redundant
+		// O(corpus) work FetchLive/ComputePlan already did) if a caller built
+		// the plan without content — e.g. a test or a hand-built plan.
+		content, _ := action.Details["content"].(string)
+		if content == "" {
+			nodesDir := filepath.Dir(filepath.Dir(projPath)) // projections/../ = lineage/
+			nodesDir = filepath.Join(nodesDir, "nodes")
 
-		entries, err := os.ReadDir(nodesDir)
-		if err != nil {
-			results = append(results, reconcile.Result{
-				Phase:  "apply",
-				Action: string(action.Action),
-				Name:   action.Name,
-				Status: reconcile.ApplyFailed,
-				Error:  fmt.Sprintf("reload nodes: %v", err),
-			})
-			continue
-		}
-
-		var nodes []LineageNode
-		for _, entry := range entries {
-			if !strings.HasSuffix(entry.Name(), ".cog.md") {
+			entries, derr := os.ReadDir(nodesDir)
+			if derr != nil {
+				results = append(results, reconcile.Result{
+					Phase:  "apply",
+					Action: string(action.Action),
+					Name:   action.Name,
+					Status: reconcile.ApplyFailed,
+					Error:  fmt.Sprintf("reload nodes: %v", derr),
+				})
 				continue
 			}
-			node, err := parseLineageNode(filepath.Join(nodesDir, entry.Name()))
-			if err == nil {
-				nodes = append(nodes, *node)
-			}
-		}
-		sort.Slice(nodes, func(i, j int) bool {
-			if nodes[i].Frontmatter.Tier != nodes[j].Frontmatter.Tier {
-				return nodes[i].Frontmatter.Tier < nodes[j].Frontmatter.Tier
-			}
-			return nodes[i].Frontmatter.ID < nodes[j].Frontmatter.ID
-		})
 
-		content := generateProjection(r.kind, nodes)
+			var nodes []LineageNode
+			for _, entry := range entries {
+				if !strings.HasSuffix(entry.Name(), ".cog.md") {
+					continue
+				}
+				node, perr := parseLineageNode(filepath.Join(nodesDir, entry.Name()))
+				if perr == nil {
+					nodes = append(nodes, *node)
+				}
+			}
+			sort.Slice(nodes, func(i, j int) bool {
+				if nodes[i].Frontmatter.Tier != nodes[j].Frontmatter.Tier {
+					return nodes[i].Frontmatter.Tier < nodes[j].Frontmatter.Tier
+				}
+				return nodes[i].Frontmatter.ID < nodes[j].Frontmatter.ID
+			})
+
+			content = generateProjection(r.kind, nodes)
+		}
 
 		// Atomic write: tmp + rename.
 		tmp := projPath + ".tmp"
@@ -451,7 +457,8 @@ func (r *ProjectionReconciler) ApplyPlan(ctx context.Context, plan *reconcile.Pl
 			Status: reconcile.ApplySucceeded,
 		})
 
-		log.Printf("[projection-reconciler] wrote %s (%d nodes)", projPath, len(nodes))
+		nodeCount, _ := action.Details["node_count"].(int)
+		log.Printf("[projection-reconciler] wrote %s (%d nodes)", projPath, nodeCount)
 	}
 
 	return results, nil
