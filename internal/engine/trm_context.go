@@ -1,7 +1,7 @@
 // trm_context.go — TRM integration into the context assembly pipeline.
 //
 // Provides:
-//   - OllamaEmbed: embed a query via the local Ollama /api/embeddings endpoint
+//   - OllamaEmbed: embed a query via an OpenAI-compatible /v1/embeddings endpoint
 //   - trmScoreDocs: score CogDoc candidates using MambaTRM + embedding index
 //   - loadTRMAtStartup: one-shot loader called from main.go
 //
@@ -19,8 +19,8 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
-	"sort"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -41,23 +41,30 @@ func queryPrefix(model string) string {
 	return ""
 }
 
-// ollamaEmbedRequest is the request body for POST /api/embeddings.
-type ollamaEmbedRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
+// openAIEmbedRequest is the request body for POST /v1/embeddings — the
+// OpenAI-compatible embeddings surface served by LM Studio, Ollama's /v1
+// endpoint, vLLM, etc. (Replaces the former Ollama-native /api/embeddings.)
+type openAIEmbedRequest struct {
+	Model string `json:"model"`
+	Input string `json:"input"`
 }
 
-// ollamaEmbedResponse is the response from POST /api/embeddings.
-type ollamaEmbedResponse struct {
-	Embedding []float64 `json:"embedding"`
+// openAIEmbedResponse is the response from POST /v1/embeddings (OpenAI-compatible).
+type openAIEmbedResponse struct {
+	Data []struct {
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
 }
 
-// OllamaEmbed calls Ollama to embed a query string. Native dimensionality
-// depends on the model (768 for nomic-embed-text, 1024 for bge-m3, etc.).
+// OllamaEmbed calls an OpenAI-compatible /v1/embeddings server to embed a query
+// string. Native dimensionality depends on the model (768 for nomic-embed-text,
+// 1024 for bge-m3, etc.); the result is Matryoshka-truncated to the index dim.
 //
 // The endpoint and model come from cfg; defaults are localhost:11434 and
-// defaultEmbedModel (bge-m3:latest). The task-specific query prefix is
-// applied only for prefix-aware models — see queryPrefix.
+// defaultEmbedModel (bge-m3:latest). The task-specific query prefix is applied
+// only for prefix-aware models — see queryPrefix. (The cfg keys are still named
+// OllamaEmbed* for config compatibility; the endpoint is now any
+// OpenAI-compatible embeddings server.)
 func OllamaEmbed(ctx context.Context, cfg *Config, query string) ([]float32, error) {
 	endpoint := cfg.OllamaEmbedEndpoint
 	if endpoint == "" {
@@ -68,9 +75,9 @@ func OllamaEmbed(ctx context.Context, cfg *Config, query string) ([]float32, err
 		model = defaultEmbedModel
 	}
 
-	reqBody, err := json.Marshal(ollamaEmbedRequest{
-		Model:  model,
-		Prompt: queryPrefix(model) + query,
+	reqBody, err := json.Marshal(openAIEmbedRequest{
+		Model: model,
+		Input: queryPrefix(model) + query,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embed request: %w", err)
@@ -79,7 +86,7 @@ func OllamaEmbed(ctx context.Context, cfg *Config, query string) ([]float32, err
 	httpCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, endpoint+"/api/embeddings", bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, endpoint+"/v1/embeddings", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("create embed request: %w", err)
 	}
@@ -96,19 +103,25 @@ func OllamaEmbed(ctx context.Context, cfg *Config, query string) ([]float32, err
 		return nil, fmt.Errorf("ollama embed: status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var embedResp ollamaEmbedResponse
+	var embedResp openAIEmbedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
 		return nil, fmt.Errorf("decode embed response: %w", err)
 	}
+	if len(embedResp.Data) == 0 || len(embedResp.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("embed server returned no embeddings")
+	}
+	embedding := embedResp.Data[0].Embedding
 
 	// Convert float64 to float32, truncating to EMBED_DIM (Matryoshka).
-	dim := len(embedResp.Embedding)
+	// PRESERVED: the on-disk index is 384-dim, so the query must be truncated to
+	// match. Do not remove without re-exporting the index at the full dimension.
+	dim := len(embedding)
 	if dim > 384 {
 		dim = 384 // Matryoshka truncation to match index
 	}
 	vec := make([]float32, dim)
 	for i := 0; i < dim; i++ {
-		vec[i] = float32(embedResp.Embedding[i])
+		vec[i] = float32(embedding[i])
 	}
 
 	// L2-normalize for cosine similarity.

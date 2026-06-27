@@ -1,6 +1,6 @@
 // decompose_store.go — Wave 3: Embedding generation and CogDoc storage
 //
-// embedResults() calls Ollama's native /api/embed endpoint to generate
+// embedResults() calls an OpenAI-compatible /v1/embeddings endpoint to generate
 // vector embeddings for each decomposition tier. Best-effort: if the
 // embed endpoint is unreachable, logs a warning and continues.
 //
@@ -44,26 +44,29 @@ func documentPrefix(model string) string {
 
 // === C1+C2: Embedding Generation ===
 
-// ollamaEmbedRequest is the request body for Ollama's /api/embed endpoint.
-type ollamaEmbedRequest struct {
+// openAIEmbedRequest is the request body for POST /v1/embeddings — the
+// OpenAI-compatible embeddings surface (LM Studio, Ollama's /v1 endpoint, vLLM).
+type openAIEmbedRequest struct {
 	Model string `json:"model"`
 	Input string `json:"input"`
 }
 
-// ollamaEmbedResponse is the response from Ollama's /api/embed endpoint.
-type ollamaEmbedResponse struct {
-	Embeddings [][]float32 `json:"embeddings"`
+// openAIEmbedResponse is the response from POST /v1/embeddings (OpenAI-compatible).
+type openAIEmbedResponse struct {
+	Data []struct {
+		Embedding []float32 `json:"embedding"`
+	} `json:"data"`
 }
 
-// embedFromOllama calls Ollama's native embed endpoint for a single text.
-// `model` is the Ollama model tag (e.g. "bge-m3:latest", "nomic-embed-text");
-// pass "" to use defaultEmbedModel. Returns the full embedding vector — native
-// dimensionality depends on the model (768 for nomic, 1024 for bge-m3).
+// embedFromOllama embeds a single text via an OpenAI-compatible /v1/embeddings
+// server. `model` is the served model id; pass "" to use defaultEmbedModel.
+// Returns the FULL embedding vector unchanged — the caller (embedResults) does
+// the per-tier Matryoshka truncation via truncateVec.
 func embedFromOllama(ctx context.Context, ollamaURL, model, text string) ([]float32, error) {
 	if model == "" {
 		model = defaultEmbedModel
 	}
-	reqBody := ollamaEmbedRequest{
+	reqBody := openAIEmbedRequest{
 		Model: model,
 		Input: text,
 	}
@@ -72,7 +75,7 @@ func embedFromOllama(ctx context.Context, ollamaURL, model, text string) ([]floa
 		return nil, fmt.Errorf("marshal embed request: %w", err)
 	}
 
-	url := ollamaURL + "/api/embed"
+	url := ollamaURL + "/v1/embeddings"
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("create embed request: %w", err)
@@ -91,16 +94,16 @@ func embedFromOllama(ctx context.Context, ollamaURL, model, text string) ([]floa
 		return nil, fmt.Errorf("embed server returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	var embedResp ollamaEmbedResponse
+	var embedResp openAIEmbedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
 		return nil, fmt.Errorf("decode embed response: %w", err)
 	}
 
-	if len(embedResp.Embeddings) == 0 {
+	if len(embedResp.Data) == 0 || len(embedResp.Data[0].Embedding) == 0 {
 		return nil, fmt.Errorf("embed server returned no embeddings")
 	}
 
-	return embedResp.Embeddings[0], nil
+	return embedResp.Data[0].Embedding, nil
 }
 
 // truncateVec returns the first n elements of a vector (Matryoshka truncation).
