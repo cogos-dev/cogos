@@ -40,23 +40,26 @@ import (
 )
 
 const (
-	defaultEmbedModel    = "bge-m3:latest"
-	matryoshkaDim        = 384
-	pipelineVersion      = "v0.1.0"
+	defaultEmbedModel = "bge-m3:latest"
+	matryoshkaDim     = 384
+	pipelineVersion   = "v0.1.0"
 )
 
-// --- Ollama embed (slim copy; no import of internal/engine) ---
+// --- OpenAI-compatible /v1/embeddings (slim copy; no import of internal/engine) ---
 
-type ollamaEmbedRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
+type openAIEmbedRequest struct {
+	Model string `json:"model"`
+	Input string `json:"input"`
 }
 
-type ollamaEmbedResponse struct {
-	Embedding []float64 `json:"embedding"`
+type openAIEmbedResponse struct {
+	Data []struct {
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
 }
 
-// embedQuery embeds a query string via Ollama and returns a unit-normalized
+// embedQuery embeds a query string via an OpenAI-compatible /v1/embeddings
+// server (LM Studio, Ollama's /v1 endpoint, vLLM) and returns a unit-normalized
 // float32 vector truncated to matryoshkaDim (384).
 func embedQuery(ctx context.Context, ollamaEndpoint, model, query string) ([]float32, error) {
 	if ollamaEndpoint == "" {
@@ -66,9 +69,9 @@ func embedQuery(ctx context.Context, ollamaEndpoint, model, query string) ([]flo
 		model = defaultEmbedModel
 	}
 
-	reqBody, err := json.Marshal(ollamaEmbedRequest{
-		Model:  model,
-		Prompt: query, // bge-m3 does not use task prefixes
+	reqBody, err := json.Marshal(openAIEmbedRequest{
+		Model: model,
+		Input: query, // bge-m3 does not use task prefixes
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embed request: %w", err)
@@ -78,7 +81,7 @@ func embedQuery(ctx context.Context, ollamaEndpoint, model, query string) ([]flo
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost,
-		ollamaEndpoint+"/api/embeddings", bytes.NewReader(reqBody))
+		ollamaEndpoint+"/v1/embeddings", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("build embed request: %w", err)
 	}
@@ -95,18 +98,22 @@ func embedQuery(ctx context.Context, ollamaEndpoint, model, query string) ([]flo
 		return nil, fmt.Errorf("ollama embed: status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var embedResp ollamaEmbedResponse
+	var embedResp openAIEmbedResponse
 	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
 		return nil, fmt.Errorf("decode embed response: %w", err)
 	}
+	if len(embedResp.Data) == 0 || len(embedResp.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("embed server returned no embeddings")
+	}
+	embedding := embedResp.Data[0].Embedding
 
-	dim := len(embedResp.Embedding)
+	dim := len(embedding)
 	if dim > matryoshkaDim {
 		dim = matryoshkaDim
 	}
 	vec := make([]float32, dim)
 	for i := 0; i < dim; i++ {
-		vec[i] = float32(embedResp.Embedding[i])
+		vec[i] = float32(embedding[i])
 	}
 	return l2Normalize(vec), nil
 }
