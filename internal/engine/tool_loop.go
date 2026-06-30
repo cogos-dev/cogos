@@ -25,6 +25,34 @@ import (
 
 const maxToolLoopIterations = 10
 
+// noProgressRepeatLimit is the number of consecutive identical tool-call
+// signatures that trigger an early exit with ErrToolLoopNoProgress (ADR-031).
+const noProgressRepeatLimit = 3
+
+// ErrToolLoopMaxTurns is returned by RunToolLoopWithTranscript when the loop
+// reaches maxToolLoopIterations without the model emitting a final text
+// response. Callers (dispatchSlot, executeCycleTaskWithPrompt) check for this
+// sentinel to mark results as max-turns-exceeded rather than silent success.
+// (ADR-031 autonomic/fail-fast)
+var ErrToolLoopMaxTurns = &toolLoopSentinel{code: "max_turns", msg: "tool loop exceeded max iterations"}
+
+// ErrToolLoopNoProgress is returned when the loop detects the model repeating
+// the same tool call (name + args) for noProgressRepeatLimit consecutive
+// iterations. Autonomic, no model call — the loop breaks immediately.
+// (ADR-031 autonomic/fail-fast)
+var ErrToolLoopNoProgress = &toolLoopSentinel{code: "no_progress", msg: "tool loop detected no-progress: identical tool call repeated"}
+
+// toolLoopSentinel is the typed sentinel for structured loop-exit signals.
+// Exported as *toolLoopSentinel so callers can errors.Is against the package
+// vars; never constructed outside this file.
+type toolLoopSentinel struct {
+	code string
+	msg  string
+}
+
+func (e *toolLoopSentinel) Error() string { return e.msg }
+func (e *toolLoopSentinel) Code() string  { return e.code }
+
 // KernelToolRegistry holds the kernel's tool definitions and executors.
 // Populated at startup from the MCP server's tool set.
 type KernelToolRegistry struct {
@@ -66,8 +94,9 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			executor:    makeExecutor(mcpSrv, mcpSrv.toolResolveURI, resolveURIInput{}),
 		},
 		{
+			// ADR-045: description kept in sync with MCP registration in mcp_server.go.
 			name:        "cog_search_memory",
-			description: "Search the CogDoc memory corpus. Returns ranked results.",
+			description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores. Fallback: ./scripts/cog memory search \"query\"",
 			schema: mergeSchemas(
 				objectSchema("query", "Search query string"),
 				optionalSchema("limit", "number", "Max results (default 10)"),
@@ -76,8 +105,9 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			executor: makeExecutor(mcpSrv, mcpSrv.toolSearchMemory, searchMemoryInput{}),
 		},
 		{
+			// ADR-045: description kept in sync with MCP registration in mcp_server.go.
 			name:        "cog_read_cogdoc",
-			description: "Read a CogDoc by URI. Returns content with parsed frontmatter and schema hints.",
+			description: "Read a CogDoc by URI or path. Resolves cog: URIs automatically. Returns full content with parsed frontmatter and optional section extraction via #fragment. Fallback: ./scripts/cog memory read <path>",
 			schema: mergeSchemas(
 				objectSchema("uri", "A cog: URI pointing to the CogDoc"),
 				optionalSchema("section", "string", "Section name to extract"),
@@ -132,8 +162,9 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			executor: makeExecutor(mcpSrv, mcpSrv.toolQueryField, queryFieldInput{}),
 		},
 		{
+			// ADR-045: description kept in sync with MCP registration in mcp_server.go.
 			name:        "cog_check_coherence",
-			description: "Run workspace coherence validation",
+			description: "Run coherence validation against the workspace. Checks URI resolution, frontmatter validity, and reference integrity. Fallback: ./scripts/cog coherence check",
 			schema:      mergeSchemas(optionalSchema("scope", "string", "structural/navigational/canonical")),
 			executor:    makeExecutor(mcpSrv, mcpSrv.toolCheckCoherence, checkCoherenceInput{}),
 		},
@@ -402,6 +433,12 @@ func RunToolLoopWithTranscript(
 	var clientToolCalls []ToolCall
 	var transcript []ToolCallRecord
 
+	// No-progress tracking (ADR-031): record the last tool-call signature
+	// (tool-name + raw arguments) and count consecutive repeats. A run of
+	// noProgressRepeatLimit identical calls is treated as a stuck loop.
+	var lastToolSig string
+	var noProgressCount int
+
 	for i := 0; i < maxToolLoopIterations; i++ {
 		resp.ToolCalls = normalizeToolCallIDs(provider.Name(), i+1, resp.ToolCalls)
 		if len(resp.ToolCalls) == 0 {
@@ -493,6 +530,28 @@ func RunToolLoopWithTranscript(
 			return resp, clientToolCalls, transcript, nil
 		}
 
+		// No-progress guard (ADR-031): build a signature from the first kernel
+		// call's name+args. If the model keeps issuing the same call
+		// noProgressRepeatLimit times in a row, break autonomically without a
+		// model call rather than letting the loop spin to maxToolLoopIterations.
+		if len(kernelCalls) > 0 {
+			sig := kernelCalls[0].Name + "\x00" + kernelCalls[0].Arguments
+			if sig == lastToolSig {
+				noProgressCount++
+				if noProgressCount >= noProgressRepeatLimit {
+					slog.Warn("tool_loop: no-progress break",
+						"tool", kernelCalls[0].Name,
+						"repeat", noProgressCount,
+						"iteration", i+1,
+					)
+					return resp, clientToolCalls, transcript, ErrToolLoopNoProgress
+				}
+			} else {
+				lastToolSig = sig
+				noProgressCount = 1
+			}
+		}
+
 		// Execute kernel tools and add results.
 		for _, tc := range kernelCalls {
 			slog.Info("tool_loop: executing kernel tool",
@@ -529,6 +588,22 @@ func RunToolLoopWithTranscript(
 			})
 		}
 
+		// Respond hard-break (ADR-052 TERMINATE-as-break): if the model invoked
+		// the "respond" tool and it succeeded (ok:true in the result JSON), the
+		// turn is complete — break immediately rather than re-calling the model.
+		// Gate B in dashboard_inlet.go may return ok:false for a duplicate call;
+		// in that case we still break (the turn was already answered) to prevent
+		// the loop continuing after a denied respond invocation.
+		for _, tc := range kernelCalls {
+			if tc.Name == engineRespondToolName {
+				slog.Info("tool_loop: respond tool invoked — hard break (ADR-052)",
+					"tool", tc.Name,
+					"iteration", i+1,
+				)
+				return resp, clientToolCalls, transcript, nil
+			}
+		}
+
 		// If there are also client tool calls, we need to stop and let the client handle them.
 		if len(clientToolCalls) > 0 {
 			// Return a synthetic response that includes both the text and pending client calls.
@@ -549,8 +624,11 @@ func RunToolLoopWithTranscript(
 		)
 	}
 
+	// Max-turns structured exit (ADR-031): return ErrToolLoopMaxTurns so
+	// dispatchSlot / executeCycleTaskWithPrompt can mark the result as
+	// max-turns-exceeded rather than silently treating it as success.
 	slog.Warn("tool_loop: max iterations reached", "max", maxToolLoopIterations)
-	return resp, clientToolCalls, transcript, nil
+	return resp, clientToolCalls, transcript, ErrToolLoopMaxTurns
 }
 
 // normalizeToolCallIDs assigns stable IDs to any tool calls that arrived

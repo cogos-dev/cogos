@@ -2,16 +2,43 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/myrgic/cogos/trace"
 )
+
+// dispatchCycleIDKey is the context key that carries the cycle-trace ID minted
+// by DispatchToHarness. All trace events emitted within a single dispatch
+// invocation (including per-tool events in the tool loop) share this ID, so
+// bus consumers can correlate them. Follows the pattern in dashboard_inlet.go.
+// ADR-083 (bus cycle-trace path, not OTel), ADR-033, ADR-072.
+type dispatchCycleIDKey struct{}
+
+// withDispatchCycleID attaches a cycle-trace ID to the context.
+func withDispatchCycleID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, dispatchCycleIDKey{}, id)
+}
+
+// dispatchCycleIDFromCtx returns the cycle-trace ID stored in the context, or
+// an empty string when none is present (tool-loop calls outside a dispatch).
+func dispatchCycleIDFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(dispatchCycleIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // defaultHarnessScopeName is the scope used when no scope is requested.
 // Callers that don't specify a scope get exactly the tool set they always have.
@@ -109,17 +136,10 @@ const (
 	localHarnessExecuteMaxToks = 1024
 )
 
-const localHarnessAssessPrompt = `You are the resident local CogOS maintenance agent.
-Operate only through local inference and the kernel's local tools.
-Decide whether a maintenance pass is warranted right now.
-Return only one compact JSON object with these keys:
-{"action":"sleep|observe|consolidate|repair|propose|escalate","reason":"short string","urgency":0..1,"target":"short string","task":"short concrete next step"}
-Prefer "sleep" unless the observation names a concrete task worth doing now.`
-
-const localHarnessExecutePrompt = `You are the resident local CogOS maintenance agent.
-Stay local-only. Use the provided kernel tools when they materially improve the answer.
-Prefer inspection and diagnosis over mutation. Finish with a concise plain-text result.
-
+// harnessURIBlock is the canonical CogDoc URI reference injected into every
+// harness prompt. Defined once here to prevent drift across prompts (ADR-066
+// pointer-discipline: single authoritative source for URI format guidance).
+const harnessURIBlock = `
 CogDoc URIs use the bare form cog:<type>/<path>. Valid types:
   mem, adr, role, skill, agent, spec, status, ledger, crystal,
   kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks
@@ -131,6 +151,18 @@ Cross-workspace refs use authority form: cog://other-workspace/mem/...
 Invalid: cog://adrs/..., cog://docs/... with raw fs paths.
 If cog_search_memory returns a bus event path (".cog/.state/buses/.../events.jsonl#N"),
 that is a chat log entry, not a readable CogDoc — do not try to read it.`
+
+const localHarnessAssessPrompt = `You are the resident local CogOS maintenance agent.
+Operate only through local inference and the kernel's local tools.
+Decide whether a maintenance pass is warranted right now.
+Return only one compact JSON object with these keys:
+{"action":"sleep|observe|consolidate|repair|propose|escalate","reason":"short string","urgency":0..1,"target":"short string","task":"short concrete next step"}
+Prefer "sleep" unless the observation names a concrete task worth doing now.`
+
+const localHarnessExecutePrompt = `You are the resident local CogOS maintenance agent.
+Stay local-only. Use the provided kernel tools when they materially improve the answer.
+Prefer inspection and diagnosis over mutation. Finish with a concise plain-text result.
+` + harnessURIBlock
 
 // localHarnessChatPrompt is the system prompt used during the execute phase
 // when pending dashboard user messages are present. It replaces the maintenance
@@ -155,21 +187,16 @@ Rules:
 - You may use other kernel tools (cog_search_memory, cog_read_cogdoc, etc.) before
   calling respond if they would help you answer accurately. Keep it brief.
 - If you are uncertain, say so plainly. Do not invent facts about the workspace.
-
-CogDoc URIs use the bare form cog:<type>/<path>. Types: mem, adr, role, skill, agent,
-spec, status, ledger, crystal, kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks.
-Cross-workspace refs: cog://other-workspace/mem/...`
+` + harnessURIBlock
 
 const localHarnessDispatchPrompt = `You are the resident local CogOS harness.
 Stay local-only. Use only the provided kernel tools. Be concise and finish with a direct answer.
+` + harnessURIBlock + `
 
-CogDoc URIs use the bare form cog:<type>/<path>. Valid types:
-  mem, adr, role, skill, agent, spec, status, ledger, crystal,
-  kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks
-Example: cog:adr/077 (ADRs resolve by numeric prefix).
-Cross-workspace refs use authority form: cog://other-workspace/mem/...
-If cog_search_memory returns ".cog/.state/buses/.../events.jsonl#N", that's a chat log entry,
-not a readable CogDoc — do not try to read it.`
+Output contract (ADR-eigen output-contract, RFC-027 alignment layer): after any
+tool calls, finish with a plain-text answer — or call respond exactly once with
+the answer. Do NOT narrate tool use, emit role/channel markers, or output special
+tokens such as <|...|> or respond{...} scaffolding.`
 
 type localHarnessAssessment struct {
 	Action  string  `json:"action"`
@@ -767,13 +794,26 @@ func (c *LocalHarnessController) executeCycleTaskWithPrompt(ctx context.Context,
 		},
 	}
 	resp, clientCalls, transcript, err := c.completeWithToolLoop(ctx, provider, req, registry)
-	if err != nil {
+	// Structured loop-exit sentinels (ADR-031, ADR-052): surface partial content
+	// rather than propagating as a hard error. The sentinel is logged below; this
+	// function then returns the partial content with a nil error, so the autonomic
+	// cycle proceeds as a soft success (the sentinel reason is not propagated up).
+	if err != nil && !errors.Is(err, ErrToolLoopMaxTurns) && !errors.Is(err, ErrToolLoopNoProgress) {
 		return "", err
+	}
+	if err != nil {
+		slog.Warn("local harness cycle: structured loop exit",
+			"sentinel", err.Error(),
+			"tool_calls", len(transcript),
+		)
 	}
 	if len(clientCalls) > 0 {
 		slog.Warn("local harness produced unsupported client tool calls", "count", len(clientCalls))
 	}
-	content := strings.TrimSpace(resp.Content)
+	var content string
+	if resp != nil {
+		content = strings.TrimSpace(resp.Content)
+	}
 	if content == "" && len(transcript) > 0 {
 		content = summarizeToolTranscript(transcript)
 	}
@@ -1352,6 +1392,26 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		batch.Notes = append(batch.Notes, note)
 	}
 
+	// ADR-083 (bus cycle-trace), ADR-033, ADR-072: mint one cycle-trace ID per
+	// DispatchToHarness invocation so that all tool-dispatch events from every
+	// fan-out slot, plus the batch-level start/end ledger entries, share a
+	// correlating ID. Consumers on the kernel bus reconstruct a full dispatch
+	// audit trail by filtering on this ID.
+	cycleID := uuid.NewString()
+	ctx = withDispatchCycleID(ctx, cycleID)
+
+	// Emit dispatch-start ledger entry (ADR-033, ADR-072).
+	_ = EmitLedgerEvent(c.cfg, map[string]any{
+		"type":   "harness.dispatch.start",
+		"source": "local-harness",
+		"payload": map[string]any{
+			"cycle_id": cycleID,
+			"n":        req.N,
+			"task":     truncateDigest(req.Task),
+			"provider": req.Provider,
+		},
+	})
+
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < req.N; i++ {
@@ -1363,6 +1423,18 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	}
 	wg.Wait()
 	batch.TotalDurationSec = time.Since(start).Seconds()
+
+	// Emit dispatch-end ledger entry (ADR-033, ADR-072).
+	_ = EmitLedgerEvent(c.cfg, map[string]any{
+		"type":   "harness.dispatch.end",
+		"source": "local-harness",
+		"payload": map[string]any{
+			"cycle_id":         cycleID,
+			"n":                req.N,
+			"total_duration_s": batch.TotalDurationSec,
+		},
+	})
+
 	return batch, nil
 }
 
@@ -1381,19 +1453,47 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	}
 	counting := &countingProvider{Provider: provider}
 
+	// ADR-066 §models-always-swappable: temperature and max_tokens must be
+	// caller-overridable. Default to the harness constants when not set.
 	temp := 0.1
+	if req.Temperature != nil {
+		temp = *req.Temperature
+	}
+	maxToks := localHarnessExecuteMaxToks
+	if req.MaxTokens > 0 {
+		maxToks = req.MaxTokens
+	}
+
+	// ADR-066 §KV-Cache-Branching: RequestID must be content-stable so that
+	// identical fan-out slots share a KV-cache prefix. Hash (systemPrompt +
+	// task + sorted tool names); append idx only for per-slot log uniqueness —
+	// the prefix up to the dash is cache-relevant and identical across slots.
+	tools := registry.Definitions()
+	toolNames := make([]string, len(tools))
+	for i, t := range tools {
+		toolNames[i] = t.Name
+	}
+	sort.Strings(toolNames)
+	h := sha256.New()
+	h.Write([]byte(systemPrompt))
+	h.Write([]byte(req.Task))
+	for _, n := range toolNames {
+		h.Write([]byte(n))
+	}
+	contentKey := hex.EncodeToString(h.Sum(nil))[:16]
+
 	compReq := &CompletionRequest{
 		SystemPrompt: systemPrompt,
 		Messages: []ProviderMessage{
 			{Role: "user", Content: strings.TrimSpace(req.Task)},
 		},
-		Tools:         registry.Definitions(),
+		Tools:         tools,
 		ToolChoice:    "auto",
-		MaxTokens:     localHarnessExecuteMaxToks,
+		MaxTokens:     maxToks,
 		Temperature:   &temp,
 		ModelOverride: model,
 		Metadata: RequestMetadata{
-			RequestID:      fmt.Sprintf("local-harness-dispatch-%d-%d", time.Now().UnixNano(), idx),
+			RequestID:      fmt.Sprintf("local-harness-dispatch-%s-%d", contentKey, idx),
 			PreferLocal:    true,
 			PreferProvider: req.Provider,
 			Source:         "local-harness-dispatch",
@@ -1404,6 +1504,32 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	resp, clientCalls, transcript, err := c.completeWithToolLoop(slotCtx, counting, compReq, registry)
 	res.DurationSec = time.Since(start).Seconds()
 	res.Turns = counting.CompleteCalls()
+
+	// ADR-083 (bus cycle-trace, not OTel), ADR-033, ADR-072: emit one
+	// KindToolDispatch cycle-trace event per tool call so bus consumers
+	// (dashboard, audit log) can see every tool invoked during this dispatch.
+	// The cycleID injected by DispatchToHarness correlates all events from one
+	// cog_dispatch_to_harness invocation.
+	cycleID := dispatchCycleIDFromCtx(parent)
+	for _, tc := range transcript {
+		var toolErr error
+		if tc.Rejected {
+			toolErr = fmt.Errorf("%s", tc.RejectReason)
+		}
+		var argsRaw json.RawMessage
+		if tc.Arguments != "" {
+			argsRaw = json.RawMessage(tc.Arguments)
+		}
+		emitTrace(trace.NewToolDispatch(
+			TraceIdentity(),
+			cycleID,
+			tc.Name,
+			argsRaw,
+			time.Duration(tc.DurationMs)*time.Millisecond,
+			toolErr,
+		))
+	}
+
 	for _, tc := range transcript {
 		entry := DispatchToolCallSummary{
 			Name:         tc.Name,
@@ -1419,6 +1545,28 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		res.Error = fmt.Sprintf("unsupported client tool calls returned: %d", len(clientCalls))
 	}
 	if err != nil {
+		// Structured loop-exit sentinels (ADR-031, ADR-052): ErrToolLoopMaxTurns
+		// and ErrToolLoopNoProgress carry a partial response and transcript; mark
+		// the slot as Degraded rather than a hard failure so the partial content
+		// is still surfaced to the caller. Hard errors (provider failure, timeout)
+		// fall through to the existing failure path below.
+		if errors.Is(err, ErrToolLoopMaxTurns) || errors.Is(err, ErrToolLoopNoProgress) {
+			res.Success = true
+			res.Degraded = true
+			res.Error = err.Error()
+			if resp != nil {
+				res.Content = stripControlTokens(strings.TrimSpace(resp.Content))
+			}
+			if res.Content == "" && len(transcript) > 0 {
+				res.Content = summarizeToolTranscript(transcript)
+			}
+			slog.Warn("local harness dispatch: structured loop exit",
+				"sentinel", err.Error(),
+				"request_id", compReq.Metadata.RequestID,
+				"tool_calls", len(transcript),
+			)
+			return res
+		}
 		if slotCtx.Err() == context.DeadlineExceeded {
 			res.Error = "timeout"
 		} else {
@@ -1427,9 +1575,18 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		return res
 	}
 	res.Success = true
-	res.Content = strings.TrimSpace(resp.Content)
+	// Strip harmony/control-token leakage before the content becomes
+	// substrate-visible. ADR-eigen (output-contract) + RFC-027 (alignment layer).
+	res.Content = stripControlTokens(strings.TrimSpace(resp.Content))
 	if res.Content == "" && len(transcript) > 0 {
+		// Model returned no final text; fall back to a transcript summary.
+		// Surface Degraded so callers know the output contract was not met.
 		res.Content = summarizeToolTranscript(transcript)
+		res.Degraded = true
+		slog.Warn("local harness dispatch: model returned no final text; degraded to transcript summary",
+			"request_id", compReq.Metadata.RequestID,
+			"tool_calls", len(transcript),
+		)
 	}
 	// slotNote carries per-slot warnings (e.g. legacy "26b route unavailable,
 	// degraded to e4b") that the caller may need to surface per-result. These

@@ -101,6 +101,17 @@ type DispatchRequest struct {
 	// let the model emit a reasoning trace before answering.
 	Thinking *bool
 
+	// Temperature overrides the sampling temperature for this dispatch. nil
+	// keeps the harness default (0.1). Per ADR-066 §models-always-swappable:
+	// inference parameters must be caller-overridable, not hardcoded.
+	Temperature *float64
+
+	// MaxTokens overrides the completion token ceiling for this dispatch.
+	// 0 (the zero value) keeps the harness default (localHarnessExecuteMaxToks=1024).
+	// Per ADR-066 §models-always-swappable: callers must be able to widen
+	// or narrow the window without a harness change.
+	MaxTokens int
+
 	// Identity propagates OIDC-shaped caller claims for trace metadata.
 	// Optional; see DispatchIdentity for forward-compat notes.
 	Identity DispatchIdentity
@@ -144,6 +155,10 @@ type DispatchResult struct {
 	// the difference between "ran on the legacy e4b/26b path" and "ran on
 	// the named provider X." Per RFC-0007 Layer 1.
 	ProviderUsed string `json:"provider_used,omitempty"`
+	// Degraded is true when the model returned no final text and the slot fell
+	// back to summarizeToolTranscript. Success is still true — the tool loop
+	// completed — but the output contract (ADR-eigen output-contract) was not met.
+	Degraded bool `json:"degraded,omitempty"`
 }
 
 // ResolvedProvider is the materialized backend a ProviderResolver returns
