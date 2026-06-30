@@ -215,7 +215,7 @@ func TestResolveURIRFCScheme(t *testing.T) {
 	}{
 		{"cog://rfc/030", "RFC-030", true},
 		{"cog://rfc/30", "RFC-030", true}, // zero-padded normalization
-		{"cog://rfc/999", "", false},       // nonexistent RFC
+		{"cog://rfc/999", "", false},      // nonexistent RFC
 	}
 
 	for _, tc := range cases {
@@ -301,5 +301,125 @@ func TestMigrationConflictsTableExists(t *testing.T) {
 	}
 	if count == 0 {
 		t.Error("expected migration_conflicts table to exist")
+	}
+}
+
+// writeCogdocInWorkspace writes a *.cog.md file under a temp workspace's .cog/mem/ tree
+// and returns the absolute path.
+func writeCogdocInWorkspace(t *testing.T, c *Constellation, relPath, frontmatter, body string) string {
+	t.Helper()
+	// c.root is the workspace root used by openTestDB
+	absDir := filepath.Join(c.root, ".cog", "mem", filepath.Dir(relPath))
+	if err := os.MkdirAll(absDir, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", absDir, err)
+	}
+	absPath := filepath.Join(c.root, ".cog", "mem", relPath)
+	content := "---\n" + frontmatter + "\n---\n\n" + body
+	if err := os.WriteFile(absPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write cogdoc %s: %v", absPath, err)
+	}
+	return absPath
+}
+
+// TestFTSIndexFileSearchable verifies that IndexFile makes a new document
+// immediately searchable via FTS5 without a full rebuildFTS.
+func TestFTSIndexFileSearchable(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	path := writeCogdocInWorkspace(t, c,
+		"semantic/alpha.cog.md",
+		"id: alpha-doc\ntype: note\ntitle: Alpha Searchable\ncreated: 2026-01-01\ntags:\n  - fts-test-alpha",
+		"This document contains the word quuxbaz for FTS testing.",
+	)
+
+	if err := c.IndexFile(path); err != nil {
+		t.Fatalf("IndexFile: %v", err)
+	}
+
+	// FTS5 query for the unique token
+	var found int
+	err := c.DB().QueryRow(
+		`SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'quuxbaz'`,
+	).Scan(&found)
+	if err != nil {
+		t.Fatalf("FTS query: %v", err)
+	}
+	if found == 0 {
+		t.Error("expected IndexFile to make document searchable via FTS, got 0 matches")
+	}
+}
+
+// TestFTSIndexFileIdempotent verifies that calling IndexFile twice on an
+// unchanged file does not duplicate FTS rows.
+func TestFTSIndexFileIdempotent(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	path := writeCogdocInWorkspace(t, c,
+		"semantic/beta.cog.md",
+		"id: beta-doc\ntype: note\ntitle: Beta Idempotent\ncreated: 2026-01-01",
+		"Idempotent body content.",
+	)
+
+	if err := c.IndexFile(path); err != nil {
+		t.Fatalf("IndexFile first call: %v", err)
+	}
+	if err := c.IndexFile(path); err != nil {
+		t.Fatalf("IndexFile second call: %v", err)
+	}
+
+	var count int
+	err := c.DB().QueryRow(
+		`SELECT COUNT(*) FROM documents_fts WHERE id = 'beta-doc'`,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("FTS count query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 FTS row after two IndexFile calls, got %d", count)
+	}
+}
+
+// TestFTSIndexFileChangedContent verifies that after content changes and a
+// second IndexFile call, the FTS reflects the new content (not the old).
+func TestFTSIndexFileChangedContent(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	path := writeCogdocInWorkspace(t, c,
+		"semantic/gamma.cog.md",
+		"id: gamma-doc\ntype: note\ntitle: Gamma Changed\ncreated: 2026-01-01",
+		"Original content with token zorgblat.",
+	)
+	if err := c.IndexFile(path); err != nil {
+		t.Fatalf("IndexFile v1: %v", err)
+	}
+
+	// Overwrite with new content
+	newContent := "---\nid: gamma-doc\ntype: note\ntitle: Gamma Changed\ncreated: 2026-01-01\n---\n\nUpdated content with token wumblefritz."
+	if err := os.WriteFile(path, []byte(newContent), 0644); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if err := c.IndexFile(path); err != nil {
+		t.Fatalf("IndexFile v2: %v", err)
+	}
+
+	// Old token must be gone
+	var oldCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'zorgblat'`).Scan(&oldCount); err != nil {
+		t.Fatalf("old token query: %v", err)
+	}
+	if oldCount != 0 {
+		t.Errorf("expected old token 'zorgblat' to be absent after update, got %d", oldCount)
+	}
+
+	// New token must be present
+	var newCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'wumblefritz'`).Scan(&newCount); err != nil {
+		t.Fatalf("new token query: %v", err)
+	}
+	if newCount == 0 {
+		t.Error("expected new token 'wumblefritz' to appear after update, got 0")
 	}
 }
