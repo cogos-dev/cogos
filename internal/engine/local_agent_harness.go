@@ -2,11 +2,14 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1381,19 +1384,47 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	}
 	counting := &countingProvider{Provider: provider}
 
+	// ADR-066 §models-always-swappable: temperature and max_tokens must be
+	// caller-overridable. Default to the harness constants when not set.
 	temp := 0.1
+	if req.Temperature != nil {
+		temp = *req.Temperature
+	}
+	maxToks := localHarnessExecuteMaxToks
+	if req.MaxTokens > 0 {
+		maxToks = req.MaxTokens
+	}
+
+	// ADR-066 §KV-Cache-Branching: RequestID must be content-stable so that
+	// identical fan-out slots share a KV-cache prefix. Hash (systemPrompt +
+	// task + sorted tool names); append idx only for per-slot log uniqueness —
+	// the prefix up to the dash is cache-relevant and identical across slots.
+	tools := registry.Definitions()
+	toolNames := make([]string, len(tools))
+	for i, t := range tools {
+		toolNames[i] = t.Name
+	}
+	sort.Strings(toolNames)
+	h := sha256.New()
+	h.Write([]byte(systemPrompt))
+	h.Write([]byte(req.Task))
+	for _, n := range toolNames {
+		h.Write([]byte(n))
+	}
+	contentKey := hex.EncodeToString(h.Sum(nil))[:16]
+
 	compReq := &CompletionRequest{
 		SystemPrompt: systemPrompt,
 		Messages: []ProviderMessage{
 			{Role: "user", Content: strings.TrimSpace(req.Task)},
 		},
-		Tools:         registry.Definitions(),
+		Tools:         tools,
 		ToolChoice:    "auto",
-		MaxTokens:     localHarnessExecuteMaxToks,
+		MaxTokens:     maxToks,
 		Temperature:   &temp,
 		ModelOverride: model,
 		Metadata: RequestMetadata{
-			RequestID:      fmt.Sprintf("local-harness-dispatch-%d-%d", time.Now().UnixNano(), idx),
+			RequestID:      fmt.Sprintf("local-harness-dispatch-%s-%d", contentKey, idx),
 			PreferLocal:    true,
 			PreferProvider: req.Provider,
 			Source:         "local-harness-dispatch",

@@ -101,6 +101,17 @@ type DispatchRequest struct {
 	// let the model emit a reasoning trace before answering.
 	Thinking *bool
 
+	// Temperature overrides the sampling temperature for this dispatch. nil
+	// keeps the harness default (0.1). Per ADR-066 §models-always-swappable:
+	// inference parameters must be caller-overridable, not hardcoded.
+	Temperature *float64
+
+	// MaxTokens overrides the completion token ceiling for this dispatch.
+	// 0 (the zero value) keeps the harness default (localHarnessExecuteMaxToks=1024).
+	// Per ADR-066 §models-always-swappable: callers must be able to widen
+	// or narrow the window without a harness change.
+	MaxTokens int
+
 	// Identity propagates OIDC-shaped caller claims for trace metadata.
 	// Optional; see DispatchIdentity for forward-compat notes.
 	Identity DispatchIdentity
