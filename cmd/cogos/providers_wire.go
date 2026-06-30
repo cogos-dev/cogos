@@ -11,9 +11,13 @@
 package main
 
 import (
+	"log/slog"
+
+	"github.com/myrgic/cogos/internal/engine"
 	"github.com/myrgic/cogos/internal/eval"
 	"github.com/myrgic/cogos/internal/providers/all"
 	subidentity "github.com/myrgic/cogos/pkg/substrate/identity"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // daemonEvalProvider is the daemon-side EvalProvider instance. The daemon does
@@ -28,4 +32,21 @@ var daemonHarnessRegistry = subidentity.NewHarnessRegistry()
 
 func init() {
 	all.Register(daemonEvalProvider, daemonHarnessRegistry)
+
+	// Wire the constellation indexer so CogDocService.WriteAndSync / PatchAndSync
+	// perform an eager per-file FTS upsert and the lazy drift-repair path in
+	// searchMemoryFTSDriftRepair can call IndexFile without importing
+	// sdk/constellation from internal/engine (package-boundary guard).
+	//
+	// constellation.Open is called once at daemon boot with the resolved workspace
+	// root.  The sdk/constellation package may maintain its own internal connection
+	// pool; the returned handle is long-lived for the process lifetime.
+	engine.WireConstellationIndexer = func(s *engine.Server) {
+		c, err := constellation.Open(s.WorkspaceRoot())
+		if err != nil {
+			slog.Warn("constellation: failed to open indexer for FTS wiring; eager upsert disabled", "err", err)
+			return
+		}
+		s.SetConstellationIndexer(c)
+	}
 }

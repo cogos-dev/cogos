@@ -6,7 +6,6 @@
 package engine
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -17,8 +16,18 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/myrgic/cogos/sdk/constellation"
 )
+
+// pkgFTSRepairIndexer is the package-level ConstellationIndexer handle used
+// by the free-function lazy drift-repair path (searchMemoryFTSDriftRepair).
+// Set by MCPServer.SetConstellationIndexer when the constellation handle is
+// wired in from the root package at daemon boot.  Nil means drift repair is
+// disabled (degraded mode; safe for tests and CLI paths).
+//
+// Package-boundary note: this var holds an engine-local interface value
+// (ConstellationIndexer, declared in cogdoc_service.go) so internal/engine
+// never imports sdk/constellation directly.
+var pkgFTSRepairIndexer ConstellationIndexer
 
 // SearchMemory searches the CogDoc corpus using the constellation FTS5 index.
 // Falls back to naive filepath.Walk grep if the constellation DB is unavailable.
@@ -41,7 +50,20 @@ func SearchMemory(workspaceRoot, query string, limit int, sector string) (any, e
 // paths.  Total repair time is capped at ~200ms; if drift is widespread the
 // function logs once and returns without repairing the bulk.  This is the
 // "idempotent lazy re-index" path: correct regardless of write path.
+//
+// The constellation handle is accessed via pkgFTSRepairIndexer (a
+// ConstellationIndexer set by MCPServer.SetConstellationIndexer at daemon
+// boot).  If the handle is nil — e.g. in tests or CLI paths where the daemon
+// wiring did not run — drift repair is silently skipped (safe degraded mode).
+// This keeps internal/engine free of any import of sdk/constellation
+// (package-boundary guard #2 in cogdoc_service.go:22).
 func searchMemoryFTSDriftRepair(workspaceRoot string) {
+	// No indexer wired — skip repair silently.
+	indexer := pkgFTSRepairIndexer
+	if indexer == nil {
+		return
+	}
+
 	const (
 		sampleLimit = 100
 		budgetMs    = 200
@@ -96,22 +118,14 @@ func searchMemoryFTSDriftRepair(workspaceRoot string) {
 		return
 	}
 
-	// Open a writable constellation handle for the targeted repairs.
-	c, err := constellation.Open(workspaceRoot)
-	if err != nil {
-		return
-	}
-	defer c.Close()
-
+	// Repair drifted entries via the wired indexer handle.
+	// Budget: ~200ms total across all repairs; abort remaining on timeout.
 	deadline := time.Now().Add(budgetMs * time.Millisecond)
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	defer cancel()
-
 	for _, e := range drifted {
-		if ctx.Err() != nil {
+		if time.Now().After(deadline) {
 			break
 		}
-		if err := c.IndexFile(e.path); err != nil {
+		if err := indexer.IndexFile(e.path); err != nil {
 			slog.Warn("constellation: drift repair failed", "path", e.path, "err", err)
 		}
 	}

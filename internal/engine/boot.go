@@ -86,14 +86,14 @@ func WithIsolatedRegistry(providers ...reconcile.Reconcilable) BootOption {
 // Kernel is an opaque handle to a running in-process kernel instance.
 // Obtain via Boot; release via Stop.
 type Kernel struct {
-	cfg             *Config
-	server          *Server
-	process         *Process
-	reconcileDaemon *ReconcileDaemon
-	cancel          context.CancelFunc
-	httpEndpoint    string // resolved actual addr, e.g. "http://127.0.0.1:54321"
-	serverDone      chan error
-	processDone     chan error
+	cfg               *Config
+	server            *Server
+	process           *Process
+	reconcileDaemon   *ReconcileDaemon
+	cancel            context.CancelFunc
+	httpEndpoint      string // resolved actual addr, e.g. "http://127.0.0.1:54321"
+	serverDone        chan error
+	processDone       chan error
 	shutdownTelemetry func(context.Context)
 
 	// bepEngine is non-nil only when cluster.enabled=true and the engine
@@ -217,6 +217,16 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// (e.g. in tests or CLI-only builds) is safe — naked-by-default contract.
 	if WireHarnessBackend != nil {
 		WireHarnessBackend(server)
+	}
+
+	// Wire the constellation indexer so CogDocService.WriteAndSync /
+	// PatchAndSync perform an eager per-file FTS upsert, and so that the lazy
+	// drift-repair path in searchMemoryFTSDriftRepair can call IndexFile without
+	// importing sdk/constellation (package-boundary guard).
+	// WireConstellationIndexer is set by cmd/cogos/providers_wire.go; nil means
+	// eager upsert and drift repair are disabled (safe degraded mode for tests).
+	if WireConstellationIndexer != nil {
+		WireConstellationIndexer(server)
 	}
 
 	// Wire the session-activity publisher.
