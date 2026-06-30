@@ -136,61 +136,68 @@ func TestDashboardInletRunCycleWithPending(t *testing.T) {
 	cfg := makeConfig(t, root)
 	cfg.LocalModel = "gemma4:e4b"
 
-	// Fake Ollama: assess returns "respond" action, execute calls the respond tool.
+	// LM Studio stub: assess returns "respond" action, execute calls the respond tool.
 	var callSeq atomic.Int64
 	model := "gemma4:e4b"
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/tags":
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"models": []map[string]any{{"name": model}},
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
 			})
-		case "/api/chat":
+		case "/v1/chat/completions":
 			seq := callSeq.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			switch seq {
 			case 1:
 				// Assess: respond to user message.
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": `{"action":"respond","reason":"user sent a message","urgency":0.8,"target":"dashboard","task":"reply to user"}`,
-					},
-					"done":              true,
-					"prompt_eval_count": 10,
-					"eval_count":        20,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": `{"action":"respond","reason":"user sent a message","urgency":0.8,"target":"dashboard","task":"reply to user"}`,
+						},
+						"finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 20},
 				})
 			case 2:
 				// Execute: model calls the respond tool.
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": "",
-						"tool_calls": []map[string]any{{
-							"function": map[string]any{
-								"name":      engineRespondToolName,
-								"arguments": `{"text":"hello from the agent","reasoning":"user greeted me"}`,
-							},
-						}},
-					},
-					"done":              false,
-					"prompt_eval_count": 10,
-					"eval_count":        15,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": "",
+							"tool_calls": []map[string]any{{
+								"id":   "call_1",
+								"type": "function",
+								"function": map[string]any{
+									"name":      engineRespondToolName,
+									"arguments": `{"text":"hello from the agent","reasoning":"user greeted me"}`,
+								},
+							}},
+						},
+						"finish_reason": "tool_calls",
+					}},
+					"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 15},
 				})
 			default:
 				// After tool result injected: return final text.
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": "responded to user",
-					},
-					"done":              true,
-					"prompt_eval_count": 5,
-					"eval_count":        10,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": "responded to user",
+						},
+						"finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 10},
 				})
 			}
 		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer llm.Close()
@@ -274,45 +281,49 @@ func TestDashboardInletFallbackFires(t *testing.T) {
 	cfg := makeConfig(t, root)
 	cfg.LocalModel = "gemma4:e4b"
 
-	// Fake Ollama: assess returns "observe" (not "respond"), execute returns
+	// LM Studio stub: assess returns "observe" (not "respond"), execute returns
 	// plain text without calling the respond tool — so the fallback should fire.
 	var callSeq atomic.Int64
 	model := "gemma4:e4b"
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/tags":
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"models": []map[string]any{{"name": model}},
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
 			})
-		case "/api/chat":
+		case "/v1/chat/completions":
 			seq := callSeq.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			switch seq {
 			case 1:
 				// Assess: observe action (not respond) — agent will not call respond tool.
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": `{"action":"observe","reason":"checking field state","urgency":0.3,"target":"memory","task":"scan recent events"}`,
-					},
-					"done":              true,
-					"prompt_eval_count": 10,
-					"eval_count":        20,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": `{"action":"observe","reason":"checking field state","urgency":0.3,"target":"memory","task":"scan recent events"}`,
+						},
+						"finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 20},
 				})
 			default:
 				// Execute: returns plain text, no tool calls.
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": fmt.Sprintf("observation complete for cycle %d", seq),
-					},
-					"done":              true,
-					"prompt_eval_count": 5,
-					"eval_count":        10,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": fmt.Sprintf("observation complete for cycle %d", seq),
+						},
+						"finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 10},
 				})
 			}
 		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer llm.Close()

@@ -5,8 +5,8 @@
 // The cog_dispatch_to_harness MCP tool surfaces this transport. It is the
 // foveal -> peripheral handoff: a big external Claude session can offload a
 // piece of cognitive work (validation, rewriting, modality matching) onto the
-// always-resident Gemma E4B (or LM Studio 26B) without burning Anthropic
-// tokens.
+// resident LM Studio instance (lmstudio-darkstar, gemma-4-26b at 127.0.0.1:1234)
+// without burning Anthropic tokens.
 //
 // This file owns the *contract* — the request and result types and the
 // AgentController extension. The concrete dispatcher lives in the root
@@ -23,13 +23,19 @@ package engine
 
 import "context"
 
-// DispatchModel selects the inference backend. "e4b" routes to the always-
-// resident Ollama (localhost:11434), "26b" routes to the configured remote
-// OpenAI-compatible endpoint (see COGOS_LLM_ENDPOINT or providers.yaml).
-// Empty string is normalized to "e4b" by the dispatcher.
+// DispatchModel selects the inference backend. "e4b" and "26b" are legacy
+// enum values retained for backward compatibility; both now route to the
+// LM Studio provider (lmstudio-darkstar, 127.0.0.1:1234). The preferred
+// path is to set DispatchRequest.Provider = "lmstudio-darkstar" explicitly.
+// Empty string routes through process-state or harness_provider config, which
+// should also resolve to lmstudio-darkstar on this node.
 type DispatchModel string
 
 const (
+	// DispatchModelE4B is retained for backward compatibility. Ollama has been
+	// decommissioned; dispatches using this value route through the legacy
+	// local-LLM probe which resolves to the LM Studio provider when Ollama is
+	// absent. Prefer Provider="lmstudio-darkstar" for new callers.
 	DispatchModelE4B DispatchModel = "e4b"
 	DispatchModel26B DispatchModel = "26b"
 )
@@ -69,9 +75,10 @@ type DispatchRequest struct {
 	// chosen scope surface as an error rather than silently dropping.
 	Tools []string
 
-	// Model selects the inference backend. Unknown values default to e4b.
-	// When Provider is set, Model is ignored — the resolved provider supplies
-	// its own model id.
+	// Model selects the inference backend. Unknown values fall through to the
+	// legacy local-LLM probe (see resolveDispatchLocalModel). Prefer setting
+	// Provider="lmstudio-darkstar" for explicit routing. When Provider is set,
+	// Model is ignored — the resolved provider supplies its own model id.
 	Model DispatchModel
 
 	// Provider, when non-empty, names a provider declared in providers.yaml
@@ -146,14 +153,11 @@ type DispatchResult struct {
 	Error       string                    `json:"error,omitempty"`
 	DurationSec float64                   `json:"duration_sec"`
 	Turns       int                       `json:"turns"`
-	// ModelUsed reports the backend that actually served this slot. May
-	// differ from DispatchRequest.Model when "26b" degraded to e4b due to
-	// LM Studio being unreachable — Error then carries the warning.
+	// ModelUsed reports the backend that actually served this slot.
 	ModelUsed DispatchModel `json:"model_used,omitempty"`
 	// ProviderUsed is the resolved provider name when DispatchRequest.Provider
 	// fired, otherwise empty. Surfaced for observability so a caller can tell
-	// the difference between "ran on the legacy e4b/26b path" and "ran on
-	// the named provider X." Per RFC-0007 Layer 1.
+	// which named provider handled the slot. Per RFC-0007 Layer 1.
 	ProviderUsed string `json:"provider_used,omitempty"`
 	// Degraded is true when the model returned no final text and the slot fell
 	// back to summarizeToolTranscript. Success is still true — the tool loop
@@ -167,8 +171,8 @@ type DispatchResult struct {
 // api_key_env at lookup time so the dispatcher does not have to know
 // which env var any given provider uses.
 type ResolvedProvider struct {
-	BackendURL  string // e.g. http://192.168.10.191:1234 (no /v1 suffix; harness appends)
-	BackendKind string // "openai" | "ollama"
+	BackendURL  string // e.g. http://127.0.0.1:1234 (no /v1 suffix; harness appends)
+	BackendKind string // "openai" | "openai-compat"
 	Model       string // e.g. google/gemma-4-26b-a4b
 	APIKey      string // already materialized; empty when the provider has no api_key_env
 }
@@ -190,9 +194,8 @@ type ProviderResolver interface {
 type DispatchBatchResult struct {
 	Results          []DispatchResult `json:"results"`
 	TotalDurationSec float64          `json:"total_duration_sec"`
-	// Notes carries batch-level diagnostic strings (e.g. "26b unreachable,
-	// degraded to e4b for slots 0,2"). Per-slot warnings live in the
-	// individual Error fields.
+	// Notes carries batch-level diagnostic strings (e.g. state-routing path
+	// taken). Per-slot warnings live in the individual Error fields.
 	Notes []string `json:"notes,omitempty"`
 }
 

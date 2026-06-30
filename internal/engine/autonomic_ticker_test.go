@@ -54,8 +54,8 @@ func TestShouldEscalate_DegradedProvider(t *testing.T) {
 	snap := KernelHealthSnapshot{
 		Timestamp: time.Now().UTC(),
 		Providers: map[string]reconcile.ResourceStatus{
-			"ok":      {Sync: reconcile.SyncStatusSynced, Health: reconcile.HealthHealthy},
-			"broken":  {Sync: reconcile.SyncStatusOutOfSync, Health: reconcile.HealthDegraded},
+			"ok":     {Sync: reconcile.SyncStatusSynced, Health: reconcile.HealthHealthy},
+			"broken": {Sync: reconcile.SyncStatusOutOfSync, Health: reconcile.HealthDegraded},
 		},
 		Counts: HealthCounts{Healthy: 1, Degraded: 1},
 	}
@@ -251,30 +251,46 @@ func TestBuildKernelHealthSnapshot_EmptyRegistry(t *testing.T) {
 
 // --- Ticker integration tests -----------------------------------------------
 
-// ollamaAssessResponse writes a valid Ollama response for the assess step.
-func ollamaAssessResponse(w http.ResponseWriter, action string) {
+// openaiAssessResponse writes a valid OpenAI-compat response for the assess step.
+func openaiAssessResponse(w http.ResponseWriter, action string) {
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"message": map[string]any{
-			"role":    "assistant",
-			"content": `{"action":"` + action + `","reason":"test","urgency":0.1,"target":"","task":""}`,
-		},
-		"done":              true,
-		"prompt_eval_count": 1,
-		"eval_count":        1,
+		"choices": []map[string]any{{
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": `{"action":"` + action + `","reason":"test","urgency":0.1,"target":"","task":""}`,
+			},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
 	})
 }
 
-// ollamaExecuteResponse writes a valid Ollama response for the execute step.
-func ollamaExecuteResponse(w http.ResponseWriter) {
+// openaiExecuteResponse writes a valid OpenAI-compat response for the execute step.
+func openaiExecuteResponse(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"message": map[string]any{
-			"role":    "assistant",
-			"content": "done",
-		},
-		"done":              true,
-		"prompt_eval_count": 1,
-		"eval_count":        1,
+		"choices": []map[string]any{{
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": "done",
+			},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
 	})
+}
+
+// ollamaAssessResponse is kept for backward compat with any callers that have
+// not yet been migrated; Ollama is decommissioned.
+func ollamaAssessResponse(w http.ResponseWriter, action string) {
+	openaiAssessResponse(w, action)
+}
+
+// ollamaExecuteResponse is kept for backward compat with any callers that have
+// not yet been migrated; Ollama is decommissioned.
+func ollamaExecuteResponse(w http.ResponseWriter) {
+	openaiExecuteResponse(w)
 }
 
 // TestAutonomicTickerAllGreenNoLLM verifies that with an all-green registry
@@ -344,20 +360,22 @@ func TestAutonomicTickerDegradedEscalates(t *testing.T) {
 	callCount := 0
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/tags":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"models": []map[string]any{{"name": model}},
-			})
-		case "/api/chat":
-			callCount++
+		case "/v1/models":
 			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
+			})
+		case "/v1/chat/completions":
+			callCount++
 			if callCount == 1 {
-				ollamaAssessResponse(w, "observe")
+				openaiAssessResponse(w, "observe")
 				return
 			}
-			ollamaExecuteResponse(w)
+			openaiExecuteResponse(w)
 		default:
-			t.Fatalf("unexpected path %s", r.URL.Path)
+			// Silently ignore unexpected probes (e.g. Ollama /api/tags probe).
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer llm.Close()
@@ -418,16 +436,18 @@ func TestAutonomicTickerIdleRecheckIn(t *testing.T) {
 	callCount := 0
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/tags":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"models": []map[string]any{{"name": model}},
-			})
-		case "/api/chat":
-			callCount++
+		case "/v1/models":
 			w.Header().Set("Content-Type", "application/json")
-			ollamaAssessResponse(w, "sleep")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
+			})
+		case "/v1/chat/completions":
+			callCount++
+			openaiAssessResponse(w, "sleep")
 		default:
-			t.Fatalf("unexpected path %s", r.URL.Path)
+			// Silently ignore unexpected probes (e.g. Ollama /api/tags probe).
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer llm.Close()
@@ -725,11 +745,11 @@ func TestAutonomicTick_DedupeReleasesOnReturnToGreen(t *testing.T) {
 // injected status. Used to verify that healDegradedProviders calls the full
 // plan/apply cycle for unhealthy providers.
 type selfHealableProvider struct {
-	name           string
-	status         reconcile.ResourceStatus
-	fetchLiveCalls int
+	name             string
+	status           reconcile.ResourceStatus
+	fetchLiveCalls   int
 	computePlanCalls int
-	applyPlanCalls int
+	applyPlanCalls   int
 	// planHasChanges controls whether ComputePlan returns a non-empty plan.
 	planHasChanges bool
 }

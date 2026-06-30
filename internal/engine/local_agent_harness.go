@@ -369,12 +369,11 @@ type LocalHarnessController struct {
 	lastEscalatedFingerprint string
 	history                  []localHarnessCycleRecord
 
-	// ollamaMu serializes all Ollama inference calls across both the metabolic
-	// cycle (runCycle) and user-initiated dispatches (DispatchToHarness).
-	// Ollama defaults to OLLAMA_NUM_PARALLEL=1; concurrent requests from the
-	// same controller cause duplicate model copies in VRAM and queued waits
-	// that look like hangs. One lock per controller, held for the duration of
-	// the inference call, makes the serialization explicit and debuggable.
+	// ollamaMu serializes all local-backend inference calls across both the
+	// metabolic cycle (runCycle) and user-initiated dispatches (DispatchToHarness).
+	// LM Studio (and previously Ollama) queue concurrent requests; serializing
+	// at this layer makes contention explicit and avoids queued-wait hangs.
+	// One lock per controller, held for the duration of the inference call.
 	ollamaMu sync.Mutex
 
 	// harnessOrientationBlock is the four-bundle orientation string prepended to
@@ -750,9 +749,8 @@ func (c *LocalHarnessController) runCycle(parent context.Context, reason string,
 	outcome.record.Model = model
 
 	// ollamaMu serializes this cycle's inference calls against concurrent
-	// DispatchToHarness calls. Ollama is single-threaded by default; holding
-	// the lock for the full assess+execute block prevents two concurrent
-	// /api/chat requests from loading duplicate model copies into VRAM.
+	// DispatchToHarness calls; local LLM servers queue concurrent requests
+	// in ways that look like hangs under high concurrency.
 	c.ollamaMu.Lock()
 	provider := buildLocalProvider(target, model, c.localProviderTimeout)
 	assessment, err := c.assessCycle(ctx, provider, outcome.record.Observation)
@@ -1023,7 +1021,11 @@ func (c *LocalHarnessController) localModelHint() string {
 	if c.cfg != nil && strings.TrimSpace(c.cfg.LocalModel) != "" {
 		return strings.TrimSpace(c.cfg.LocalModel)
 	}
-	return defaultOllamaModel
+	// No LocalModel configured. Return empty string so resolvePreferredLocalModel
+	// picks the first model advertised by the server (LM Studio default loaded model).
+	// Previously this fell back to defaultOllamaModel ("gemma4:e4b"); Ollama is
+	// decommissioned and that constant is removed.
+	return ""
 }
 
 // buildContextualFallback produces a short placeholder text for the
@@ -1271,8 +1273,11 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	//      in providers config. If the current state maps to a configured
 	//      provider, dispatch there. This wires the autonomic loop and harness
 	//      dispatches through the same routing table as the main router.
-	//   3. Legacy Model-enum routing ("e4b" | "26b") via local-LLM probe.
-	//      Backward-compatible fallback when no process-state route applies.
+	//   2.5. harness_provider config default (e.g. "lmstudio-darkstar").
+	//   3. Legacy local-LLM probe: probes the configured endpoint (default
+	//      openaiCompatDefaultEndpoint = 127.0.0.1:1234) for an OpenAI-compat
+	//      server. Ollama is no longer the default; the probe order in
+	//      detectLocalLLMTarget now tries OpenAI-compat first.
 	//
 	// Unknown provider names error fast — never silently fall through to
 	// the legacy path because that would mask a config typo.
@@ -1281,8 +1286,8 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	var routeUsed DispatchModel
 	// note is a batch-level diagnostic string (e.g. state-routing path taken).
 	// slotNote carries per-slot warnings that must appear on each DispatchResult
-	// (e.g. "26b route unavailable, degraded to e4b") — distinct from note so
-	// state-routing diagnostics are not incorrectly surfaced in slot Error fields.
+	// — distinct from note so state-routing diagnostics are not incorrectly
+	// surfaced in slot Error fields.
 	var note string
 	var slotNote string
 	var err error
@@ -1386,7 +1391,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 						// Populate req.Provider so dispatchSlot records the
 						// resolved provider name in ProviderUsed — otherwise it
 						// stays empty and the caller can't distinguish this path
-						// from the legacy Ollama path.
+						// from the legacy local-LLM probe path.
 						req.Provider = stateProvider
 						note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
 						usedStateRoute = true
@@ -1456,7 +1461,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 					return nil, errors.New(n)
 				}
 				model, routeUsed = m, ru
-				// Downgrade warnings (e.g. "26b route unavailable, degraded to e4b")
+				// Routing warnings (e.g. "26b route unavailable, using preferred local model")
 				// are per-slot: each slot's result must carry the warning so callers
 				// that inspect individual slots know the requested model wasn't honored.
 				// These are distinct from batch-level diagnostics (state-routing note)
@@ -1498,16 +1503,14 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	}
 
 	// ollamaMu serializes dispatch inference calls against concurrent metabolic
-	// cycles for all local-inference backends. "Local" backends (Ollama,
-	// OpenAI-compat mlx-lm/vllm/lmstudio, mlx-supervised, pi) compete for the
-	// same on-device accelerator/VRAM; a dispatch arriving while runCycle is
-	// mid-stream would issue a concurrent inference call that may load a second
-	// model copy into VRAM or cause memory pressure.
+	// cycles for all local-inference backends. Local backends (LM Studio,
+	// OpenAI-compat mlx-lm/vllm, mlx-supervised, pi) compete for the same
+	// on-device accelerator/VRAM; a dispatch arriving while runCycle is
+	// mid-stream may load a second model copy into VRAM or cause memory pressure.
 	//
 	// The gate is keyed on provider.Capabilities().IsLocal so it covers all
-	// local backends uniformly, not just the "ollama" type name. Remote
-	// providers (anthropic, etc.) are excluded — they have no shared hardware
-	// resource with the local metabolic cycle.
+	// local backends uniformly. Remote providers (anthropic, etc.) are excluded
+	// — they have no shared hardware resource with the local metabolic cycle.
 	if provider.Capabilities().IsLocal {
 		c.ollamaMu.Lock()
 		defer c.ollamaMu.Unlock()
@@ -1748,12 +1751,12 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 			"tool_calls", len(transcript),
 		)
 	}
-	// slotNote carries per-slot warnings (e.g. legacy "26b route unavailable,
-	// degraded to e4b") that the caller may need to surface per-result. These
-	// are distinct from batch-level state-routing diagnostics, which live in
-	// batch.Notes and must not be set here.
+	// slotNote carries per-slot warnings (e.g. "26b route unavailable, using
+	// preferred local model") that the caller may need to surface per-result.
+	// These are distinct from batch-level state-routing diagnostics, which live
+	// in batch.Notes and must not be set here.
 	// Preserve any existing res.Error (e.g. unsupported client tool calls)
-	// rather than clobbering it; append the downgrade note instead.
+	// rather than clobbering it; append the note instead.
 	if slotNote != "" {
 		if res.Error == "" {
 			res.Error = slotNote

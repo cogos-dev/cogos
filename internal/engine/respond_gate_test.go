@@ -117,35 +117,45 @@ func TestGateA_AutonomicCycleDoesNotPublish(t *testing.T) {
 	model := "gemma4:e4b"
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/tags":
+		case "/v1/models":
+			// OpenAI-compat probe — detectLocalLLMTarget tries this first.
+			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"models": []map[string]any{{"name": model}},
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
 			})
-		case "/api/chat":
+		case "/v1/chat/completions":
 			seq := callSeq.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			switch seq {
 			case 1:
 				// assess: non-sleep action so executeCycleTask is called.
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": `{"action":"consolidate","reason":"housekeeping","urgency":0.2,"target":"memory","task":"scan recent events"}`,
-					},
-					"done": true, "prompt_eval_count": 10, "eval_count": 20,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": `{"action":"consolidate","reason":"housekeeping","urgency":0.2,"target":"memory","task":"scan recent events"}`,
+						},
+						"finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 20},
 				})
 			default:
 				// execute: plain text, no tool calls.
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": "housekeeping complete",
-					},
-					"done": true, "prompt_eval_count": 5, "eval_count": 10,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": "housekeeping complete",
+						},
+						"finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 10},
 				})
 			}
 		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
+			// Silently ignore unexpected probes (e.g. /api/tags Ollama probe).
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer llm.Close()
