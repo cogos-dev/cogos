@@ -1,9 +1,18 @@
-// provider_ollama.go — OllamaProvider
+// provider_ollama.go — OllamaProvider [DECOMMISSIONED]
 //
-// Implements Provider against a local Ollama server (http://localhost:11434).
-// Uses /api/chat for multi-turn conversations (not /api/generate).
-// Streaming: Ollama returns newline-delimited JSON chunks.
-// think=false: disables qwen3's thinking mode to avoid silent token burn.
+// Ollama has been removed as the default and supported local inference backend.
+// The replacement is LM Studio via the named provider "lmstudio-darkstar"
+// (OpenAI-compat at 127.0.0.1:1234, resident gemma-4-26b).
+//
+// This file is retained so that:
+//  1. Nodes with "type: ollama" in providers.yaml continue to compile and
+//     produce a clear error rather than a silent type-mismatch crash.
+//  2. The buildLocalProvider path still handles LocalLLMBackendOllama if the
+//     Ollama probe succeeds on a non-standard node configuration.
+//
+// New callers must NOT reference OllamaProvider or defaultOllamaModel.
+// The Ollama integration test and the "ollama" provider registration in
+// defaults/providers.yaml have been removed.
 package engine
 
 import (
@@ -19,6 +28,10 @@ import (
 	"time"
 )
 
+// defaultOllamaModel is retained only for backward compat with tests and
+// configs that reference it. Ollama is decommissioned; do not use this as
+// a routing default. The resident local model is google/gemma-4-26b via
+// LM Studio (lmstudio-darkstar).
 const defaultOllamaModel = "gemma4:e4b"
 
 type ollamaModelProfile struct {

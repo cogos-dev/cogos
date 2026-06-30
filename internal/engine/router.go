@@ -652,7 +652,11 @@ func applyLocalModelConfig(cfg *Config, pcfg *ProvidersConfig) {
 		if providerType == "" {
 			providerType = name
 		}
-		if providerType != "ollama" {
+		// Apply local_model override to any local OpenAI-compat provider
+		// (lmstudio, vllm, llamacpp) or the legacy ollama type.
+		switch providerType {
+		case "lmstudio", "openai-compat", "vllm", "llamacpp", "ollama":
+		default:
 			continue
 		}
 		if pc.Model == "" || cfg.localModelConfigured {
@@ -804,11 +808,15 @@ func defaultProvidersConfig(localModel string) ProvidersConfig {
 		}
 
 	case "ollama":
-		// Ollama is reachable; use the configured or default model.
+		// Ollama is reachable but is no longer the default backend. Warn and
+		// register it under its own name so existing Ollama installs still work,
+		// but log a clear deprecation notice. Operators should migrate to LM Studio
+		// and set providers.yaml with "type: lmstudio" or "type: openai-compat".
 		if localModel == "" {
 			localModel = defaultOllamaModel
 		}
-		slog.Info("router: no providers.yaml, auto-selected Ollama as default local backend")
+		slog.Warn("router: Ollama detected at :11434 but Ollama is decommissioned as the default backend; " +
+			"registering temporarily — migrate to LM Studio (127.0.0.1:1234) and providers.yaml")
 		return ProvidersConfig{
 			Providers: map[string]ProviderConfig{
 				"ollama": {
@@ -832,7 +840,7 @@ func defaultProvidersConfig(localModel string) ProvidersConfig {
 		// "no local model configured" state instead of silently failing on the
 		// first inference request.
 		slog.Warn("router: no providers.yaml and no local LLM backend reachable " +
-			"(tried LM Studio :1234, Ollama :11434); add providers.yaml or start a local server")
+			"(tried LM Studio :1234, Ollama :11434); add providers.yaml or start LM Studio")
 		return ProvidersConfig{
 			Providers: map[string]ProviderConfig{
 				"no-local-model": {
@@ -856,7 +864,8 @@ type openaiCompatProbeEndpoint struct {
 }
 
 // openaiCompatWellKnownEndpoints lists endpoints to probe on startup.
-// Ollama (localhost:11434) is handled separately; these are OpenAI-compatible servers.
+// Ollama (localhost:11434) was previously handled separately; it is now
+// decommissioned. These are OpenAI-compatible server endpoints.
 var openaiCompatWellKnownEndpoints = []openaiCompatProbeEndpoint{
 	{name: "lmstudio", endpoint: "http://localhost:1234"},
 }
