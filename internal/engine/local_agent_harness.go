@@ -775,13 +775,25 @@ func (c *LocalHarnessController) executeCycleTaskWithPrompt(ctx context.Context,
 		},
 	}
 	resp, clientCalls, transcript, err := c.completeWithToolLoop(ctx, provider, req, registry)
-	if err != nil {
+	// Structured loop-exit sentinels (ADR-031, ADR-052): surface partial content
+	// rather than propagating as a hard error. The cycle record will reflect the
+	// sentinel reason via the caller (runCycle records err.Error() in Reason).
+	if err != nil && !errors.Is(err, ErrToolLoopMaxTurns) && !errors.Is(err, ErrToolLoopNoProgress) {
 		return "", err
+	}
+	if err != nil {
+		slog.Warn("local harness cycle: structured loop exit",
+			"sentinel", err.Error(),
+			"tool_calls", len(transcript),
+		)
 	}
 	if len(clientCalls) > 0 {
 		slog.Warn("local harness produced unsupported client tool calls", "count", len(clientCalls))
 	}
-	content := strings.TrimSpace(resp.Content)
+	var content string
+	if resp != nil {
+		content = strings.TrimSpace(resp.Content)
+	}
 	if content == "" && len(transcript) > 0 {
 		content = summarizeToolTranscript(transcript)
 	}
@@ -1455,6 +1467,28 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		res.Error = fmt.Sprintf("unsupported client tool calls returned: %d", len(clientCalls))
 	}
 	if err != nil {
+		// Structured loop-exit sentinels (ADR-031, ADR-052): ErrToolLoopMaxTurns
+		// and ErrToolLoopNoProgress carry a partial response and transcript; mark
+		// the slot as Degraded rather than a hard failure so the partial content
+		// is still surfaced to the caller. Hard errors (provider failure, timeout)
+		// fall through to the existing failure path below.
+		if errors.Is(err, ErrToolLoopMaxTurns) || errors.Is(err, ErrToolLoopNoProgress) {
+			res.Success = true
+			res.Degraded = true
+			res.Error = err.Error()
+			if resp != nil {
+				res.Content = stripControlTokens(strings.TrimSpace(resp.Content))
+			}
+			if res.Content == "" && len(transcript) > 0 {
+				res.Content = summarizeToolTranscript(transcript)
+			}
+			slog.Warn("local harness dispatch: structured loop exit",
+				"sentinel", err.Error(),
+				"request_id", compReq.Metadata.RequestID,
+				"tool_calls", len(transcript),
+			)
+			return res
+		}
 		if slotCtx.Err() == context.DeadlineExceeded {
 			res.Error = "timeout"
 		} else {
