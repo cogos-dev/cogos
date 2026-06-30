@@ -44,26 +44,51 @@ func dispatchCycleIDFromCtx(ctx context.Context) string {
 // Callers that don't specify a scope get exactly the tool set they always have.
 const defaultHarnessScopeName = "consolidation"
 
-// harnessToolScopes is the named-scope catalog for harness dispatches.
+// harnessToolScopes is the named-scope catalog for harness dispatches (RFC-016).
 // Each scope is a named set of tool names the harness may use.
 //
-// "consolidation" — substrate-only tools: memory, observability, identity.
+// "consolidation" — RFC-016 canonical 11 substrate tools: memory, observability,
 //
-//	This is the default scope (unchanged from the original tool set).
-//	The harness operates on cogdocs, the field, and coherence only.
+//	identity. respond is intentionally ABSENT from this base scope — callers
+//	that need respond must request consolidation_with_respond explicitly.
+//	Removing respond from the default aligns with RFC-016's canonical 11.
+//
+// "consolidation_with_respond" — consolidation + respond tool. Used by the
+//
+//	autonomic cycle when pending dashboard messages are present.
+//
+// "consolidation_no_respond" — consolidation without respond. Used by purely
+//
+//	autonomic ticks (no pending user messages). The model cannot publish to
+//	bus_dashboard_response during an autonomic-only cycle.
 //
 // "audit" — consolidation tools PLUS read-only filesystem access.
 //
-//	Use this scope when the harness needs to inspect source, configs,
-//	or workspace files without mutating anything.
+//	Use when the harness needs to inspect source, configs, or workspace files
+//	without mutating anything.
+//
+// "search" — lightweight lookup micro-scope (RFC-016 §micro-scopes). Resolves
+//
+//	URIs, searches memory, and queries the field. No read of full CogDocs,
+//	no event emission. Suitable for single-tool-call breadth fan-out.
+//
+// "observe" — consolidation read tools minus cog_emit_event (RFC-016 §micro-scopes).
+//
+//	Grants full read access to the substrate (CogDocs, state, coherence,
+//	nucleus, index, context) without the ability to emit events.
+//
+// "emit" — single-tool micro-scope: cog_emit_event only (RFC-016 §micro-scopes).
+//
+//	Suitable for a slot whose sole job is to publish a structured bus event.
 //
 // Future scopes (add entries here when the underlying mechanisms land):
 //
 //	"maintenance" — read+write filesystem tools gated behind per-dispatch
-//	                worktree isolation (see ADR-081 §8 worktree work).
+//	                worktree isolation (RFC-017, dedicated PR).
 //	"introspection" — audit tools plus kernel state-dump tools for deep
 //	                  diagnostic cycles.
 var harnessToolScopes = map[string][]string{
+	// consolidation — RFC-016 canonical 11. respond removed from base scope.
 	"consolidation": {
 		"cog_resolve_uri",
 		"cog_search_memory",
@@ -76,12 +101,11 @@ var harnessToolScopes = map[string][]string{
 		"cog_get_index",
 		"cog_assemble_context",
 		"cog_emit_event",
-		engineRespondToolName, // Piece 3a: respond tool in consolidation scope
 	},
-	// consolidation_with_respond is identical to consolidation but named
-	// explicitly so callers can request it by scope name. The autonomic
-	// cycle uses this scope only when pending user messages are present;
-	// for purely autonomic ticks it uses consolidation_no_respond instead.
+	// consolidation_with_respond — consolidation + respond. The autonomic
+	// cycle wires backgroundTools from this scope so the model can reply to
+	// pending dashboard messages. Callers that need respond must request this
+	// scope explicitly; the base "consolidation" scope no longer includes it.
 	"consolidation_with_respond": {
 		"cog_resolve_uri",
 		"cog_search_memory",
@@ -96,9 +120,9 @@ var harnessToolScopes = map[string][]string{
 		"cog_emit_event",
 		engineRespondToolName,
 	},
-	// consolidation_no_respond is the autonomic-only scope: identical to
-	// consolidation except the respond tool is absent. The model cannot
-	// publish to bus_dashboard_response during a pure autonomic cycle.
+	// consolidation_no_respond — consolidation without respond. Used by purely
+	// autonomic ticks (no pending user messages). The model cannot publish to
+	// bus_dashboard_response during an autonomic-only cycle.
 	"consolidation_no_respond": {
 		"cog_resolve_uri",
 		"cog_search_memory",
@@ -126,6 +150,29 @@ var harnessToolScopes = map[string][]string{
 		"cog_emit_event",
 		"cog_read_file",
 		"cog_grep_files",
+	},
+	// search — RFC-016 §micro-scopes. Lightweight URI/memory/field lookup only.
+	"search": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_query_field",
+	},
+	// observe — RFC-016 §micro-scopes. Full substrate read access, no event emission.
+	"observe": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_read_cogdoc",
+		"cog_query_field",
+		"cog_check_coherence",
+		"cog_get_state",
+		"cog_get_trust",
+		"cog_get_nucleus",
+		"cog_get_index",
+		"cog_assemble_context",
+	},
+	// emit — RFC-016 §micro-scopes. Single-purpose: publish a structured bus event.
+	"emit": {
+		"cog_emit_event",
 	},
 }
 
@@ -356,7 +403,12 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 	}
 	toolNames, ok := harnessToolScopes[scopeName]
 	if !ok {
-		return nil, fmt.Errorf("unknown harness scope %q (known: consolidation, consolidation_with_respond, consolidation_no_respond, audit)", scopeName)
+		known := make([]string, 0, len(harnessToolScopes))
+		for k := range harnessToolScopes {
+			known = append(known, k)
+		}
+		sort.Strings(known)
+		return nil, fmt.Errorf("unknown harness scope %q (known: %v)", scopeName, known)
 	}
 	registry := NewKernelToolRegistry(mcpSrv)
 	// Piece 3b: inject the respond native tool into the full registry before
@@ -368,9 +420,21 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		return nil, err
 	}
 
-	// Gate A: build a respond-free tool set for purely autonomic cycles.
-	// When runCycle drains an empty pending queue, it uses this registry so
-	// the model cannot see (and therefore cannot invoke) the respond tool.
+	// Gate A — build cycle-appropriate tool sets from canonical scope entries.
+	//
+	// backgroundTools is always wired from consolidation_with_respond so the
+	// autonomic cycle can call respond when pending dashboard messages are
+	// present, regardless of which scope was requested at construction time.
+	// This decouples the dispatch scope (what external callers get) from the
+	// autonomic cycle's respond access.
+	//
+	// backgroundToolsNoRespond is the respond-free set for purely autonomic
+	// ticks (no pending user messages); the model cannot see the respond tool
+	// so it structurally cannot publish to bus_dashboard_response.
+	withRespondTools, err := registry.Scoped(harnessToolScopes["consolidation_with_respond"])
+	if err != nil {
+		return nil, fmt.Errorf("build with-respond tool scope: %w", err)
+	}
 	noRespondTools, err := registry.Scoped(harnessToolScopes["consolidation_no_respond"])
 	if err != nil {
 		return nil, fmt.Errorf("build no-respond tool scope: %w", err)
@@ -407,7 +471,7 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		process:                  process,
 		toolRegistry:             registry,
 		dispatchTools:            dispatchTools,
-		backgroundTools:          dispatchTools,
+		backgroundTools:          withRespondTools,
 		backgroundToolsNoRespond: noRespondTools,
 		agentID:                  DefaultAgentID,
 		started:                  time.Now().UTC(),
