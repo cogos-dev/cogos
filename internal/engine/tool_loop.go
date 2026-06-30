@@ -94,8 +94,9 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			executor:    makeExecutor(mcpSrv, mcpSrv.toolResolveURI, resolveURIInput{}),
 		},
 		{
+			// ADR-045: description kept in sync with MCP registration in mcp_server.go.
 			name:        "cog_search_memory",
-			description: "Search the CogDoc memory corpus. Returns ranked results.",
+			description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores. Fallback: ./scripts/cog memory search \"query\"",
 			schema: mergeSchemas(
 				objectSchema("query", "Search query string"),
 				optionalSchema("limit", "number", "Max results (default 10)"),
@@ -104,8 +105,9 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			executor: makeExecutor(mcpSrv, mcpSrv.toolSearchMemory, searchMemoryInput{}),
 		},
 		{
+			// ADR-045: description kept in sync with MCP registration in mcp_server.go.
 			name:        "cog_read_cogdoc",
-			description: "Read a CogDoc by URI. Returns content with parsed frontmatter and schema hints.",
+			description: "Read a CogDoc by URI or path. Resolves cog: URIs automatically. Returns full content with parsed frontmatter and optional section extraction via #fragment. Fallback: ./scripts/cog memory read <path>",
 			schema: mergeSchemas(
 				objectSchema("uri", "A cog: URI pointing to the CogDoc"),
 				optionalSchema("section", "string", "Section name to extract"),
@@ -160,8 +162,9 @@ func NewKernelToolRegistry(mcpSrv *MCPServer) *KernelToolRegistry {
 			executor: makeExecutor(mcpSrv, mcpSrv.toolQueryField, queryFieldInput{}),
 		},
 		{
+			// ADR-045: description kept in sync with MCP registration in mcp_server.go.
 			name:        "cog_check_coherence",
-			description: "Run workspace coherence validation",
+			description: "Run coherence validation against the workspace. Checks URI resolution, frontmatter validity, and reference integrity. Fallback: ./scripts/cog coherence check",
 			schema:      mergeSchemas(optionalSchema("scope", "string", "structural/navigational/canonical")),
 			executor:    makeExecutor(mcpSrv, mcpSrv.toolCheckCoherence, checkCoherenceInput{}),
 		},

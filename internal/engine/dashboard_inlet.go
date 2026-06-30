@@ -443,7 +443,7 @@ func engineRespondExecutor(ctx context.Context, arguments string) (string, error
 func respondToolDefinition() ToolDefinition {
 	return ToolDefinition{
 		Name:        engineRespondToolName,
-		Description: "Send a response to the user in the current dashboard conversation. Use this after you have observed a user_message event and want to reply. The message is published on bus_dashboard_response for the Mod³ dashboard to render. Call at most once per user turn; use wait if no reply is warranted.",
+		Description: "Send a response to the user in the current dashboard conversation. Use this after you have observed a user_message event and want to reply. The message is published on bus_dashboard_response for the Mod³ dashboard to render. Call at most once per user turn; skip respond entirely if no reply is needed. A second call within the same turn is rejected.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{

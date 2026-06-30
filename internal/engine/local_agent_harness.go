@@ -136,17 +136,10 @@ const (
 	localHarnessExecuteMaxToks = 1024
 )
 
-const localHarnessAssessPrompt = `You are the resident local CogOS maintenance agent.
-Operate only through local inference and the kernel's local tools.
-Decide whether a maintenance pass is warranted right now.
-Return only one compact JSON object with these keys:
-{"action":"sleep|observe|consolidate|repair|propose|escalate","reason":"short string","urgency":0..1,"target":"short string","task":"short concrete next step"}
-Prefer "sleep" unless the observation names a concrete task worth doing now.`
-
-const localHarnessExecutePrompt = `You are the resident local CogOS maintenance agent.
-Stay local-only. Use the provided kernel tools when they materially improve the answer.
-Prefer inspection and diagnosis over mutation. Finish with a concise plain-text result.
-
+// harnessURIBlock is the canonical CogDoc URI reference injected into every
+// harness prompt. Defined once here to prevent drift across prompts (ADR-066
+// pointer-discipline: single authoritative source for URI format guidance).
+const harnessURIBlock = `
 CogDoc URIs use the bare form cog:<type>/<path>. Valid types:
   mem, adr, role, skill, agent, spec, status, ledger, crystal,
   kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks
@@ -158,6 +151,18 @@ Cross-workspace refs use authority form: cog://other-workspace/mem/...
 Invalid: cog://adrs/..., cog://docs/... with raw fs paths.
 If cog_search_memory returns a bus event path (".cog/.state/buses/.../events.jsonl#N"),
 that is a chat log entry, not a readable CogDoc — do not try to read it.`
+
+const localHarnessAssessPrompt = `You are the resident local CogOS maintenance agent.
+Operate only through local inference and the kernel's local tools.
+Decide whether a maintenance pass is warranted right now.
+Return only one compact JSON object with these keys:
+{"action":"sleep|observe|consolidate|repair|propose|escalate","reason":"short string","urgency":0..1,"target":"short string","task":"short concrete next step"}
+Prefer "sleep" unless the observation names a concrete task worth doing now.`
+
+const localHarnessExecutePrompt = `You are the resident local CogOS maintenance agent.
+Stay local-only. Use the provided kernel tools when they materially improve the answer.
+Prefer inspection and diagnosis over mutation. Finish with a concise plain-text result.
+` + harnessURIBlock
 
 // localHarnessChatPrompt is the system prompt used during the execute phase
 // when pending dashboard user messages are present. It replaces the maintenance
@@ -182,21 +187,11 @@ Rules:
 - You may use other kernel tools (cog_search_memory, cog_read_cogdoc, etc.) before
   calling respond if they would help you answer accurately. Keep it brief.
 - If you are uncertain, say so plainly. Do not invent facts about the workspace.
-
-CogDoc URIs use the bare form cog:<type>/<path>. Types: mem, adr, role, skill, agent,
-spec, status, ledger, crystal, kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks.
-Cross-workspace refs: cog://other-workspace/mem/...`
+` + harnessURIBlock
 
 const localHarnessDispatchPrompt = `You are the resident local CogOS harness.
 Stay local-only. Use only the provided kernel tools. Be concise and finish with a direct answer.
-
-CogDoc URIs use the bare form cog:<type>/<path>. Valid types:
-  mem, adr, role, skill, agent, spec, status, ledger, crystal,
-  kernel, canonical, config, ontology, work, handoff, artifact, docs, hooks
-Example: cog:adr/077 (ADRs resolve by numeric prefix).
-Cross-workspace refs use authority form: cog://other-workspace/mem/...
-If cog_search_memory returns ".cog/.state/buses/.../events.jsonl#N", that's a chat log entry,
-not a readable CogDoc — do not try to read it.
+` + harnessURIBlock + `
 
 Output contract (ADR-eigen output-contract, RFC-027 alignment layer): after any
 tool calls, finish with a plain-text answer — or call respond exactly once with

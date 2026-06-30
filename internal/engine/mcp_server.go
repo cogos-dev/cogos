@@ -1704,12 +1704,19 @@ tailLoop:
 }
 
 // toolGetIndex — no longer registered as an MCP tool; used by the internal tool loop (tool_loop.go).
+// Output is capped per ADR-066 pointer-discipline: the index can cover thousands of CogDocs,
+// so we apply the configured byte cap to prevent context blowout. Callers needing deeper
+// inspection should dereference specific cog: URIs via cog_read_cogdoc.
 func (m *MCPServer) toolGetIndex(ctx context.Context, req *mcp.CallToolRequest, input getIndexInput) (*mcp.CallToolResult, any, error) {
 	index, err := BuildMemoryIndex(m.cfg.WorkspaceRoot, input.Sector)
 	if err != nil {
 		return textResult(fmt.Sprintf("index build failed: %v", err))
 	}
-	return marshalResult(index)
+	maxBytes := DefaultMaxToolOutputBytes
+	if m.cfg != nil {
+		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
+	}
+	return capMarshalResult(index, maxBytes)
 }
 
 func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, input ingestInput) (*mcp.CallToolResult, any, error) {
