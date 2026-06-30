@@ -172,7 +172,12 @@ CogDoc URIs use the bare form cog:<type>/<path>. Valid types:
 Example: cog:adr/077 (ADRs resolve by numeric prefix).
 Cross-workspace refs use authority form: cog://other-workspace/mem/...
 If cog_search_memory returns ".cog/.state/buses/.../events.jsonl#N", that's a chat log entry,
-not a readable CogDoc — do not try to read it.`
+not a readable CogDoc — do not try to read it.
+
+Output contract (ADR-eigen output-contract, RFC-027 alignment layer): after any
+tool calls, finish with a plain-text answer — or call respond exactly once with
+the answer. Do NOT narrate tool use, emit role/channel markers, or output special
+tokens such as <|...|> or respond{...} scaffolding.`
 
 type localHarnessAssessment struct {
 	Action  string  `json:"action"`
@@ -1458,9 +1463,18 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		return res
 	}
 	res.Success = true
-	res.Content = strings.TrimSpace(resp.Content)
+	// Strip harmony/control-token leakage before the content becomes
+	// substrate-visible. ADR-eigen (output-contract) + RFC-027 (alignment layer).
+	res.Content = stripControlTokens(strings.TrimSpace(resp.Content))
 	if res.Content == "" && len(transcript) > 0 {
+		// Model returned no final text; fall back to a transcript summary.
+		// Surface Degraded so callers know the output contract was not met.
 		res.Content = summarizeToolTranscript(transcript)
+		res.Degraded = true
+		slog.Warn("local harness dispatch: model returned no final text; degraded to transcript summary",
+			"request_id", compReq.Metadata.RequestID,
+			"tool_calls", len(transcript),
+		)
 	}
 	// slotNote carries per-slot warnings (e.g. legacy "26b route unavailable,
 	// degraded to e4b") that the caller may need to surface per-result. These

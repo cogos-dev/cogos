@@ -155,6 +155,10 @@ type DispatchResult struct {
 	// the difference between "ran on the legacy e4b/26b path" and "ran on
 	// the named provider X." Per RFC-0007 Layer 1.
 	ProviderUsed string `json:"provider_used,omitempty"`
+	// Degraded is true when the model returned no final text and the slot fell
+	// back to summarizeToolTranscript. Success is still true — the tool loop
+	// completed — but the output contract (ADR-eigen output-contract) was not met.
+	Degraded bool `json:"degraded,omitempty"`
 }
 
 // ResolvedProvider is the materialized backend a ProviderResolver returns
