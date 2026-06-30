@@ -14,7 +14,31 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/myrgic/cogos/trace"
 )
+
+// dispatchCycleIDKey is the context key that carries the cycle-trace ID minted
+// by DispatchToHarness. All trace events emitted within a single dispatch
+// invocation (including per-tool events in the tool loop) share this ID, so
+// bus consumers can correlate them. Follows the pattern in dashboard_inlet.go.
+// ADR-083 (bus cycle-trace path, not OTel), ADR-033, ADR-072.
+type dispatchCycleIDKey struct{}
+
+// withDispatchCycleID attaches a cycle-trace ID to the context.
+func withDispatchCycleID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, dispatchCycleIDKey{}, id)
+}
+
+// dispatchCycleIDFromCtx returns the cycle-trace ID stored in the context, or
+// an empty string when none is present (tool-loop calls outside a dispatch).
+func dispatchCycleIDFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(dispatchCycleIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // defaultHarnessScopeName is the scope used when no scope is requested.
 // Callers that don't specify a scope get exactly the tool set they always have.
@@ -1372,6 +1396,26 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		batch.Notes = append(batch.Notes, note)
 	}
 
+	// ADR-083 (bus cycle-trace), ADR-033, ADR-072: mint one cycle-trace ID per
+	// DispatchToHarness invocation so that all tool-dispatch events from every
+	// fan-out slot, plus the batch-level start/end ledger entries, share a
+	// correlating ID. Consumers on the kernel bus reconstruct a full dispatch
+	// audit trail by filtering on this ID.
+	cycleID := uuid.NewString()
+	ctx = withDispatchCycleID(ctx, cycleID)
+
+	// Emit dispatch-start ledger entry (ADR-033, ADR-072).
+	_ = EmitLedgerEvent(c.cfg, map[string]any{
+		"type":   "harness.dispatch.start",
+		"source": "local-harness",
+		"payload": map[string]any{
+			"cycle_id": cycleID,
+			"n":        req.N,
+			"task":     truncateDigest(req.Task),
+			"provider": req.Provider,
+		},
+	})
+
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < req.N; i++ {
@@ -1383,6 +1427,18 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	}
 	wg.Wait()
 	batch.TotalDurationSec = time.Since(start).Seconds()
+
+	// Emit dispatch-end ledger entry (ADR-033, ADR-072).
+	_ = EmitLedgerEvent(c.cfg, map[string]any{
+		"type":   "harness.dispatch.end",
+		"source": "local-harness",
+		"payload": map[string]any{
+			"cycle_id":         cycleID,
+			"n":                req.N,
+			"total_duration_s": batch.TotalDurationSec,
+		},
+	})
+
 	return batch, nil
 }
 
@@ -1452,6 +1508,32 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	resp, clientCalls, transcript, err := c.completeWithToolLoop(slotCtx, counting, compReq, registry)
 	res.DurationSec = time.Since(start).Seconds()
 	res.Turns = counting.CompleteCalls()
+
+	// ADR-083 (bus cycle-trace, not OTel), ADR-033, ADR-072: emit one
+	// KindToolDispatch cycle-trace event per tool call so bus consumers
+	// (dashboard, audit log) can see every tool invoked during this dispatch.
+	// The cycleID injected by DispatchToHarness correlates all events from one
+	// cog_dispatch_to_harness invocation.
+	cycleID := dispatchCycleIDFromCtx(parent)
+	for _, tc := range transcript {
+		var toolErr error
+		if tc.Rejected {
+			toolErr = fmt.Errorf("%s", tc.RejectReason)
+		}
+		var argsRaw json.RawMessage
+		if tc.Arguments != "" {
+			argsRaw = json.RawMessage(tc.Arguments)
+		}
+		emitTrace(trace.NewToolDispatch(
+			TraceIdentity(),
+			cycleID,
+			tc.Name,
+			argsRaw,
+			time.Duration(tc.DurationMs)*time.Millisecond,
+			toolErr,
+		))
+	}
+
 	for _, tc := range transcript {
 		entry := DispatchToolCallSummary{
 			Name:         tc.Name,
