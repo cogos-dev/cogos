@@ -59,16 +59,16 @@ type StateTransitionEvent struct {
 // ToolDispatchEvent describes a single tool invocation issued by the agent
 // harness (see agent_tools*.go).
 type ToolDispatchEvent struct {
-	Tool        string          `json:"tool"`
-	Args        json.RawMessage `json:"args,omitempty"`
-	DurationMS  int64           `json:"duration_ms"`
-	Error       string          `json:"error,omitempty"`
+	Tool       string          `json:"tool"`
+	Args       json.RawMessage `json:"args,omitempty"`
+	DurationMS int64           `json:"duration_ms"`
+	Error      string          `json:"error,omitempty"`
 	// Attribution carries the dispatch caller's subject (RFC-identity-embedding
 	// I1/I2): "anonymous" when no identity was presented, otherwise the Sub
 	// field from the DispatchIdentity that triggered this harness invocation.
 	// Empty on events emitted by the legacy metabolic-cycle path (root
 	// agent_harness.go) which does not carry a DispatchIdentity.
-	Attribution string          `json:"attribution,omitempty"`
+	Attribution string `json:"attribution,omitempty"`
 }
 
 // AssessmentEvent mirrors the Assessment struct in agent_harness.go. The

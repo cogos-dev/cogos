@@ -5,13 +5,14 @@
 // when serve_daemon.go was deleted.
 //
 // The bridge:
-//   Mod³ → POST /v1/bus/send bus_id=bus_dashboard_chat
-//        → BusSessionManager.AppendEvent dispatches to handlers
-//        → handleEngineDashboardChatEvent enqueues to enginePendingMsgs
-//        → LocalHarnessController.runCycle drains queue, enriches observation
-//        → agent invokes `respond` tool OR ensureUserTurnReply fires fallback
-//        → enginePublishDashboardResponse writes to bus_dashboard_response
-//        → SSE subscribers (Mod³) receive the response
+//
+//	Mod³ → POST /v1/bus/send bus_id=bus_dashboard_chat
+//	     → BusSessionManager.AppendEvent dispatches to handlers
+//	     → handleEngineDashboardChatEvent enqueues to enginePendingMsgs
+//	     → LocalHarnessController.runCycle drains queue, enriches observation
+//	     → agent invokes `respond` tool OR ensureUserTurnReply fires fallback
+//	     → enginePublishDashboardResponse writes to bus_dashboard_response
+//	     → SSE subscribers (Mod³) receive the response
 //
 // Wiring: call InstallEngineDashboardInlet(mgr) once at server startup
 // alongside SetBusSessionManager on the LocalHarnessController.

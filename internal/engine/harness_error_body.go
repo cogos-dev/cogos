@@ -3,7 +3,9 @@
 // Wave-2 conformance (ADR-031 authority, RFC-020 four-element subset).
 // RFC-020 is UNRATIFIED — elements 3 (classifier intent) and 6 (override)
 // are deferred until ratification. The four shipped here are:
-//   is_error / code / what / why / fix / norm
+//
+//	is_error / code / what / why / fix / norm
+//
 // (what + fix + norm are the per-code substrate-legible annotations;
 // intent + override are deferred.)
 package engine

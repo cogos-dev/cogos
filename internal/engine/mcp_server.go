@@ -2910,11 +2910,11 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 			}
 		}
 		return marshalResult(map[string]any{
-			"res":          "abstract",
-			"match_count":  len(matches),
+			"res":           "abstract",
+			"match_count":   len(matches),
 			"matched_files": files,
-			"truncated":    truncated,
-			"note":         "pointer-first (ADR pointer-first-mcp-responses); pass res=full to retrieve per-match path/line/text",
+			"truncated":     truncated,
+			"note":          "pointer-first (ADR pointer-first-mcp-responses); pass res=full to retrieve per-match path/line/text",
 		})
 	}
 

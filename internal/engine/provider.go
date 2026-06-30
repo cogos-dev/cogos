@@ -214,7 +214,7 @@ type CompletionResponse struct {
 // StreamChunk is one piece of a streaming response.
 type StreamChunk struct {
 	Delta         string         `json:"delta,omitempty"`
-	IsReasoning   bool           `json:"is_reasoning,omitempty"`  // true when Delta carries reasoning/thinking content
+	IsReasoning   bool           `json:"is_reasoning,omitempty"` // true when Delta carries reasoning/thinking content
 	ToolCallDelta *ToolCallDelta `json:"tool_call_delta,omitempty"`
 	Done          bool           `json:"done"`
 	StopReason    string         `json:"stop_reason,omitempty"`   // e.g. "end_turn", "max_tokens", "tool_use"
