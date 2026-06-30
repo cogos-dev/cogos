@@ -44,26 +44,51 @@ func dispatchCycleIDFromCtx(ctx context.Context) string {
 // Callers that don't specify a scope get exactly the tool set they always have.
 const defaultHarnessScopeName = "consolidation"
 
-// harnessToolScopes is the named-scope catalog for harness dispatches.
+// harnessToolScopes is the named-scope catalog for harness dispatches (RFC-016).
 // Each scope is a named set of tool names the harness may use.
 //
-// "consolidation" — substrate-only tools: memory, observability, identity.
+// "consolidation" — RFC-016 canonical 11 substrate tools: memory, observability,
 //
-//	This is the default scope (unchanged from the original tool set).
-//	The harness operates on cogdocs, the field, and coherence only.
+//	identity. respond is intentionally ABSENT from this base scope — callers
+//	that need respond must request consolidation_with_respond explicitly.
+//	Removing respond from the default aligns with RFC-016's canonical 11.
+//
+// "consolidation_with_respond" — consolidation + respond tool. Used by the
+//
+//	autonomic cycle when pending dashboard messages are present.
+//
+// "consolidation_no_respond" — consolidation without respond. Used by purely
+//
+//	autonomic ticks (no pending user messages). The model cannot publish to
+//	bus_dashboard_response during an autonomic-only cycle.
 //
 // "audit" — consolidation tools PLUS read-only filesystem access.
 //
-//	Use this scope when the harness needs to inspect source, configs,
-//	or workspace files without mutating anything.
+//	Use when the harness needs to inspect source, configs, or workspace files
+//	without mutating anything.
+//
+// "search" — lightweight lookup micro-scope (RFC-016 §micro-scopes). Resolves
+//
+//	URIs, searches memory, and queries the field. No read of full CogDocs,
+//	no event emission. Suitable for single-tool-call breadth fan-out.
+//
+// "observe" — consolidation read tools minus cog_emit_event (RFC-016 §micro-scopes).
+//
+//	Grants full read access to the substrate (CogDocs, state, coherence,
+//	nucleus, index, context) without the ability to emit events.
+//
+// "emit" — single-tool micro-scope: cog_emit_event only (RFC-016 §micro-scopes).
+//
+//	Suitable for a slot whose sole job is to publish a structured bus event.
 //
 // Future scopes (add entries here when the underlying mechanisms land):
 //
 //	"maintenance" — read+write filesystem tools gated behind per-dispatch
-//	                worktree isolation (see ADR-081 §8 worktree work).
+//	                worktree isolation (RFC-017, dedicated PR).
 //	"introspection" — audit tools plus kernel state-dump tools for deep
 //	                  diagnostic cycles.
 var harnessToolScopes = map[string][]string{
+	// consolidation — RFC-016 canonical 11. respond removed from base scope.
 	"consolidation": {
 		"cog_resolve_uri",
 		"cog_search_memory",
@@ -76,12 +101,11 @@ var harnessToolScopes = map[string][]string{
 		"cog_get_index",
 		"cog_assemble_context",
 		"cog_emit_event",
-		engineRespondToolName, // Piece 3a: respond tool in consolidation scope
 	},
-	// consolidation_with_respond is identical to consolidation but named
-	// explicitly so callers can request it by scope name. The autonomic
-	// cycle uses this scope only when pending user messages are present;
-	// for purely autonomic ticks it uses consolidation_no_respond instead.
+	// consolidation_with_respond — consolidation + respond. The autonomic
+	// cycle wires backgroundTools from this scope so the model can reply to
+	// pending dashboard messages. Callers that need respond must request this
+	// scope explicitly; the base "consolidation" scope no longer includes it.
 	"consolidation_with_respond": {
 		"cog_resolve_uri",
 		"cog_search_memory",
@@ -96,9 +120,9 @@ var harnessToolScopes = map[string][]string{
 		"cog_emit_event",
 		engineRespondToolName,
 	},
-	// consolidation_no_respond is the autonomic-only scope: identical to
-	// consolidation except the respond tool is absent. The model cannot
-	// publish to bus_dashboard_response during a pure autonomic cycle.
+	// consolidation_no_respond — consolidation without respond. Used by purely
+	// autonomic ticks (no pending user messages). The model cannot publish to
+	// bus_dashboard_response during an autonomic-only cycle.
 	"consolidation_no_respond": {
 		"cog_resolve_uri",
 		"cog_search_memory",
@@ -126,6 +150,29 @@ var harnessToolScopes = map[string][]string{
 		"cog_emit_event",
 		"cog_read_file",
 		"cog_grep_files",
+	},
+	// search — RFC-016 §micro-scopes. Lightweight URI/memory/field lookup only.
+	"search": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_query_field",
+	},
+	// observe — RFC-016 §micro-scopes. Full substrate read access, no event emission.
+	"observe": {
+		"cog_resolve_uri",
+		"cog_search_memory",
+		"cog_read_cogdoc",
+		"cog_query_field",
+		"cog_check_coherence",
+		"cog_get_state",
+		"cog_get_trust",
+		"cog_get_nucleus",
+		"cog_get_index",
+		"cog_assemble_context",
+	},
+	// emit — RFC-016 §micro-scopes. Single-purpose: publish a structured bus event.
+	"emit": {
+		"cog_emit_event",
 	},
 }
 
@@ -197,6 +244,40 @@ Output contract (ADR-eigen output-contract, RFC-027 alignment layer): after any
 tool calls, finish with a plain-text answer — or call respond exactly once with
 the answer. Do NOT narrate tool use, emit role/channel markers, or output special
 tokens such as <|...|> or respond{...} scaffolding.`
+
+// buildHarnessOrientationBlock constructs the four-bundle orientation string
+// that is prepended to localHarnessDispatchPrompt when no caller-supplied
+// SystemPrompt is present (RFC-018 §stateless-approximation, ADR-066
+// §pointer-discipline). The four bundles are intentionally pointer-first and
+// bounded: no inline file or CogDoc content is embedded here.
+//
+// Bundle layout:
+//  1. Identity  — name + role inline (NOT the full Card).
+//  2. Directive — framing that the concrete task arrives in the user message.
+//  3. Scope     — the named harness scope; signals which tools are available.
+//  4. Substrate — workspace root as a cog:// pointer (no inline content).
+func buildHarnessOrientationBlock(name, role, scopeName, workspaceRoot string) string {
+	if name == "" {
+		name = "local-harness"
+	}
+	if role == "" {
+		role = "CogOS resident agent"
+	}
+	if scopeName == "" {
+		scopeName = defaultHarnessScopeName
+	}
+	wsPointer := "cog:workspace/root"
+	if workspaceRoot != "" {
+		wsPointer = "cog:workspace/root (" + workspaceRoot + ")"
+	}
+	return strings.Join([]string{
+		"[orientation]",
+		"identity: " + name + " — " + role,
+		"directive: your task is in the user message below; complete it using the available tools",
+		"scope: " + scopeName,
+		"substrate: " + wsPointer,
+	}, "\n")
+}
 
 type localHarnessAssessment struct {
 	Action  string  `json:"action"`
@@ -295,6 +376,15 @@ type LocalHarnessController struct {
 	// that look like hangs. One lock per controller, held for the duration of
 	// the inference call, makes the serialization explicit and debuggable.
 	ollamaMu sync.Mutex
+
+	// harnessOrientationBlock is the four-bundle orientation string prepended to
+	// localHarnessDispatchPrompt when req.SystemPrompt is empty (RFC-018 §stateless
+	// approximation, ADR-066 pointer-discipline). Computed once at construction so
+	// the content is stable across fan-out slots — the Wave-1 content-keyed
+	// RequestID hashes the system prompt, so any per-call variation would defeat
+	// KV-cache sharing. Content: identity (name + role inline, NOT the full Card),
+	// directive framing, scope sentinel, and workspace pointer (cog:// URI).
+	harnessOrientationBlock string
 }
 
 func NewLocalHarnessController(cfg *Config, nucleus *Nucleus, process *Process, mcpSrv *MCPServer) (*LocalHarnessController, error) {
@@ -313,7 +403,12 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 	}
 	toolNames, ok := harnessToolScopes[scopeName]
 	if !ok {
-		return nil, fmt.Errorf("unknown harness scope %q (known: consolidation, consolidation_with_respond, consolidation_no_respond, audit)", scopeName)
+		known := make([]string, 0, len(harnessToolScopes))
+		for k := range harnessToolScopes {
+			known = append(known, k)
+		}
+		sort.Strings(known)
+		return nil, fmt.Errorf("unknown harness scope %q (known: %v)", scopeName, known)
 	}
 	registry := NewKernelToolRegistry(mcpSrv)
 	// Piece 3b: inject the respond native tool into the full registry before
@@ -325,9 +420,21 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		return nil, err
 	}
 
-	// Gate A: build a respond-free tool set for purely autonomic cycles.
-	// When runCycle drains an empty pending queue, it uses this registry so
-	// the model cannot see (and therefore cannot invoke) the respond tool.
+	// Gate A — build cycle-appropriate tool sets from canonical scope entries.
+	//
+	// backgroundTools is always wired from consolidation_with_respond so the
+	// autonomic cycle can call respond when pending dashboard messages are
+	// present, regardless of which scope was requested at construction time.
+	// This decouples the dispatch scope (what external callers get) from the
+	// autonomic cycle's respond access.
+	//
+	// backgroundToolsNoRespond is the respond-free set for purely autonomic
+	// ticks (no pending user messages); the model cannot see the respond tool
+	// so it structurally cannot publish to bus_dashboard_response.
+	withRespondTools, err := registry.Scoped(harnessToolScopes["consolidation_with_respond"])
+	if err != nil {
+		return nil, fmt.Errorf("build with-respond tool scope: %w", err)
+	}
 	noRespondTools, err := registry.Scoped(harnessToolScopes["consolidation_no_respond"])
 	if err != nil {
 		return nil, fmt.Errorf("build no-respond tool scope: %w", err)
@@ -338,18 +445,39 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		interval = time.Duration(cfg.HeartbeatInterval) * time.Second
 	}
 
+	// RFC-018 §stateless-approximation, ADR-066 §pointer-discipline:
+	// Compute the four-bundle orientation block once at construction so it is
+	// stable across fan-out slots (required for the Wave-1 content-keyed
+	// RequestID KV-cache sharing). The four bundles are:
+	//   1. Identity  — name + role inline; NOT the full Card.
+	//   2. Directive — framing that the task arrives in the user message.
+	//   3. Scope     — the named harness scope active for this controller.
+	//   4. Substrate — workspace root as a cog:// pointer (no inline content).
+	identityName := ""
+	identityRole := ""
+	wsRoot := ""
+	if nucleus != nil {
+		identityName = nucleus.Name
+		identityRole = nucleus.Role
+	}
+	if cfg != nil {
+		wsRoot = cfg.WorkspaceRoot
+	}
+	orientationBlock := buildHarnessOrientationBlock(identityName, identityRole, scopeName, wsRoot)
+
 	return &LocalHarnessController{
 		cfg:                      cfg,
 		nucleus:                  nucleus,
 		process:                  process,
 		toolRegistry:             registry,
 		dispatchTools:            dispatchTools,
-		backgroundTools:          dispatchTools,
+		backgroundTools:          withRespondTools,
 		backgroundToolsNoRespond: noRespondTools,
 		agentID:                  DefaultAgentID,
 		started:                  time.Now().UTC(),
 		interval:                 interval,
 		localProviderTimeout:     resolveLocalProviderTimeout(cfg),
+		harnessOrientationBlock:  orientationBlock,
 	}, nil
 }
 
@@ -1400,15 +1528,24 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	cycleID := uuid.NewString()
 	ctx = withDispatchCycleID(ctx, cycleID)
 
+	// RFC-identity-embedding I1/I2: resolve the caller subject for honest
+	// attribution in both bound and anonymous states. No capability gating here;
+	// this is observability metadata only (Wave-6b adds CRD validation).
+	subject := req.Identity.Sub
+	if subject == "" {
+		subject = "anonymous"
+	}
+
 	// Emit dispatch-start ledger entry (ADR-033, ADR-072).
 	_ = EmitLedgerEvent(c.cfg, map[string]any{
 		"type":   "harness.dispatch.start",
 		"source": "local-harness",
 		"payload": map[string]any{
-			"cycle_id": cycleID,
-			"n":        req.N,
-			"task":     truncateDigest(req.Task),
-			"provider": req.Provider,
+			"cycle_id":    cycleID,
+			"n":           req.N,
+			"task":        truncateDigest(req.Task),
+			"provider":    req.Provider,
+			"attribution": subject,
 		},
 	})
 
@@ -1418,7 +1555,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote)
+			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote, subject)
 		}(i)
 	}
 	wg.Wait()
@@ -1432,13 +1569,16 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 			"cycle_id":         cycleID,
 			"n":                req.N,
 			"total_duration_s": batch.TotalDurationSec,
+			"attribution":      subject,
 		},
 	})
 
 	return batch, nil
 }
 
-func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string) DispatchResult {
+// dispatchSlot executes one fan-out slot. subject is the resolved dispatch
+// identity (RFC-identity-embedding I1/I2): "anonymous" or req.Identity.Sub.
+func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string, subject string) DispatchResult {
 	res := DispatchResult{
 		Index:        idx,
 		ModelUsed:    routeUsed,
@@ -1449,7 +1589,12 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 
 	systemPrompt := strings.TrimSpace(req.SystemPrompt)
 	if systemPrompt == "" {
-		systemPrompt = localHarnessDispatchPrompt
+		// RFC-018 §stateless-approximation, ADR-066 §pointer-discipline:
+		// Compose the four-bundle orientation block (computed once at controller
+		// construction) with the base dispatch prompt. The orientation block is
+		// prefix-stable across fan-out slots so KV-cache sharing is preserved.
+		// When req.SystemPrompt is set the caller owns the prompt; use it verbatim.
+		systemPrompt = c.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
 	}
 	counting := &countingProvider{Provider: provider}
 
@@ -1497,6 +1642,9 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 			PreferLocal:    true,
 			PreferProvider: req.Provider,
 			Source:         "local-harness-dispatch",
+			// RFC-identity-embedding I1/I2: carry attribution through to
+			// provider adapters so the ledger InferenceEvent can record it.
+			Attribution: subject,
 		},
 	}
 
@@ -1520,10 +1668,11 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		if tc.Arguments != "" {
 			argsRaw = json.RawMessage(tc.Arguments)
 		}
-		emitTrace(trace.NewToolDispatch(
+		emitTrace(trace.NewToolDispatchWithAttribution(
 			TraceIdentity(),
 			cycleID,
 			tc.Name,
+			subject, // RFC-identity-embedding I1/I2
 			argsRaw,
 			time.Duration(tc.DurationMs)*time.Millisecond,
 			toolErr,
@@ -1553,7 +1702,18 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		if errors.Is(err, ErrToolLoopMaxTurns) || errors.Is(err, ErrToolLoopNoProgress) {
 			res.Success = true
 			res.Degraded = true
-			res.Error = err.Error()
+			// Structured is_error body (ADR-031 autonomic/fail-fast, RFC-020
+			// four-element subset). Serialise as JSON so MCP callers receive a
+			// machine-readable error body rather than a bare string.
+			if sentinel, ok := err.(*toolLoopSentinel); ok {
+				if body, merr := json.Marshal(LoopExitErrorBody(sentinel)); merr == nil {
+					res.Error = string(body)
+				} else {
+					res.Error = err.Error()
+				}
+			} else {
+				res.Error = err.Error()
+			}
 			if resp != nil {
 				res.Content = stripControlTokens(strings.TrimSpace(resp.Content))
 			}

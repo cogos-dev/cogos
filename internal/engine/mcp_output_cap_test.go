@@ -167,7 +167,7 @@ func TestToolReadFile_ByteCapApplied(t *testing.T) {
 	path := filepath.Join(root, "big.txt")
 	writeTestFile(t, path, strings.Join(lines, "\n")+"\n")
 
-	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path})
+	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path, Res: "full"})
 	if err != nil {
 		t.Fatalf("toolReadFile: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestToolReadFile_MinifiedOneLineBlobCapped(t *testing.T) {
 	path := filepath.Join(root, "minified.js")
 	writeTestFile(t, path, bigLine)
 
-	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path})
+	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path, Res: "full"})
 	if err != nil {
 		t.Fatalf("toolReadFile on minified blob: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestToolReadFile_OffsetSkipsOverLongLines(t *testing.T) {
 	path := filepath.Join(root, "mixed.txt")
 	writeTestFile(t, path, contents)
 
-	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path, Offset: 1})
+	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path, Offset: 1, Res: "full"})
 	if err != nil {
 		t.Fatalf("toolReadFile with offset over long line: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestToolReadFile_RelativePathResolvesAgainstWorkspaceRoot(t *testing.T) {
 
 	writeTestFile(t, filepath.Join(root, "rel.txt"), "relative content\n")
 
-	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: "rel.txt"})
+	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: "rel.txt", Res: "full"})
 	if err != nil {
 		t.Fatalf("toolReadFile relative path: %v", err)
 	}
@@ -390,6 +390,7 @@ func TestToolGrepFiles_LongLineDoesNotAbortScan(t *testing.T) {
 	result, _, err := server.toolGrepFiles(context.Background(), nil, grepFilesInput{
 		Pattern: "NEEDLE",
 		Path:    root,
+		Res:     "full",
 	})
 	if err != nil {
 		t.Fatalf("toolGrepFiles: %v", err)
@@ -410,7 +411,7 @@ func TestToolReadFile_SmallFileNotCapped(t *testing.T) {
 	path := filepath.Join(root, "small.go")
 	writeTestFile(t, path, "package engine\n\nfunc Foo() {}\n")
 
-	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path})
+	result, _, err := server.toolReadFile(context.Background(), nil, readFileInput{Path: path, Res: "full"})
 	if err != nil {
 		t.Fatalf("toolReadFile: %v", err)
 	}
@@ -443,6 +444,7 @@ func TestToolGrepFiles_ByteCapApplied(t *testing.T) {
 		Pattern:    "MATCH",
 		Path:       root,
 		MaxResults: 100,
+		Res:        "full",
 	})
 	if err != nil {
 		t.Fatalf("toolGrepFiles: %v", err)

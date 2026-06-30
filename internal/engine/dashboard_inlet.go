@@ -5,13 +5,14 @@
 // when serve_daemon.go was deleted.
 //
 // The bridge:
-//   Mod³ → POST /v1/bus/send bus_id=bus_dashboard_chat
-//        → BusSessionManager.AppendEvent dispatches to handlers
-//        → handleEngineDashboardChatEvent enqueues to enginePendingMsgs
-//        → LocalHarnessController.runCycle drains queue, enriches observation
-//        → agent invokes `respond` tool OR ensureUserTurnReply fires fallback
-//        → enginePublishDashboardResponse writes to bus_dashboard_response
-//        → SSE subscribers (Mod³) receive the response
+//
+//	Mod³ → POST /v1/bus/send bus_id=bus_dashboard_chat
+//	     → BusSessionManager.AppendEvent dispatches to handlers
+//	     → handleEngineDashboardChatEvent enqueues to enginePendingMsgs
+//	     → LocalHarnessController.runCycle drains queue, enriches observation
+//	     → agent invokes `respond` tool OR ensureUserTurnReply fires fallback
+//	     → enginePublishDashboardResponse writes to bus_dashboard_response
+//	     → SSE subscribers (Mod³) receive the response
 //
 // Wiring: call InstallEngineDashboardInlet(mgr) once at server startup
 // alongside SetBusSessionManager on the LocalHarnessController.
@@ -367,11 +368,12 @@ var engineRespondPublish = enginePublishDashboardResponse
 // user-turn execute phase.
 func engineRespondExecutor(ctx context.Context, arguments string) (string, error) {
 	// Gate B: reject 2nd+ invocations within the same user turn.
+	// Returns a structured is_error body (ADR-031 autonomic/fail-fast,
+	// RFC-020 four-element subset) so the model receives machine-readable
+	// guidance rather than a bare {ok:false} map.
 	if atomic.LoadUint64(&engineRespondPerTurnCount) > 0 {
-		result, _ := json.Marshal(map[string]interface{}{
-			"ok":    false,
-			"error": "respond already invoked this turn (1 reply per turn)",
-		})
+		const gateReason = "respond already invoked this turn (1 reply per turn)"
+		result, _ := json.Marshal(GateBDenialErrorBody(gateReason))
 		return string(result), nil
 	}
 
