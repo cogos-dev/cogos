@@ -62,7 +62,6 @@ func (c *Constellation) IndexWorkspace() error {
 
 	indexed := 0
 	skipped := 0
-	var indexErr error
 
 	// NOTE: an earlier revision purged "stale" rows whose path did not begin with the
 	// current workspace root (DELETE ... WHERE path NOT LIKE <root>/%). That was unsafe:
@@ -89,10 +88,6 @@ func (c *Constellation) IndexWorkspace() error {
 			if err := c.indexCogdoc(tx, path); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to index %s: %v\n", path, err)
 				skipped++
-				// Store first error but continue indexing
-				if indexErr == nil {
-					indexErr = err
-				}
 			} else {
 				indexed++
 			}
@@ -128,7 +123,11 @@ func (c *Constellation) IndexWorkspace() error {
 		fmt.Fprintf(os.Stderr, "Warning: failed to rebuild FTS: %v\n", err)
 	}
 
-	fmt.Printf("Indexed %d cogdocs (%d skipped)\n", indexed, skipped)
+	if skipped > 0 {
+		fmt.Printf("Indexed %d cogdocs (%d skipped — see warnings above)\n", indexed, skipped)
+	} else {
+		fmt.Printf("Indexed %d cogdocs\n", indexed)
+	}
 
 	// Async: trigger embedding backfill if embed client is configured
 	if c.embedClient != nil {
@@ -143,7 +142,12 @@ func (c *Constellation) IndexWorkspace() error {
 		}()
 	}
 
-	return indexErr
+	// Per-doc parse/index failures are warnings, not command failures: the
+	// walk, commit, ref-resolution, and FTS rebuild all succeeded, so the index
+	// is consistent for every doc that could be parsed. Return nil so callers
+	// (e.g. cogos reindex) exit 0 on a successful-with-skips run. The warnings
+	// printed above are the signal for the skipped documents.
+	return nil
 }
 
 // IndexFile indexes a single cogdoc file into the constellation.

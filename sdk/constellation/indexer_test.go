@@ -378,6 +378,65 @@ func TestFTSIndexFileIdempotent(t *testing.T) {
 	}
 }
 
+// TestIndexWorkspaceToleratesMalformedFrontmatter verifies that IndexWorkspace
+// exits without error when one cogdoc has unparseable YAML frontmatter but the
+// remaining docs are valid. The valid docs must be indexed and searchable; the
+// malformed doc is skipped with a warning. This is a regression test for the
+// bug where a single bad-frontmatter doc caused cogos reindex to exit non-zero
+// even after indexing thousands of other docs successfully.
+func TestIndexWorkspaceToleratesMalformedFrontmatter(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	// Write two valid cogdocs.
+	writeCogdocInWorkspace(t, c,
+		"semantic/good-alpha.cog.md",
+		"id: good-alpha\ntype: note\ntitle: Good Alpha\ncreated: 2026-01-01",
+		"This document has a unique token: xyzzy42.",
+	)
+	writeCogdocInWorkspace(t, c,
+		"semantic/good-beta.cog.md",
+		"id: good-beta\ntype: note\ntitle: Good Beta\ncreated: 2026-01-01",
+		"Another valid document with token: plugh77.",
+	)
+
+	// Write one cogdoc with malformed YAML frontmatter (mapping value in a
+	// scalar context — the same failure class observed in production).
+	malformedFM := "id: bad-doc\ntitle: Bad: value: with colons: everywhere\ntype: note"
+	writeCogdocInWorkspace(t, c,
+		"semantic/malformed.cog.md",
+		malformedFM,
+		"This document will be skipped.",
+	)
+
+	// IndexWorkspace must return nil — per-doc parse failures are warnings.
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("IndexWorkspace returned error on malformed doc: %v", err)
+	}
+
+	// Both valid docs must be indexed.
+	var docCount int
+	if err := c.DB().QueryRow(
+		`SELECT COUNT(*) FROM documents WHERE id IN ('good-alpha', 'good-beta')`,
+	).Scan(&docCount); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if docCount != 2 {
+		t.Errorf("expected 2 valid docs indexed, got %d", docCount)
+	}
+
+	// Valid docs must be FTS-searchable.
+	var ftsCount int
+	if err := c.DB().QueryRow(
+		`SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'xyzzy42'`,
+	).Scan(&ftsCount); err != nil {
+		t.Fatalf("FTS query: %v", err)
+	}
+	if ftsCount == 0 {
+		t.Error("expected good-alpha to be FTS-searchable after IndexWorkspace, got 0 matches")
+	}
+}
+
 // TestFTSIndexFileChangedContent verifies that after content changes and a
 // second IndexFile call, the FTS reflects the new content (not the old).
 func TestFTSIndexFileChangedContent(t *testing.T) {
