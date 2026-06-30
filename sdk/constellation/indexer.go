@@ -64,18 +64,14 @@ func (c *Constellation) IndexWorkspace() error {
 	skipped := 0
 	var indexErr error
 
-	// CRITICAL-4: purge stale paths from a prior workspace root before re-indexing.
-	// These accumulate when the workspace root changes (e.g., when the directory is
-	// renamed or a symlink is replaced with a canonical path).  We delete any indexed
-	// document whose absolute path does not begin with the current workspace root so
-	// that the purge is portable and correct for any host or user.
-	// Log but do not abort if purge fails — stale rows are cosmetic, not blocking.
-	stalePrefix := c.root + string(os.PathSeparator)
-	if result, err := tx.Exec("DELETE FROM documents WHERE path NOT LIKE ?", stalePrefix+"%"); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: stale-path purge failed: %v\n", err)
-	} else if n, _ := result.RowsAffected(); n > 0 {
-		fmt.Printf("Purged %d stale out-of-workspace paths\n", n)
-	}
+	// NOTE: an earlier revision purged "stale" rows whose path did not begin with the
+	// current workspace root (DELETE ... WHERE path NOT LIKE <root>/%). That was unsafe:
+	// the documents table also holds rows indexed from OUTSIDE the workspace root (e.g.
+	// conversation/session documents under ~/.claude), so a blanket prefix-negation DELETE
+	// would remove legitimately-indexed rows — and an unescaped LIKE pattern from the root
+	// path could match unintended rows via the _/% metacharacters. Orphan cleanup (removing
+	// rows whose underlying file no longer exists) belongs in a dedicated stat-based sweep,
+	// not a path-prefix DELETE; re-indexing below is idempotent and does not require it.
 
 	// Walk .cog directory for cogdocs
 	err = filepath.WalkDir(filepath.Join(c.root, ".cog"), func(path string, d fs.DirEntry, err error) error {

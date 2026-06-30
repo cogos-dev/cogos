@@ -230,40 +230,37 @@ func TestResolveURIRFCScheme(t *testing.T) {
 	}
 }
 
-// TestIndexWorkspaceStalePathPurge verifies stale cog-workspace paths are purged (CRITICAL-4).
-func TestIndexWorkspaceStalePathPurge(t *testing.T) {
+// TestIndexWorkspacePreservesOutOfWorkspaceRows verifies that IndexWorkspace does NOT
+// delete rows whose path falls outside the current workspace root. The documents table
+// legitimately holds out-of-workspace rows (e.g. conversation/session documents indexed
+// from ~/.claude), so the earlier blanket "DELETE WHERE path NOT LIKE <root>/%" purge was
+// unsafe and has been removed. This test locks in the corrected invariant.
+func TestIndexWorkspacePreservesOutOfWorkspaceRows(t *testing.T) {
 	c, cleanup := openTestDB(t)
 	defer cleanup()
 
-	// Insert a stale cog-workspace row directly
+	// Insert a legitimately-indexed out-of-workspace row (e.g. a claude-code session).
 	_, err := c.db.Exec(`INSERT INTO documents (id, path, type, title, created, content, content_hash, indexed_at, file_mtime)
-		VALUES ('stale-doc', '/Users/slowbro/cog-workspace/.cog/mem/test.cog.md',
-		        'note', 'Stale', '2025-01-01', 'body', 'hash', '2025-01-01', '2025-01-01')`)
+		VALUES ('session:abc', '/Users/someone/.claude/projects/p/abc.jsonl',
+		        'session', 'Session', '2025-01-01', 'body', 'hash', '2025-01-01', '2025-01-01')`)
 	if err != nil {
-		t.Fatalf("insert stale doc: %v", err)
+		t.Fatalf("insert out-of-workspace doc: %v", err)
 	}
 
-	// Verify it's there
-	var before int
-	c.db.QueryRow("SELECT COUNT(*) FROM documents WHERE path LIKE '/Users/slowbro/cog-workspace/%'").Scan(&before)
-	if before != 1 {
-		t.Fatalf("expected 1 stale row before purge, got %d", before)
-	}
-
-	// Create the .cog directory structure required for WalkDir
+	// Create the .cog directory structure required for WalkDir.
 	cogDir := filepath.Join(c.root, ".cog")
 	if err := os.MkdirAll(cogDir, 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	// Run index (will trigger purge + walk the empty .cog dir)
+	// Run a full index over an (otherwise empty) workspace.
 	_ = c.IndexWorkspace() // errors from empty .cog dir are acceptable
 
-	// Verify stale row is gone
+	// The out-of-workspace row must survive — IndexWorkspace must not purge it.
 	var after int
-	c.db.QueryRow("SELECT COUNT(*) FROM documents WHERE path LIKE '/Users/slowbro/cog-workspace/%'").Scan(&after)
-	if after != 0 {
-		t.Errorf("expected stale cog-workspace rows to be purged, got %d remaining", after)
+	c.db.QueryRow("SELECT COUNT(*) FROM documents WHERE id = 'session:abc'").Scan(&after)
+	if after != 1 {
+		t.Errorf("out-of-workspace row was deleted by IndexWorkspace; want preserved, got count=%d", after)
 	}
 }
 
