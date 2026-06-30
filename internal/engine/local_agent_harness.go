@@ -1702,7 +1702,18 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		if errors.Is(err, ErrToolLoopMaxTurns) || errors.Is(err, ErrToolLoopNoProgress) {
 			res.Success = true
 			res.Degraded = true
-			res.Error = err.Error()
+			// Structured is_error body (ADR-031 autonomic/fail-fast, RFC-020
+			// four-element subset). Serialise as JSON so MCP callers receive a
+			// machine-readable error body rather than a bare string.
+			if sentinel, ok := err.(*toolLoopSentinel); ok {
+				if body, merr := json.Marshal(LoopExitErrorBody(sentinel)); merr == nil {
+					res.Error = string(body)
+				} else {
+					res.Error = err.Error()
+				}
+			} else {
+				res.Error = err.Error()
+			}
 			if resp != nil {
 				res.Content = stripControlTokens(strings.TrimSpace(resp.Content))
 			}

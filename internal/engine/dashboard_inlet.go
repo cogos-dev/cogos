@@ -367,11 +367,12 @@ var engineRespondPublish = enginePublishDashboardResponse
 // user-turn execute phase.
 func engineRespondExecutor(ctx context.Context, arguments string) (string, error) {
 	// Gate B: reject 2nd+ invocations within the same user turn.
+	// Returns a structured is_error body (ADR-031 autonomic/fail-fast,
+	// RFC-020 four-element subset) so the model receives machine-readable
+	// guidance rather than a bare {ok:false} map.
 	if atomic.LoadUint64(&engineRespondPerTurnCount) > 0 {
-		result, _ := json.Marshal(map[string]interface{}{
-			"ok":    false,
-			"error": "respond already invoked this turn (1 reply per turn)",
-		})
+		const gateReason = "respond already invoked this turn (1 reply per turn)"
+		result, _ := json.Marshal(GateBDenialErrorBody(gateReason))
 		return string(result), nil
 	}
 

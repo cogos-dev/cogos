@@ -228,13 +228,17 @@ func TestGateB_MultipleRespondCallsInOneTurn(t *testing.T) {
 	}
 
 	// Second invocation must be rejected by Gate B.
+	// New shape: is_error body (ADR-031, RFC-020 four-element subset) —
+	// {is_error:true, code:"respond_denied", what:..., why:..., fix:..., norm:...}
 	r2 := invoke(t, "second reply — must be blocked")
-	if ok, _ := r2["ok"].(bool); ok {
-		t.Errorf("2nd invoke should return ok=false (Gate B): %v", r2)
+	if isErr, _ := r2["is_error"].(bool); !isErr {
+		t.Errorf("2nd invoke should return is_error=true (Gate B): %v", r2)
 	}
-	errMsg, _ := r2["error"].(string)
-	if errMsg == "" {
-		t.Errorf("2nd invoke: expected non-empty error field, got: %v", r2)
+	if code, _ := r2["code"].(string); code != "respond_denied" {
+		t.Errorf("2nd invoke: expected code=respond_denied, got: %v", r2)
+	}
+	if why, _ := r2["why"].(string); why == "" {
+		t.Errorf("2nd invoke: expected non-empty why field, got: %v", r2)
 	}
 	if n := atomic.LoadInt64(&publishCount); n != 1 {
 		t.Errorf("after 2nd invoke: publishCount = %d, want still 1", n)
@@ -242,8 +246,8 @@ func TestGateB_MultipleRespondCallsInOneTurn(t *testing.T) {
 
 	// Third invocation must also be rejected.
 	r3 := invoke(t, "third reply — also blocked")
-	if ok, _ := r3["ok"].(bool); ok {
-		t.Errorf("3rd invoke should return ok=false (Gate B): %v", r3)
+	if isErr, _ := r3["is_error"].(bool); !isErr {
+		t.Errorf("3rd invoke should return is_error=true (Gate B): %v", r3)
 	}
 	if n := atomic.LoadInt64(&publishCount); n != 1 {
 		t.Errorf("after 3rd invoke: publishCount = %d, want still 1", n)
@@ -290,9 +294,10 @@ func TestGateB_PerTurnCounterResetBetweenTurns(t *testing.T) {
 	if ok, _ := r1a["ok"].(bool); !ok {
 		t.Fatalf("turn 1, 1st call should succeed: %v", r1a)
 	}
+	// Gate-B denial now returns is_error body (ADR-031, RFC-020 four-element subset).
 	r1b := invoke(t, "turn-1 second (blocked)")
-	if ok, _ := r1b["ok"].(bool); ok {
-		t.Errorf("turn 1, 2nd call should be blocked: %v", r1b)
+	if isErr, _ := r1b["is_error"].(bool); !isErr {
+		t.Errorf("turn 1, 2nd call should return is_error=true (Gate B): %v", r1b)
 	}
 
 	// Simulate runCycle resetting the counter for the next user turn.
@@ -304,9 +309,9 @@ func TestGateB_PerTurnCounterResetBetweenTurns(t *testing.T) {
 		t.Errorf("turn 2, 1st call after reset should succeed: %v", r2a)
 	}
 
-	// Turn 2 second call must still be blocked.
+	// Turn 2 second call must still be blocked (is_error body).
 	r2b := invoke(t, "turn-2 second (blocked)")
-	if ok, _ := r2b["ok"].(bool); ok {
-		t.Errorf("turn 2, 2nd call should be blocked after reset: %v", r2b)
+	if isErr, _ := r2b["is_error"].(bool); !isErr {
+		t.Errorf("turn 2, 2nd call should return is_error=true after reset: %v", r2b)
 	}
 }
