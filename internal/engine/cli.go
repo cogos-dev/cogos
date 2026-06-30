@@ -55,6 +55,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "  version     Print build version and exit\n")
 	fmt.Fprintf(w, "  node        Manage node configuration\n")
 	fmt.Fprintf(w, "  reconcile   Run reconciliation loop diagnostics\n")
+	fmt.Fprintf(w, "  reindex     Rebuild the FTS5 constellation index from scratch\n")
 	fmt.Fprintf(w, "  spine       Show the decision manifold (gravity/inertia field over ADRs/RFCs)\n")
 	fmt.Fprintf(w, "  mcp         MCP server sub-commands (serve, ...)\n")
 	fmt.Fprintf(w, "  emit        Emit an event onto the kernel bus\n")
@@ -155,6 +156,9 @@ func Main() {
 			return
 		case "self-update":
 			runSelfUpdateCmd(args[1:], *workspace, *port)
+			return
+		case "reindex":
+			runReindexCmd(args[1:], *workspace)
 			return
 		}
 	}
