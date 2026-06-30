@@ -64,13 +64,17 @@ func (c *Constellation) IndexWorkspace() error {
 	skipped := 0
 	var indexErr error
 
-	// CRITICAL-4: purge stale cog-workspace paths before re-indexing.
-	// These accumulate when the workspace root changes (e.g., cog-workspace → cog).
+	// CRITICAL-4: purge stale paths from a prior workspace root before re-indexing.
+	// These accumulate when the workspace root changes (e.g., when the directory is
+	// renamed or a symlink is replaced with a canonical path).  We delete any indexed
+	// document whose absolute path does not begin with the current workspace root so
+	// that the purge is portable and correct for any host or user.
 	// Log but do not abort if purge fails — stale rows are cosmetic, not blocking.
-	if result, err := tx.Exec("DELETE FROM documents WHERE path LIKE '/Users/slowbro/cog-workspace/%'"); err != nil {
+	stalePrefix := c.root + string(os.PathSeparator)
+	if result, err := tx.Exec("DELETE FROM documents WHERE path NOT LIKE ?", stalePrefix+"%"); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: stale-path purge failed: %v\n", err)
 	} else if n, _ := result.RowsAffected(); n > 0 {
-		fmt.Printf("Purged %d stale cog-workspace paths\n", n)
+		fmt.Printf("Purged %d stale out-of-workspace paths\n", n)
 	}
 
 	// Walk .cog directory for cogdocs
