@@ -89,16 +89,6 @@ services:
     depends_on: [kernel]
     consumers: []
 
-  # ollama is user-managed (install via Homebrew or `ollama serve`).
-  # Kernel probes health but does not control the lifecycle. kind: observed.
-  ollama:
-    kind: observed
-    port: 11434
-    health: /api/tags
-    restart: ""
-    depends_on: []
-    consumers: []
-
   # openclaw is the OpenClaw server when externally launched (not via gateway).
   # Kernel probes health but does not control the lifecycle. kind: observed.
   openclaw:

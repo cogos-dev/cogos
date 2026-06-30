@@ -175,5 +175,5 @@ body:
         rather than the project's defaults.
       placeholder: |
         - Workspace: ~/workspaces/cog
-        - Active local providers: claude-code, ollama (gemma4:e4b)
+        - Active local providers: claude-code, lmstudio-darkstar (gemma-4-26b)
         - Other services on adjacent ports: BrowserOS dashboard on :7000
