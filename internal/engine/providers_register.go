@@ -55,3 +55,13 @@ var WireHarnessBackend func(s *Server)
 // observatory coverage route). Set by cmd/cogos extension init() functions.
 // Nil means no additional routes are registered.
 var RegisterHTTPExtensions func(s *Server, mux *http.ServeMux)
+
+// WireConstellationIndexer is called once during Boot after NewServer, to wire
+// a live ConstellationIndexer (the *constellation.Constellation handle from the
+// root package) into the server so that CogDocService.WriteAndSync /
+// PatchAndSync perform an eager per-file FTS upsert, and so that the lazy
+// drift-repair path in searchMemoryFTSDriftRepair can call IndexFile without
+// importing sdk/constellation (package-boundary guard).
+// Set by cmd/cogos/providers_wire.go with the concrete *constellation.Constellation.
+// Nil means eager upsert and drift repair are disabled (degraded mode; safe).
+var WireConstellationIndexer func(s *Server)

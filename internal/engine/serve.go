@@ -346,6 +346,27 @@ func (s *Server) SetClusterRouter(r RemoteDispatchRouter) {
 	}
 }
 
+// SetConstellationIndexer wires a live ConstellationIndexer into the server
+// so that CogDocService.WriteAndSync / PatchAndSync perform an eager per-file
+// FTS upsert, and so that the lazy drift-repair path in
+// searchMemoryFTSDriftRepair can call IndexFile without importing
+// sdk/constellation (package-boundary guard #2 in cogdoc_service.go:22).
+// Called from Boot() via WireConstellationIndexer after NewServer.
+// Nil-safe: disables eager upsert and drift repair in degraded/test mode.
+func (s *Server) SetConstellationIndexer(c ConstellationIndexer) {
+	if s.mcpServer != nil {
+		s.mcpServer.SetConstellationIndexer(c)
+	}
+}
+
+// WorkspaceRoot returns the workspace root path for this server instance.
+// Used by external wiring hooks (e.g. WireConstellationIndexer in
+// cmd/cogos/providers_wire.go) that need the path without importing internal
+// engine state.
+func (s *Server) WorkspaceRoot() string {
+	return s.cfg.WorkspaceRoot
+}
+
 // Start begins serving. It blocks until the server stops.
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.srv.Addr)

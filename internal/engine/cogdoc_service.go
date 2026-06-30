@@ -16,12 +16,22 @@ import (
 	"path/filepath"
 )
 
+// ConstellationIndexer is the minimal interface that CogDocService requires
+// to perform an eager per-file FTS upsert after each write.  The concrete
+// type is *constellation.Constellation; the interface lives here so that
+// internal/engine does not import sdk/constellation directly (package-boundary
+// guard #2 from the architectural spec).
+type ConstellationIndexer interface {
+	IndexFile(path string) error
+}
+
 // CogDocService provides a single, consistent write path for all CogDoc mutations.
 // All writes go through WriteAndSync or PatchAndSync so that the index, field,
 // and ledger stay in lockstep.
 type CogDocService struct {
-	cfg     *Config
-	process *Process
+	cfg           *Config
+	process       *Process
+	constellation ConstellationIndexer // optional; set by WithConstellationIndexer
 }
 
 // NewCogDocService constructs a CogDocService bound to the given config and process.
@@ -30,6 +40,14 @@ func NewCogDocService(cfg *Config, process *Process) *CogDocService {
 		cfg:     cfg,
 		process: process,
 	}
+}
+
+// WithConstellationIndexer wires an optional constellation handle into the
+// service so that every WriteAndSync / PatchAndSync triggers an eager FTS
+// upsert for the affected file.  Pass nil to disable (no-op; default).
+// Typically called from the root package at MCP-server construction time.
+func (s *CogDocService) WithConstellationIndexer(c ConstellationIndexer) {
+	s.constellation = c
 }
 
 // WriteResult is the outcome of a successful CogDoc write or patch.
@@ -60,6 +78,13 @@ func (s *CogDocService) WriteAndSync(path string, opts CogDocWriteOpts) (*WriteR
 
 	// 3. Refresh index.
 	s.refreshIndex()
+
+	// 3b. Eager FTS upsert for the written file (best-effort; never fails write).
+	if s.constellation != nil {
+		if err := s.constellation.IndexFile(absPath); err != nil {
+			slog.Warn("cogdoc_service: constellation IndexFile failed", "path", absPath, "err", err)
+		}
+	}
 
 	// 4. Boost attentional field.
 	s.boostField(absPath)
@@ -110,6 +135,13 @@ func (s *CogDocService) PatchAndSync(uri string, patches cogdocFrontmatterPatch)
 
 	// 4. Refresh index.
 	s.refreshIndex()
+
+	// 4b. Eager FTS upsert for the patched file (best-effort; never fails patch).
+	if s.constellation != nil {
+		if err := s.constellation.IndexFile(res.Path); err != nil {
+			slog.Warn("cogdoc_service: constellation IndexFile failed", "path", res.Path, "err", err)
+		}
+	}
 
 	// 5. Boost attentional field.
 	s.boostField(res.Path)

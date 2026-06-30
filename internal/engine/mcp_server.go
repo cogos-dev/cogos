@@ -119,6 +119,14 @@ type MCPServer struct {
 	// resource (RFC Phase 1). Each MCPServer has its own prober so that test
 	// instances don't share probe state. See mcp_kernel_status.go.
 	kernelProber kernelStatusProber
+
+	// constellationIndexer is the optional eager-upsert handle wired from the
+	// root package at construction time via SetConstellationIndexer.  The
+	// concrete type is *constellation.Constellation; the interface lives in
+	// cogdoc_service.go so internal/engine does not import sdk/constellation
+	// directly (package-boundary guard).  When non-nil, also stored in
+	// pkgFTSRepairIndexer so the free-function lazy-repair path can reach it.
+	constellationIndexer ConstellationIndexer
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
@@ -199,6 +207,21 @@ func (m *MCPServer) SetClusterRouter(r RemoteDispatchRouter) {
 // configured" error in that case.
 func (m *MCPServer) SetChannelSessionBackend(b channelSessionBackend) {
 	m.channelSessionBackend = b
+}
+
+// SetConstellationIndexer wires a live ConstellationIndexer into the MCP
+// server so that CogDocService.WriteAndSync / PatchAndSync trigger an eager
+// per-file FTS upsert, and so that the lazy drift-repair path in
+// searchMemoryFTSDriftRepair can call IndexFile without importing
+// sdk/constellation (package-boundary guard #2 in cogdoc_service.go:22).
+// Also propagates to the package-level pkgFTSRepairIndexer used by the
+// free-function search path.  Safe to call with nil (disables eager upsert
+// and drift repair; correct degraded mode for tests and CLI paths).
+func (m *MCPServer) SetConstellationIndexer(c ConstellationIndexer) {
+	m.constellationIndexer = c
+	m.cogdocSvc.WithConstellationIndexer(c)
+	// Expose to the free-function lazy-repair path (searchMemoryFTSDriftRepair).
+	pkgFTSRepairIndexer = c
 }
 
 // Handler returns the http.Handler for mounting at /mcp.

@@ -8,10 +8,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ftsMu serialises all FTS mutations (rebuildFTS and upsertFTSRow).
+// The underlying SQLite connection is single-writer, but multi-statement
+// sequences (delete + insert) must not interleave with a concurrent full
+// rebuild.
+var ftsMu sync.Mutex
 
 // Cogdoc represents a parsed cogdoc with frontmatter and content.
 type Cogdoc struct {
@@ -57,14 +64,14 @@ func (c *Constellation) IndexWorkspace() error {
 	skipped := 0
 	var indexErr error
 
-	// CRITICAL-4: purge stale cog-workspace paths before re-indexing.
-	// These accumulate when the workspace root changes (e.g., cog-workspace → cog).
-	// Log but do not abort if purge fails — stale rows are cosmetic, not blocking.
-	if result, err := tx.Exec("DELETE FROM documents WHERE path LIKE '/Users/slowbro/cog-workspace/%'"); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: stale-path purge failed: %v\n", err)
-	} else if n, _ := result.RowsAffected(); n > 0 {
-		fmt.Printf("Purged %d stale cog-workspace paths\n", n)
-	}
+	// NOTE: an earlier revision purged "stale" rows whose path did not begin with the
+	// current workspace root (DELETE ... WHERE path NOT LIKE <root>/%). That was unsafe:
+	// the documents table also holds rows indexed from OUTSIDE the workspace root (e.g.
+	// conversation/session documents under ~/.claude), so a blanket prefix-negation DELETE
+	// would remove legitimately-indexed rows — and an unescaped LIKE pattern from the root
+	// path could match unintended rows via the _/% metacharacters. Orphan cleanup (removing
+	// rows whose underlying file no longer exists) belongs in a dedicated stat-based sweep,
+	// not a path-prefix DELETE; re-indexing below is idempotent and does not require it.
 
 	// Walk .cog directory for cogdocs
 	err = filepath.WalkDir(filepath.Join(c.root, ".cog"), func(path string, d fs.DirEntry, err error) error {
@@ -158,13 +165,24 @@ func (c *Constellation) IndexFile(path string) error {
 		return err
 	}
 
+	// Look up the doc id inside the transaction so we get the row even if it
+	// was just inserted (not yet committed to the reader connection).
+	var docID string
+	idErr := tx.QueryRow("SELECT id FROM documents WHERE path = ?", path).Scan(&docID)
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	// Rebuild FTS to include the new/updated document
-	if err := c.rebuildFTS(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: FTS rebuild after IndexFile: %v\n", err)
+	if idErr != nil {
+		// Row absent means indexCogdoc skipped (unchanged hash). FTS already
+		// up-to-date for this document; nothing to do.
+		return nil
+	}
+
+	// Targeted O(1) FTS upsert — avoids full table rebuild on every write.
+	if err := c.upsertFTSRow(docID); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: FTS upsert after IndexFile: %v\n", err)
 	}
 
 	// Async embedding if configured
@@ -316,8 +334,8 @@ func parseCogdoc(data []byte, path string) (*Cogdoc, error) {
 		Title        string        `yaml:"title"`
 		Created      string        `yaml:"created"`
 		Updated      string        `yaml:"updated"`
-		Modified     string        `yaml:"modified"`  // CRITICAL-1: parse-time alias for updated
-		Revised      string        `yaml:"revised"`   // CRITICAL-1: parse-time alias for updated
+		Modified     string        `yaml:"modified"` // CRITICAL-1: parse-time alias for updated
+		Revised      string        `yaml:"revised"`  // CRITICAL-1: parse-time alias for updated
 		Sector       string        `yaml:"sector"`
 		MemorySector string        `yaml:"memory_sector"` // CRITICAL-1: parse-time alias for sector
 		Status       string        `yaml:"status"`
@@ -696,10 +714,58 @@ func (c *Constellation) resolveUnresolvedRefs() (int, error) {
 	return resolved, nil
 }
 
+// upsertFTSRow performs a targeted FTS upsert for a single document.
+// It deletes the existing FTS row (if any) then inserts a fresh one that
+// joins the latest tags from the tags table. The two-statement sequence is
+// wrapped in a savepoint so a crash between delete and insert leaves the
+// FTS index intact rather than missing the row. ftsMu is held for the
+// duration so a concurrent rebuildFTS cannot interleave.
+func (c *Constellation) upsertFTSRow(docID string) error {
+	ftsMu.Lock()
+	defer ftsMu.Unlock()
+
+	// Use a savepoint for crash-consistency within the single-writer connection.
+	if _, err := c.db.Exec("SAVEPOINT fts_upsert"); err != nil {
+		return fmt.Errorf("fts_upsert savepoint: %w", err)
+	}
+
+	if _, err := c.db.Exec("DELETE FROM documents_fts WHERE id = ?", docID); err != nil {
+		_, _ = c.db.Exec("ROLLBACK TO SAVEPOINT fts_upsert")
+		_, _ = c.db.Exec("RELEASE SAVEPOINT fts_upsert")
+		return fmt.Errorf("fts_upsert delete: %w", err)
+	}
+
+	_, err := c.db.Exec(`
+		INSERT INTO documents_fts(id, title, content, tags, sector, type)
+		SELECT
+			d.id,
+			d.title,
+			d.content,
+			COALESCE((SELECT group_concat(tag, ' ') FROM tags WHERE document_id = d.id), ''),
+			d.sector,
+			d.type
+		FROM documents d
+		WHERE d.id = ?
+	`, docID)
+	if err != nil {
+		_, _ = c.db.Exec("ROLLBACK TO SAVEPOINT fts_upsert")
+		_, _ = c.db.Exec("RELEASE SAVEPOINT fts_upsert")
+		return fmt.Errorf("fts_upsert insert: %w", err)
+	}
+
+	if _, err := c.db.Exec("RELEASE SAVEPOINT fts_upsert"); err != nil {
+		return fmt.Errorf("fts_upsert release: %w", err)
+	}
+	return nil
+}
+
 // rebuildFTS manually populates the FTS index with current documents and aggregated tags.
 // This is called after indexing completes to sync tags into the FTS table.
 // Nuclear fix: We don't use triggers anymore - manual population after all docs + tags indexed.
 func (c *Constellation) rebuildFTS() error {
+	ftsMu.Lock()
+	defer ftsMu.Unlock()
+
 	// Clear existing FTS data
 	if _, err := c.db.Exec("DELETE FROM documents_fts"); err != nil {
 		return fmt.Errorf("failed to clear FTS: %w", err)

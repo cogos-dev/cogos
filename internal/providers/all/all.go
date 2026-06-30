@@ -63,7 +63,7 @@ import (
 // globalConfig is the minimal shape of ~/.cog/node/global.yaml used by
 // workspace resolution.
 type globalConfig struct {
-	CurrentWorkspace string                    `yaml:"current-workspace,omitempty"`
+	CurrentWorkspace string                     `yaml:"current-workspace,omitempty"`
 	Workspaces       map[string]*workspaceEntry `yaml:"workspaces,omitempty"`
 }
 
@@ -93,8 +93,8 @@ func loadGlobalConfig() (workspace.ConfigProvider, error) {
 	oldPath := filepath.Join(home, ".cog", "config")
 
 	path := newPath
-	if _, statErr := os.Stat(newPath); os.IsNotExist(statErr) {
-		if _, statErr2 := os.Stat(oldPath); statErr2 == nil {
+	if info, statErr := os.Stat(newPath); os.IsNotExist(statErr) || (statErr == nil && info.IsDir()) {
+		if info2, statErr2 := os.Stat(oldPath); statErr2 == nil && !info2.IsDir() {
 			path = oldPath
 		}
 	}
