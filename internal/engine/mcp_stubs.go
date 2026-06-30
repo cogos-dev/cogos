@@ -6,8 +6,10 @@
 package engine
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // SearchMemory searches the CogDoc corpus using the constellation FTS5 index.
@@ -33,8 +36,94 @@ func SearchMemory(workspaceRoot, query string, limit int, sector string) (any, e
 	return searchMemoryGrep(workspaceRoot, query, limit, sector)
 }
 
+// searchMemoryFTSDriftRepair samples up to 100 indexed documents, compares their
+// stored file_mtime to the on-disk mtime, and calls IndexFile for any drifted
+// paths.  Total repair time is capped at ~200ms; if drift is widespread the
+// function logs once and returns without repairing the bulk.  This is the
+// "idempotent lazy re-index" path: correct regardless of write path.
+func searchMemoryFTSDriftRepair(workspaceRoot string) {
+	const (
+		sampleLimit = 100
+		budgetMs    = 200
+		wideThresh  = 10 // more than this many drifted rows → skip inline repair
+	)
+
+	dbPath := filepath.Join(workspaceRoot, ".cog", ".state", "constellation.db")
+	db, err := sql.Open("sqlite3", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=3000")
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	// Sample recent documents, fetching path + stored mtime.
+	rows, err := db.Query(
+		`SELECT path, file_mtime FROM documents
+		 WHERE path NOT LIKE '%.state/%'
+		 ORDER BY indexed_at DESC LIMIT ?`, sampleLimit,
+	)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	type entry struct {
+		path  string
+		mtime string
+	}
+	var drifted []entry
+	for rows.Next() {
+		var path, storedMtime string
+		if err := rows.Scan(&path, &storedMtime); err != nil {
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			continue // file removed — not a drift case for FTS
+		}
+		diskMtime := info.ModTime().Format(time.RFC3339)
+		if diskMtime != storedMtime {
+			drifted = append(drifted, entry{path: path, mtime: diskMtime})
+		}
+	}
+	_ = rows.Close()
+
+	if len(drifted) == 0 {
+		return
+	}
+	if len(drifted) > wideThresh {
+		slog.Warn("constellation: widespread FTS drift detected; run `cogos reindex` to repair",
+			"drifted_sample", len(drifted))
+		return
+	}
+
+	// Open a writable constellation handle for the targeted repairs.
+	c, err := constellation.Open(workspaceRoot)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+
+	deadline := time.Now().Add(budgetMs * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	for _, e := range drifted {
+		if ctx.Err() != nil {
+			break
+		}
+		if err := c.IndexFile(e.path); err != nil {
+			slog.Warn("constellation: drift repair failed", "path", e.path, "err", err)
+		}
+	}
+}
+
 // searchMemoryFTS queries the constellation SQLite FTS5 index for matching documents.
 func searchMemoryFTS(dbPath, workspaceRoot, query string, limit int, sector string) (map[string]any, error) {
+	// Lazy drift repair: sample recent rows and repair any whose on-disk mtime
+	// differs from the stored mtime.  Capped at ~200ms and ≤10 rows so hot
+	// search paths are not materially impacted.
+	searchMemoryFTSDriftRepair(workspaceRoot)
+
 	db, err := sql.Open("sqlite3", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=3000")
 	if err != nil {
 		return nil, fmt.Errorf("open constellation db: %w", err)
