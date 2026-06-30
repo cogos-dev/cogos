@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"time"
 
 	bep "github.com/myrgic/cogos/pkg/substrate/bep"
@@ -296,6 +297,32 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 			} else {
 				slog.Info("decision-lineage watcher started", "corpus_dir", corpusDir)
 			}
+		}
+	}
+
+	// Start the mem-currency watcher so FTS stays current when .cog.md files
+	// are written outside the MCP write path (e.g. by `cogos ingest`, direct
+	// editor saves, or CI automation).  The watcher also adds newly created
+	// subdirectories of .cog/mem/ to the fsnotify watch set so that new memory
+	// sector dirs are watched immediately on macOS kqueue (which is
+	// non-recursive).
+	//
+	// Only started when a ConstellationIndexer has been wired (i.e. after
+	// WireConstellationIndexer ran above).  In tests and CLI paths where
+	// pkgFTSRepairIndexer is nil, this block is a no-op.
+	if pkgFTSRepairIndexer != nil {
+		memDir := filepath.Join(cfg.WorkspaceRoot, ".cog", "mem")
+		mw := NewMemWatcher(memDir, pkgFTSRepairIndexer)
+		if err := mw.Start(); err != nil {
+			slog.Debug("mem_watcher: not started (mem dir absent or fsnotify unavailable)",
+				"mem_dir", memDir, "err", err)
+		} else {
+			slog.Info("mem_watcher: started", "mem_dir", memDir)
+			// Stop the watcher when the kernel context is cancelled.
+			go func() {
+				<-kernelCtx.Done()
+				mw.Stop()
+			}()
 		}
 	}
 
