@@ -403,13 +403,21 @@ func (m *MCPServer) registerTools() {
 	// MCP tools so they're callable directly from Claude Code sessions.
 	// In harness dispatches these are available only when scope="audit".
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
-		Name:        "cog_read_file",
-		Description: "Read an arbitrary file within the workspace root. Returns line-numbered content with optional offset/limit (default 500 lines). Rejects paths outside the workspace root. Use for source inspection and substrate-introspection tasks. Fallback: cat -n <path>",
+		Name: "cog_read_file",
+		Description: "Read an arbitrary file within the workspace root. " +
+			"res=abstract (default, ADR pointer-first): returns a pointer envelope — workspace-relative path, file size, " +
+			"and a short excerpt — without dumping content into the agent context. " +
+			"res=full: returns line-numbered content with optional offset/limit (default 500 lines). " +
+			"Rejects paths outside the workspace root. Use for source inspection and substrate-introspection tasks. " +
+			"Fallback: cat -n <path>",
 	}), withToolObserver(m, "cog_read_file", m.toolReadFile))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
-		Name:        "cog_grep_files",
-		Description: "Regex search over files within the workspace root (uses ripgrep when available, falls back to pure-Go walk). Returns matching lines with relative path and line number. Rejects search paths outside the workspace root. Fallback: rg --no-heading -n <pattern> <path>",
+		Name: "cog_grep_files",
+		Description: "Regex search over files within the workspace root (uses ripgrep when available, falls back to pure-Go walk). " +
+			"res=abstract (default, ADR pointer-first): returns match count + unique matched file paths — no line text. " +
+			"res=full: returns per-match path/line/text entries. " +
+			"Rejects search paths outside the workspace root. Fallback: rg --no-heading -n <pattern> <path>",
 	}), withToolObserver(m, "cog_grep_files", m.toolGrepFiles))
 
 	// Phase 1B: peer-awareness packet (READ side of the 4E ambient-
@@ -871,6 +879,17 @@ type readFileInput struct {
 	Path   string `json:"path" jsonschema:"Absolute path within workspace root"`
 	Offset int    `json:"offset,omitempty" jsonschema:"Line offset (0-based). Default 0."`
 	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum lines to return. Default 500."`
+	// Res controls the response fidelity (ADR pointer-first-mcp-responses).
+	// "abstract" (default) returns a pointer envelope: workspace-relative path,
+	// file size, and a short excerpt — sufficient to decide whether to fetch
+	// the full content. "full" returns the line-numbered file content (existing
+	// behaviour). Default is "abstract" to prevent bulk content blowout in
+	// audit-scope harness dispatches; callers that need content pass res="full".
+	//
+	// NOTE: a cog:file/<rel-path> URI projection (dereferenceable without
+	// cog_read_file) is deferred pending resolver work (see uri.go projections).
+	// Until then res=abstract emits a workspace-relative path as the pointer.
+	Res string `json:"res,omitempty" jsonschema:"Response fidelity: \"abstract\" (default, pointer envelope) or \"full\" (line-numbered content). ADR pointer-first-mcp-responses."`
 }
 
 // grepFilesInput is the input type for cog_grep_files (audit scope).
@@ -878,6 +897,12 @@ type grepFilesInput struct {
 	Pattern    string `json:"pattern" jsonschema:"Regular expression pattern to search for"`
 	Path       string `json:"path,omitempty" jsonschema:"Directory or file to search (defaults to workspace root)"`
 	MaxResults int    `json:"max_results,omitempty" jsonschema:"Maximum matches to return. Default 50."`
+	// Res controls the response fidelity (ADR pointer-first-mcp-responses).
+	// "abstract" (default) returns a summary envelope: match count, unique
+	// matched file paths, and truncation flag — no line text. "full" returns
+	// the per-match path/line/text entries (existing behaviour). Default is
+	// "abstract" to prevent bulk match-text blowout in audit-scope dispatches.
+	Res string `json:"res,omitempty" jsonschema:"Response fidelity: \"abstract\" (default, match summary + file list) or \"full\" (per-match path/line/text). ADR pointer-first-mcp-responses."`
 }
 
 // ── Tool Implementations ─────────────────────────────────────────────────────
@@ -2480,7 +2505,21 @@ func fallbackResult(errMsg, fallbackCmd string) (*mcp.CallToolResult, any, error
 // must be within cfg.WorkspaceRoot. Returns line-numbered content with
 // optional offset and limit for large files.
 //
-// Example output:
+// res=abstract (default, ADR pointer-first-mcp-responses): returns a pointer
+// envelope with the workspace-relative path, file size, and a short excerpt
+// without loading the full content into the agent context.
+// res=full: returns the full line-numbered content (legacy behaviour).
+//
+// NOTE: a cog:file/<rel-path> projection that would make the pointer
+// dereferenceable purely via URI is deferred (not in uri.go projections).
+// Until that lands, res=abstract emits a workspace-relative path that can be
+// re-fetched via cog_read_file with res=full.
+//
+// Example output (res=abstract):
+//
+//	{"path":"internal/engine/foo.go","file_size_bytes":4096,"excerpt":"...","res":"abstract"}
+//
+// Example output (res=full):
 //
 //	{"content":"   1\tpackage engine\n   2\t\n", "lines":2, "truncated":false}
 func (m *MCPServer) toolReadFile(ctx context.Context, req *mcp.CallToolRequest, input readFileInput) (*mcp.CallToolResult, any, error) {
@@ -2524,6 +2563,47 @@ func (m *MCPServer) toolReadFile(ctx context.Context, req *mcp.CallToolRequest, 
 		if !strings.HasPrefix(absReal, rootReal+string(filepath.Separator)) && absReal != rootReal {
 			return textResult(fmt.Sprintf("path %q is outside workspace root %q", input.Path, workspaceRoot))
 		}
+	}
+
+	// res=abstract (default, ADR pointer-first-mcp-responses): emit a pointer
+	// envelope without dumping file content into the agent context. The pointer
+	// is the workspace-relative path (re-fetchable via cog_read_file?res=full).
+	// A cog:file/<rel-path> URI projection that would make this dereferenceable
+	// purely by URI is deferred pending resolver work (uri.go projections).
+	if input.Res == "" || input.Res == "abstract" {
+		fi, statErr := os.Stat(abs)
+		if statErr != nil {
+			return textResult(fmt.Sprintf("stat failed: %v", statErr))
+		}
+		// Compute workspace-relative pointer path.
+		ptrPath := abs
+		if workspaceRoot != "" {
+			if rel, relErr := filepath.Rel(workspaceRoot, abs); relErr == nil {
+				ptrPath = rel
+			}
+		}
+		// Read a short excerpt (first ~512 bytes) so the caller can decide
+		// without fetching the full file.
+		const excerptBytes = 512
+		excerpt := ""
+		if ef, efErr := os.Open(abs); efErr == nil {
+			var eb [excerptBytes]byte
+			n, _ := ef.Read(eb[:])
+			ef.Close()
+			if n > 0 {
+				excerpt = string(eb[:n])
+				if n == excerptBytes && fi.Size() > excerptBytes {
+					excerpt += "…"
+				}
+			}
+		}
+		return marshalResult(map[string]any{
+			"res":             "abstract",
+			"path":            ptrPath,
+			"file_size_bytes": fi.Size(),
+			"excerpt":         excerpt,
+			"note":            "pointer-first (ADR pointer-first-mcp-responses); pass res=full to retrieve line-numbered content",
+		})
 	}
 
 	f, err := os.Open(abs)
@@ -2814,6 +2894,30 @@ func (m *MCPServer) toolGrepFiles(ctx context.Context, req *mcp.CallToolRequest,
 	if m.cfg != nil {
 		maxBytes = m.cfg.EffectiveMaxToolOutputBytes()
 	}
+
+	// res=abstract (default, ADR pointer-first-mcp-responses): return a summary
+	// envelope — match count and the set of matched file paths — without dumping
+	// per-match line text into the agent context. The file paths are
+	// workspace-relative and re-fetchable via cog_read_file or cog_grep_files
+	// with res=full. Pass res=full to obtain the per-match path/line/text list.
+	if input.Res == "" || input.Res == "abstract" {
+		seen := make(map[string]struct{}, len(matches))
+		var files []string
+		for _, m := range matches {
+			if _, ok := seen[m.Path]; !ok {
+				seen[m.Path] = struct{}{}
+				files = append(files, m.Path)
+			}
+		}
+		return marshalResult(map[string]any{
+			"res":          "abstract",
+			"match_count":  len(matches),
+			"matched_files": files,
+			"truncated":    truncated,
+			"note":         "pointer-first (ADR pointer-first-mcp-responses); pass res=full to retrieve per-match path/line/text",
+		})
+	}
+
 	return capMarshalResult(map[string]any{
 		"matches":   matches,
 		"truncated": truncated,
