@@ -795,8 +795,9 @@ func (c *LocalHarnessController) executeCycleTaskWithPrompt(ctx context.Context,
 	}
 	resp, clientCalls, transcript, err := c.completeWithToolLoop(ctx, provider, req, registry)
 	// Structured loop-exit sentinels (ADR-031, ADR-052): surface partial content
-	// rather than propagating as a hard error. The cycle record will reflect the
-	// sentinel reason via the caller (runCycle records err.Error() in Reason).
+	// rather than propagating as a hard error. The sentinel is logged below; this
+	// function then returns the partial content with a nil error, so the autonomic
+	// cycle proceeds as a soft success (the sentinel reason is not propagated up).
 	if err != nil && !errors.Is(err, ErrToolLoopMaxTurns) && !errors.Is(err, ErrToolLoopNoProgress) {
 		return "", err
 	}
