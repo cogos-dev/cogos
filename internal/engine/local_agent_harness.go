@@ -1400,15 +1400,24 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	cycleID := uuid.NewString()
 	ctx = withDispatchCycleID(ctx, cycleID)
 
+	// RFC-identity-embedding I1/I2: resolve the caller subject for honest
+	// attribution in both bound and anonymous states. No capability gating here;
+	// this is observability metadata only (Wave-6b adds CRD validation).
+	subject := req.Identity.Sub
+	if subject == "" {
+		subject = "anonymous"
+	}
+
 	// Emit dispatch-start ledger entry (ADR-033, ADR-072).
 	_ = EmitLedgerEvent(c.cfg, map[string]any{
 		"type":   "harness.dispatch.start",
 		"source": "local-harness",
 		"payload": map[string]any{
-			"cycle_id": cycleID,
-			"n":        req.N,
-			"task":     truncateDigest(req.Task),
-			"provider": req.Provider,
+			"cycle_id":    cycleID,
+			"n":           req.N,
+			"task":        truncateDigest(req.Task),
+			"provider":    req.Provider,
+			"attribution": subject,
 		},
 	})
 
@@ -1418,7 +1427,7 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote)
+			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote, subject)
 		}(i)
 	}
 	wg.Wait()
@@ -1432,13 +1441,16 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 			"cycle_id":         cycleID,
 			"n":                req.N,
 			"total_duration_s": batch.TotalDurationSec,
+			"attribution":      subject,
 		},
 	})
 
 	return batch, nil
 }
 
-func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string) DispatchResult {
+// dispatchSlot executes one fan-out slot. subject is the resolved dispatch
+// identity (RFC-identity-embedding I1/I2): "anonymous" or req.Identity.Sub.
+func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string, subject string) DispatchResult {
 	res := DispatchResult{
 		Index:        idx,
 		ModelUsed:    routeUsed,
@@ -1497,6 +1509,9 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 			PreferLocal:    true,
 			PreferProvider: req.Provider,
 			Source:         "local-harness-dispatch",
+			// RFC-identity-embedding I1/I2: carry attribution through to
+			// provider adapters so the ledger InferenceEvent can record it.
+			Attribution: subject,
 		},
 	}
 
@@ -1520,10 +1535,11 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		if tc.Arguments != "" {
 			argsRaw = json.RawMessage(tc.Arguments)
 		}
-		emitTrace(trace.NewToolDispatch(
+		emitTrace(trace.NewToolDispatchWithAttribution(
 			TraceIdentity(),
 			cycleID,
 			tc.Name,
+			subject, // RFC-identity-embedding I1/I2
 			argsRaw,
 			time.Duration(tc.DurationMs)*time.Millisecond,
 			toolErr,

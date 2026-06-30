@@ -59,10 +59,16 @@ type StateTransitionEvent struct {
 // ToolDispatchEvent describes a single tool invocation issued by the agent
 // harness (see agent_tools*.go).
 type ToolDispatchEvent struct {
-	Tool       string          `json:"tool"`
-	Args       json.RawMessage `json:"args,omitempty"`
-	DurationMS int64           `json:"duration_ms"`
-	Error      string          `json:"error,omitempty"`
+	Tool        string          `json:"tool"`
+	Args        json.RawMessage `json:"args,omitempty"`
+	DurationMS  int64           `json:"duration_ms"`
+	Error       string          `json:"error,omitempty"`
+	// Attribution carries the dispatch caller's subject (RFC-identity-embedding
+	// I1/I2): "anonymous" when no identity was presented, otherwise the Sub
+	// field from the DispatchIdentity that triggered this harness invocation.
+	// Empty on events emitted by the legacy metabolic-cycle path (root
+	// agent_harness.go) which does not carry a DispatchIdentity.
+	Attribution string          `json:"attribution,omitempty"`
 }
 
 // AssessmentEvent mirrors the Assessment struct in agent_harness.go. The
@@ -96,15 +102,24 @@ func NewStateTransition(source, cycleID string, from, to fmt.Stringer, reason st
 // NewToolDispatch builds a CycleEvent wrapping a ToolDispatchEvent. args may
 // be nil; if non-nil it is expected to already be valid JSON.
 func NewToolDispatch(source, cycleID, tool string, args json.RawMessage, duration time.Duration, err error) (CycleEvent, error) {
+	return NewToolDispatchWithAttribution(source, cycleID, tool, "", args, duration, err)
+}
+
+// NewToolDispatchWithAttribution is like NewToolDispatch but also stamps an
+// attribution subject onto the event (RFC-identity-embedding I1/I2). Use
+// "anonymous" when no identity was presented; empty string is equivalent and
+// omitted from the JSON wire form.
+func NewToolDispatchWithAttribution(source, cycleID, tool, attribution string, args json.RawMessage, duration time.Duration, err error) (CycleEvent, error) {
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
 	}
 	return newEvent(source, cycleID, KindToolDispatch, ToolDispatchEvent{
-		Tool:       tool,
-		Args:       args,
-		DurationMS: duration.Milliseconds(),
-		Error:      errStr,
+		Tool:        tool,
+		Args:        args,
+		DurationMS:  duration.Milliseconds(),
+		Error:       errStr,
+		Attribution: attribution,
 	})
 }
 
