@@ -198,6 +198,40 @@ tool calls, finish with a plain-text answer — or call respond exactly once wit
 the answer. Do NOT narrate tool use, emit role/channel markers, or output special
 tokens such as <|...|> or respond{...} scaffolding.`
 
+// buildHarnessOrientationBlock constructs the four-bundle orientation string
+// that is prepended to localHarnessDispatchPrompt when no caller-supplied
+// SystemPrompt is present (RFC-018 §stateless-approximation, ADR-066
+// §pointer-discipline). The four bundles are intentionally pointer-first and
+// bounded: no inline file or CogDoc content is embedded here.
+//
+// Bundle layout:
+//  1. Identity  — name + role inline (NOT the full Card).
+//  2. Directive — framing that the concrete task arrives in the user message.
+//  3. Scope     — the named harness scope; signals which tools are available.
+//  4. Substrate — workspace root as a cog:// pointer (no inline content).
+func buildHarnessOrientationBlock(name, role, scopeName, workspaceRoot string) string {
+	if name == "" {
+		name = "local-harness"
+	}
+	if role == "" {
+		role = "CogOS resident agent"
+	}
+	if scopeName == "" {
+		scopeName = defaultHarnessScopeName
+	}
+	wsPointer := "cog:workspace/root"
+	if workspaceRoot != "" {
+		wsPointer = "cog:workspace/root (" + workspaceRoot + ")"
+	}
+	return strings.Join([]string{
+		"[orientation]",
+		"identity: " + name + " — " + role,
+		"directive: your task is in the user message below; complete it using the available tools",
+		"scope: " + scopeName,
+		"substrate: " + wsPointer,
+	}, "\n")
+}
+
 type localHarnessAssessment struct {
 	Action  string  `json:"action"`
 	Reason  string  `json:"reason"`
@@ -295,6 +329,15 @@ type LocalHarnessController struct {
 	// that look like hangs. One lock per controller, held for the duration of
 	// the inference call, makes the serialization explicit and debuggable.
 	ollamaMu sync.Mutex
+
+	// harnessOrientationBlock is the four-bundle orientation string prepended to
+	// localHarnessDispatchPrompt when req.SystemPrompt is empty (RFC-018 §stateless
+	// approximation, ADR-066 pointer-discipline). Computed once at construction so
+	// the content is stable across fan-out slots — the Wave-1 content-keyed
+	// RequestID hashes the system prompt, so any per-call variation would defeat
+	// KV-cache sharing. Content: identity (name + role inline, NOT the full Card),
+	// directive framing, scope sentinel, and workspace pointer (cog:// URI).
+	harnessOrientationBlock string
 }
 
 func NewLocalHarnessController(cfg *Config, nucleus *Nucleus, process *Process, mcpSrv *MCPServer) (*LocalHarnessController, error) {
@@ -338,6 +381,26 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		interval = time.Duration(cfg.HeartbeatInterval) * time.Second
 	}
 
+	// RFC-018 §stateless-approximation, ADR-066 §pointer-discipline:
+	// Compute the four-bundle orientation block once at construction so it is
+	// stable across fan-out slots (required for the Wave-1 content-keyed
+	// RequestID KV-cache sharing). The four bundles are:
+	//   1. Identity  — name + role inline; NOT the full Card.
+	//   2. Directive — framing that the task arrives in the user message.
+	//   3. Scope     — the named harness scope active for this controller.
+	//   4. Substrate — workspace root as a cog:// pointer (no inline content).
+	identityName := ""
+	identityRole := ""
+	wsRoot := ""
+	if nucleus != nil {
+		identityName = nucleus.Name
+		identityRole = nucleus.Role
+	}
+	if cfg != nil {
+		wsRoot = cfg.WorkspaceRoot
+	}
+	orientationBlock := buildHarnessOrientationBlock(identityName, identityRole, scopeName, wsRoot)
+
 	return &LocalHarnessController{
 		cfg:                      cfg,
 		nucleus:                  nucleus,
@@ -350,6 +413,7 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		started:                  time.Now().UTC(),
 		interval:                 interval,
 		localProviderTimeout:     resolveLocalProviderTimeout(cfg),
+		harnessOrientationBlock:  orientationBlock,
 	}, nil
 }
 
@@ -1461,7 +1525,12 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 
 	systemPrompt := strings.TrimSpace(req.SystemPrompt)
 	if systemPrompt == "" {
-		systemPrompt = localHarnessDispatchPrompt
+		// RFC-018 §stateless-approximation, ADR-066 §pointer-discipline:
+		// Compose the four-bundle orientation block (computed once at controller
+		// construction) with the base dispatch prompt. The orientation block is
+		// prefix-stable across fan-out slots so KV-cache sharing is preserved.
+		// When req.SystemPrompt is set the caller owns the prompt; use it verbatim.
+		systemPrompt = c.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
 	}
 	counting := &countingProvider{Provider: provider}
 
