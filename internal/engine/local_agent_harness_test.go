@@ -21,36 +21,40 @@ func TestLocalHarnessControllerTriggerAndList(t *testing.T) {
 	model := "gemma4:e4b"
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/tags":
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"models": []map[string]any{{"name": model}},
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
 			})
-		case "/api/chat":
+		case "/v1/chat/completions":
 			call++
 			w.Header().Set("Content-Type", "application/json")
 			if call == 1 {
 				_ = json.NewEncoder(w).Encode(map[string]any{
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": `{"action":"observe","reason":"field changed","urgency":0.4,"target":"memory","task":"summarize current state"}`,
-					},
-					"done":              true,
-					"prompt_eval_count": 1,
-					"eval_count":        1,
+					"choices": []map[string]any{{
+						"message": map[string]any{
+							"role":    "assistant",
+							"content": `{"action":"observe","reason":"field changed","urgency":0.4,"target":"memory","task":"summarize current state"}`,
+						},
+						"finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
 				})
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": "local harness executed",
-				},
-				"done":              true,
-				"prompt_eval_count": 1,
-				"eval_count":        1,
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "local harness executed",
+					},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
 			})
 		default:
-			t.Fatalf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer llm.Close()
@@ -138,10 +142,10 @@ func TestServerLegacyAgentStatusRoute(t *testing.T) {
 }
 
 // TestLocalHarnessOllamaConcurrencySerialized verifies that ollamaMu prevents
-// runCycle and DispatchToHarness from issuing concurrent /api/chat requests.
-// It spins up a fake Ollama server that increments an in-flight counter on
+// runCycle and DispatchToHarness from issuing concurrent inference requests.
+// It spins up a fake LM Studio server that increments an in-flight counter on
 // entry and decrements on exit; any counter value > 1 means concurrent calls
-// leaked through and would load duplicate model copies on a real Ollama node.
+// leaked through the serialization gate.
 func TestLocalHarnessOllamaConcurrencySerialized(t *testing.T) {
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
@@ -158,11 +162,13 @@ func TestLocalHarnessOllamaConcurrencySerialized(t *testing.T) {
 
 	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/tags":
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"models": []map[string]any{{"name": model}},
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
 			})
-		case "/api/chat":
+		case "/v1/chat/completions":
 			cur := inFlight.Add(1)
 			// Record the peak concurrency seen.
 			for {
@@ -178,16 +184,17 @@ func TestLocalHarnessOllamaConcurrencySerialized(t *testing.T) {
 
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"message": map[string]any{
-					"role":    "assistant",
-					"content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`,
-				},
-				"done":              true,
-				"prompt_eval_count": 1,
-				"eval_count":        1,
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`,
+					},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
 			})
 		default:
-			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer llm.Close()
@@ -224,7 +231,7 @@ func TestLocalHarnessOllamaConcurrencySerialized(t *testing.T) {
 	}
 
 	if got := maxInFlight.Load(); got > 1 {
-		t.Errorf("max concurrent Ollama /api/chat calls = %d; want <= 1 (ollamaMu not working)", got)
+		t.Errorf("max concurrent /v1/chat/completions calls = %d; want <= 1 (ollamaMu not working)", got)
 	}
 }
 
@@ -367,9 +374,10 @@ routing:
 		TimeoutSeconds: 10,
 	})
 
-	// The legacy Ollama probe should have been hit (via /api/tags), not state-routed.
+	// The legacy local-LLM probe should have been hit (via /api/tags Ollama probe
+	// as fallback after /v1/models fails), not state-routed.
 	if !ollamaCalled.Load() {
-		t.Errorf("Ollama /api/tags was NOT called; unknown state should fall back to legacy path, not route via process_state_routing[\"unknown\"]")
+		t.Errorf("legacy probe was NOT called; unknown state should fall back to legacy path, not route via process_state_routing[\"unknown\"]")
 	}
 }
 
@@ -426,7 +434,7 @@ routing:
 	})
 
 	if !ollamaCalled.Load() {
-		t.Errorf("Ollama /api/tags was NOT called; receptive state with no mapping should fall back to legacy path")
+		t.Errorf("legacy probe was NOT called; receptive state with no mapping should fall back to legacy path")
 	}
 }
 
@@ -487,7 +495,7 @@ routing:
 	})
 
 	if !ollamaCalled.Load() {
-		t.Errorf("Ollama /api/tags was NOT called; disabled state-routed provider should fall back to legacy path")
+		t.Errorf("legacy probe was NOT called; disabled state-routed provider should fall back to legacy path")
 	}
 }
 
@@ -544,7 +552,7 @@ routing:
 	})
 
 	if !ollamaCalled.Load() {
-		t.Errorf("Ollama /api/tags was NOT called; missing provider in state_routing should fall back to legacy path")
+		t.Errorf("legacy probe was NOT called; missing provider in state_routing should fall back to legacy path")
 	}
 }
 
@@ -686,7 +694,7 @@ func TestDispatchToHarness_StateRouting_LocalProviderSerializesWithCycle(t *test
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"message": map[string]any{"role": "assistant", "content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`},
-				"done": true, "prompt_eval_count": 1, "eval_count": 1,
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
 			})
 		}
 	}))
@@ -836,7 +844,7 @@ func TestDispatchToHarness_TypelessOllamaStillAcquiresOllamaMu(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"message": map[string]any{"role": "assistant", "content": `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`},
-				"done": true, "prompt_eval_count": 1, "eval_count": 1,
+				"done":    true, "prompt_eval_count": 1, "eval_count": 1,
 			})
 		}
 	}))

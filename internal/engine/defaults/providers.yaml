@@ -2,13 +2,16 @@
 # The router loads enabled providers at startup and routes requests
 # based on capability, availability, and the sovereignty gradient.
 #
+# Default local backend: LM Studio (lmstudio-darkstar) at 127.0.0.1:1234.
+# This is the resident gemma-4-26b instance on the Darkstar node.
+# Operators on other nodes should override in providers.local.yaml.
+#
 # Additional provider types are first-class but disabled by default:
 #   - vllm           : OpenAI-compatible local server (Linux/CUDA). See
 #                      docs/inference/vllm.md for setup. The kernel
 #                      assumes the operator runs `vllm serve` themselves;
 #                      a future "vllm-supervised" type will add launchd /
 #                      systemd lifecycle management.
-#   - lmstudio       : LM Studio's local OpenAI-compatible server.
 #   - mlx-supervised : kernel-managed mlx_lm.server (Apple Silicon).
 # Add them to providers.local.yaml to opt in. Example for vLLM:
 #   vllm-local:
@@ -20,12 +23,12 @@
 #     context_window: 32768
 
 providers:
-  ollama:
-    type: ollama
+  lmstudio-darkstar:
+    type: lmstudio
     enabled: true
-    endpoint: "http://localhost:11434"
-    model: "gemma4:e4b"
-    timeout: 120
+    endpoint: "http://127.0.0.1:1234"
+    model: "google/gemma-4-26b-a4b"
+    timeout: 300
     context_window: 128000
 
   anthropic:
@@ -39,5 +42,5 @@ providers:
 routing:
   prefer_local: true
   fallback_chain:
-    - ollama
+    - lmstudio-darkstar
     - anthropic

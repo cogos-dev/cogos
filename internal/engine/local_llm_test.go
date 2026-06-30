@@ -70,25 +70,23 @@ func TestResolvePreferredLocalModelLMSStyleName(t *testing.T) {
 	}
 }
 
-// TestResolvePreferredLocalModelFallsToE4B verifies that when the preferred
+// TestResolvePreferredLocalModelFallsToFirst verifies that when the preferred
 // model is absent and the LMS-style normalization also fails to match, the
-// function returns defaultOllamaModel ("gemma4:e4b") rather than an arbitrary
-// small model (e.g. "llama3.2:1b").
-func TestResolvePreferredLocalModelFallsToE4B(t *testing.T) {
+// function returns the first available model (not a hard-coded Ollama name,
+// since Ollama is decommissioned).
+func TestResolvePreferredLocalModelFallsToFirst(t *testing.T) {
 	t.Parallel()
-	// "configured-but-not-loaded" is not present in models; neither is the
-	// normalized form; E4B is available.
+	// "configured-but-not-loaded" is not present; first model should be returned.
 	models := []string{"llama3.2:1b", "gemma4:e4b"}
 	got := resolvePreferredLocalModel(models, "configured-but-not-loaded")
-	if got != defaultOllamaModel {
-		t.Errorf("fallback to E4B floor: got %q; want %q (defaultOllamaModel)", got, defaultOllamaModel)
+	if got != "llama3.2:1b" {
+		t.Errorf("fallback to first model: got %q; want %q", got, "llama3.2:1b")
 	}
 }
 
-// TestResolvePreferredLocalModelE4BNotAvailableFallsToFirst verifies that when
-// neither the preferred model nor defaultOllamaModel is available, the function
-// returns models[0] as a last resort (preserving existing behavior for
-// edge-case deployments).
+// TestResolvePreferredLocalModelNoMatchFallsToFirst verifies that when neither
+// the preferred model nor its normalized equivalent is available, the function
+// returns models[0] as a last resort.
 func TestResolvePreferredLocalModelE4BNotAvailableFallsToFirst(t *testing.T) {
 	t.Parallel()
 	models := []string{"llama3.2:1b", "mistral:7b"}
@@ -137,18 +135,18 @@ func TestResolveDispatchLocalModelLMSNameResolvesToOllama(t *testing.T) {
 	}
 }
 
-// TestResolveDispatchLocalModelFallsToE4BNotLlama verifies defect 2 fix:
-// when the configured local model is absent, the fallback must be
-// defaultOllamaModel ("gemma4:e4b"), NOT whatever happens to be models[0]
-// (e.g. "llama3.2:1b").
+// TestResolveDispatchLocalModelFallsToFirst verifies that when the configured
+// local model is absent, the fallback is models[0] (the first model the server
+// advertises) rather than a hard-coded Ollama model name. Ollama is
+// decommissioned; defaultOllamaModel is no longer a priority floor.
 func TestResolveDispatchLocalModelFallsToE4BNotLlama(t *testing.T) {
 	t.Parallel()
-	// models list matches the scenario from the bug report: llama3.2:1b sorts
-	// first (or is the only model besides e4b). Configured model not present.
+	// models list has llama3.2:1b first; configured model not present.
+	// With Ollama decommissioned, the fallback is now models[0].
 	models := []string{"llama3.2:1b", "gemma4:e4b"}
 	model, route, note := resolveDispatchLocalModel(models, "google/gemma-4-26b-a4b", DispatchModelE4B)
-	if model != defaultOllamaModel {
-		t.Errorf("wrong fallback: got %q; want %q (defaultOllamaModel, not llama3.2:1b)", model, defaultOllamaModel)
+	if model != "llama3.2:1b" {
+		t.Errorf("wrong fallback: got %q; want %q (first model in list)", model, "llama3.2:1b")
 	}
 	if route != DispatchModelE4B {
 		t.Errorf("route: got %q; want %q", route, DispatchModelE4B)

@@ -50,20 +50,23 @@ func resolveLocalLLMEndpoint(cfgEndpoint string) string {
 
 func detectLocalLLMTarget(ctx context.Context, cfgEndpoint string) (LocalLLMTarget, error) {
 	baseURL := resolveLocalLLMEndpoint(cfgEndpoint)
-	if models, err := probeOllamaModels(ctx, baseURL); err == nil {
-		return LocalLLMTarget{
-			BaseURL: baseURL,
-			Backend: LocalLLMBackendOllama,
-			Models:  models,
-		}, nil
-	} else if models, err2 := probeOpenAICompatModels(ctx, baseURL); err2 == nil {
+	// Probe OpenAI-compat first (LM Studio at :1234). Ollama probe is kept as
+	// a secondary fallback to preserve backward compat for nodes that still run
+	// Ollama, but Ollama is no longer the default backend on this node.
+	if models, err := probeOpenAICompatModels(ctx, baseURL); err == nil {
 		return LocalLLMTarget{
 			BaseURL: baseURL,
 			Backend: LocalLLMBackendOpenAICompat,
 			Models:  models,
 		}, nil
+	} else if models, err2 := probeOllamaModels(ctx, baseURL); err2 == nil {
+		return LocalLLMTarget{
+			BaseURL: baseURL,
+			Backend: LocalLLMBackendOllama,
+			Models:  models,
+		}, nil
 	} else {
-		return LocalLLMTarget{}, fmt.Errorf("local llm unavailable at %s (ollama probe: %v; openai probe: %v)", baseURL, err, err2)
+		return LocalLLMTarget{}, fmt.Errorf("local llm unavailable at %s (openai-compat probe: %v; ollama probe: %v)", baseURL, err, err2)
 	}
 }
 
@@ -156,8 +159,7 @@ func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Pro
 //
 // Lookup order:
 //
-//   - "ollama" provider entry (preferred — detectLocalLLMTarget probes the
-//     Ollama API shape first)
+//   - "lmstudio-darkstar" provider entry (the resident LM Studio instance)
 //   - any other enabled provider whose Endpoint resolves to a localhost URL
 //   - 0 (caller falls back to localProviderDefaultTimeoutSec)
 //
@@ -170,7 +172,8 @@ func resolveLocalProviderTimeout(cfg *Config) int {
 	if err != nil {
 		return 0
 	}
-	if pc, ok := pcfg.Providers["ollama"]; ok && pc.IsEnabled() && pc.Timeout > 0 {
+	// Prefer the named resident LM Studio provider.
+	if pc, ok := pcfg.Providers["lmstudio-darkstar"]; ok && pc.IsEnabled() && pc.Timeout > 0 {
 		return pc.Timeout
 	}
 	for _, pc := range pcfg.Providers {
@@ -200,24 +203,28 @@ func isLocalEndpoint(endpoint string) bool {
 	return false
 }
 
-// normalizeModelNameForOllama converts an LM-Studio / MLX-style model name
-// (e.g. "google/gemma-4-26b-a4b") to the Ollama tag format ("gemma4:26b")
-// so that cross-format configured names can be matched against the list of
-// locally installed Ollama models.
+// normalizeModelNameForLegacy converts an LM-Studio / MLX-style model name
+// (e.g. "google/gemma-4-26b-a4b") to a short tag form ("gemma4:26b") for
+// cross-format name matching against the list returned by the local LLM server.
 //
 // Conversion rules (applied in order):
 //  1. Strip a leading "vendor/" prefix (e.g. "google/gemma-4-26b-a4b" →
 //     "gemma-4-26b-a4b").
-//  2. Replace "gemma-4" with "gemma4" to align with Ollama's naming.
+//  2. Replace "gemma-4" with "gemma4".
 //  3. Truncate at the size tag (e.g. "26b" or "e4b") and convert
 //     "gemma4-NNb" → "gemma4:NNb".
 //
-// If the name does not look like an LMS-style cross-format name (no "/" and
-// already matches the "family:tag" Ollama shape), the original string is
-// returned unchanged so normal prefix matching still applies.
+// If the name does not look like an LMS-style cross-format name, the original
+// string is returned unchanged so normal prefix matching still applies.
 var lmsModelPattern = regexp.MustCompile(`^(?:[^/]+/)?gemma-4-([0-9]+[bB]|e[0-9]+[bB])`)
 
+// normalizeModelNameForOllama is an alias retained for backward compat with
+// callers that use the old name. Delegates to normalizeModelNameForLegacy.
 func normalizeModelNameForOllama(name string) string {
+	return normalizeModelNameForLegacy(name)
+}
+
+func normalizeModelNameForLegacy(name string) string {
 	name = strings.TrimSpace(name)
 	if !strings.Contains(name, "/") && !strings.HasPrefix(strings.ToLower(name), "gemma-4") {
 		// Not an LMS-style name; return as-is so prefix matching is unaffected.
@@ -235,16 +242,16 @@ func normalizeModelNameForOllama(name string) string {
 func resolvePreferredLocalModel(models []string, preferred string) string {
 	preferred = strings.TrimSpace(preferred)
 	if preferred != "" {
-		// First pass: exact match or Ollama-prefix match.
+		// First pass: exact match or prefix match.
 		for _, model := range models {
 			if model == preferred || strings.HasPrefix(model, preferred) {
 				return model
 			}
 		}
-		// Second pass: try the normalized (Ollama-format) equivalent of the
-		// configured name. This handles LM-Studio / MLX style names like
-		// "google/gemma-4-26b-a4b" that map to Ollama tags like "gemma4:26b".
-		normalized := normalizeModelNameForOllama(preferred)
+		// Second pass: try the short-tag equivalent of the configured name.
+		// This handles LM-Studio / MLX style names like "google/gemma-4-26b-a4b"
+		// that may appear in a server's model list under a shorter alias.
+		normalized := normalizeModelNameForLegacy(preferred)
 		if normalized != preferred {
 			for _, model := range models {
 				if model == normalized || strings.HasPrefix(model, normalized) {
@@ -253,14 +260,8 @@ func resolvePreferredLocalModel(models []string, preferred string) string {
 			}
 		}
 	}
-	// No preferred match: fall back to the canonical E4B floor model if it is
-	// available, rather than returning models[0] which may be a smaller or
-	// unrelated model (e.g. "llama3.2:1b").
-	for _, model := range models {
-		if model == defaultOllamaModel || strings.HasPrefix(model, defaultOllamaModel) {
-			return model
-		}
-	}
+	// No preferred match: return the first available model rather than a
+	// hard-coded Ollama model name (Ollama is decommissioned).
 	if len(models) > 0 {
 		return models[0]
 	}
@@ -293,18 +294,16 @@ func resolveDispatchLocalModel(models []string, preferred string, requested Disp
 		if fallback == "" {
 			return "", DispatchModelE4B, "26b route unavailable: no local models are loaded"
 		}
-		return fallback, DispatchModelE4B, "26b route unavailable, degraded to e4b"
+		return fallback, DispatchModelE4B, "26b route unavailable, using preferred local model"
 	default:
 		selected := resolvePreferredLocalModel(models, preferred)
 		if selected == "" {
 			return "", DispatchModelE4B, "no local models are loaded"
 		}
 		// Report a mismatch when neither the preferred name nor its
-		// normalized Ollama equivalent was found, so the operator can
-		// diagnose configuration drift.  "selected" at this point is the
-		// E4B floor (from resolvePreferredLocalModel's fallback logic)
-		// rather than an arbitrary models[0].
-		if preferred != "" && selected != preferred && selected != normalizeModelNameForOllama(preferred) {
+		// normalized equivalent was found, so the operator can diagnose
+		// configuration drift.
+		if preferred != "" && selected != preferred && selected != normalizeModelNameForLegacy(preferred) {
 			return selected, DispatchModelE4B, fmt.Sprintf("configured local model %q not loaded, using %q", preferred, selected)
 		}
 		return selected, DispatchModelE4B, ""
