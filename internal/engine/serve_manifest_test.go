@@ -188,6 +188,51 @@ func TestClassifyMCPFamily(t *testing.T) {
 	}
 }
 
+// TestTrackTool_InputSchemaBackfilled verifies that after NewMCPServer
+// finishes construction, an eager tool's toolMeta entry carries a non-empty
+// InputSchema — proving backfillEagerSchemas actually populates the field
+// mcp.AddTool's inference never writes back onto the original *mcp.Tool
+// pointer captured by trackTool.
+func TestTrackTool_InputSchemaBackfilled(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog"}
+	nucleus := &Nucleus{Name: "schema-test"}
+	proc := NewProcess(cfg, nucleus)
+	m := NewMCPServer(cfg, nucleus, proc)
+
+	var found *mcpToolMeta
+	for i := range m.toolMeta {
+		if m.toolMeta[i].Name == "cog_search_memory" {
+			found = &m.toolMeta[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("cog_search_memory not present in toolMeta")
+	}
+	if !found.Eager {
+		t.Error("cog_search_memory should be Eager=true (porcelain)")
+	}
+	if found.InputSchema == nil {
+		t.Fatal("cog_search_memory InputSchema should be non-nil after backfillEagerSchemas")
+	}
+	schema, ok := found.InputSchema.(map[string]interface{})
+	if !ok {
+		t.Fatalf("InputSchema type = %T; want map[string]interface{}", found.InputSchema)
+	}
+	if schema["type"] != "object" {
+		t.Errorf("InputSchema[\"type\"] = %v; want \"object\"", schema["type"])
+	}
+	props, ok := schema["properties"].(map[string]interface{})
+	if !ok || len(props) == 0 {
+		t.Errorf("InputSchema properties missing or empty: %v", schema["properties"])
+	}
+	if _, ok := props["query"]; !ok {
+		t.Errorf("expected \"query\" property in cog_search_memory schema; got %v", props)
+	}
+}
+
 // keys is a local helper to extract map keys for test diagnostics.
 func keys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))

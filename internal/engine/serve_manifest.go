@@ -44,6 +44,18 @@ type mcpToolMeta struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Family      string `json:"family"`
+	// Eager reports whether this tool was registered on the live mcp.AddTool
+	// path (porcelain — appears in tools/list) versus the deferred catalog
+	// reached via cog_tool_search/cog_tool_invoke (plumbing — invoke-only).
+	// See trackToolDeferred and the tier-then-trim mechanism doc.
+	Eager bool `json:"eager"`
+	// InputSchema is the tool's JSON Schema, captured off the *mcp.Tool
+	// pointer in trackTool/trackToolDeferred BEFORE the pointer is handed to
+	// mcp.AddTool (which internally copies via `tt := *t`, so reading the
+	// schema off the original after that point would still work for the
+	// pointer itself, but capturing here keeps deferred tools — which never
+	// reach mcp.AddTool at all — populated the same way as eager ones).
+	InputSchema any `json:"input_schema,omitempty"`
 }
 
 // route registers a handler on mux and records the (method, path) tuple onto
@@ -166,13 +178,61 @@ func classifyMCPFamily(name string) string {
 //
 // Returning the pointer means each existing registration changes by one
 // wrapping call — no separate metadata list, no risk of drift.
+//
+// InputSchema capture: t.InputSchema is read here, BEFORE the pointer is
+// handed to mcp.AddTool, per the design note in mcpToolMeta. In practice this
+// is almost always nil at this point — every call site in this codebase
+// relies on mcp.AddTool's automatic schema inference from the handler's `In`
+// type parameter (see AddTool's doc comment: "If the tool's input schema is
+// nil, it is set to the schema inferred from the In type parameter"), and
+// that inference writes the result onto an internal copy (`tt := *t`) the SDK
+// makes inside toolForErr — never back onto the original *t this function
+// holds. So for eager tools registered via mcp.AddTool with inference, the
+// InputSchema field captured here stays nil; it is backfilled after
+// registration completes by backfillEagerSchemas (constructor, after
+// registerTools/registerResources), which queries the live server the same
+// way snapshotToolDefinitions does. This function still captures whatever is
+// present on t at call time so explicitly-schema'd tools (t.InputSchema set
+// on the literal) are captured immediately and correctly.
 func (m *MCPServer) trackTool(t *mcp.Tool) *mcp.Tool {
 	m.toolMeta = append(m.toolMeta, mcpToolMeta{
 		Name:        t.Name,
 		Description: t.Description,
 		Family:      classifyMCPFamily(t.Name),
+		Eager:       true,
+		InputSchema: t.InputSchema,
 	})
 	return t
+}
+
+// backfillEagerSchemas fills in m.toolMeta[i].InputSchema for every eager
+// entry whose schema wasn't captured at registration time (the common case —
+// see trackTool's doc comment on why inferred schemas aren't visible on the
+// original *mcp.Tool pointer). It queries the now-fully-registered live
+// server via the same in-process ListTools mechanism snapshotToolDefinitions
+// uses, so this must run after registerTools()/registerResources() return.
+// Best-effort: a query failure leaves InputSchema nil on affected entries
+// rather than failing construction.
+func (m *MCPServer) backfillEagerSchemas() {
+	if m.server == nil {
+		return
+	}
+	defs := snapshotToolDefinitions(m.server)
+	if len(defs) == 0 {
+		return
+	}
+	schemaByName := make(map[string]map[string]interface{}, len(defs))
+	for _, d := range defs {
+		schemaByName[d.Name] = d.InputSchema
+	}
+	for i := range m.toolMeta {
+		if !m.toolMeta[i].Eager || m.toolMeta[i].InputSchema != nil {
+			continue
+		}
+		if s, ok := schemaByName[m.toolMeta[i].Name]; ok {
+			m.toolMeta[i].InputSchema = s
+		}
+	}
 }
 
 // TrackTool is the exported equivalent of trackTool for use by extension

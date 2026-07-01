@@ -168,6 +168,12 @@ func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Pro
 	m.registerTools()
 	m.registerResources()
 
+	// Backfill InputSchema onto eager toolMeta entries (see trackTool's doc
+	// comment: mcp.AddTool's schema inference never writes back onto the
+	// original *mcp.Tool pointer, so this queries the live server the same
+	// way snapshotToolDefinitions does, immediately below).
+	m.backfillEagerSchemas()
+
 	// Snapshot the registered tool list as kernel-side ToolDefinitions so the
 	// chat path can auto-advertise the kernel's MCP tool surface to the
 	// inference provider when the request targets the kernel-agent route
