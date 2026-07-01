@@ -36,9 +36,10 @@ func (m *MCPServer) SetForkRegistry(fr *ForkRegistry) {
 // ─── tool registration ────────────────────────────────────────────────────────
 
 // registerForkSessionTool installs the cog_fork_session MCP tool.
-// Called from registerSessionTools() in mcp_sessions.go.
+// Called from registerSessionTools() in mcp_sessions.go. Deferred/plumbing —
+// a rare RFC-0005 primitive, not part of the porcelain preload set.
 func (m *MCPServer) registerForkSessionTool() {
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "cog_fork_session",
 		Description: "Fork an existing session at a specific ledger state, " +
 			"producing a child session with an optional layer overlay. " +
@@ -49,7 +50,7 @@ func (m *MCPServer) registerForkSessionTool() {
 			"(caller-supplied or auto-minted as fork-<parent>-<hex>). " +
 			"Returns: child_session_id, fork_block_hash, fork_point, pinned_until. " +
 			"Cross-workspace forks return 501 Not Implemented (reserved for v1).",
-	}), withToolObserver(m, "cog_fork_session", m.toolForkSession))
+	}, withToolObserver(m, "cog_fork_session", m.toolForkSession))
 }
 
 // ─── input / output types ────────────────────────────────────────────────────

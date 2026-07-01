@@ -129,9 +129,10 @@ func (m *MCPServer) getModalityProxy() *modalityProxy {
 
 // registerMod3Tools installs the 7 mod3_* MCP tools. Called from
 // MCPServer.registerTools after the cog_* tools so the tool index stays
-// stable at the front.
+// stable at the front. All mod3_* tools are plumbing (deferred) — reachable
+// via cog_tool_search + cog_tool_invoke, not the porcelain preload set.
 func (m *MCPServer) registerMod3Tools() {
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_speak",
 		Description: "Synthesize text to speech via mod3's queue-aware /v1/speak " +
 			"endpoint. Required: text. Optional: session_id, voice, speed, " +
@@ -147,33 +148,33 @@ func (m *MCPServer) registerMod3Tools() {
 			"overlapping audio, no local afplay spawned by the kernel. " +
 			"Fallback: curl -X POST http://localhost:7860/v1/speak " +
 			"-H 'Content-Type: application/json' -d '{\"text\":\"...\"}'",
-	}), withToolObserver(m, "mod3_speak", m.toolMod3Speak))
+	}, withToolObserver(m, "mod3_speak", m.toolMod3Speak))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_stop",
 		Description: "Stop current mod3 speech and/or cancel queued jobs. " +
 			"Optional: session_id, job_id (cancel one specific job). Empty " +
 			"cancels current playback and clears the queue. Returns mod3's " +
 			"barge-in interruption context. Fallback: curl -X POST " +
 			"http://localhost:7860/v1/stop",
-	}), withToolObserver(m, "mod3_stop", m.toolMod3Stop))
+	}, withToolObserver(m, "mod3_stop", m.toolMod3Stop))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_voices",
 		Description: "List available mod3 voices, optionally scoped to a " +
 			"session. Optional: session_id. Returns the voice catalogue mod3 " +
 			"exposes (id, name, language, gender metadata per voice). " +
 			"Fallback: mod3 API endpoint /v1/voices (local port 7860)",
-	}), withToolObserver(m, "mod3_voices", m.toolMod3Voices))
+	}, withToolObserver(m, "mod3_voices", m.toolMod3Voices))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_status",
 		Description: "Probe mod3's /health endpoint. Returns the raw health " +
 			"payload (model_loaded, engine info, queue_depth, etc). 502 if " +
 			"mod3 is unreachable. Fallback: mod3 API endpoint /health (local port 7860)",
-	}), withToolObserver(m, "mod3_status", m.toolMod3Status))
+	}, withToolObserver(m, "mod3_status", m.toolMod3Status))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_register_session",
 		Description: "Register a channel-participant session. Routes through " +
 			"the kernel's /v1/channel-sessions/register endpoint so " +
@@ -186,26 +187,26 @@ func (m *MCPServer) registerMod3Tools() {
 			"mod3} block: kernel identity record + mod3's full " +
 			"SessionRegisterResponse (assigned_voice, voice_conflict, " +
 			"output_device, queue_depth).",
-	}), withToolObserver(m, "mod3_register_session", m.toolMod3RegisterSession))
+	}, withToolObserver(m, "mod3_register_session", m.toolMod3RegisterSession))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_deregister_session",
 		Description: "Deregister a channel-participant session. Routes " +
 			"through the kernel's /v1/channel-sessions/{id}/deregister " +
 			"endpoint so the kernel drops its identity record in sync with " +
 			"mod3. Required: session_id. Returns mod3's deregister " +
 			"acknowledgment (released_voice, dropped_jobs).",
-	}), withToolObserver(m, "mod3_deregister_session", m.toolMod3DeregisterSession))
+	}, withToolObserver(m, "mod3_deregister_session", m.toolMod3DeregisterSession))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_list_sessions",
 		Description: "List channel-participant sessions via the kernel's " +
 			"/v1/channel-sessions endpoint. Returns a merged {kernel, mod3} " +
 			"block: kernel identity records + mod3's live per-channel state " +
 			"(voice_pool, voice_holders, serializer policy).",
-	}), withToolObserver(m, "mod3_list_sessions", m.toolMod3ListSessions))
+	}, withToolObserver(m, "mod3_list_sessions", m.toolMod3ListSessions))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "mod3_tail_logs",
 		Description: "Tail recent structured chat-flow events from mod3's " +
 			"in-memory ring buffer (up to 5000 events, DEBUG-level). " +
@@ -216,7 +217,7 @@ func (m *MCPServer) registerMod3Tools() {
 			"since (ISO timestamp or relative like 5m), " +
 			"limit (default 50, max 500). " +
 			"Fallback: curl 'http://localhost:7860/v1/logs/chat-flow?limit=20'",
-	}), withToolObserver(m, "mod3_tail_logs", m.toolMod3TailLogs))
+	}, withToolObserver(m, "mod3_tail_logs", m.toolMod3TailLogs))
 }
 
 // ─── input / output types ────────────────────────────────────────────────────
@@ -524,10 +525,10 @@ func buildSynthesizeBody(in mod3SpeakInput) map[string]any {
 	return body
 }
 
-// checkSessionSubscriber asks mod3 whether ``sessionID`` has at least one
+// checkSessionSubscriber asks mod3 whether “sessionID“ has at least one
 // active dashboard WebSocket subscriber for audio playback. Returns
-// ``(subscribed, nil)`` on success, ``(false, err)`` on transport failure.
-// ``(false, nil)`` — the default when the proxy has no check configured —
+// “(subscribed, nil)“ on success, “(false, err)“ on transport failure.
+// “(false, nil)“ — the default when the proxy has no check configured —
 // also suppresses the routing path, so legacy callers see the exact same
 // afplay behavior as before.
 //

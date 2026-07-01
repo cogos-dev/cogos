@@ -48,8 +48,8 @@ type architectureResolveInput struct {
 }
 
 type architectureReadInput struct {
-	Handle           string `json:"handle" jsonschema:"the handle to read"`
-	FrontmatterOnly  bool   `json:"frontmatter_only,omitempty" jsonschema:"return only frontmatter (faster), not full blocks"`
+	Handle          string `json:"handle" jsonschema:"the handle to read"`
+	FrontmatterOnly bool   `json:"frontmatter_only,omitempty" jsonschema:"return only frontmatter (faster), not full blocks"`
 }
 
 type architectureListInput struct {
@@ -74,9 +74,9 @@ type architectureAuditInput struct {
 }
 
 type architectureWriteInput struct {
-	Slug   string                 `json:"slug" jsonschema:"canonical slug; must match tree.frontmatter.slug"`
-	Tree   map[string]any         `json:"tree" jsonschema:"the parsed tree to write (output of architecture_propose or architecture_read)"`
-	Author string                 `json:"author" jsonschema:"identity slug of author"`
+	Slug   string         `json:"slug" jsonschema:"canonical slug; must match tree.frontmatter.slug"`
+	Tree   map[string]any `json:"tree" jsonschema:"the parsed tree to write (output of architecture_propose or architecture_read)"`
+	Author string         `json:"author" jsonschema:"identity slug of author"`
 }
 
 type architectureProposeInput struct {
@@ -97,47 +97,48 @@ type architectureProjectInput struct {
 // ─── Registration ────────────────────────────────────────────────────────────
 
 // registerArchitectureTools registers all 8 architecture skill tools.
-// Called from MCPServer.registerTools.
+// Called from MCPServer.registerTools. All plumbing (deferred) — reachable
+// via cog_tool_search + cog_tool_invoke, not the porcelain preload set.
 func (m *MCPServer) registerArchitectureTools() {
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_resolve",
 		Description: "Resolve any handle (canonical URI, alias, slug, legacy numeric URI, wiki-link) to canonical URI + on-disk path. From the architecture skill plugin per ADR-architecture-memory-canonical-form-and-projection.",
-	}), withToolObserver(m, "cog_architecture_resolve", m.toolArchitectureResolve))
+	}, withToolObserver(m, "cog_architecture_resolve", m.toolArchitectureResolve))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_read",
 		Description: "Read an architecture document by handle. Returns parsed CogBlock tree, or frontmatter-only for fast lookups.",
-	}), withToolObserver(m, "cog_architecture_read", m.toolArchitectureRead))
+	}, withToolObserver(m, "cog_architecture_read", m.toolArchitectureRead))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_list",
 		Description: "Enumerate architecture documents with optional filters (kind, status, tag, scope, limit). Returns JSON array of doc stubs.",
-	}), withToolObserver(m, "cog_architecture_list", m.toolArchitectureList))
+	}, withToolObserver(m, "cog_architecture_list", m.toolArchitectureList))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_search",
 		Description: "Ranked full-text + frontmatter search across the architecture corpus. Scoring: title=10x, tags=5x, body=1x; 2x for accepted status; -1 for superseded/retired.",
-	}), withToolObserver(m, "cog_architecture_search", m.toolArchitectureSearch))
+	}, withToolObserver(m, "cog_architecture_search", m.toolArchitectureSearch))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_audit",
 		Description: "Run the projection-time audit gate on a document. 8 checks (schema, slug, roundtrip, PII, restricted-tags, distinctions, salience, refs). public_ready=true activates strict gates that block projection on PII or restricted tags.",
-	}), withToolObserver(m, "cog_architecture_audit", m.toolArchitectureAudit))
+	}, withToolObserver(m, "cog_architecture_audit", m.toolArchitectureAudit))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_write",
 		Description: "Write or update an architecture document at its canonical path. Validates schema, slug consistency, and roundtrip-clean before atomic rename. Returns canonical URI + action (created|updated).",
-	}), withToolObserver(m, "cog_architecture_write", m.toolArchitectureWrite))
+	}, withToolObserver(m, "cog_architecture_write", m.toolArchitectureWrite))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_propose",
 		Description: "Generate an ADR or RFC draft tree with stub sections and pre-populated frontmatter. Does NOT write to disk; returns the tree for review + subsequent cog_architecture_write.",
-	}), withToolObserver(m, "cog_architecture_propose", m.toolArchitecturePropose))
+	}, withToolObserver(m, "cog_architecture_propose", m.toolArchitecturePropose))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_architecture_project",
 		Description: "Project a canonical architecture document to a target workspace. Composes resolve + audit + scrub + write. public_ready=true blocks projection on PII or restricted-tag findings before any target write.",
-	}), withToolObserver(m, "cog_architecture_project", m.toolArchitectureProject))
+	}, withToolObserver(m, "cog_architecture_project", m.toolArchitectureProject))
 }
 
 // ─── Shared helper ───────────────────────────────────────────────────────────

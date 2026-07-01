@@ -42,6 +42,13 @@ func (m *MCPServer) sessionsBackendReady() bool {
 // registerSessionTools installs the 8 cog_* session/handoff tools. Kept in
 // its own method so mcp_server.go stays tidy; the registration site in
 // registerTools calls this last.
+//
+// Porcelain/plumbing split (workflow wkweyu50g): register/list_sessions/
+// heartbeat/end_session/list_handoffs/claim_handoff are the six session tools
+// in the preload porcelain set — registered eagerly via mcp.AddTool.
+// offer_handoff, complete_handoff, and fork_session are less frequently
+// reached (offer/complete are the two ends of a lifecycle a session touches
+// at most once each; fork is a rare RFC-0005 primitive) and are deferred.
 func (m *MCPServer) registerSessionTools() {
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_register_session",
@@ -79,15 +86,6 @@ func (m *MCPServer) registerSessionTools() {
 	}), withToolObserver(m, "cog_list_sessions", m.toolListSessions))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
-		Name: "cog_offer_handoff",
-		Description: "Post a handoff.offer to bus_handoffs. Mints a new " +
-			"handoff_id (ho-<ms>-<hex>). task.title, task.goal, and a " +
-			"non-empty task.next_steps list are required. TTL defaults to " +
-			"3600s; expired offers are 409 on claim. Returns the full " +
-			"offer payload so the caller can inspect what was written.",
-	}), withToolObserver(m, "cog_offer_handoff", m.toolOfferHandoff))
-
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name: "cog_list_handoffs",
 		Description: "List tracked handoffs with optional filters: " +
 			"state (open|claimed|completed|expired) and for_session. The " +
@@ -104,12 +102,23 @@ func (m *MCPServer) registerSessionTools() {
 			"Returns the full offer payload on success.",
 	}), withToolObserver(m, "cog_claim_handoff", m.toolClaimHandoff))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	// ── Deferred (plumbing) ──────────────────────────────────────────────
+
+	trackToolDeferred(m, &mcp.Tool{
+		Name: "cog_offer_handoff",
+		Description: "Post a handoff.offer to bus_handoffs. Mints a new " +
+			"handoff_id (ho-<ms>-<hex>). task.title, task.goal, and a " +
+			"non-empty task.next_steps list are required. TTL defaults to " +
+			"3600s; expired offers are 409 on claim. Returns the full " +
+			"offer payload so the caller can inspect what was written.",
+	}, withToolObserver(m, "cog_offer_handoff", m.toolOfferHandoff))
+
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "cog_complete_handoff",
 		Description: "Mark a claimed handoff as completed. Rejected with " +
 			"409 if the handoff has not been claimed yet or is already " +
 			"complete. Optional outcome, notes, and next_handoff_id.",
-	}), withToolObserver(m, "cog_complete_handoff", m.toolCompleteHandoff))
+	}, withToolObserver(m, "cog_complete_handoff", m.toolCompleteHandoff))
 
 	// RFC-0005: session forking primitive.
 	m.registerForkSessionTool()
@@ -133,7 +142,7 @@ type registerSessionInput struct {
 	// When Subject is non-empty and a harnessBackend is wired, a
 	// HarnessBindingCRD is created linking sessionID → Subject.
 	Subject     string `json:"subject,omitempty"`      // identity sub-slug (e.g. "chaz", "cog")
-	Iss         string `json:"iss,omitempty"`           // OIDC issuer hint (e.g. "anthropic.claude-code")
+	Iss         string `json:"iss,omitempty"`          // OIDC issuer hint (e.g. "anthropic.claude-code")
 	BindingType string `json:"binding_type,omitempty"` // "agent" (default) or "user"
 }
 

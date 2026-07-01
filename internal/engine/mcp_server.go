@@ -68,10 +68,19 @@ type MCPServer struct {
 	channelSessionBackend channelSessionBackend
 
 	// toolMeta is the manifest-introspection registry for MCP tools.
-	// Populated by trackTool at registration time (see serve_manifest.go);
-	// read by handleManifest. Frozen after registerTools returns, so
-	// lock-free reads are safe.
+	// Populated by trackTool/trackToolDeferred at registration time (see
+	// serve_manifest.go); read by handleManifest. Frozen after registerTools
+	// returns, so lock-free reads are safe.
 	toolMeta []mcpToolMeta
+
+	// deferredHandlers is the plumbing catalog (porcelain/plumbing tool
+	// surface, workflow wkweyu50g): tools registered via trackToolDeferred
+	// instead of mcp.AddTool, keyed by tool name. These never appear in
+	// tools/list; they are reachable only through cog_tool_search (discover)
+	// and cog_tool_invoke (dispatch). Populated during registerTools() and
+	// frozen afterwards — lock-free reads are safe post-construction, same
+	// contract as toolMeta.
+	deferredHandlers map[string]deferredToolHandler
 
 	// toolDefs is the cached snapshot of MCP tools as kernel-side
 	// [ToolDefinition] values, suitable for direct injection onto a
@@ -157,12 +166,13 @@ func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Pro
 	}, nil)
 
 	m := &MCPServer{
-		server:          server,
-		cfg:             cfg,
-		nucleus:         nucleus,
-		process:         process,
-		cogdocSvc:       NewCogDocService(cfg, process),
-		agentController: ctrl,
+		server:           server,
+		cfg:              cfg,
+		nucleus:          nucleus,
+		process:          process,
+		cogdocSvc:        NewCogDocService(cfg, process),
+		agentController:  ctrl,
+		deferredHandlers: make(map[string]deferredToolHandler),
 	}
 
 	m.registerTools()
@@ -248,11 +258,28 @@ func (m *MCPServer) Server() *mcp.Server {
 // Design: tools are actions with side effects or non-trivial computation.
 // Read-only state queries will migrate to MCP Resources in Phase 2.
 //
-// Every handler is wrapped with withToolObserver so an invocation emits a
-// paired tool.call + tool.result event to the hash-chained ledger. This
-// closes Agent F gap #6 and activates the gate.go:94 recognizer that has
-// been waiting for a producer.
+// Porcelain/plumbing tool surface (workflow wkweyu50g, tier-then-trim
+// mechanism doc cog:mem/semantic/architecture/mcp-tool-surface-tier-then-trim
+// #Mechanism, RESOLVED): only the ~13-tool porcelain set below is registered
+// via mcp.AddTool (trackTool) — the set that appears in tools/list and is
+// eagerly visible to every harness. Everything else (the plumbing) routes
+// through trackToolDeferred into m.deferredHandlers instead, reachable only
+// via cog_tool_search (discover) and cog_tool_invoke (dispatch). This is a
+// server-autonomous mechanism: the kernel cannot ask Claude Code (or any
+// other harness) to defer-load specific MCP tools, so it shrinks its own
+// advertised schema surface instead of relying on client cooperation.
+//
+// Every eager handler is wrapped with withToolObserver so an invocation
+// emits a paired tool.call + tool.result event to the hash-chained ledger.
+// This closes Agent F gap #6 and activates the gate.go:94 recognizer that
+// has been waiting for a producer. Deferred (plumbing) handlers keep their
+// original withToolObserver wrapping too — trackToolDeferred's In type
+// parameter is inferred from the wrapped handler's signature, so converting
+// a registration site from trackTool/mcp.AddTool to trackToolDeferred does
+// not change what runs, only how it's reached.
 func (m *MCPServer) registerTools() {
+	// ── Porcelain (eager, mcp.AddTool) ──────────────────────────────────────
+
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_search_memory",
 		Description: "Full-text and semantic search over the CogDoc memory corpus. Returns ranked results with salience scores. Fallback: ./scripts/cog memory search \"query\"",
@@ -269,11 +296,6 @@ func (m *MCPServer) registerTools() {
 	}), withToolObserver(m, "cog_write_cogdoc", m.toolWriteCogdoc))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
-		Name:        "cog_patch_frontmatter",
-		Description: "Merge description, tags, or type patches into a CogDoc frontmatter block.",
-	}), withToolObserver(m, "cog_patch_frontmatter", m.toolPatchFrontmatter))
-
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_check_coherence",
 		Description: "Run coherence validation against the workspace. Checks URI resolution, frontmatter validity, and reference integrity. Fallback: ./scripts/cog coherence check",
 	}), withToolObserver(m, "cog_check_coherence", m.toolCheckCoherence))
@@ -284,16 +306,34 @@ func (m *MCPServer) registerTools() {
 	}), withToolObserver(m, "cog_get_state", m.toolGetState))
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+		Name:        "cog_dispatch_to_harness",
+		Description: "Phase 2 transport: dispatch a task into the kernel-interior agent harness with structured return, optional concurrency (n=1..4), named tool scope, per-call tool narrowing, optional system-prompt override, and pluggable model routing (default: LM Studio via provider=\"lmstudio-darkstar\", resident gemma-4-26b at 127.0.0.1:1234). Synchronous: blocks until every slot completes, errors, or hits its per-slot timeout (default 30s, max 120s). Returns one DispatchResult per slot with content (the agent's final respond text), tool-call digests, duration, and turn count. Use this for the foveal->peripheral handoff — offload validation, rewriting, modality matching to the resident swarm instead of paying with Anthropic tokens. Named scopes (RFC-016): \"consolidation\" (default, 11 substrate tools: memory/field/coherence/identity; respond excluded from base), \"consolidation_with_respond\" (+ respond), \"consolidation_no_respond\" (no respond), \"audit\" (consolidation + cog_read_file + cog_grep_files), \"search\" (cog_resolve_uri/cog_search_memory/cog_query_field), \"observe\" (consolidation reads, no emit), \"emit\" (cog_emit_event only). Unknown scope names error immediately. Backward-compat note: cog_trigger_agent_loop still wakes the singleton with no payload; this tool is the new payload-bearing path.",
+	}), m.toolDispatchToHarness)
+
+	// Kernel-native session/handoff tools (mcp_sessions.go). The porcelain
+	// subset (register/list/heartbeat/end/list_handoffs/claim_handoff) is
+	// registered eagerly inside registerSessionTools; the rest
+	// (offer_handoff, complete_handoff, fork_session) is deferred there too.
+	m.registerSessionTools()
+
+	// ── Plumbing (deferred, trackToolDeferred) ──────────────────────────────
+
+	trackToolDeferred(m, &mcp.Tool{
+		Name:        "cog_patch_frontmatter",
+		Description: "Merge description, tags, or type patches into a CogDoc frontmatter block.",
+	}, withToolObserver(m, "cog_patch_frontmatter", m.toolPatchFrontmatter))
+
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_query_field",
 		Description: "Query the attentional field — the salience-scored map of all tracked CogDocs. Returns top-N items, optionally filtered by sector. Shows what the kernel considers most relevant right now.",
-	}), withToolObserver(m, "cog_query_field", m.toolQueryField))
+	}, withToolObserver(m, "cog_query_field", m.toolQueryField))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_assemble_context",
 		Description: "Build a context package for a given token budget with an explicit focus topic. Use this for intentional context assembly (subtasks, specific investigations). The automatic foveated-context hook handles ambient context on every prompt.",
-	}), withToolObserver(m, "cog_assemble_context", m.toolAssembleContext))
+	}, withToolObserver(m, "cog_assemble_context", m.toolAssembleContext))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "cog_emit_event",
 		Description: "Emit a typed event to the workspace ledger. " +
 			"Events: attention.boost (uri + weight), session.marker (label), " +
@@ -301,96 +341,91 @@ func (m *MCPServer) registerTools() {
 			"peer.utterance (from + to + content + turn; both sessions must be registered). " +
 			"Optional from_session: records the emitting session as event source; required for peer.utterance and must match payload.from. " +
 			"Fallback: events are JSONL in .cog/ledger/",
-	}), withToolObserver(m, "cog_emit_event", m.toolEmitEvent))
+	}, withToolObserver(m, "cog_emit_event", m.toolEmitEvent))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_read_ledger",
 		Description: "Read the hash-chained event ledger. Filter by session_id, event_type (exact or 'prefix.*' wildcard), after_seq (requires session_id), since_timestamp (RFC3339), or limit (default 100, max 1000). Set verify_chain=true to recompute hashes and validate prior_hash links. Fallback: cat .cog/ledger/<session_id>/events.jsonl",
-	}), m.toolReadLedger)
+	}, m.toolReadLedger)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_read_events",
 		Description: "Query recent kernel events for observability. Returns historical events from the ledger without chain verification (use cog_read_ledger for audit). Filters: session_id, event_type (exact or 'attention.*' wildcard), source ('kernel-v3' / 'mcp-client'), since/until (RFC3339 or duration shorthand like '5m'), limit (default 100, max 1000), order ('desc' newest-first default, 'asc' oldest-first). Fallback: ls .cog/ledger/ && cat .cog/ledger/*/events.jsonl",
-	}), m.toolReadEvents)
+	}, m.toolReadEvents)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_tail_events",
 		Description: "Tail kernel events as they are appended to the ledger, like 'tail -f'. Blocks until max_events or max_duration reached. Same filters as cog_read_events plus since= for replay before going live. Bounded by max_events (default 100, max 1000) and max_duration (default 60s, max 10m). Fallback: kernel API streaming endpoint /v1/events/stream (local port 6931)",
-	}), m.toolTailEvents)
+	}, m.toolTailEvents)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_ingest",
 		Description: "Ingest external material into CogOS knowledge. Deterministic decomposition — no LLM calls. Supports URLs, conversations, documents. Applies membrane policy (accept/quarantine/defer/discard).",
-	}), withToolObserver(m, "cog_ingest", m.toolIngest))
+	}, withToolObserver(m, "cog_ingest", m.toolIngest))
 
 	// Tool-call observability — reads the paired tool.call/tool.result events
 	// the wrapper above emits. Self-reflective: these two tools also go
 	// through withToolObserver and end up in their own query results.
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_read_tool_calls",
 		Description: "Query recent tool invocations and their outcomes. Returns call+result pairs from the ledger, filterable by tool_name, status (pending/success/error/rejected/timeout), source, ownership, call_id, or time window. Default limit 100, max 500. Arguments and output are opt-in via include_args/include_output. Fallback: grep '\"type\":\"tool\\.' .cog/ledger/<sid>/events.jsonl",
-	}), withToolObserver(m, "cog_read_tool_calls", m.toolReadToolCalls))
+	}, withToolObserver(m, "cog_read_tool_calls", m.toolReadToolCalls))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_tail_tool_calls",
 		Description: "Tail tool-call events live. Replays recent tool.call / tool.result events (up to max_events, default 50), applying the same filters as cog_read_tool_calls. When Agent N's event bus lands, this will stream new events live; until then it returns a snapshot of the latest matching rows. Fallback: tail -f .cog/ledger/<sid>/events.jsonl | grep '\"type\":\"tool\\.'",
-	}), withToolObserver(m, "cog_tail_tool_calls", m.toolTailToolCalls))
+	}, withToolObserver(m, "cog_tail_tool_calls", m.toolTailToolCalls))
 
 	// Agent state / loop control — closes Agent F gap #8 per Agent T's design.
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_list_agents",
 		Description: "Enumerate active agent harness instances inside the kernel. Each entry summarises identity, state, and recent activity. Today returns one element (\"primary\") reflecting the ServeAgent singleton; forward-compatible for future multi-agent deployment. Fallback: kernel API endpoint /v1/agents (local port 6931)",
-	}), m.toolListAgents)
+	}, m.toolListAgents)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_get_agent_state",
 		Description: "Full state snapshot of one agent instance — status summary, activity awareness, rolling cycle memory, pending proposals, inbox queue, and optionally the most recent cycle traces. Matches the shape of GET /v1/agents/{id}. Fallback: kernel API endpoint /v1/agents/primary (local port 6931)",
-	}), m.toolGetAgentState)
+	}, m.toolGetAgentState)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_trigger_agent_loop",
 		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: kernel API POST /v1/agents/primary/tick (local port 6931)",
-	}), m.toolTriggerAgentLoop)
+	}, m.toolTriggerAgentLoop)
 
-	mcp.AddTool(m.server, &mcp.Tool{
-		Name:        "cog_dispatch_to_harness",
-		Description: "Phase 2 transport: dispatch a task into the kernel-interior agent harness with structured return, optional concurrency (n=1..4), named tool scope, per-call tool narrowing, optional system-prompt override, and pluggable model routing (default: LM Studio via provider=\"lmstudio-darkstar\", resident gemma-4-26b at 127.0.0.1:1234). Synchronous: blocks until every slot completes, errors, or hits its per-slot timeout (default 30s, max 120s). Returns one DispatchResult per slot with content (the agent's final respond text), tool-call digests, duration, and turn count. Use this for the foveal->peripheral handoff — offload validation, rewriting, modality matching to the resident swarm instead of paying with Anthropic tokens. Named scopes (RFC-016): \"consolidation\" (default, 11 substrate tools: memory/field/coherence/identity; respond excluded from base), \"consolidation_with_respond\" (+ respond), \"consolidation_no_respond\" (no respond), \"audit\" (consolidation + cog_read_file + cog_grep_files), \"search\" (cog_resolve_uri/cog_search_memory/cog_query_field), \"observe\" (consolidation reads, no emit), \"emit\" (cog_emit_event only). Unknown scope names error immediately. Backward-compat note: cog_trigger_agent_loop still wakes the singleton with no payload; this tool is the new payload-bearing path.",
-	}, m.toolDispatchToHarness)
-
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_tail_kernel_log",
 		Description: "Read recent entries from the kernel's own diagnostic log (slog JSON at .cog/run/kernel.log.jsonl). Returns newest-first, optionally filtered by level, substring, and time range. This is the OPERATOR/DEBUG surface — for hash-chained event history use cog_read_ledger (when available); for client metabolites (turn metrics, attention, proprioceptive) use cog_search_traces. Fallback: tail -n 100 .cog/run/kernel.log.jsonl | jq -c .",
-	}), m.toolTailKernelLog)
+	}, m.toolTailKernelLog)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "cog_read_conversation",
 		Description: "Read conversation turns (prompt + response pairs) from a session's chat history. " +
 			"Each turn is a complete user-to-assistant exchange; kernel tool calls are inlined when include_tools=true. " +
 			"Backed by the turn.completed ledger event + per-session sidecar (.cog/run/turns/<sid>.jsonl). " +
 			"Use after_turn / before_turn for pagination. Default: current process session, 20 turns, ascending. " +
 			"Fallback (kernel unavailable): jq -c . .cog/run/turns/<sid>.jsonl",
-	}), m.toolReadConversation)
+	}, m.toolReadConversation)
 
 	// Config mutation API (Agent O design — closes Agent F gaps #5 + #19).
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_read_config",
 		Description: "Read the kernel config (.cog/config/kernel.yaml). Returns the effective resolved config (defaults + file overrides). Optional include_raw_yaml returns the raw file bytes; include_defaults also returns the hardcoded defaults for diffing. kernel.yaml only — sibling configs (providers.yaml, secrets.yaml) are out of scope.",
-	}), m.toolReadConfig)
+	}, m.toolReadConfig)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_write_config",
 		Description: "Merge a patch into the kernel config (.cog/config/kernel.yaml) using RFC 7396 JSON merge-patch semantics: fields omitted from the patch are left unchanged; explicit null removes a field and restores the default on next boot. Validated before persisting — returns violations without writing on failure. Atomic write + rotating .bak-<timestamp> backups (keeps 10). Takes effect on next daemon restart (requires_restart: true in response). Fallback: edit .cog/config/kernel.yaml and run `./scripts/cog restart`. No authentication — the kernel assumes a trusted local caller.",
-	}), m.toolWriteConfig)
+	}, m.toolWriteConfig)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_rollback_config",
 		Description: "Restore kernel.yaml from a prior .bak-<timestamp> backup. Pass list_only=true to enumerate available backups without restoring. If backup is empty, the most recent backup is used. Atomic restore; response carries updated backup list.",
-	}), m.toolRollbackConfig)
+	}, m.toolRollbackConfig)
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_search_traces",
 		Description: "Search kernel trace JSONL streams in .cog/run/ (attention, proprioceptive, internal_requests). Filter by source, session_id, level, case-insensitive substring, and time range (since/until accept RFC3339 or duration like 5m/1h). Returns unified chronological results with per-source scan diagnostics. Fallback: ls .cog/run/*.jsonl && jq -c . .cog/run/<name>.jsonl | head",
-	}), m.toolSearchTraces)
+	}, m.toolSearchTraces)
 
 	// Memory section-index ops (RFC-017 Phase B). Port of the legacy
 	// `cog memory toc` / `cog memory index` verbs from the 2.5.0 monolith
@@ -400,38 +435,35 @@ func (m *MCPServer) registerTools() {
 	// path to generate or inspect the `sections:` frontmatter block.
 	// Without that block, every cog_read_cogdoc degrades to a full-doc
 	// read. See Phase 24 MCP API Coverage Audit for the gap analysis.
-	mcp.AddTool(m.server, &mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_memory_toc",
 		Description: "List a CogDoc's sections with line ranges and byte sizes. Default output is a pretty-printed text table showing total lines/bytes plus per-section nesting, line range, and size; pass as_yaml=true to get the `sections:` frontmatter YAML block that cog_memory_index injects. Useful for orienting to a long document before extracting a specific section via cog_read_cogdoc with #fragment. Fallback: ./scripts/cog memory toc <path> [--yaml]",
 	}, withToolObserver(m, "cog_memory_toc", m.toolMemoryTOC))
 
-	mcp.AddTool(m.server, &mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_memory_index",
 		Description: "Generate the `sections:` frontmatter block for a CogDoc and inject it into the file's frontmatter (replacing any prior sections field). Required for cheap section-addressed reads: without `sections:` every cog_read_cogdoc call with a section selector falls back to whole-document reads. Pass dry_run=true to preview the block without writing. Requires existing frontmatter; indexing a plain markdown file is a no-op by design (run cog_write_cogdoc first). Writes are atomic. Fallback: ./scripts/cog memory index <path> [--dry-run]",
 	}, withToolObserver(m, "cog_memory_index", m.toolMemoryIndex))
-
-	// Kernel-native session/handoff tools (mcp_sessions.go). The 8 tools
-	// complement the 8 cogos_* bridge tools living in cog-sandbox-mcp:
-	// both surfaces coexist by design — same kernel truth, two MCP
-	// doorways (amendment #5 of the Agent P hybrid plan).
-	m.registerSessionTools()
 
 	// Wave 3: mod3 proxy tools (mcp_modality_proxy.go). The kernel becomes
 	// the MCP front door for mod3 — HTTP-forwards synthesis/stop/voices/
 	// status and plays the returned audio/wav locally. Supersedes the
 	// installed binary's OpenClaw gateway which silently drops audio bytes.
+	// All mod3_* tools are plumbing (registerMod3Tools uses trackToolDeferred).
 	m.registerMod3Tools()
 
 	// Architecture skill plugin tools (mcp_architecture.go). 8 cog_architecture_*
 	// tools that subprocess-exec the Python implementations at
 	// {WorkspaceRoot}/.cog/skills/architecture/tools/architecture_*.py per the
-	// architecture-memory-canonical-form-and-projection ADR.
+	// architecture-memory-canonical-form-and-projection ADR. All plumbing
+	// (registerArchitectureTools uses trackToolDeferred).
 	m.registerArchitectureTools()
 
-	// Audit-scope read-only filesystem tools. Also registered as first-class
-	// MCP tools so they're callable directly from Claude Code sessions.
-	// In harness dispatches these are available only when scope="audit".
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	// Audit-scope read-only filesystem tools. Deferred/plumbing — reachable
+	// via cog_tool_search + cog_tool_invoke, or directly when a harness
+	// dispatch narrows scope="audit" (mcp_server.go's toolDispatchToHarness
+	// path resolves these by name, not via mcp.AddTool registration).
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "cog_read_file",
 		Description: "Read an arbitrary file within the workspace root. " +
 			"res=abstract (default, ADR pointer-first): returns a pointer envelope — workspace-relative path, file size, " +
@@ -439,19 +471,19 @@ func (m *MCPServer) registerTools() {
 			"res=full: returns line-numbered content with optional offset/limit (default 500 lines). " +
 			"Rejects paths outside the workspace root. Use for source inspection and substrate-introspection tasks. " +
 			"Fallback: cat -n <path>",
-	}), withToolObserver(m, "cog_read_file", m.toolReadFile))
+	}, withToolObserver(m, "cog_read_file", m.toolReadFile))
 
-	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "cog_grep_files",
 		Description: "Regex search over files within the workspace root (uses ripgrep when available, falls back to pure-Go walk). " +
 			"res=abstract (default, ADR pointer-first): returns match count + unique matched file paths — no line text. " +
 			"res=full: returns per-match path/line/text entries. " +
 			"Rejects search paths outside the workspace root. Fallback: rg --no-heading -n <pattern> <path>",
-	}), withToolObserver(m, "cog_grep_files", m.toolGrepFiles))
+	}, withToolObserver(m, "cog_grep_files", m.toolGrepFiles))
 
 	// Phase 1B: peer-awareness packet (READ side of the 4E ambient-
 	// awareness loop; Phase 1A publishes channel.<sid>.activity).
-	mcp.AddTool(m.server, &mcp.Tool{
+	trackToolDeferred(m, &mcp.Tool{
 		Name: "cog_render_peer_awareness_packet",
 		Description: "Render a token-budgeted peer-awareness packet for a " +
 			"session. Combines the session's recent tailer activity, open " +
@@ -462,6 +494,11 @@ func (m *MCPServer) registerTools() {
 			"a UserPromptSubmit preamble. Fallback: kernel API endpoint " +
 			"/v1/peer-awareness?sid=<sid> (local port 6931)",
 	}, withToolObserver(m, "cog_render_peer_awareness_packet", m.toolRenderPeerAwarenessPacket))
+
+	// The porcelain/plumbing catalog itself: cog_tool_search (discover) and
+	// cog_tool_invoke (dispatch) are the two new eager tools that front the
+	// deferred plumbing set registered above.
+	m.registerToolCatalogTools()
 }
 
 // registerResources registers MCP Resources — read-only addressable data.
