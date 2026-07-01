@@ -23,12 +23,14 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -44,6 +46,18 @@ type mcpToolMeta struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Family      string `json:"family"`
+	// Eager reports whether this tool was registered on the live mcp.AddTool
+	// path (porcelain — appears in tools/list) versus the deferred catalog
+	// reached via cog_tool_search/cog_tool_invoke (plumbing — invoke-only).
+	// See trackToolDeferred and the tier-then-trim mechanism doc.
+	Eager bool `json:"eager"`
+	// InputSchema is the tool's JSON Schema, captured off the *mcp.Tool
+	// pointer in trackTool/trackToolDeferred BEFORE the pointer is handed to
+	// mcp.AddTool (which internally copies via `tt := *t`, so reading the
+	// schema off the original after that point would still work for the
+	// pointer itself, but capturing here keeps deferred tools — which never
+	// reach mcp.AddTool at all — populated the same way as eager ones).
+	InputSchema any `json:"input_schema,omitempty"`
 }
 
 // route registers a handler on mux and records the (method, path) tuple onto
@@ -166,13 +180,123 @@ func classifyMCPFamily(name string) string {
 //
 // Returning the pointer means each existing registration changes by one
 // wrapping call — no separate metadata list, no risk of drift.
+//
+// InputSchema capture: t.InputSchema is read here, BEFORE the pointer is
+// handed to mcp.AddTool, per the design note in mcpToolMeta. In practice this
+// is almost always nil at this point — every call site in this codebase
+// relies on mcp.AddTool's automatic schema inference from the handler's `In`
+// type parameter (see AddTool's doc comment: "If the tool's input schema is
+// nil, it is set to the schema inferred from the In type parameter"), and
+// that inference writes the result onto an internal copy (`tt := *t`) the SDK
+// makes inside toolForErr — never back onto the original *t this function
+// holds. So for eager tools registered via mcp.AddTool with inference, the
+// InputSchema field captured here stays nil; it is backfilled after
+// registration completes by backfillEagerSchemas (constructor, after
+// registerTools/registerResources), which queries the live server the same
+// way snapshotToolDefinitions does. This function still captures whatever is
+// present on t at call time so explicitly-schema'd tools (t.InputSchema set
+// on the literal) are captured immediately and correctly.
 func (m *MCPServer) trackTool(t *mcp.Tool) *mcp.Tool {
 	m.toolMeta = append(m.toolMeta, mcpToolMeta{
 		Name:        t.Name,
 		Description: t.Description,
 		Family:      classifyMCPFamily(t.Name),
+		Eager:       true,
+		InputSchema: t.InputSchema,
 	})
 	return t
+}
+
+// backfillEagerSchemas fills in m.toolMeta[i].InputSchema for every eager
+// entry whose schema wasn't captured at registration time (the common case —
+// see trackTool's doc comment on why inferred schemas aren't visible on the
+// original *mcp.Tool pointer). It queries the now-fully-registered live
+// server via the same in-process ListTools mechanism snapshotToolDefinitions
+// uses, so this must run after registerTools()/registerResources() return.
+// Best-effort: a query failure leaves InputSchema nil on affected entries
+// rather than failing construction.
+func (m *MCPServer) backfillEagerSchemas() {
+	if m.server == nil {
+		return
+	}
+	defs := snapshotToolDefinitions(m.server)
+	if len(defs) == 0 {
+		return
+	}
+	schemaByName := make(map[string]map[string]interface{}, len(defs))
+	for _, d := range defs {
+		schemaByName[d.Name] = d.InputSchema
+	}
+	for i := range m.toolMeta {
+		if !m.toolMeta[i].Eager || m.toolMeta[i].InputSchema != nil {
+			continue
+		}
+		if s, ok := schemaByName[m.toolMeta[i].Name]; ok {
+			m.toolMeta[i].InputSchema = s
+		}
+	}
+}
+
+// deferredToolHandler is the untyped dispatch shape stored in
+// m.deferredHandlers for plumbing tools (porcelain/plumbing tool surface,
+// workflow wkweyu50g). argsJSON is the raw JSON arguments object (possibly
+// nil/empty); the handler is responsible for unmarshaling into its own typed
+// input, mirroring what mcp.AddTool's generated glue does for eager tools.
+type deferredToolHandler func(ctx context.Context, req *mcp.CallToolRequest, argsJSON json.RawMessage) (*mcp.CallToolResult, error)
+
+// trackToolDeferred registers a plumbing tool WITHOUT calling mcp.AddTool —
+// it never reaches the server's live tool registry, so it never appears in
+// tools/list. This is the mechanism half of the porcelain/plumbing split:
+// only the ~13 porcelain tools go through mcp.AddTool (trackTool); everything
+// else routes through here into m.deferredHandlers, reachable at runtime only
+// via cog_tool_search (discover) and cog_tool_invoke (dispatch).
+//
+// Generic over In so the input JSON Schema can be inferred exactly the way
+// mcp.AddTool infers it for eager tools (same jsonschema-go package, same
+// struct-tag conventions) — cog_tool_search callers get a real, usable
+// schema instead of an empty object. h is the typed handler, identical in
+// shape to what a normal mcp.AddTool registration would take; this function
+// wraps it into the untyped deferredToolHandler stored in the map.
+//
+// Best-effort on schema inference: a failure (should not happen for the
+// existing well-formed input structs) leaves InputSchema nil rather than
+// panicking — plumbing tools degrade to an empty-object schema in that case,
+// same as AddTool's "any" special case.
+func trackToolDeferred[In any](m *MCPServer, t *mcp.Tool, h mcp.ToolHandlerFor[In, any]) {
+	schema, err := jsonschema.For[In](nil)
+	var inputSchema any
+	if err == nil && schema != nil {
+		// Round-trip through JSON to a map[string]interface{} so the shape
+		// matches what backfillEagerSchemas stores for eager tools (both feed
+		// the same cog_tool_search / manifest JSON output).
+		if b, mErr := json.Marshal(schema); mErr == nil {
+			var m2 map[string]interface{}
+			if uErr := json.Unmarshal(b, &m2); uErr == nil {
+				inputSchema = m2
+			}
+		}
+	}
+
+	m.toolMeta = append(m.toolMeta, mcpToolMeta{
+		Name:        t.Name,
+		Description: t.Description,
+		Family:      classifyMCPFamily(t.Name),
+		Eager:       false,
+		InputSchema: inputSchema,
+	})
+
+	m.deferredHandlers[t.Name] = func(ctx context.Context, req *mcp.CallToolRequest, argsJSON json.RawMessage) (*mcp.CallToolResult, error) {
+		var in In
+		if len(argsJSON) > 0 {
+			if err := json.Unmarshal(argsJSON, &in); err != nil {
+				var errRes mcp.CallToolResult
+				errRes.SetError(err)
+				return &errRes, nil
+			}
+		}
+		result, _, err := h(ctx, req, in)
+		return result, err
+	}
 }
 
 // TrackTool is the exported equivalent of trackTool for use by extension

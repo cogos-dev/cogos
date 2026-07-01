@@ -37,6 +37,13 @@ func (s *Server) registerMCPRoutes(mux *http.ServeMux) {
 	if RegisterMCPExtensions != nil {
 		RegisterMCPExtensions(mcpSrv)
 	}
+	// Extension hooks above may register additional EAGER tools via
+	// srv.TrackTool *after* the constructor's initial backfillEagerSchemas ran,
+	// leaving their inferred InputSchemas nil in toolMeta (e.g. conversations'
+	// cog_search_conversations / cog_get_conversation_turn). Re-run the
+	// idempotent backfill now that the live server holds every extension tool,
+	// so cog_tool_search returns real schemas for them too.
+	mcpSrv.backfillEagerSchemas()
 	s.mcpServer = mcpSrv
 	h := mcpSrv.Handler()
 	s.routeH(mux, "GET /mcp", mcpGetHandler(h))
