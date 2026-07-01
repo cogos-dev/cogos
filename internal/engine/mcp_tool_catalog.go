@@ -177,8 +177,8 @@ func (m *MCPServer) toolToolSearch(ctx context.Context, req *mcp.CallToolRequest
 // ── cog_tool_invoke ───────────────────────────────────────────────────────
 
 type toolInvokeInput struct {
-	Name string          `json:"name" jsonschema:"The plumbing tool's name, as returned by cog_tool_search"`
-	Args json.RawMessage `json:"args,omitempty" jsonschema:"Arguments object for the underlying tool; omit or pass {} for tools with no required input"`
+	Name string         `json:"name" jsonschema:"The plumbing tool's name, as returned by cog_tool_search"`
+	Args map[string]any `json:"args,omitempty" jsonschema:"Arguments object for the underlying tool; omit or pass {} for tools with no required input"`
 }
 
 // toolToolInvoke implements cog_tool_invoke. See the file-level doc comment
@@ -222,7 +222,11 @@ func (m *MCPServer) toolToolInvoke(ctx context.Context, req *mcp.CallToolRequest
 		}
 	}
 
-	result, err := handler(ctx, req, input.Args)
+	argsJSON, err := json.Marshal(input.Args)
+	if err != nil {
+		return fallbackResult(fmt.Sprintf("cog_tool_invoke: marshal args for %s: %v", name, err), "")
+	}
+	result, err := handler(ctx, req, argsJSON)
 	if err != nil {
 		return fallbackResult(fmt.Sprintf("cog_tool_invoke: %s: %v", name, err), "")
 	}
