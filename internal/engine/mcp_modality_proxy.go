@@ -525,10 +525,10 @@ func buildSynthesizeBody(in mod3SpeakInput) map[string]any {
 	return body
 }
 
-// checkSessionSubscriber asks mod3 whether “sessionID“ has at least one
+// checkSessionSubscriber asks mod3 whether `sessionID` has at least one
 // active dashboard WebSocket subscriber for audio playback. Returns
-// “(subscribed, nil)“ on success, “(false, err)“ on transport failure.
-// “(false, nil)“ — the default when the proxy has no check configured —
+// `(subscribed, nil)` on success, `(false, err)` on transport failure.
+// `(false, nil)` — the default when the proxy has no check configured —
 // also suppresses the routing path, so legacy callers see the exact same
 // afplay behavior as before.
 //

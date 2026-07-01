@@ -260,7 +260,7 @@ func (m *MCPServer) Server() *mcp.Server {
 //
 // Porcelain/plumbing tool surface (workflow wkweyu50g, tier-then-trim
 // mechanism doc cog:mem/semantic/architecture/mcp-tool-surface-tier-then-trim
-// #Mechanism, RESOLVED): only the ~13-tool porcelain set below is registered
+// #Mechanism, RESOLVED): only the ~14-tool porcelain set below is registered
 // via mcp.AddTool (trackTool) — the set that appears in tools/list and is
 // eagerly visible to every harness. Everything else (the plumbing) routes
 // through trackToolDeferred into m.deferredHandlers instead, reachable only
