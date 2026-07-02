@@ -207,6 +207,73 @@ func TestToolInvoke_EnforcesCapabilityGating(t *testing.T) {
 	}
 }
 
+// TestToolInvoke_FailsClosedOnUnresolvedSession verifies the fail-closed nit:
+// when IdentityNakedDefault gating is enabled and a capResolver is wired, but
+// the transport session cannot be resolved to a bound subject (no
+// cog_register_session with a subject was performed), cog_tool_invoke must DENY
+// rather than dispatch. cog_tool_invoke is the porcelain gateway to the entire
+// deferred-plumbing catalog; permitting an unattributable caller to reach
+// arbitrary plumbing tools would make it a confused-deputy bypass of per-tool
+// capability gating.
+func TestToolInvoke_FailsClosedOnUnresolvedSession(t *testing.T) {
+	t.Parallel()
+	m, _ := newMCPServerWithGating(t, true /* flagOn */)
+
+	// Invoke WITHOUT registering a session first → correlation unresolved.
+	ok, text := invokeViaStreamableNoCorrelation(t, m, "cog_read_ledger", map[string]any{})
+	if ok {
+		t.Fatalf("expected fail-closed denial for unresolved session with gating on; got success: %s", text)
+	}
+	if !g2ContainsAny(text, "requires a resolved session identity", "capability envelope") {
+		t.Errorf("expected an unresolved-identity denial message; got: %s", text)
+	}
+}
+
+// invokeViaStreamableNoCorrelation calls cog_tool_invoke over the real
+// Streamable HTTP transport WITHOUT first calling cog_register_session, so the
+// transport session ID does not resolve to any subject in the correlation
+// store. Returns (!IsError, text).
+func invokeViaStreamableNoCorrelation(
+	t *testing.T, m *MCPServer, underlyingTool string, underlyingArgs map[string]any,
+) (bool, string) {
+	t.Helper()
+	handler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+		return m.server
+	}, nil)
+	httpSrv := httptest.NewServer(handler)
+	t.Cleanup(httpSrv.Close)
+
+	ctx := t.Context()
+	client := mcp.NewClient(&mcp.Implementation{Name: "invoke-nocorr-test", Version: "1"}, nil)
+	transport := &mcp.StreamableClientTransport{Endpoint: httpSrv.URL + "/"}
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	defer session.Close()
+
+	result, callErr := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "cog_tool_invoke",
+		Arguments: map[string]any{
+			"name": underlyingTool,
+			"args": underlyingArgs,
+		},
+	})
+	if callErr != nil {
+		return false, callErr.Error()
+	}
+	if result == nil || len(result.Content) == 0 {
+		return true, ""
+	}
+	text := ""
+	for _, c := range result.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			text += tc.Text
+		}
+	}
+	return !result.IsError, text
+}
+
 // invokeViaStreamableWithCorrelation is a cog_tool_invoke-specific variant of
 // callToolViaStreamableWithCorrelation (mcp_sessions_g2_test.go) that mints a
 // session_id compatible with sessionIDPattern (ASCII-lowercase, hyphens only

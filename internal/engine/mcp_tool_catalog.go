@@ -207,18 +207,35 @@ func (m *MCPServer) toolToolInvoke(ctx context.Context, req *mcp.CallToolRequest
 	// session — exactly the check withToolObserver performs for a direct
 	// call, applied here so a deferred tool gets the same enforcement it
 	// would have gotten had it been registered eagerly.
+	//
+	// FAIL CLOSED: cog_tool_invoke is the porcelain gateway to the entire
+	// deferred-plumbing catalog. When gating is enabled (IdentityNakedDefault
+	// AND a capResolver is wired) but the transport session cannot be resolved
+	// to a bound subject, we cannot evaluate the capability envelope for the
+	// underlying tool — so we DENY rather than dispatch. Permitting an
+	// unattributable caller to reach arbitrary plumbing tools would make
+	// cog_tool_invoke a confused-deputy bypass of per-tool gating, which is
+	// exactly the hazard this file exists to prevent. This is the stricter
+	// posture the gateway warrants: identity-less transport must not invoke
+	// plumbing when gating is on.
 	if m.cfg != nil && m.cfg.IdentityNakedDefault && m.capResolver != nil {
 		transportID := ""
 		if req != nil && req.Session != nil {
 			transportID = req.Session.ID()
 		}
-		if entry, ok := m.resolveTransportSession(transportID); ok && entry.Subject != "" {
-			if !m.capResolver.CanInvoke(entry.Subject, name) {
-				return fallbackResult(
-					"capability envelope denied: subject "+entry.Subject+" is not permitted to invoke "+name,
-					"",
-				)
-			}
+		entry, ok := m.resolveTransportSession(transportID)
+		if !ok || entry == nil || entry.Subject == "" {
+			return fallbackResult(
+				"capability envelope: cog_tool_invoke requires a resolved session identity when identity-naked gating is enabled; "+
+					"register the transport session (cog_register_session with a subject) before invoking plumbing tool "+name,
+				"",
+			)
+		}
+		if !m.capResolver.CanInvoke(entry.Subject, name) {
+			return fallbackResult(
+				"capability envelope denied: subject "+entry.Subject+" is not permitted to invoke "+name,
+				"",
+			)
 		}
 	}
 
