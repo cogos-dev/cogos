@@ -20,6 +20,23 @@ import (
 // rebuild.
 var ftsMu sync.Mutex
 
+// indexMu serialises whole indexing operations (IndexFile / IndexWorkspace).
+//
+// The connection pool is MaxOpenConns(1), so at most one *statement* runs at a
+// time — but a single indexing operation is a MULTI-statement unit: db.Begin()
+// opens a transaction, indexCogdoc runs several Exec/Query calls, tx.Commit()
+// closes it, and then upsertFTSRow issues its own SAVEPOINT/DELETE/INSERT/RELEASE
+// sequence as autocommit statements. If two IndexFile calls interleave on the
+// single connection, one goroutine's SAVEPOINT (a transaction-control statement)
+// can be issued while another goroutine holds an open db.Begin() transaction on
+// the same connection, producing "cannot start a transaction within a
+// transaction" — a failure that was previously swallowed by a slog.Warn, silently
+// dropping the index update. Holding indexMu for the whole operation makes
+// concurrent IndexFile calls safe and lossless (they serialise instead of
+// racing). ftsMu still guards upsertFTSRow vs. rebuildFTS for callers that hold
+// neither (none today, but the invariant is preserved).
+var indexMu sync.Mutex
+
 // Cogdoc represents a parsed cogdoc with frontmatter and content.
 type Cogdoc struct {
 	ID               string
@@ -47,6 +64,13 @@ type Reference struct {
 
 // IndexWorkspace scans the workspace and indexes all cogdocs.
 func (c *Constellation) IndexWorkspace() error {
+	// Serialise against concurrent IndexFile calls: both open a db.Begin()
+	// transaction on the single-writer connection, and interleaving them
+	// corrupts transaction state (see indexMu). A full rebuild must own the
+	// connection for the duration of its transaction + FTS rebuild.
+	indexMu.Lock()
+	defer indexMu.Unlock()
+
 	tx, err := c.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -100,6 +124,19 @@ func (c *Constellation) IndexWorkspace() error {
 		return fmt.Errorf("failed to walk workspace: %w", err)
 	}
 
+	// Prune ghost rows: cogdoc rows under .cog/mem/ whose backing file no longer
+	// exists on disk. Re-indexing is additive (INSERT OR REPLACE) and never
+	// removes rows for deleted files, so without this sweep a deleted cogdoc's
+	// row (and its FTS entry, tags, refs) persist forever. Scope the sweep to
+	// managed cogdoc paths ('%/.cog/mem/%.cog.md') so non-cogdoc rows indexed
+	// from outside the memory corpus (e.g. conversation/session documents) are
+	// never touched. tags / doc_references / backlinks cascade on delete;
+	// documents_fts is rebuilt from documents below.
+	pruned, err := c.pruneGhostCogdocs(tx)
+	if err != nil {
+		return fmt.Errorf("failed to prune ghost cogdocs: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -128,6 +165,9 @@ func (c *Constellation) IndexWorkspace() error {
 	} else {
 		fmt.Printf("Indexed %d cogdocs\n", indexed)
 	}
+	if pruned > 0 {
+		fmt.Printf("Pruned %d ghost cogdoc rows (files removed from disk)\n", pruned)
+	}
 
 	// Async: trigger embedding backfill if embed client is configured
 	if c.embedClient != nil {
@@ -150,16 +190,80 @@ func (c *Constellation) IndexWorkspace() error {
 	return nil
 }
 
+// pruneGhostCogdocs removes documents rows for managed cogdocs whose backing
+// file no longer exists on disk. It is the stat-based orphan sweep referenced in
+// IndexWorkspace's design note: re-indexing is additive and never deletes rows,
+// so deleted cogdocs would otherwise leave permanent ghost rows in the index.
+//
+// Scope is intentionally narrow: only rows whose path matches
+// '%/.cog/mem/%.cog.md' are candidates, so rows indexed from outside the memory
+// corpus are never removed. Deletes cascade to tags / doc_references / backlinks
+// (schema FKs, ON DELETE CASCADE); the caller rebuilds documents_fts from
+// documents afterward, so no explicit FTS delete is needed here. Returns the
+// number of rows pruned.
+func (c *Constellation) pruneGhostCogdocs(tx *sql.Tx) (int, error) {
+	rows, err := tx.Query(
+		`SELECT id, path FROM documents WHERE path LIKE '%/.cog/mem/%.cog.md'`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("select cogdoc rows: %w", err)
+	}
+
+	type ghost struct {
+		id   string
+		path string
+	}
+	var ghosts []ghost
+	for rows.Next() {
+		var id, path string
+		if err := rows.Scan(&id, &path); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan cogdoc row: %w", err)
+		}
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			ghosts = append(ghosts, ghost{id: id, path: path})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("iterate cogdoc rows: %w", err)
+	}
+	// Close before issuing DELETEs: the single-writer connection cannot run a
+	// mutation while this cursor is still open.
+	rows.Close()
+
+	pruned := 0
+	for _, g := range ghosts {
+		if _, err := tx.Exec("DELETE FROM documents WHERE id = ?", g.id); err != nil {
+			return pruned, fmt.Errorf("delete ghost %s (%s): %w", g.id, g.path, err)
+		}
+		pruned++
+	}
+	return pruned, nil
+}
+
 // IndexFile indexes a single cogdoc file into the constellation.
 // This is the public entry point for incremental indexing (e.g., after
 // a decomposition stores a new CogDoc). It handles its own transaction,
 // FTS rebuild for the affected document, and optional async embedding.
 func (c *Constellation) IndexFile(path string) error {
+	// Serialise the whole operation (tx + commit + FTS upsert) against other
+	// IndexFile / IndexWorkspace callers. On the MaxOpenConns(1) pool an
+	// interleaved SAVEPOINT (from upsertFTSRow) and an open db.Begin() tx on the
+	// same connection otherwise trigger "cannot start a transaction within a
+	// transaction", which was silently swallowed and dropped the index update.
+	indexMu.Lock()
+	defer indexMu.Unlock()
+
 	tx, err := c.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
+	committed := false
 	defer func() {
+		if committed {
+			return
+		}
 		if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
 			fmt.Fprintf(os.Stderr, "Warning: IndexFile rollback: %v\n", err)
 		}
@@ -177,10 +281,12 @@ func (c *Constellation) IndexFile(path string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+	committed = true
 
 	if idErr != nil {
-		// Row absent means indexCogdoc skipped (unchanged hash). FTS already
-		// up-to-date for this document; nothing to do.
+		// Row absent should not happen: indexCogdoc always upserts a row for the
+		// path (even on unchanged-hash it now refreshes file_mtime in place).
+		// Treat as "nothing more to do" rather than an error.
 		return nil
 	}
 
@@ -230,7 +336,18 @@ func (c *Constellation) indexCogdoc(tx *sql.Tx, path string) error {
 	var existingHash string
 	err = tx.QueryRow("SELECT content_hash FROM documents WHERE path = ?", path).Scan(&existingHash)
 	if err == nil && existingHash == contentHash {
-		// Already indexed, no change
+		// Content unchanged, but the file may have been touched (mtime bumped
+		// with identical bytes — e.g. an editor rewrite or `touch`). The stored
+		// file_mtime is the ONLY signal the engine's lazy drift-repair uses to
+		// decide a row is stale; if we return here without refreshing it, the
+		// drift check flags this document as drifted on every search, forever,
+		// and re-indexes it needlessly. Cheaply update the stored mtime so a
+		// touched-but-unchanged file reports no drift on the next pass.
+		if _, uerr := tx.Exec(
+			"UPDATE documents SET file_mtime = ? WHERE path = ?", mtime, path,
+		); uerr != nil {
+			return fmt.Errorf("failed to refresh file_mtime on unchanged doc: %w", uerr)
+		}
 		return nil
 	}
 

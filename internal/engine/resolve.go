@@ -64,8 +64,15 @@ var intentAliases = map[string]ModelResolution{
 	// Other provider aliases.
 	"codex": {PreferProvider: "codex"},
 	// Local/kernel aliases — injectKernelTools tells the gateway to wire tools.
-	"ollama":       {PreferProvider: "ollama", InjectKernelTools: true},
-	"kernel-agent": {PreferProvider: "ollama", InjectKernelTools: true},
+	// Repointed from the decommissioned "ollama" provider to "lmstudio-darkstar"
+	// (the live local backend, per PR #417). On a stock install no "ollama"
+	// provider is registered, so the old value resolved to nothing; the "ollama"
+	// alias key is kept as a convenience spelling that now routes to the live
+	// local provider. Installs that still declare an "ollama" provider in
+	// providers.yaml are unaffected — they select it by its provider name, not
+	// via this alias default.
+	"ollama":       {PreferProvider: "lmstudio-darkstar", InjectKernelTools: true},
+	"kernel-agent": {PreferProvider: "lmstudio-darkstar", InjectKernelTools: true},
 }
 
 // ResolveModelRequest maps a model string to a ModelResolution using the
@@ -80,11 +87,11 @@ var intentAliases = map[string]ModelResolution{
 // above); all other strings are unchanged:
 //
 //	""            → {} (empty, default routing)
-//	"local"       → resolved via router.FirstLocalProvider / ProviderForName("ollama")
+//	"local"       → resolved via router.FirstLocalProvider / ProviderForName("lmstudio-darkstar")
 //	"claude"      → {claude-oauth, ""}
 //	"codex"       → {codex, ""}
-//	"ollama"      → {ollama, "", injectKernelTools}
-//	"kernel-agent"→ {ollama, "", injectKernelTools}
+//	"ollama"      → {lmstudio-darkstar, "", injectKernelTools}
+//	"kernel-agent"→ {lmstudio-darkstar, "", injectKernelTools}
 //	named provider→ {name, ""} (ProviderForName)
 //	model id      → {provider, model} (ProviderForModel + ModelOverride)
 func ResolveModelRequest(router Router, model string, requestID string) ModelResolution {
@@ -96,6 +103,12 @@ func ResolveModelRequest(router Router, model string, requestID string) ModelRes
 	if model == "local" {
 		if router == nil {
 			return ModelResolution{}
+		}
+		// Prefer the live local backend (lmstudio-darkstar, per PR #417); fall
+		// back to a still-declared "ollama" provider for installs that kept it,
+		// then to any registered local provider.
+		if name, ok := router.ProviderForName("lmstudio-darkstar"); ok {
+			return ModelResolution{PreferProvider: name}
 		}
 		if name, ok := router.ProviderForName("ollama"); ok {
 			return ModelResolution{PreferProvider: name}

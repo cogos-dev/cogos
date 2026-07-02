@@ -1,15 +1,17 @@
 // provider_pi.go — PiProvider
 //
 // Implements Provider by spawning `pi -p` subprocesses for local agentic
-// inference. Pi handles the tool loop (read, bash, edit, write) against
-// local models via Ollama, while the kernel handles context assembly.
+// inference. Pi handles the tool loop (read, bash, edit, write) against local
+// models, while the kernel handles context assembly.
 //
 // This is the local counterpart to ClaudeCodeProvider:
 //   - ClaudeCodeProvider: cloud agentic inference (Claude Max via OAuth)
-//   - PiProvider: local agentic inference (Ollama via Pi)
+//   - PiProvider: local agentic inference via Pi
 //
 // The kernel assembles foveated context and injects it via --system-prompt.
-// Pi runs the agent loop. Ollama runs the model.
+// Pi runs the agent loop; the local backend runs the model. The default local
+// backend is LM Studio (lmstudio-darkstar, resident gemma-4-26b at
+// 127.0.0.1:1234) — see PR #417, which decommissioned Ollama as the default.
 //
 // Output: parsed from `--mode json` which emits NDJSON AgentSessionEvents.
 package engine
@@ -25,23 +27,34 @@ import (
 	"time"
 )
 
+// defaultLocalPiProvider is the pi `--provider` value used when a PiProvider
+// config does not specify one. Repointed from "ollama" to "lmstudio" to match
+// the engine's live local backend after PR #417 (Ollama decommissioned).
+const defaultLocalPiProvider = "lmstudio"
+
+// defaultLocalModel is the model used when a PiProvider config does not specify
+// one. The resident local model is google/gemma-4-26b-a4b via LM Studio
+// (lmstudio-darkstar), consistent with defaults/providers.yaml. Repointed from
+// defaultOllamaModel per PR #417.
+const defaultLocalModel = "google/gemma-4-26b-a4b"
+
 // PiProvider implements Provider by spawning pi CLI processes.
 type PiProvider struct {
-	name      string
-	provider  string // ollama, openrouter, etc.
-	model     string // gemma4:e4b, gemma4:e2b, etc.
-	thinking  string // off, minimal, low, medium, high, xhigh
-	timeout   time.Duration
-	piBinary  string // path to pi binary (default: "pi")
-	tools     string // comma-separated tools (default: "read,bash,edit,write")
-	procMgr   *ProcessManager
+	name     string
+	provider string // lmstudio, openrouter, etc.
+	model    string // e.g. google/gemma-4-26b-a4b
+	thinking string // off, minimal, low, medium, high, xhigh
+	timeout  time.Duration
+	piBinary string // path to pi binary (default: "pi")
+	tools    string // comma-separated tools (default: "read,bash,edit,write")
+	procMgr  *ProcessManager
 }
 
 // NewPiProvider creates a PiProvider from a ProviderConfig.
 func NewPiProvider(name string, cfg ProviderConfig, procMgr *ProcessManager) *PiProvider {
 	model := cfg.Model
 	if model == "" {
-		model = defaultOllamaModel
+		model = defaultLocalModel
 	}
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	if timeout == 0 {
@@ -52,7 +65,7 @@ func NewPiProvider(name string, cfg ProviderConfig, procMgr *ProcessManager) *Pi
 		binary = cfg.Endpoint
 	}
 
-	provider := "ollama"
+	provider := defaultLocalPiProvider
 	thinking := "off"
 	tools := "read,bash,edit,write"
 

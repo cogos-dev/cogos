@@ -119,9 +119,11 @@ func TestResolveModelRequest_Codex(t *testing.T) {
 
 func TestResolveModelRequest_OllamaInjectTools(t *testing.T) {
 	t.Parallel()
+	// The "ollama" alias is a convenience spelling that now routes to the live
+	// local backend (lmstudio-darkstar) after PR #417 decommissioned Ollama.
 	res := ResolveModelRequest(nil, "ollama", "req-3")
-	if res.PreferProvider != "ollama" {
-		t.Errorf("ollama: PreferProvider = %q; want ollama", res.PreferProvider)
+	if res.PreferProvider != "lmstudio-darkstar" {
+		t.Errorf("ollama: PreferProvider = %q; want lmstudio-darkstar", res.PreferProvider)
 	}
 	if !res.InjectKernelTools {
 		t.Error("ollama: InjectKernelTools should be true")
@@ -131,16 +133,31 @@ func TestResolveModelRequest_OllamaInjectTools(t *testing.T) {
 func TestResolveModelRequest_KernelAgentInjectTools(t *testing.T) {
 	t.Parallel()
 	res := ResolveModelRequest(nil, "kernel-agent", "req-4")
-	if res.PreferProvider != "ollama" {
-		t.Errorf("kernel-agent: PreferProvider = %q; want ollama", res.PreferProvider)
+	if res.PreferProvider != "lmstudio-darkstar" {
+		t.Errorf("kernel-agent: PreferProvider = %q; want lmstudio-darkstar", res.PreferProvider)
 	}
 	if !res.InjectKernelTools {
 		t.Error("kernel-agent: InjectKernelTools should be true")
 	}
 }
 
+func TestResolveModelRequest_Local_PrefersLMStudioDarkstar(t *testing.T) {
+	t.Parallel()
+	// When both the live default (lmstudio-darkstar) and a legacy "ollama"
+	// provider are registered, "local" must prefer lmstudio-darkstar.
+	r := newStubRouter().
+		addProvider("lmstudio-darkstar", "", true).
+		addProvider("ollama", "", true)
+	res := ResolveModelRequest(r, "local", "req-5b")
+	if res.PreferProvider != "lmstudio-darkstar" {
+		t.Errorf("local: PreferProvider = %q; want lmstudio-darkstar", res.PreferProvider)
+	}
+}
+
 func TestResolveModelRequest_Local_WithOllama(t *testing.T) {
 	t.Parallel()
+	// An install that still declares an "ollama" provider (no lmstudio-darkstar)
+	// keeps its behavior: "local" falls back to it.
 	r := newStubRouter().addProvider("ollama", "", true)
 	res := ResolveModelRequest(r, "local", "req-5")
 	if res.PreferProvider != "ollama" {

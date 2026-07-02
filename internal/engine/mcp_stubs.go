@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -70,6 +71,13 @@ func searchMemoryFTSDriftRepair(workspaceRoot string) {
 		wideThresh  = 10 // more than this many drifted rows → skip inline repair
 	)
 
+	// Budget bounds the whole repair pass. It is checked upfront and again
+	// between IndexFile calls (the only points at which we can cheaply yield —
+	// a single IndexFile is not internally time-sliceable). Establishing the
+	// deadline before any I/O means a hot search path that is already over
+	// budget from prior work does no scanning at all.
+	deadline := time.Now().Add(budgetMs * time.Millisecond)
+
 	dbPath := filepath.Join(workspaceRoot, ".cog", ".state", "constellation.db")
 	db, err := sql.Open("sqlite3", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=3000")
 	if err != nil {
@@ -77,10 +85,15 @@ func searchMemoryFTSDriftRepair(workspaceRoot string) {
 	}
 	defer db.Close()
 
-	// Sample recent documents, fetching path + stored mtime.
+	// Sample recent documents, fetching path + stored mtime + stored content
+	// hash. Scope the sample to the managed memory corpus ('%/.cog/mem/%') so
+	// it is symmetric with the mem_watcher (which only watches .cog/mem/) — a
+	// row indexed from outside the corpus is not something this lazy path can
+	// or should repair. content_hash is fetched for the equal-second tiebreak
+	// below.
 	rows, err := db.Query(
-		`SELECT path, file_mtime FROM documents
-		 WHERE path NOT LIKE '%.state/%'
+		`SELECT path, file_mtime, content_hash FROM documents
+		 WHERE path LIKE '%/.cog/mem/%'
 		 ORDER BY indexed_at DESC LIMIT ?`, sampleLimit,
 	)
 	if err != nil {
@@ -94,16 +107,27 @@ func searchMemoryFTSDriftRepair(workspaceRoot string) {
 	}
 	var drifted []entry
 	for rows.Next() {
-		var path, storedMtime string
-		if err := rows.Scan(&path, &storedMtime); err != nil {
+		var path, storedMtime, storedHash string
+		if err := rows.Scan(&path, &storedMtime, &storedHash); err != nil {
 			continue
 		}
 		info, statErr := os.Stat(path)
 		if statErr != nil {
-			continue // file removed — not a drift case for FTS
+			continue // file removed — not a drift case for FTS (prune handles it)
 		}
 		diskMtime := info.ModTime().Format(time.RFC3339)
 		if diskMtime != storedMtime {
+			drifted = append(drifted, entry{path: path, mtime: diskMtime})
+			continue
+		}
+		// Equal RFC3339 second: file_mtime is second-granular, so a file
+		// rewritten within the same wall-clock second as the last index reads
+		// as "unchanged" here — a false negative. Break the tie with a content
+		// hash: read the raw file, extract the cogdoc body the same way the
+		// indexer does, and compare its SHA-256 to the stored content_hash.
+		// Only runs on the (rare) equal-second case, so the extra read is not
+		// on the common path.
+		if h, ok := cogdocBodyHash(path); ok && h != storedHash {
 			drifted = append(drifted, entry{path: path, mtime: diskMtime})
 		}
 	}
@@ -120,7 +144,6 @@ func searchMemoryFTSDriftRepair(workspaceRoot string) {
 
 	// Repair drifted entries via the wired indexer handle.
 	// Budget: ~200ms total across all repairs; abort remaining on timeout.
-	deadline := time.Now().Add(budgetMs * time.Millisecond)
 	for _, e := range drifted {
 		if time.Now().After(deadline) {
 			break
@@ -129,6 +152,28 @@ func searchMemoryFTSDriftRepair(workspaceRoot string) {
 			slog.Warn("constellation: drift repair failed", "path", e.path, "err", err)
 		}
 	}
+}
+
+// cogdocBodyHash reads the cogdoc at path and returns the SHA-256 hex of its
+// body content, computed identically to the constellation indexer
+// (content = TrimSpace of everything after the second "---" delimiter, hashed
+// as sha256(content)). Returns ("", false) if the file cannot be read or does
+// not have the expected frontmatter delimiters. It is used only for the
+// equal-second mtime tiebreak in drift repair, so it deliberately mirrors the
+// indexer's parse-content rule without importing sdk/constellation
+// (package-boundary guard).
+func cogdocBodyHash(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	parts := strings.SplitN(string(data), "---", 3)
+	if len(parts) < 3 {
+		return "", false
+	}
+	content := strings.TrimSpace(parts[2])
+	sum := sha256.Sum256([]byte(content))
+	return fmt.Sprintf("%x", sum), true
 }
 
 // searchMemoryFTS queries the constellation SQLite FTS5 index for matching documents.
