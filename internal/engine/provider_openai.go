@@ -60,7 +60,17 @@ func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvi
 	endpoint := resolveLocalLLMEndpoint(cfg.Endpoint)
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	if timeout == 0 {
-		timeout = 60 * time.Second
+		// #432: a fixed ceiling below realistic local latency is an
+		// infinite-retry engine — local models under concurrent-slot prefill
+		// load observed 2-4 min single-turn latency in the incident that
+		// closed this issue. The previous 60s fallback here silently
+		// under-timed any provider config that omitted `timeout:`, so a
+		// caller relying on the default would hit the same abandon-and-retry
+		// failure mode as the (now-fixed) 30s dispatch default in
+		// agent_dispatch_query.go. Match that default so both ceilings agree
+		// absent explicit config; providers.yaml's committed defaults
+		// (lmstudio-darkstar: 300s) remain the recommended explicit value.
+		timeout = time.Duration(dispatchTimeoutDefault) * time.Second
 	}
 	maxTokens := cfg.MaxTokens
 	if maxTokens == 0 {
@@ -465,6 +475,113 @@ func (p *OpenAICompatProvider) Complete(ctx context.Context, req *CompletionRequ
 	}
 
 	return parseOpenAIResponse(&or, model, p.name, time.Since(start)), nil
+}
+
+// CompleteCancelSafe is like Complete but propagates ctx-cancellation to the
+// server by routing the request through Stream and aggregating the resulting
+// chunks into a single CompletionResponse.
+//
+// Background (#432): a plain non-streaming /v1/chat/completions request that
+// the kernel abandons (ctx cancel/timeout) does NOT reliably cause LM Studio
+// (or other openai-compat servers) to abort generation server-side — the
+// local http.Client gives up waiting for a response, but the TCP connection
+// isn't torn down in time for the server to notice, so the model keeps
+// generating headless in one of the server's parallel slots (confirmed via
+// TestOpenAICompleteHTTPError's sibling probe: a canceled Complete() request
+// leaves the server-side context alive). A streaming request's body-read loop
+// is actively selecting on the connection, so client disconnection propagates
+// immediately and the server aborts generation (confirmed clean shutdown in
+// the 2026-07-04 incident for every request using chat_completion_stream_request/
+// Stream()). Callers that need cancel-safety without changing their call
+// shape (internal non-interactive consults, dispatch, tool-loop re-calls)
+// should call this instead of Complete.
+func (p *OpenAICompatProvider) CompleteCancelSafe(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
+	start := time.Now()
+	model := p.effectiveModel(req)
+
+	ch, err := p.Stream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		content          strings.Builder
+		reasoningContent strings.Builder
+		toolCalls        []ToolCall
+		toolCallsByIndex = map[int]*ToolCall{}
+		toolCallOrder    []int
+		stopReason       string
+		usage            TokenUsage
+		streamErr        error
+	)
+
+	for chunk := range ch {
+		if chunk.Error != nil {
+			streamErr = chunk.Error
+			continue
+		}
+		if chunk.IsReasoning {
+			reasoningContent.WriteString(chunk.Delta)
+		} else if chunk.Delta != "" {
+			content.WriteString(chunk.Delta)
+		}
+		if chunk.ToolCallDelta != nil {
+			td := chunk.ToolCallDelta
+			tc, ok := toolCallsByIndex[td.Index]
+			if !ok {
+				tc = &ToolCall{}
+				toolCallsByIndex[td.Index] = tc
+				toolCallOrder = append(toolCallOrder, td.Index)
+			}
+			if td.ID != "" {
+				tc.ID = td.ID
+			}
+			if td.Name != "" {
+				tc.Name = td.Name
+			}
+			if td.ArgsDelta != "" {
+				tc.Arguments += td.ArgsDelta
+			}
+		}
+		if chunk.Done {
+			if chunk.StopReason != "" {
+				stopReason = chunk.StopReason
+			}
+			if chunk.Usage != nil {
+				usage = *chunk.Usage
+			}
+		}
+	}
+
+	// If the context was canceled mid-stream, report that rather than a
+	// partial/empty success — callers (assessCycle, dispatch, tool loop)
+	// treat a cancel-safe error identically to a Complete() error.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("openai-compat: cancel-safe complete: %w", ctxErr)
+	}
+	if streamErr != nil {
+		return nil, fmt.Errorf("openai-compat: cancel-safe complete: %w", streamErr)
+	}
+
+	for _, idx := range toolCallOrder {
+		toolCalls = append(toolCalls, *toolCallsByIndex[idx])
+	}
+	if stopReason == "" {
+		stopReason = "end_turn"
+	}
+
+	return &CompletionResponse{
+		Content:          content.String(),
+		ReasoningContent: reasoningContent.String(),
+		ToolCalls:        toolCalls,
+		StopReason:       stopReason,
+		Usage:            usage,
+		ProviderMeta: ProviderMeta{
+			Provider: p.name,
+			Model:    model,
+			Latency:  time.Since(start),
+		},
+	}, nil
 }
 
 // parseOpenAIResponse converts an openaiChatResponse into a provider-agnostic

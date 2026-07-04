@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1049,5 +1050,240 @@ func TestNewOpenAICompatProviderNoDefaultOptions(t *testing.T) {
 	})
 	if p.defaultOptions != nil {
 		t.Errorf("defaultOptions should be nil when not configured; got %v", p.defaultOptions)
+	}
+}
+
+// ── CompleteCancelSafe / cancellation propagation (#432) ────────────────────
+
+// TestOpenAICompleteDoesNotPropagateCancelToServer is a regression probe that
+// documents the #432 defect this fix closes: a plain non-streaming Complete()
+// request that the client abandons via ctx cancel does NOT reliably cause the
+// server to observe the cancellation within a bounded window. This is the
+// exact "kernel gives up, LM Studio keeps generating headless" failure mode
+// from the incident forensics. The test asserts the (undesirable) status quo
+// for Complete() specifically so a future change to Complete()'s transport
+// behavior is caught here rather than silently reintroducing the zombie
+// class; CompleteCancelSafe (tested below) is the supported fix.
+func TestOpenAICompleteDoesNotPropagateCancelToServer(t *testing.T) {
+	t.Parallel()
+	closed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+			close(closed)
+		case <-time.After(3 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "m")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	_, _ = p.Complete(ctx, &CompletionRequest{Messages: []ProviderMessage{{Role: "user", Content: "hi"}}})
+
+	select {
+	case <-closed:
+		t.Fatal("Complete() propagated cancellation to the server — if this now passes, the non-streaming transport behavior changed and CompleteCancelSafe's rationale comment should be revisited")
+	case <-time.After(500 * time.Millisecond):
+		// Expected: server never saw the cancellation within a short window.
+	}
+}
+
+// TestOpenAICompleteCancelSafePropagatesToServer is the core #432 regression
+// test: CompleteCancelSafe must cause the server to observe ctx cancellation
+// (connection closes) so an abandoned generation actually aborts server-side
+// instead of running headless.
+func TestOpenAICompleteCancelSafePropagatesToServer(t *testing.T) {
+	t.Parallel()
+	closed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		chunk := openaiStreamChunk{
+			ID:      "chatcmpl-1",
+			Choices: []openaiStreamChoice{{Index: 0, Delta: openaiStreamDelta{Content: "partial"}}},
+		}
+		b, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		flusher.Flush()
+		select {
+		case <-r.Context().Done():
+			close(closed)
+		case <-time.After(3 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "m")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	_, err := p.CompleteCancelSafe(ctx, &CompletionRequest{Messages: []ProviderMessage{{Role: "user", Content: "hi"}}})
+	if err == nil {
+		t.Error("expected an error from CompleteCancelSafe when ctx is canceled mid-stream")
+	}
+
+	select {
+	case <-closed:
+		// Expected: the server observed the cancellation (connection closed).
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never observed ctx cancellation within 2s — CompleteCancelSafe did not propagate cancellation")
+	}
+}
+
+// TestOpenAICompleteCancelSafeAggregatesContent verifies the happy path:
+// CompleteCancelSafe must aggregate streamed deltas (text, reasoning, tool
+// calls, usage, stop reason) into the same shape Complete() would have
+// returned, since callers switching from Complete to CompleteCancelSafe
+// must see no behavioral difference beyond cancellation semantics.
+func TestOpenAICompleteCancelSafeAggregatesContent(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload openaiChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !payload.Stream {
+			http.Error(w, "expected stream:true from CompleteCancelSafe", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for _, delta := range []string{"Hel", "lo", "!"} {
+			chunk := openaiStreamChunk{Choices: []openaiStreamChoice{{Index: 0, Delta: openaiStreamDelta{Content: delta}}}}
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		}
+		stop := "stop"
+		final := openaiStreamChunk{
+			Choices: []openaiStreamChoice{{Index: 0, Delta: openaiStreamDelta{}, FinishReason: &stop}},
+			Usage:   &openaiUsageResponse{PromptTokens: 7, CompletionTokens: 3, TotalTokens: 10},
+		}
+		b, _ := json.Marshal(final)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "test-model")
+	resp, err := p.CompleteCancelSafe(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("CompleteCancelSafe: %v", err)
+	}
+	if resp.Content != "Hello!" {
+		t.Errorf("Content = %q; want Hello!", resp.Content)
+	}
+	if resp.StopReason != "end_turn" {
+		t.Errorf("StopReason = %q; want end_turn", resp.StopReason)
+	}
+	if resp.Usage.InputTokens != 7 || resp.Usage.OutputTokens != 3 {
+		t.Errorf("Usage = %+v; want {7, 3}", resp.Usage)
+	}
+	if resp.ProviderMeta.Provider != "openai-compat" {
+		t.Errorf("ProviderMeta.Provider = %q; want openai-compat", resp.ProviderMeta.Provider)
+	}
+}
+
+// TestOpenAICompleteCancelSafeSurfacesStreamError verifies that a mid-stream
+// error is surfaced as an error from CompleteCancelSafe rather than silently
+// returning a partial/empty success.
+func TestOpenAICompleteCancelSafeSurfacesStreamError(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, "data: {not valid json\n\n")
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "m")
+	_, err := p.CompleteCancelSafe(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Error("expected error from malformed SSE chunk")
+	}
+}
+
+// TestCompleteCancelSafeIfSupportedUsesCancelSafeForOpenAICompat verifies the
+// dispatch helper routes to CompleteCancelSafe when the provider implements
+// CancelSafeCompleter.
+func TestCompleteCancelSafeIfSupportedUsesCancelSafeForOpenAICompat(t *testing.T) {
+	t.Parallel()
+	var sawStream bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload openaiChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		sawStream = payload.Stream
+		if payload.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+		_ = json.NewEncoder(w).Encode(openaiChatResponseJSON("non-stream", "stop"))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "m")
+	_, err := CompleteCancelSafeIfSupported(context.Background(), p, &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("CompleteCancelSafeIfSupported: %v", err)
+	}
+	if !sawStream {
+		t.Error("CompleteCancelSafeIfSupported did not route an *OpenAICompatProvider through the streaming (cancel-safe) path")
+	}
+}
+
+// stubProviderNoCancelSafe is a minimal Provider that does NOT implement
+// CancelSafeCompleter, used to verify CompleteCancelSafeIfSupported falls
+// back to plain Complete for providers outside the #432 fix's scope.
+type stubProviderNoCancelSafe struct {
+	completeCalled bool
+}
+
+func (s *stubProviderNoCancelSafe) Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
+	s.completeCalled = true
+	return &CompletionResponse{Content: "stub"}, nil
+}
+func (s *stubProviderNoCancelSafe) Stream(ctx context.Context, req *CompletionRequest) (<-chan StreamChunk, error) {
+	ch := make(chan StreamChunk)
+	close(ch)
+	return ch, nil
+}
+func (s *stubProviderNoCancelSafe) Name() string                       { return "stub" }
+func (s *stubProviderNoCancelSafe) Model() string                      { return "stub-model" }
+func (s *stubProviderNoCancelSafe) Available(ctx context.Context) bool { return true }
+func (s *stubProviderNoCancelSafe) Capabilities() ProviderCapabilities { return ProviderCapabilities{} }
+func (s *stubProviderNoCancelSafe) Ping(ctx context.Context) (time.Duration, error) {
+	return 0, nil
+}
+
+func TestCompleteCancelSafeIfSupportedFallsBackForPlainProvider(t *testing.T) {
+	t.Parallel()
+	s := &stubProviderNoCancelSafe{}
+	resp, err := CompleteCancelSafeIfSupported(context.Background(), s, &CompletionRequest{})
+	if err != nil {
+		t.Fatalf("CompleteCancelSafeIfSupported: %v", err)
+	}
+	if !s.completeCalled {
+		t.Error("expected fallback to Complete() for a provider that does not implement CancelSafeCompleter")
+	}
+	if resp.Content != "stub" {
+		t.Errorf("Content = %q; want stub", resp.Content)
 	}
 }

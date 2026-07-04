@@ -10,10 +10,21 @@ import (
 )
 
 // dispatchTimeoutDefault is the per-slot wall-clock budget when the caller
-// passed 0 or omitted the field. 30s comfortably covers the resident E4B's
-// 10-turn worst case at ~3s/turn while staying well under the
-// h.httpClient.Timeout (180s) so the inner HTTP call is the actual cap.
-const dispatchTimeoutDefault = 30
+// passed 0 or omitted the field.
+//
+// #432 forensics: the prior value here was 30s, sized for the resident E4B's
+// 10-turn worst case at ~3s/turn. That assumption broke once larger local
+// models joined the resident mix (Ornith 35B, gemma under concurrent-slot
+// prefill load per #430/#432) — real single-turn latency under load runs
+// 2-4 minutes, so a 30s ceiling canceled every such request client-side while
+// LM Studio kept generating server-side (non-streaming completions don't
+// abort on client cancel — see CompleteCancelSafeIfSupported/provider_openai.go),
+// and the retry that followed stacked a second zombie generation on top.
+// 240s covers the observed 2-4 min realistic worst case with headroom while
+// staying under dispatchTimeoutMax (300s) and h.httpClient.Timeout (which
+// providers.yaml should set to at least this value for local endpoints —
+// see NewOpenAICompatProvider's timeout resolution).
+const dispatchTimeoutDefault = 240
 
 // dispatchTimeoutMax caps the per-slot budget. 300s accommodates cold-start
 // load of larger local models (gemma4:e4b at ~110s on M4 Pro) plus the

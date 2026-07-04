@@ -9,6 +9,7 @@ package engine
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,4 +96,26 @@ func mustLoadNucleus(t *testing.T, cfg *Config) *Nucleus {
 		t.Fatalf("LoadNucleus: %v", err)
 	}
 	return n
+}
+
+// writeSSECompletion writes a minimal one-chunk openai-compat SSE response
+// carrying content as the full assistant message, followed by a terminal
+// [DONE] sentinel. Used by mock /v1/chat/completions handlers that need to
+// honor stream:true requests (#432: internal call sites now route
+// non-interactive completions through CompleteCancelSafe, which always
+// requests streaming — a mock that ignores `stream` and always returns a
+// plain JSON body silently produces an empty response for these callers).
+func writeSSECompletion(t *testing.T, w http.ResponseWriter, content string) {
+	t.Helper()
+	w.Header().Set("Content-Type", "text/event-stream")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		t.Fatalf("writeSSECompletion: ResponseWriter does not support flushing")
+	}
+	fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":%q}}]}\n\n", content)
+	flusher.Flush()
+	fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n")
+	flusher.Flush()
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }

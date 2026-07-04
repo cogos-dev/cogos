@@ -499,9 +499,14 @@ func RunToolLoopWithTranscript(
 					Content: fmt.Sprintf("Tool call rejected: %s. Please try again with valid parameters.", rejected[0].Reason),
 				})
 
+				// Cancel-safe (#432): re-calls mid-loop share the same
+				// server-side zombie-generation risk as the initial call —
+				// route through streaming when the provider supports it so a
+				// ctx cancel/timeout here also aborts generation server-side.
 				var err error
-				resp, err = provider.Complete(ctx, req)
+				resp, err = CompleteCancelSafeIfSupported(ctx, provider, req)
 				if err != nil {
+					recordAbandonedInference("tool-loop-rejection-recall", req.Metadata.RequestID, err)
 					return nil, clientToolCalls, transcript, fmt.Errorf("tool_loop re-call after rejection: %w", err)
 				}
 
@@ -610,10 +615,12 @@ func RunToolLoopWithTranscript(
 			return resp, clientToolCalls, transcript, nil
 		}
 
-		// Re-call the provider with the updated messages.
+		// Re-call the provider with the updated messages. Cancel-safe (#432):
+		// see the rejection re-call above for rationale.
 		var err error
-		resp, err = provider.Complete(ctx, req)
+		resp, err = CompleteCancelSafeIfSupported(ctx, provider, req)
 		if err != nil {
+			recordAbandonedInference("tool-loop-recall", req.Metadata.RequestID, err)
 			return nil, clientToolCalls, transcript, fmt.Errorf("tool_loop re-call: %w", err)
 		}
 

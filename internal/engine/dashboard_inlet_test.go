@@ -295,33 +295,36 @@ func TestDashboardInletFallbackFires(t *testing.T) {
 			})
 		case "/v1/chat/completions":
 			seq := callSeq.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			switch seq {
-			case 1:
-				// Assess: observe action (not respond) — agent will not call respond tool.
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"choices": []map[string]any{{
-						"message": map[string]any{
-							"role":    "assistant",
-							"content": `{"action":"observe","reason":"checking field state","urgency":0.3,"target":"memory","task":"scan recent events"}`,
-						},
-						"finish_reason": "stop",
-					}},
-					"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 20},
-				})
-			default:
-				// Execute: returns plain text, no tool calls.
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"choices": []map[string]any{{
-						"message": map[string]any{
-							"role":    "assistant",
-							"content": fmt.Sprintf("observation complete for cycle %d", seq),
-						},
-						"finish_reason": "stop",
-					}},
-					"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 10},
-				})
+			// #432: assessCycle/executeCycleTaskWithPrompt route through
+			// CompleteCancelSafe (Stream under the hood) now, so honor the
+			// request's stream field like a real openai-compat server.
+			var body struct {
+				Stream bool `json:"stream"`
 			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			var content string
+			if seq == 1 {
+				// Assess: observe action (not respond) — agent will not call respond tool.
+				content = `{"action":"observe","reason":"checking field state","urgency":0.3,"target":"memory","task":"scan recent events"}`
+			} else {
+				// Execute: returns plain text, no tool calls.
+				content = fmt.Sprintf("observation complete for cycle %d", seq)
+			}
+			if body.Stream {
+				writeSSECompletion(t, w, content)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": content,
+					},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 20},
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

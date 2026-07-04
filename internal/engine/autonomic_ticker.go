@@ -40,9 +40,9 @@ import (
 // avoid log spam. Recovery (a successful reconcile) resets the counter.
 var (
 	healBackoffMu      sync.Mutex
-	healBackoffFails   = map[string]int{}    // consecutive failure count per provider
-	healBackoffSkipsAt = map[string]int{}    // tick count at which backoff expires
-	healTickCount      int                   // monotonic tick counter
+	healBackoffFails   = map[string]int{} // consecutive failure count per provider
+	healBackoffSkipsAt = map[string]int{} // tick count at which backoff expires
+	healTickCount      int                // monotonic tick counter
 )
 
 const (
@@ -73,9 +73,20 @@ const defaultIdleRecheckIn = 1 * time.Hour
 
 // KernelHealthSnapshot is the aggregate view produced each tick.
 type KernelHealthSnapshot struct {
-	Timestamp time.Time                         `json:"timestamp"`
+	Timestamp time.Time                           `json:"timestamp"`
 	Providers map[string]reconcile.ResourceStatus `json:"providers"`
-	Counts    HealthCounts                      `json:"counts"`
+	Counts    HealthCounts                        `json:"counts"`
+	// Anomalies is the count of abandoned/canceled internal inference calls
+	// (#432) observed since the previous tick. Distinct from the per-provider
+	// Health buckets below: a canceled inference is a control-loop event, not
+	// a provider health state, but the incident this closes ran with vitals
+	// reading 0anom for hours because nothing folded the WARN-logged
+	// cancellations into a counted, tick-visible signal. Zero on a tick where
+	// nothing was abandoned.
+	Anomalies int `json:"anomalies"`
+	// AnomaliesTotal is the cumulative count since process start, carried for
+	// post-hoc audit alongside the per-tick delta above.
+	AnomaliesTotal int64 `json:"anomalies_total"`
 }
 
 // HealthCounts is the four-bucket summary.
@@ -86,11 +97,15 @@ type HealthCounts struct {
 	Suspended int `json:"suspended"`
 }
 
-// AllGreen reports whether every provider is Synced/Healthy/(Idle or empty).
-// A snapshot with zero providers is considered green — the ticker should only
-// escalate when something is observably wrong, not when the registry is empty.
+// AllGreen reports whether every provider is Synced/Healthy/(Idle or empty)
+// AND no inference was abandoned/canceled this tick. A snapshot with zero
+// providers is considered green on the provider axis — the ticker should
+// only escalate when something is observably wrong, not when the registry
+// is empty. Anomalies still gate green even with zero providers: #432's
+// incident is exactly "provider health looked fine, requests were dying
+// unnoticed."
 func (s KernelHealthSnapshot) AllGreen() bool {
-	return s.Counts.Degraded == 0 && s.Counts.Missing == 0 && s.Counts.Suspended == 0
+	return s.Counts.Degraded == 0 && s.Counts.Missing == 0 && s.Counts.Suspended == 0 && s.Anomalies == 0
 }
 
 // HasOperationInProgress reports whether any provider is currently running an
@@ -147,6 +162,14 @@ func buildKernelHealthSnapshot(ctx context.Context) KernelHealthSnapshot {
 		Providers: make(map[string]reconcile.ResourceStatus),
 	}
 
+	// Fold abandoned/canceled inference (#432) into every snapshot,
+	// regardless of provider registry state — this is a control-loop signal,
+	// not a per-provider one, and must not be skipped by the empty-registry
+	// early return below.
+	total, delta := abandonedInferenceSnapshot()
+	snap.Anomalies = int(delta)
+	snap.AnomaliesTotal = total
+
 	names := reconcile.ListProviders()
 	if len(names) == 0 {
 		return snap
@@ -176,10 +199,11 @@ func buildKernelHealthSnapshot(ctx context.Context) KernelHealthSnapshot {
 type escalationReason string
 
 const (
-	escalateDegradedHealth   escalationReason = "degraded_health"
-	escalateOutOfSync        escalationReason = "out_of_sync"
-	escalateExplicitTrigger  escalationReason = "explicit_trigger"
-	escalateIdleRecheckIn    escalationReason = "idle_recheckin"
+	escalateDegradedHealth     escalationReason = "degraded_health"
+	escalateAbandonedInference escalationReason = "abandoned_inference"
+	escalateOutOfSync          escalationReason = "out_of_sync"
+	escalateExplicitTrigger    escalationReason = "explicit_trigger"
+	escalateIdleRecheckIn      escalationReason = "idle_recheckin"
 )
 
 // shouldEscalate returns a non-empty reason if the tick should route to the
@@ -187,7 +211,15 @@ const (
 // work. triggerPending is true when an external TriggerAgent call has been
 // queued; lastLLMCycle is the wall-clock time the last LLM cycle ran.
 func shouldEscalate(snap KernelHealthSnapshot, triggerPending bool, lastLLMCycle time.Time, cfg AutonomicConfig) escalationReason {
-	// Health degradation is the highest-priority signal.
+	// Abandoned/canceled inference (#432) is reported distinctly from
+	// provider-health degradation even though both fail AllGreen() — it's a
+	// control-loop event (a request the kernel gave up on), not a provider
+	// reporting itself unhealthy, and the two want different operator/agent
+	// framing in logs and dedupe fingerprints.
+	if snap.Anomalies > 0 {
+		return escalateAbandonedInference
+	}
+	// Health degradation is the next-highest-priority signal.
 	if !snap.AllGreen() {
 		return escalateDegradedHealth
 	}

@@ -623,6 +623,8 @@ func (c *LocalHarnessController) autonomicTick(ctx context.Context) {
 		"providers", len(snap.Providers),
 		"degraded", snap.Counts.Degraded,
 		"missing", snap.Counts.Missing,
+		"anomalies", snap.Anomalies,
+		"anomalies_total", snap.AnomaliesTotal,
 	)
 	c.tryStartCycle(string(reason), 0, nil)
 
@@ -858,7 +860,18 @@ func (c *LocalHarnessController) finishCycle(record localHarnessCycleRecord) {
 
 func (c *LocalHarnessController) assessCycle(ctx context.Context, provider Provider, observation string) (*localHarnessAssessment, error) {
 	temp := 0.0
-	resp, err := provider.Complete(ctx, &CompletionRequest{
+	requestID := fmt.Sprintf("local-harness-assess-%d", time.Now().UnixNano())
+	// Cancel-safe (#432): this is the hourly/degraded-health autonomic consult
+	// path identified as the "Generated prediction" (non-streaming)
+	// zombie-capable class. Route through streaming so a ctx cancel/timeout
+	// actually aborts generation server-side instead of running headless.
+	// Track the request as in-flight for the duration of the call so a
+	// resubmit racing this one is refused (retry dedup, #432 item d).
+	if !beginInflightInference(requestID) {
+		return nil, fmt.Errorf("local-harness: assess request %s already in flight", requestID)
+	}
+	defer endInflightInference(requestID)
+	resp, err := CompleteCancelSafeIfSupported(ctx, provider, &CompletionRequest{
 		SystemPrompt: localHarnessAssessPrompt,
 		Messages: []ProviderMessage{
 			{Role: "user", Content: observation},
@@ -866,12 +879,13 @@ func (c *LocalHarnessController) assessCycle(ctx context.Context, provider Provi
 		MaxTokens:   localHarnessAssessMaxToks,
 		Temperature: &temp,
 		Metadata: RequestMetadata{
-			RequestID:   fmt.Sprintf("local-harness-assess-%d", time.Now().UnixNano()),
+			RequestID:   requestID,
 			PreferLocal: true,
 			Source:      "local-harness",
 		},
 	})
 	if err != nil {
+		recordAbandonedInference("local-harness-assess", requestID, err)
 		return nil, err
 	}
 
@@ -1807,8 +1821,23 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 }
 
 func (c *LocalHarnessController) completeWithToolLoop(ctx context.Context, provider Provider, req *CompletionRequest, registry *KernelToolRegistry) (*CompletionResponse, []ToolCall, []ToolCallRecord, error) {
-	resp, err := provider.Complete(ctx, req)
+	requestID := req.Metadata.RequestID
+	// Cancel-safe + dedup (#432): dispatch is the other non-interactive,
+	// non-streaming call site the incident identified. Refuse to start a
+	// second attempt under the same content-stable request identity while a
+	// prior one may still be generating server-side (retry discipline, #432
+	// item d); the content-stable RequestID (sha256 of prompt+task+tools,
+	// see dispatchSlot) means a genuine resubmit of the same work collides
+	// here rather than stacking a second server-side generation.
+	if requestID != "" && !beginInflightInference(requestID) {
+		return nil, nil, nil, fmt.Errorf("local-harness: dispatch request %s already in flight", requestID)
+	}
+	if requestID != "" {
+		defer endInflightInference(requestID)
+	}
+	resp, err := CompleteCancelSafeIfSupported(ctx, provider, req)
 	if err != nil {
+		recordAbandonedInference("local-harness-dispatch", requestID, err)
 		return nil, nil, nil, err
 	}
 	if len(resp.ToolCalls) == 0 {
@@ -1825,6 +1854,21 @@ type countingProvider struct {
 func (p *countingProvider) Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
 	p.completeCalls.Add(1)
 	return p.Provider.Complete(ctx, req)
+}
+
+// CompleteCancelSafe delegates to the embedded provider's CompleteCancelSafe
+// when it implements CancelSafeCompleter. Required so CompleteCancelSafeIfSupported
+// (#432) can still route dispatch calls through the cancel-safe path:
+// countingProvider embeds Provider (the interface), and Go only promotes
+// methods declared on that static interface type — CompleteCancelSafe isn't
+// one of them, so without this override a *countingProvider wrapping a
+// cancel-safe-capable *OpenAICompatProvider would silently fall back to
+// plain Complete, reintroducing the zombie-generation risk specifically on
+// the dispatch path (dispatchSlot always wraps its provider in
+// countingProvider to track turn counts).
+func (p *countingProvider) CompleteCancelSafe(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
+	p.completeCalls.Add(1)
+	return CompleteCancelSafeIfSupported(ctx, p.Provider, req)
 }
 
 func (p *countingProvider) CompleteCalls() int {

@@ -1363,12 +1363,19 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 	var pt chatPhaseTimings
 	pt.promptEvalStart = time.Now()
 
-	resp, err := provider.Complete(ctx, req)
+	// Cancel-safe (#432): a non-streaming request the kernel gives up on
+	// (client disconnect, handler ctx cancel) does not reliably abort
+	// generation server-side on providers like LM Studio — the request still
+	// gets a fully-buffered JSON response here (unchanged client contract),
+	// but routing through CompleteCancelSafeIfSupported means an abandoned
+	// call actually stops consuming the local inference seat.
+	resp, err := CompleteCancelSafeIfSupported(ctx, provider, req)
 	pt.promptEvalEnd = time.Now()
 	// answerStart/End are derived after we inspect the response payload so we
 	// can split the round-trip duration proportionally when reasoning content
 	// is present. They are set below, after the tool loop.
 	if err != nil {
+		recordAbandonedInference("chat-complete", req.Metadata.RequestID, err)
 		slog.Warn("chat: complete error", "err", err)
 		if turn != nil {
 			turn.Status = "error"
@@ -1444,9 +1451,11 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 				}
 			}
 			// Preserve any external tool_calls for the next iteration's
-			// response so we don't drop them on the floor.
-			next, nerr := provider.Complete(ctx, req)
+			// response so we don't drop them on the floor. Cancel-safe (#432):
+			// same rationale as the initial completeChat call above.
+			next, nerr := CompleteCancelSafeIfSupported(ctx, provider, req)
 			if nerr != nil {
+				recordAbandonedInference("chat-complete-post-tool", req.Metadata.RequestID, nerr)
 				slog.Warn("chat: complete after internal tool exec failed", "err", nerr)
 				if turn != nil {
 					turn.Status = "error"
