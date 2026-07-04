@@ -196,10 +196,25 @@ func (m *MCPServer) toolToolInvoke(ctx context.Context, req *mcp.CallToolRequest
 		// No silent widening: reject unknown names outright, mirroring
 		// KernelToolRegistry.Scoped (tool_loop.go) rather than falling
 		// through to some generic dispatch.
-		return fallbackResult(
-			fmt.Sprintf("cog_tool_invoke: unknown tool %q (not in the deferred plumbing catalog; use cog_tool_search to discover valid names)", name),
-			"",
-		)
+		//
+		// Two distinct rejection reasons, per flight review 2026-07-03 §5.4:
+		// a genuinely unknown/misspelled name vs. a name that IS a real tool
+		// but is eager (already directly callable, never registered into
+		// m.deferredHandlers). The flight model (gemma-4-26b) hit the eager
+		// case twice in a row against the generic "not in the deferred
+		// plumbing catalog" message before self-correcting — naming the
+		// corrective action inline collapses that to one attempt.
+		if eagerToolExists(m.toolMeta, name) {
+			return fallbackResult(
+				fmt.Sprintf("cog_tool_invoke: tool %q is eager — call it directly, not via cog_tool_invoke", name),
+				"",
+			)
+		}
+		msg := fmt.Sprintf("cog_tool_invoke: unknown tool %q (not in the deferred plumbing catalog; use cog_tool_search to discover valid names)", name)
+		if suggestions := nearestToolNames(m.toolMeta, name, 3); len(suggestions) > 0 {
+			msg += fmt.Sprintf("; did you mean: %s?", strings.Join(suggestions, ", "))
+		}
+		return fallbackResult(msg, "")
 	}
 
 	// SECURITY-CRITICAL (ADR G2 PART C): gate the UNDERLYING tool (name),
@@ -248,4 +263,94 @@ func (m *MCPServer) toolToolInvoke(ctx context.Context, req *mcp.CallToolRequest
 		return fallbackResult(fmt.Sprintf("cog_tool_invoke: %s: %v", name, err), "")
 	}
 	return result, nil, nil
+}
+
+// eagerToolExists reports whether name matches a registered EAGER tool in
+// toolMeta (i.e. a porcelain tool, already directly callable via CallTool /
+// tools-list — never routed through m.deferredHandlers). Used to distinguish
+// "you called cog_tool_invoke on a tool that should be called directly"
+// from "this name doesn't exist in the catalog at all".
+func eagerToolExists(toolMeta []mcpToolMeta, name string) bool {
+	for _, t := range toolMeta {
+		if t.Eager && t.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// nearestToolNames returns up to limit tool names from the full catalog
+// (both eager and deferred) ranked by Levenshtein distance to name, for
+// typo-correction suggestions on an unknown-name rejection. Cheap win per
+// flight review 2026-07-03 §5.4: catalog size is ~57 entries, so a full
+// O(n) distance scan per rejection is negligible.
+func nearestToolNames(toolMeta []mcpToolMeta, name string, limit int) []string {
+	if name == "" || len(toolMeta) == 0 {
+		return nil
+	}
+	type scored struct {
+		name string
+		dist int
+	}
+	candidates := make([]scored, 0, len(toolMeta))
+	for _, t := range toolMeta {
+		if t.Name == "" {
+			continue
+		}
+		candidates = append(candidates, scored{name: t.Name, dist: levenshtein(name, t.Name)})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].dist != candidates[j].dist {
+			return candidates[i].dist < candidates[j].dist
+		}
+		return candidates[i].name < candidates[j].name
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	out := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		out = append(out, c.name)
+	}
+	return out
+}
+
+// levenshtein computes the classic edit-distance metric between two strings
+// (single-byte-rune ops: insert, delete, substitute), using an O(min(len))-
+// space rolling two-row implementation. Case-insensitive so a caller's
+// slightly-wrong-cased guess still ranks near its intended target.
+func levenshtein(a, b string) int {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+	ar, br := []rune(a), []rune(b)
+	if len(ar) < len(br) {
+		ar, br = br, ar
+	}
+	prev := make([]int, len(br)+1)
+	curr := make([]int, len(br)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		curr[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			curr[j] = m
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(br)]
 }

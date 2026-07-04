@@ -17,6 +17,12 @@
 //  6. TestDeferredTool_NotInEagerToolsList — a deferred tool (cog_read_ledger)
 //     is NOT present in the live server's tools/list (ListTools), only in
 //     the toolMeta catalog cog_tool_search reads from.
+//  7. TestToolInvoke_EagerToolNamesCorrectiveAction — cog_tool_invoke on an
+//     eager tool names the fix inline ("call it directly") instead of the
+//     generic unknown-name message (flight review 2026-07-03 §5.4).
+//  8. TestToolInvoke_UnknownNameSuggestsNearestMatches (+ the two focused
+//     unit tests below) — a genuinely unknown/misspelled name keeps the
+//     generic message but gains nearest-name-match suggestions.
 package engine
 
 import (
@@ -412,5 +418,101 @@ func TestDeferredTool_NotInEagerToolsList(t *testing.T) {
 	}
 	if !deferredMetaFound {
 		t.Error("cog_read_ledger should still be present in m.toolMeta (deferred catalog)")
+	}
+}
+
+// ─── 7. cog_tool_invoke on an EAGER tool names the corrective action ─────────
+
+// TestToolInvoke_EagerToolNamesCorrectiveAction is the regression for flight
+// review 2026-07-03 §5.4: cog_tool_invoke("cog_get_state", ...) — a porcelain
+// (eager) tool, never registered into m.deferredHandlers — previously
+// returned the same generic "not in the deferred plumbing catalog" message
+// as a genuinely unknown name. The flight model (gemma-4-26b) burned two
+// attempts on this before self-correcting. The eager case must instead name
+// the fix inline: call the tool directly.
+func TestToolInvoke_EagerToolNamesCorrectiveAction(t *testing.T) {
+	t.Parallel()
+	m := newPlainMCPServer(t)
+
+	text, isErr, callErr := m.CallTool(context.Background(), "cog_tool_invoke", []byte(`{"name":"cog_get_state","args":{}}`))
+	if callErr != nil {
+		t.Fatalf("unexpected transport error: %v", callErr)
+	}
+	if !isErr {
+		t.Fatalf("expected cog_get_state (eager, not in deferredHandlers) to be rejected via invoke; got text: %s", text)
+	}
+	if !g2ContainsAny(text, "is eager", "call it directly") {
+		t.Errorf("expected an eager-tool corrective message naming direct call; got: %s", text)
+	}
+	// Must NOT fall back to the generic unknown-name message — that's the
+	// whole point of the distinction.
+	if g2ContainsAny(text, "not in the deferred plumbing catalog") {
+		t.Errorf("eager-tool rejection should not reuse the generic unknown-name message; got: %s", text)
+	}
+}
+
+// ─── 8. cog_tool_invoke on an unknown/misspelled name suggests near matches ──
+
+// TestToolInvoke_UnknownNameSuggestsNearestMatches verifies the cheap-win
+// typo-correction addition: a name that is neither in m.deferredHandlers nor
+// a known eager tool keeps the original generic message, but gains up to 3
+// nearest-name suggestions from the full catalog so an operator/model with a
+// slightly-wrong name gets a corrective nudge instead of a dead end.
+func TestToolInvoke_UnknownNameSuggestsNearestMatches(t *testing.T) {
+	t.Parallel()
+	m := newPlainMCPServer(t)
+
+	// A near-miss on a real deferred tool name.
+	text, isErr, callErr := m.CallTool(context.Background(), "cog_tool_invoke", []byte(`{"name":"cog_read_ledgr","args":{}}`))
+	if callErr != nil {
+		t.Fatalf("unexpected transport error: %v", callErr)
+	}
+	if !isErr {
+		t.Fatalf("expected cog_read_ledgr (misspelled, unknown) to be rejected; got text: %s", text)
+	}
+	if !g2ContainsAny(text, "not in the deferred plumbing catalog") {
+		t.Errorf("expected the generic unknown-name message to still be present; got: %s", text)
+	}
+	if !g2ContainsAny(text, "did you mean", "cog_read_ledger") {
+		t.Errorf("expected a nearest-match suggestion including cog_read_ledger; got: %s", text)
+	}
+}
+
+// TestNearestToolNames_RanksClosestFirst is a focused unit test on the
+// suggestion-ranking helper itself, independent of the MCP transport.
+func TestNearestToolNames_RanksClosestFirst(t *testing.T) {
+	t.Parallel()
+	toolMeta := []mcpToolMeta{
+		{Name: "cog_read_ledger", Eager: false},
+		{Name: "cog_read_cogdoc", Eager: true},
+		{Name: "mod3_speak", Eager: false},
+	}
+
+	got := nearestToolNames(toolMeta, "cog_read_ledgr", 2)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 suggestions; got %v", got)
+	}
+	if got[0] != "cog_read_ledger" {
+		t.Errorf("closest match = %q; want cog_read_ledger", got[0])
+	}
+}
+
+// TestEagerToolExists_DistinguishesEagerFromDeferred pins the lookup helper
+// cog_tool_invoke's rejection path uses to decide which message to return.
+func TestEagerToolExists_DistinguishesEagerFromDeferred(t *testing.T) {
+	t.Parallel()
+	toolMeta := []mcpToolMeta{
+		{Name: "cog_get_state", Eager: true},
+		{Name: "cog_read_ledger", Eager: false},
+	}
+
+	if !eagerToolExists(toolMeta, "cog_get_state") {
+		t.Error("cog_get_state should be reported as an eager tool")
+	}
+	if eagerToolExists(toolMeta, "cog_read_ledger") {
+		t.Error("cog_read_ledger is deferred (Eager=false), should not be reported eager")
+	}
+	if eagerToolExists(toolMeta, "cog_does_not_exist") {
+		t.Error("a name absent from toolMeta entirely should not be reported eager")
 	}
 }
