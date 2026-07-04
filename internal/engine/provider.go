@@ -49,6 +49,36 @@ type Provider interface {
 	Ping(ctx context.Context) (time.Duration, error)
 }
 
+// CancelSafeCompleter is implemented by providers whose Complete() cannot
+// reliably propagate ctx-cancellation to the server (#432). Such providers
+// expose CompleteCancelSafe, which routes the request through their
+// streaming path (or another mechanism that does tear down the server-side
+// connection on cancel) so that an abandoned request actually aborts
+// generation instead of running headless.
+//
+// Providers that don't implement this (Anthropic HTTP, ClaudeCode subprocess,
+// etc.) either already propagate cancellation correctly through their own
+// transport or are out of scope for the local-inference zombie-generation
+// failure mode this interface exists to close. Callers should use
+// CompleteCancelSafeIfSupported rather than asserting this interface directly.
+type CancelSafeCompleter interface {
+	CompleteCancelSafe(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error)
+}
+
+// CompleteCancelSafeIfSupported calls p.CompleteCancelSafe when the provider
+// implements CancelSafeCompleter, otherwise falls back to plain Complete.
+// Internal non-interactive call sites (autonomic consult, dispatch, tool-loop
+// re-calls) should route through this rather than calling Complete directly,
+// so that a ctx cancel/timeout actually aborts server-side generation on
+// providers where that matters (#432) without changing behavior for
+// providers where it doesn't apply.
+func CompleteCancelSafeIfSupported(ctx context.Context, p Provider, req *CompletionRequest) (*CompletionResponse, error) {
+	if cs, ok := p.(CancelSafeCompleter); ok {
+		return cs.CompleteCancelSafe(ctx, req)
+	}
+	return p.Complete(ctx, req)
+}
+
 // ── Request types ─────────────────────────────────────────────────────────────
 
 // CompletionRequest carries the assembled context package to the model.

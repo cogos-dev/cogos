@@ -333,8 +333,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Context, req *CompletionRequest,
 	provider Provider, respID, model string, turn *TurnRecord) {
 
-	resp, err := provider.Complete(ctx, req)
+	// Cancel-safe (#432): same rationale as completeChat in serve.go — the
+	// Anthropic-compat non-streaming surface hits the same provider pool and
+	// is subject to the same zombie-generation risk on abandoned requests.
+	resp, err := CompleteCancelSafeIfSupported(ctx, provider, req)
 	if err != nil {
+		recordAbandonedInference("anthropic-complete", req.Metadata.RequestID, err)
 		slog.Warn("anthropic: complete error", "err", err)
 		if turn != nil {
 			turn.Status = "error"

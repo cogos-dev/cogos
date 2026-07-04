@@ -3,11 +3,15 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestLocalHarnessControllerTriggerAndList(t *testing.T) {
@@ -29,25 +33,29 @@ func TestLocalHarnessControllerTriggerAndList(t *testing.T) {
 			})
 		case "/v1/chat/completions":
 			call++
-			w.Header().Set("Content-Type", "application/json")
+			// #432: assessCycle/executeCycleTaskWithPrompt now route through
+			// CompleteCancelSafe (Stream under the hood) so a ctx cancel/
+			// timeout actually aborts generation server-side. Honor the
+			// request's stream field like a real openai-compat server so
+			// this mock exercises the same path production traffic takes.
+			var body struct {
+				Stream bool `json:"stream"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			content := "local harness executed"
 			if call == 1 {
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"choices": []map[string]any{{
-						"message": map[string]any{
-							"role":    "assistant",
-							"content": `{"action":"observe","reason":"field changed","urgency":0.4,"target":"memory","task":"summarize current state"}`,
-						},
-						"finish_reason": "stop",
-					}},
-					"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
-				})
+				content = `{"action":"observe","reason":"field changed","urgency":0.4,"target":"memory","task":"summarize current state"}`
+			}
+			if body.Stream {
+				writeSSECompletion(t, w, content)
 				return
 			}
+			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"choices": []map[string]any{{
 					"message": map[string]any{
 						"role":    "assistant",
-						"content": "local harness executed",
+						"content": content,
 					},
 					"finish_reason": "stop",
 				}},
@@ -96,6 +104,85 @@ func TestLocalHarnessControllerTriggerAndList(t *testing.T) {
 	}
 	if snap.Traces[0].Result != "local harness executed" {
 		t.Fatalf("trace result = %q; want local harness executed", snap.Traces[0].Result)
+	}
+}
+
+// TestLocalHarnessAutonomicConsult_SetsMaxTokensBound verifies #432 item (c):
+// internal non-interactive consults (the autonomic assess step here) must
+// carry a bounded max_tokens on the wire even when the provider itself would
+// otherwise apply a larger default — bounded generation must hold even if
+// cancellation fails to propagate for any reason. Asserts the wire-level
+// request body, not just the CompletionRequest struct field, so a bug in
+// marshaling (e.g. buildOpenAIRequest's maxTokens precedence) would be
+// caught here too.
+func TestLocalHarnessAutonomicConsult_SetsMaxTokensBound(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	cfg.LocalModel = "gemma4:e4b"
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+
+	var assessMaxTokens int
+	var sawAssessCall bool
+	model := "gemma4:e4b"
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"id": model, "object": "model"}},
+			})
+		case "/v1/chat/completions":
+			var body struct {
+				Stream    bool `json:"stream"`
+				MaxTokens int  `json:"max_tokens"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if !sawAssessCall {
+				sawAssessCall = true
+				assessMaxTokens = body.MaxTokens
+			}
+			content := `{"action":"sleep","reason":"idle","urgency":0.0,"target":"","task":""}`
+			if body.Stream {
+				writeSSECompletion(t, w, content)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message":       map[string]any{"role": "assistant", "content": content},
+					"finish_reason": "stop",
+				}},
+				"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer llm.Close()
+	t.Setenv(localLLMEndpointEnv, llm.URL)
+
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	res, err := ctrl.TriggerAgent(context.Background(), DefaultAgentID, "test", true)
+	if err != nil {
+		t.Fatalf("TriggerAgent: %v", err)
+	}
+	if !res.Triggered {
+		t.Fatalf("expected triggered=true, got %+v", res)
+	}
+	if !sawAssessCall {
+		t.Fatal("assess call was never observed by the mock server")
+	}
+	if assessMaxTokens != localHarnessAssessMaxToks {
+		t.Errorf("assess call max_tokens on the wire = %d; want %d (localHarnessAssessMaxToks)", assessMaxTokens, localHarnessAssessMaxToks)
+	}
+	if assessMaxTokens <= 0 {
+		t.Error("assess call must carry a bounded (>0) max_tokens even when cancellation fails to propagate")
 	}
 }
 
@@ -1458,5 +1545,131 @@ func TestDispatchToHarness_ProviderCannotServeModel_FailsLoudly(t *testing.T) {
 	}
 	if res.ServedModel != "" {
 		t.Errorf("ServedModel = %q; want empty on a failed dispatch (nothing actually served)", res.ServedModel)
+	}
+}
+
+// TestDispatchToHarness_ConcurrentIdenticalDispatchIsDeduped is the #432
+// retry-discipline regression test: dispatchSlot's RequestID is a
+// content-stable hash of systemPrompt+task+tool-names (for KV-cache sharing
+// across fan-out slots per ADR-066), which means two independent
+// DispatchToHarness(..., N:1) calls carrying identical content produce the
+// same RequestID — exactly the shape of a client resubmitting a request
+// whose prior attempt may still be generating server-side. The second
+// concurrent call must be refused rather than starting a second server-side
+// generation under the same identity.
+// TestCompleteWithToolLoop_ConcurrentSameRequestIDIsDeduped is the #432
+// retry-discipline regression test at the layer where the guard actually
+// lives: completeWithToolLoop refuses a second call under the same
+// RequestMetadata.RequestID while the first is still in flight, so a caller
+// resubmitting a request whose prior attempt may still be generating
+// server-side collides with the guard instead of stacking a second
+// generation. Exercised directly against completeWithToolLoop (rather than
+// through DispatchToHarness, whose c.ollamaMu batch-level mutex already
+// fully serializes local-provider dispatches and so would never let two
+// calls race at this layer) to isolate exactly the mechanism under test.
+func TestCompleteWithToolLoop_ConcurrentSameRequestIDIsDeduped(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	// releaseFirst gates the first request's stream completion so the second
+	// (duplicate) call has a window to arrive while the first is still
+	// registered in-flight.
+	releaseFirst := make(chan struct{})
+	var firstArrived sync.WaitGroup
+	firstArrived.Add(1)
+	var firstArrivedOnce sync.Once
+
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"id": "gemma4:e4b", "object": "model"}},
+			})
+		case "/v1/chat/completions":
+			firstArrivedOnce.Do(func() { firstArrived.Done() })
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n")
+			flusher.Flush()
+			// Hold the stream open until the test releases it, simulating a
+			// long-running generation the second call would race against.
+			<-releaseFirst
+			fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer llm.Close()
+	t.Setenv(localLLMEndpointEnv, llm.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	provider := NewOpenAICompatProvider("agent-local", ProviderConfig{
+		Endpoint: llm.URL,
+		Model:    "gemma4:e4b",
+		Timeout:  10,
+	})
+	registry := NewKernelToolRegistry(srv.mcpServer)
+
+	const sharedRequestID = "local-harness-dispatch-dedup-test-0"
+	makeReq := func() *CompletionRequest {
+		return &CompletionRequest{
+			Messages: []ProviderMessage{{Role: "user", Content: "identical dedup-test task"}},
+			Metadata: RequestMetadata{RequestID: sharedRequestID},
+		}
+	}
+
+	type outcome struct {
+		resp *CompletionResponse
+		err  error
+	}
+	results := make(chan outcome, 2)
+
+	go func() {
+		resp, _, _, callErr := ctrl.completeWithToolLoop(context.Background(), provider, makeReq(), registry)
+		results <- outcome{resp, callErr}
+	}()
+	firstArrived.Wait()
+
+	go func() {
+		resp, _, _, callErr := ctrl.completeWithToolLoop(context.Background(), provider, makeReq(), registry)
+		results <- outcome{resp, callErr}
+	}()
+
+	// Give the second call a moment to reach the dedup guard before releasing
+	// the first stream (avoids a race where the first completes, clears its
+	// in-flight registration, and the second no longer collides).
+	time.Sleep(150 * time.Millisecond)
+	close(releaseFirst)
+
+	first := <-results
+	second := <-results
+
+	dedupRefusals := 0
+	successes := 0
+	for _, o := range []outcome{first, second} {
+		switch {
+		case o.err != nil && strings.Contains(o.err.Error(), "already in flight"):
+			dedupRefusals++
+		case o.err == nil:
+			successes++
+		default:
+			t.Errorf("unexpected error: %v", o.err)
+		}
+	}
+	if dedupRefusals != 1 {
+		t.Errorf("dedup refusals = %d; want exactly 1 (one of the two concurrent identical-RequestID calls must be refused)", dedupRefusals)
+	}
+	if successes != 1 {
+		t.Errorf("successes = %d; want exactly 1", successes)
 	}
 }

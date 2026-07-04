@@ -251,14 +251,24 @@ func TestBuildKernelHealthSnapshot_EmptyRegistry(t *testing.T) {
 
 // --- Ticker integration tests -----------------------------------------------
 
-// openaiAssessResponse writes a valid OpenAI-compat response for the assess step.
-func openaiAssessResponse(w http.ResponseWriter, action string) {
+// openaiAssessResponse writes a valid OpenAI-compat response for the assess
+// step, honoring the request's stream field. #432: assessCycle now routes
+// through CompleteCancelSafe (Stream under the hood), so a mock that always
+// returns a plain JSON body regardless of stream:true would silently produce
+// an empty response for that call.
+func openaiAssessResponse(t *testing.T, w http.ResponseWriter, r *http.Request, action string) {
+	t.Helper()
+	content := `{"action":"` + action + `","reason":"test","urgency":0.1,"target":"","task":""}`
+	if requestWantsStream(r) {
+		writeSSECompletion(t, w, content)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"choices": []map[string]any{{
 			"message": map[string]any{
 				"role":    "assistant",
-				"content": `{"action":"` + action + `","reason":"test","urgency":0.1,"target":"","task":""}`,
+				"content": content,
 			},
 			"finish_reason": "stop",
 		}},
@@ -266,8 +276,14 @@ func openaiAssessResponse(w http.ResponseWriter, action string) {
 	})
 }
 
-// openaiExecuteResponse writes a valid OpenAI-compat response for the execute step.
-func openaiExecuteResponse(w http.ResponseWriter) {
+// openaiExecuteResponse writes a valid OpenAI-compat response for the execute
+// step, honoring the request's stream field (see openaiAssessResponse).
+func openaiExecuteResponse(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	if requestWantsStream(r) {
+		writeSSECompletion(t, w, "done")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"choices": []map[string]any{{
@@ -281,16 +297,27 @@ func openaiExecuteResponse(w http.ResponseWriter) {
 	})
 }
 
+// requestWantsStream peeks at the request body's stream field without
+// consuming it for downstream handlers (each caller here only reads the
+// body once, so a simple decode is sufficient).
+func requestWantsStream(r *http.Request) bool {
+	var body struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	return body.Stream
+}
+
 // ollamaAssessResponse is kept for backward compat with any callers that have
 // not yet been migrated; Ollama is decommissioned.
-func ollamaAssessResponse(w http.ResponseWriter, action string) {
-	openaiAssessResponse(w, action)
+func ollamaAssessResponse(t *testing.T, w http.ResponseWriter, r *http.Request, action string) {
+	openaiAssessResponse(t, w, r, action)
 }
 
 // ollamaExecuteResponse is kept for backward compat with any callers that have
 // not yet been migrated; Ollama is decommissioned.
-func ollamaExecuteResponse(w http.ResponseWriter) {
-	openaiExecuteResponse(w)
+func ollamaExecuteResponse(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	openaiExecuteResponse(t, w, r)
 }
 
 // TestAutonomicTickerAllGreenNoLLM verifies that with an all-green registry
@@ -369,10 +396,10 @@ func TestAutonomicTickerDegradedEscalates(t *testing.T) {
 		case "/v1/chat/completions":
 			callCount++
 			if callCount == 1 {
-				openaiAssessResponse(w, "observe")
+				openaiAssessResponse(t, w, r, "observe")
 				return
 			}
-			openaiExecuteResponse(w)
+			openaiExecuteResponse(t, w, r)
 		default:
 			// Silently ignore unexpected probes (e.g. Ollama /api/tags probe).
 			w.WriteHeader(http.StatusNotFound)
@@ -444,7 +471,7 @@ func TestAutonomicTickerIdleRecheckIn(t *testing.T) {
 			})
 		case "/v1/chat/completions":
 			callCount++
-			openaiAssessResponse(w, "sleep")
+			openaiAssessResponse(t, w, r, "sleep")
 		default:
 			// Silently ignore unexpected probes (e.g. Ollama /api/tags probe).
 			w.WriteHeader(http.StatusNotFound)

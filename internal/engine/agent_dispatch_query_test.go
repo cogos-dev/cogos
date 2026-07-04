@@ -44,8 +44,14 @@ func TestQueryDispatchToHarness_NormalizationDefaults(t *testing.T) {
 	if got.Model != DispatchModelE4B {
 		t.Errorf("Model default not applied, got %q", got.Model)
 	}
-	if got.TimeoutSeconds != 30 {
-		t.Errorf("TimeoutSeconds default not applied, got %d", got.TimeoutSeconds)
+	// #432: default raised from 30s to dispatchTimeoutDefault (240s) — a 30s
+	// ceiling canceled every request under realistic local-model latency
+	// (2-4 min under prefill load), and the non-streaming call underneath
+	// didn't even abort server-side on that cancel. Assert against the named
+	// constant so this test tracks intentional future changes to the default
+	// rather than re-pinning a magic number.
+	if got.TimeoutSeconds != dispatchTimeoutDefault {
+		t.Errorf("TimeoutSeconds default not applied, got %d, want %d", got.TimeoutSeconds, dispatchTimeoutDefault)
 	}
 	if got.N != 1 {
 		t.Errorf("N default not applied, got %d", got.N)

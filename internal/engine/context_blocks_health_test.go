@@ -63,6 +63,15 @@ var healthRegistryMu sync.Mutex
 // withProviders sets up the global reconcile registry with the supplied
 // providers, runs fn, and resets the registry at the end. NOT safe for
 // t.Parallel() — uses a package-level mutex.
+//
+// Also resets the #432 abandoned-inference delta baseline before fn runs.
+// buildKernelHealthSnapshot folds that process-global counter into
+// snap.Anomalies (and AllGreen()/shouldEscalate consult it), so an unrelated
+// test elsewhere in the package that legitimately hits an error path through
+// CompleteCancelSafeIfSupported (e.g. a dispatch test asserting a provider
+// failure) would otherwise leak a nonzero delta into whichever test next
+// calls buildKernelHealthSnapshot — exactly the kind of cross-test pollution
+// this fixture already guards against for the provider registry.
 func withProviders(t *testing.T, providers []*stubProvider, fn func()) {
 	t.Helper()
 	healthRegistryMu.Lock()
@@ -70,6 +79,7 @@ func withProviders(t *testing.T, providers []*stubProvider, fn func()) {
 
 	reconcile.ResetProviders()
 	defer reconcile.ResetProviders()
+	resetAbandonedInferenceCounterForTest()
 
 	for _, p := range providers {
 		reconcile.RegisterProvider(p.name, p)
