@@ -5,6 +5,28 @@ import (
 	"testing"
 )
 
+// ── resolveLocalLLMEndpoint ────────────────────────────────────────────────────
+
+// TestResolveLocalLLMEndpointDefaultsToLMStudioNotOllama pins the no-config,
+// no-env fallback to LM Studio's port (:1234), not Ollama's (:11434).
+// Regression for flight review 2026-07-03 §5.2: a no-provider
+// cog_dispatch_to_harness call resolves through resolveLocalLLMEndpoint ->
+// NewOpenAICompatProvider when no explicit provider/state-route/
+// harness_provider path fires (see local_agent_harness.go Path 3). Before
+// this fix, openaiCompatDefaultEndpoint had drifted back to Ollama's
+// decommissioned :11434 (tombstoned in PR #417), so this exact path
+// dead-ended connection-refused instead of reaching the resident LM Studio
+// backend. Uses t.Setenv rather than t.Parallel so COGOS_LLM_ENDPOINT is
+// deterministically unset for the duration of this test.
+func TestResolveLocalLLMEndpointDefaultsToLMStudioNotOllama(t *testing.T) {
+	t.Setenv(localLLMEndpointEnv, "")
+	got := resolveLocalLLMEndpoint("")
+	want := "http://localhost:1234"
+	if got != want {
+		t.Errorf("resolveLocalLLMEndpoint(\"\") = %q; want %q (LM Studio, not Ollama's decommissioned :11434)", got, want)
+	}
+}
+
 // ── normalizeModelNameForOllama ───────────────────────────────────────────────
 
 func TestNormalizeModelNameForOllama(t *testing.T) {

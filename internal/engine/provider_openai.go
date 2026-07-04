@@ -25,9 +25,17 @@ import (
 const (
 	// openaiCompatDefaultEndpoint is the fallback endpoint when no Endpoint is
 	// configured and the COGOS_LLM_ENDPOINT environment variable is unset.
-	// Defaults to the Ollama loopback port; override via config or env for
-	// other servers (LM Studio on :1234, vLLM, llama.cpp, remote hosts, etc.).
-	openaiCompatDefaultEndpoint = "http://localhost:11434"
+	// Defaults to LM Studio's loopback port (the live local backend since
+	// PR #417 decommissioned Ollama's :11434 as the default — see
+	// provider_ollama.go's decommission header and router.go's
+	// probeLocalBackend/defaultProvidersConfig, both of which already probe
+	// LM Studio :1234 first). This constant had drifted back to Ollama's
+	// :11434 after that decommission, which meant a no-provider dispatch
+	// (resolveLocalLLMEndpoint -> NewOpenAICompatProvider) dead-ended
+	// connection-refused instead of reaching the resident LM Studio backend
+	// (flight review 2026-07-03 §5.2). Override via config or env for other
+	// servers (vLLM, llama.cpp, remote hosts, etc.).
+	openaiCompatDefaultEndpoint = "http://localhost:1234"
 	openaiCompatDefaultMaxToks  = 4096
 )
 
@@ -46,7 +54,7 @@ type OpenAICompatProvider struct {
 // NewOpenAICompatProvider creates an OpenAICompatProvider from a ProviderConfig.
 //
 // Endpoint resolution order: cfg.Endpoint > COGOS_LLM_ENDPOINT env >
-// openaiCompatDefaultEndpoint (localhost Ollama default). This lets users
+// openaiCompatDefaultEndpoint (localhost LM Studio default). This lets users
 // point at an arbitrary OpenAI-compatible server without editing config.
 func NewOpenAICompatProvider(name string, cfg ProviderConfig) *OpenAICompatProvider {
 	endpoint := resolveLocalLLMEndpoint(cfg.Endpoint)
@@ -258,8 +266,8 @@ type openaiToolCallDetail struct {
 
 // Non-streaming response.
 type openaiChatResponse struct {
-	ID      string              `json:"id"`
-	Choices []openaiChoice      `json:"choices"`
+	ID      string               `json:"id"`
+	Choices []openaiChoice       `json:"choices"`
 	Usage   *openaiUsageResponse `json:"usage,omitempty"`
 }
 
@@ -277,15 +285,15 @@ type openaiUsageResponse struct {
 
 // SSE streaming chunk.
 type openaiStreamChunk struct {
-	ID      string                   `json:"id"`
-	Choices []openaiStreamChoice     `json:"choices"`
-	Usage   *openaiUsageResponse     `json:"usage,omitempty"` // some servers send usage on final chunk
+	ID      string               `json:"id"`
+	Choices []openaiStreamChoice `json:"choices"`
+	Usage   *openaiUsageResponse `json:"usage,omitempty"` // some servers send usage on final chunk
 }
 
 type openaiStreamChoice struct {
-	Index        int                `json:"index"`
-	Delta        openaiStreamDelta  `json:"delta"`
-	FinishReason *string            `json:"finish_reason"` // pointer: null until final chunk
+	Index        int               `json:"index"`
+	Delta        openaiStreamDelta `json:"delta"`
+	FinishReason *string           `json:"finish_reason"` // pointer: null until final chunk
 }
 
 type openaiStreamDelta struct {
