@@ -51,14 +51,20 @@ func (r *DispatchRequest) Normalize() error {
 	// non-empty value through; the dispatcher fails fast on unknown names
 	// before any slot starts.
 	switch r.Model {
-	case "", DispatchModelE4B:
+	case "":
 		r.Model = DispatchModelE4B
-	case DispatchModel26B:
-		// keep
+	case DispatchModelE4B, DispatchModel26B:
+		// keep — recognized legacy routing enum values.
 	default:
-		// Unknown values silently fall back to e4b per the spec — the
-		// dispatcher logs the substitution at its own layer if it cares.
-		r.Model = DispatchModelE4B
+		// Not a recognized routing enum value: treat it as an explicit
+		// model id the caller is requesting (e.g. "ornith-1.0-35b"),
+		// per issue #430. Preserve it in RequestedModel so the dispatcher
+		// can honor it end-to-end instead of silently coercing to "e4b" —
+		// the prior behavior masked the caller's intent before routing
+		// ever saw it. Model itself still carries the raw string through
+		// for Path 0's alias-table lookup (ResolveModelRequest); Path 1/2.5
+		// consult RequestedModel directly.
+		r.RequestedModel = string(r.Model)
 	}
 	if r.TimeoutSeconds <= 0 {
 		r.TimeoutSeconds = dispatchTimeoutDefault

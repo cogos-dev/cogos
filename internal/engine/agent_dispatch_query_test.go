@@ -66,14 +66,36 @@ func TestQueryDispatchToHarness_ClampsRanges(t *testing.T) {
 	}
 }
 
-func TestQueryDispatchToHarness_UnknownModelDefaultsToE4B(t *testing.T) {
+// TestQueryDispatchToHarness_ExplicitModelPreservedAsRequestedModel covers
+// issue #430: a model string that isn't one of the recognized routing enum
+// values ("", "e4b", "26b") must be preserved as the caller's explicit
+// request, not silently collapsed to "e4b". Prior behavior (pre-#430) lost
+// the caller's intent right here, before routing ever saw it.
+func TestQueryDispatchToHarness_ExplicitModelPreservedAsRequestedModel(t *testing.T) {
 	disp := &fakeAgentDispatcher{cannedOk: true}
-	req := DispatchRequest{Task: "x", Model: DispatchModel("frobnicate")}
+	req := DispatchRequest{Task: "x", Model: DispatchModel("ornith-1.0-35b")}
 	if _, err := QueryDispatchToHarness(context.Background(), disp, req); err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	if disp.lastReq.Model != DispatchModelE4B {
-		t.Errorf("unknown model not normalized to e4b, got %q", disp.lastReq.Model)
+	if got := disp.lastReq.RequestedModel; got != "ornith-1.0-35b" {
+		t.Errorf("explicit model not preserved in RequestedModel, got %q", got)
+	}
+}
+
+// TestQueryDispatchToHarness_RecognizedEnumValuesLeaveRequestedModelEmpty
+// guards backward compatibility: the legacy "e4b"/"26b"/"" routing values
+// must NOT populate RequestedModel — they continue to route through the
+// legacy local-LLM probe (Path 3) exactly as before.
+func TestQueryDispatchToHarness_RecognizedEnumValuesLeaveRequestedModelEmpty(t *testing.T) {
+	for _, m := range []DispatchModel{"", DispatchModelE4B, DispatchModel26B} {
+		disp := &fakeAgentDispatcher{cannedOk: true}
+		req := DispatchRequest{Task: "x", Model: m}
+		if _, err := QueryDispatchToHarness(context.Background(), disp, req); err != nil {
+			t.Fatalf("query(model=%q): %v", m, err)
+		}
+		if got := disp.lastReq.RequestedModel; got != "" {
+			t.Errorf("model=%q: expected empty RequestedModel, got %q", m, got)
+		}
 	}
 }
 

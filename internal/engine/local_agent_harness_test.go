@@ -1194,3 +1194,269 @@ func TestDispatchToHarness_EmptyHarnessProvider_FallsBackToLegacy(t *testing.T) 
 		t.Errorf("Ollama /api/tags was NOT called; empty harness_provider should fall back to the legacy probe path")
 	}
 }
+
+// ── Issue #430: explicit-model-wins-over-config-default + served-model visibility ──
+
+// TestDispatchToHarness_ExplicitProvider_RequestedModelWinsOverConfigDefault
+// verifies that when a caller names both an explicit provider AND an
+// explicit model, the wire request sent to that provider carries the
+// caller's model — not the provider config's declared default. This is
+// Path 1 (explicit named provider) in DispatchToHarness.
+func TestDispatchToHarness_ExplicitProvider_RequestedModelWinsOverConfigDefault(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-content-hash-id","object":"model"}]}`))
+		case "/v1/chat/completions":
+			var body struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotModel = body.Model
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "chatcmpl-test", "object": "chat.completion", "model": body.Model,
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	// Provider config hardcodes a model, mirroring the Darkstar
+	// providers.local.yaml gemma content-hash id from the issue.
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  lmstudio-darkstar:
+    type: openai
+    endpoint: `+srv.URL+`
+    model: gemma-content-hash-id
+`)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, server.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "explicit model must win",
+		Provider:       "lmstudio-darkstar",
+		Model:          DispatchModel("ornith-1.0-35b"),
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if len(batch.Results) != 1 {
+		t.Fatalf("batch.Results len = %d; want 1", len(batch.Results))
+	}
+	res := batch.Results[0]
+
+	if gotModel != "ornith-1.0-35b" {
+		t.Errorf("wire request model = %q; want caller's explicit \"ornith-1.0-35b\" (config default must not win)", gotModel)
+	}
+	if res.ProviderUsed != "lmstudio-darkstar" {
+		t.Errorf("ProviderUsed = %q; want \"lmstudio-darkstar\"", res.ProviderUsed)
+	}
+	if res.ServedModel != "ornith-1.0-35b" {
+		t.Errorf("ServedModel = %q; want \"ornith-1.0-35b\" (the model actually sent to the provider)", res.ServedModel)
+	}
+	if !res.Success {
+		t.Errorf("Success = false; want true, error=%q", res.Error)
+	}
+}
+
+// TestDispatchToHarness_ExplicitProvider_ConfigDefaultAppliesWhenNoModelRequested
+// is the control: when the caller names a provider but no model, the
+// provider's configured model remains the default — unchanged from prior
+// behavior. Also asserts ServedModel reflects that default.
+func TestDispatchToHarness_ExplicitProvider_ConfigDefaultAppliesWhenNoModelRequested(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-content-hash-id","object":"model"}]}`))
+		case "/v1/chat/completions":
+			var body struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotModel = body.Model
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "chatcmpl-test", "object": "chat.completion", "model": body.Model,
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  lmstudio-darkstar:
+    type: openai
+    endpoint: `+srv.URL+`
+    model: gemma-content-hash-id
+`)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, server.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "no explicit model — config default applies",
+		Provider:       "lmstudio-darkstar",
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	res := batch.Results[0]
+
+	if gotModel != "gemma-content-hash-id" {
+		t.Errorf("wire request model = %q; want provider's configured default \"gemma-content-hash-id\"", gotModel)
+	}
+	if res.ServedModel != "gemma-content-hash-id" {
+		t.Errorf("ServedModel = %q; want \"gemma-content-hash-id\"", res.ServedModel)
+	}
+}
+
+// TestDispatchToHarness_HarnessProviderDefault_RequestedModelWins covers Path
+// 2.5 (cfg.HarnessProvider default): an explicit caller model must still win
+// even when the provider itself came from the harness_provider config
+// default rather than an explicit req.Provider.
+func TestDispatchToHarness_HarnessProviderDefault_RequestedModelWins(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-content-hash-id","object":"model"}]}`))
+		case "/v1/chat/completions":
+			var body struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotModel = body.Model
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "chatcmpl-test", "object": "chat.completion", "model": body.Model,
+				"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+				"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  lmstudio-darkstar:
+    type: openai
+    endpoint: `+srv.URL+`
+    model: gemma-content-hash-id
+`)
+	cfg.HarnessProvider = "lmstudio-darkstar"
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, server.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "explicit model over harness_provider default",
+		Model:          DispatchModel("ornith-1.0-35b"),
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	res := batch.Results[0]
+
+	if gotModel != "ornith-1.0-35b" {
+		t.Errorf("wire request model = %q; want caller's explicit \"ornith-1.0-35b\"", gotModel)
+	}
+	if res.ProviderUsed != "lmstudio-darkstar" {
+		t.Errorf("ProviderUsed = %q; want \"lmstudio-darkstar\"", res.ProviderUsed)
+	}
+	if res.ServedModel != "ornith-1.0-35b" {
+		t.Errorf("ServedModel = %q; want \"ornith-1.0-35b\"", res.ServedModel)
+	}
+}
+
+// TestDispatchToHarness_ProviderCannotServeModel_FailsLoudly verifies that
+// when the resolved provider rejects the requested model (simulated here as
+// an HTTP 400, mirroring LM Studio's real refusal behavior from the issue's
+// ctx-262144 battery), the dispatch surfaces a hard per-slot error rather
+// than silently falling back to a different model.
+func TestDispatchToHarness_ProviderCannotServeModel_FailsLoudly(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-content-hash-id","object":"model"}]}`))
+		case "/v1/chat/completions":
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"model 'ornith-1.0-35b' would likely overload your system"}`))
+		}
+	}))
+	defer srv.Close()
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  lmstudio-darkstar:
+    type: openai
+    endpoint: `+srv.URL+`
+    model: gemma-content-hash-id
+`)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, server.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "provider refuses requested model",
+		Provider:       "lmstudio-darkstar",
+		Model:          DispatchModel("ornith-1.0-35b"),
+		N:              1,
+		TimeoutSeconds: 10,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	res := batch.Results[0]
+
+	if res.Success {
+		t.Errorf("Success = true; want false — provider refused the requested model, must fail loudly not substitute")
+	}
+	if res.Error == "" {
+		t.Errorf("Error is empty; want the provider's refusal surfaced to the caller")
+	}
+	if res.ServedModel != "" {
+		t.Errorf("ServedModel = %q; want empty on a failed dispatch (nothing actually served)", res.ServedModel)
+	}
+}

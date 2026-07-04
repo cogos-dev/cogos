@@ -75,17 +75,29 @@ type DispatchRequest struct {
 	// chosen scope surface as an error rather than silently dropping.
 	Tools []string
 
-	// Model selects the inference backend. Unknown values fall through to the
-	// legacy local-LLM probe (see resolveDispatchLocalModel). Prefer setting
-	// Provider="lmstudio-darkstar" for explicit routing. When Provider is set,
-	// Model is ignored — the resolved provider supplies its own model id.
+	// Model selects the inference backend. Recognized enum values ("e4b",
+	// "26b", "") route through the legacy local-LLM probe (see
+	// resolveDispatchLocalModel). Any other value is treated as an explicit
+	// model id requested by the caller (see RequestedModel) rather than
+	// being silently collapsed to "e4b" — Normalize() preserves it.
 	Model DispatchModel
+
+	// RequestedModel is the caller's explicit model id, populated by
+	// Normalize() whenever Model is not one of the recognized routing enum
+	// values ("", "e4b", "26b"). Per issue #430: a model explicitly named by
+	// the caller must win over the resolved provider's configured default
+	// (ProviderConfig.Model) and must never be silently substituted. Empty
+	// means the caller did not name a specific model — the resolved
+	// provider's configured model applies as the default, unchanged from
+	// prior behavior.
+	RequestedModel string
 
 	// Provider, when non-empty, names a provider declared in providers.yaml
 	// or providers.local.yaml. The dispatcher resolves the name to a
 	// concrete backend (URL, kind, model, api-key) via the wired
-	// ProviderResolver and uses those values instead of the Model-based
-	// fallback. Unknown names are rejected at Normalize time. See RFC-0007.
+	// ProviderResolver. The provider's declared model is used as the
+	// default; RequestedModel, when set, overrides it (see Normalize /
+	// RequestedModel doc, RFC-0007, issue #430).
 	Provider string
 
 	// TimeoutSeconds is the per-dispatch wall-clock budget. Clamped to
@@ -153,12 +165,23 @@ type DispatchResult struct {
 	Error       string                    `json:"error,omitempty"`
 	DurationSec float64                   `json:"duration_sec"`
 	Turns       int                       `json:"turns"`
-	// ModelUsed reports the backend that actually served this slot.
+	// ModelUsed reports the legacy routing enum ("e4b"/"26b") the local-LLM
+	// probe path (Path 3) resolved to. Empty on every other routing path —
+	// ServedModel is the canonical "what actually served" signal across all
+	// paths (see below, issue #430).
 	ModelUsed DispatchModel `json:"model_used,omitempty"`
 	// ProviderUsed is the resolved provider name when DispatchRequest.Provider
 	// fired, otherwise empty. Surfaced for observability so a caller can tell
 	// which named provider handled the slot. Per RFC-0007 Layer 1.
 	ProviderUsed string `json:"provider_used,omitempty"`
+	// ServedModel is the concrete model id actually sent to the provider on
+	// the wire for this slot (CompletionResponse.ProviderMeta.Model), whether
+	// it came from the caller's RequestedModel, a config default, or the
+	// legacy local-LLM probe. Populated on every successful slot regardless
+	// of routing path. Per issue #430: the kernel trace/session record and
+	// the dispatch result must both expose the served model, not just
+	// ProviderUsed.
+	ServedModel string `json:"served_model,omitempty"`
 	// Degraded is true when the model returned no final text and the slot fell
 	// back to summarizeToolTranscript. Success is still true — the tool loop
 	// completed — but the output contract (ADR-eigen output-contract) was not met.
