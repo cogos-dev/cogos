@@ -1324,9 +1324,22 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 			}
 		}
 		provider = p
-		model = pc.Model
+		// Per issue #430: an explicit caller-requested model must win over
+		// the provider config's declared model. The config's model is the
+		// default when the caller specifies none. This does not touch
+		// issue #420's provider-precedence semantics — req.Provider still
+		// resolves the same way; only the *model* selection within that
+		// resolved provider now prefers the caller's explicit request.
+		if req.RequestedModel != "" {
+			model = req.RequestedModel
+			note = fmt.Sprintf("explicit-model: provider=%s model=%s (config default %s overridden)", req.Provider, req.RequestedModel, pc.Model)
+		} else {
+			model = pc.Model
+		}
 		// routeUsed stays empty; ProviderUsed on each slot is the canonical
-		// signal that the named-provider path fired.
+		// signal that the named-provider path fired. ServedModel (set from
+		// the provider response's ProviderMeta.Model) is the canonical
+		// signal for which model actually served.
 	} else {
 		// Path 0: model-string resolution via shared alias table (ADDITIVE).
 		// When req.Model is a recognised intent alias or model id (e.g.
@@ -1387,13 +1400,21 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 							}
 						}
 						provider = p
-						model = pc.Model
+						// Per issue #430: an explicit caller model wins over the
+						// config default here too — state-routing only chooses
+						// the provider, not the model.
+						if req.RequestedModel != "" {
+							model = req.RequestedModel
+							note = fmt.Sprintf("state-routing: state=%s -> provider=%s model=%s (config default %s overridden)", c.process.State().String(), stateProvider, req.RequestedModel, pc.Model)
+						} else {
+							model = pc.Model
+							note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
+						}
 						// Populate req.Provider so dispatchSlot records the
 						// resolved provider name in ProviderUsed — otherwise it
 						// stays empty and the caller can't distinguish this path
 						// from the legacy local-LLM probe path.
 						req.Provider = stateProvider
-						note = fmt.Sprintf("state-routing: state=%s -> provider=%s", c.process.State().String(), stateProvider)
 						usedStateRoute = true
 					}
 					// If provider not found or disabled: fall through to legacy path silently.
@@ -1443,11 +1464,20 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 					}
 				}
 				provider = p
-				model = pc.Model
+				// Per issue #430: honor an explicit caller model even when the
+				// provider itself was resolved from the harness_provider config
+				// default. The config's model remains the default when the
+				// caller specified none.
+				if req.RequestedModel != "" {
+					model = req.RequestedModel
+					note = fmt.Sprintf("harness-provider: provider=%s model=%s (config default %s overridden)", hp, req.RequestedModel, pc.Model)
+				} else {
+					model = pc.Model
+					note = fmt.Sprintf("harness-provider: provider=%s", hp)
+				}
 				// Populate req.Provider so dispatchSlot records the resolved
 				// provider name in ProviderUsed.
 				req.Provider = hp
-				note = fmt.Sprintf("harness-provider: provider=%s", hp)
 				usedHarnessProvider = true
 			}
 			if !usedStateRoute && !usedHarnessProvider {
@@ -1695,6 +1725,15 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	}
 	if len(clientCalls) > 0 {
 		res.Error = fmt.Sprintf("unsupported client tool calls returned: %d", len(clientCalls))
+	}
+	// ServedModel is the model id the provider actually reported serving
+	// (CompletionResponse.ProviderMeta.Model), independent of success/degraded
+	// outcome — set it whenever a response came back at all. Per issue #430
+	// this is the canonical "what actually served" signal, alongside
+	// ProviderUsed, in both the dispatch result and (via the ledger events
+	// below) the kernel trace/session record.
+	if resp != nil {
+		res.ServedModel = resp.ProviderMeta.Model
 	}
 	if err != nil {
 		// Structured loop-exit sentinels (ADR-031, ADR-052): ErrToolLoopMaxTurns
