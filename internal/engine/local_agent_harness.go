@@ -384,6 +384,29 @@ type LocalHarnessController struct {
 	// KV-cache sharing. Content: identity (name + role inline, NOT the full Card),
 	// directive framing, scope sentinel, and workspace pointer (cog:// URI).
 	harnessOrientationBlock string
+
+	// mcpSrv is retained (previously the constructor accepted it only to
+	// build the tool registry, then dropped it) so dispatchSlot can reach a
+	// capability gater wired onto the MCP server *after* this controller was
+	// constructed (MCPServer.SetCapabilityResolver runs post-construction —
+	// see mcp_sessions_identity.go). Read lazily via capabilityGater() on
+	// every dispatch rather than snapshotted once, since the resolver can be
+	// wired (or, in tests, swapped) at any point in the process lifetime.
+	// Nil-safe: a nil mcpSrv (should not happen — NewLocalHarnessControllerWithScope
+	// already requires a non-nil mcpSrv) degrades capabilityGater() to nil,
+	// which is permit-by-default same as an unwired resolver.
+	mcpSrv *MCPServer
+}
+
+// capabilityGater returns the capability gater currently wired onto this
+// controller's MCP server, or nil when none is wired (permit-by-default).
+// See the mcpSrv field doc for why this is a lazy read rather than a
+// construction-time snapshot.
+func (c *LocalHarnessController) capabilityGater() capabilityGater {
+	if c == nil || c.mcpSrv == nil {
+		return nil
+	}
+	return c.mcpSrv.capResolver
 }
 
 func NewLocalHarnessController(cfg *Config, nucleus *Nucleus, process *Process, mcpSrv *MCPServer) (*LocalHarnessController, error) {
@@ -477,6 +500,7 @@ func NewLocalHarnessControllerWithScope(cfg *Config, nucleus *Nucleus, process *
 		interval:                 interval,
 		localProviderTimeout:     resolveLocalProviderTimeout(cfg),
 		harnessOrientationBlock:  orientationBlock,
+		mcpSrv:                   mcpSrv,
 	}, nil
 }
 
@@ -1698,6 +1722,31 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 			// provider adapters so the ledger InferenceEvent can record it.
 			Attribution: subject,
 		},
+	}
+
+	// Capability gating (RFC-identity-embedding, the gap the file previously
+	// called out explicitly at this spot: "No capability gating here; this
+	// is observability metadata only"). Reuses filterToolsByCapability
+	// (serve_kernel_agent_tools.go) — the same permit-by-default filter the
+	// chat path applies — rather than duplicating its logic here.
+	//
+	// Three-part gate, matching the chat path's own contract
+	// (serve.go: `cfg.IdentityNakedDefault && bound.Bound && capResolver != nil`):
+	//   - IdentityNakedDefault: the dark flag: false today by default
+	//     (config.go), so this is a no-op until an operator opts in.
+	//   - gater != nil: SetCapabilityResolver has zero production callers as
+	//     of this change (capResolver is nil at runtime everywhere) — so
+	//     even with the flag on, gating stays dark until separate boot
+	//     wiring constructs a CapabilityCache+CapabilityResolver. Acceptable:
+	//     same dark-flag posture as the chat path's existing (also-dark)
+	//     gates (tool_observer.go, mcp_tool_catalog.go, serve.go).
+	//   - subject != "anonymous": an unbound/unauthenticated dispatch has no
+	//     envelope to check against; mirrors the chat path's `bound.Bound`
+	//     check (bound.Subject would be irrelevant when not bound).
+	if c.cfg != nil && c.cfg.IdentityNakedDefault && subject != "" && subject != "anonymous" {
+		if gater := c.capabilityGater(); gater != nil {
+			filterToolsByCapability(compReq, subject, gater)
+		}
 	}
 
 	start := time.Now()
