@@ -181,10 +181,11 @@ jobs:
           # Double-slash = absolute path in CC permission rules (verified:
           # single-slash deny of /etc/** was a no-op; double-slash DENIED).
           DENY='{"permissions":{"deny":['
-          DENY+='"Read(//proc/**)","Grep(//proc/**)","Read(//sys/**)","Grep(//sys/**)",'
-          DENY+='"Read(//home/runner/.claude/**)","Grep(//home/runner/.claude/**)",'
-          DENY+='"Read(//home/runner/.config/**)","Read(**/.credentials.json)",'
-          DENY+='"Read(**/.git/config)","Read(//home/runner/.netrc)"]}}'
+          DENY+='"Read(//proc/**)","Grep(//proc/**)","Glob(//proc/**)",'
+          DENY+='"Read(//sys/**)","Grep(//sys/**)","Glob(//sys/**)",'
+          DENY+='"Read(//home/runner/.claude/**)","Grep(//home/runner/.claude/**)","Glob(//home/runner/.claude/**)",'
+          DENY+='"Read(//home/runner/.config/**)","Glob(//home/runner/.config/**)",'
+          DENY+='"Read(**/.credentials.json)","Read(**/.git/config)","Read(//home/runner/.netrc)"]}}'
           printf '%s' "$DENY" | jq -e . > /dev/null  # malformed JSON dies loudly here
           { echo 'DENY<<COG_DENY_EOF'; printf '%s\n' "$DENY"; echo 'COG_DENY_EOF'; } >> "$GITHUB_ENV"
           CANARY=$(claude -p 'Use the Read tool to read the file /proc/version. Output its first line verbatim if the read succeeds, or exactly the word DENIED if the tool call is refused.' \
@@ -222,6 +223,13 @@ jobs:
           COG_REVIEW_MODEL: ${{ vars.COG_REVIEW_MODEL || 'claude-sonnet-5' }}
         run: |
           set -uo pipefail
+          # Actions invokes run scripts with bash -e; `set -uo pipefail` ADDS
+          # flags but does not clear inherited errexit (round-4 self-review
+          # finding — the canary step already guarded its claude call, this
+          # sibling didn't). Without +e here, a crashed/timed-out claude
+          # aborts the step before exit-capture and before the redaction
+          # backstop — the exact class the backstop exists for.
+          set +e
           claude -p "$(cat /tmp/cog-review/prompt.md)" \
             --output-format json \
             --max-turns 40 \
@@ -229,7 +237,9 @@ jobs:
             --settings "$DENY" \
             --model "$COG_REVIEW_MODEL" \
             > /tmp/cog-review/raw.json 2> /tmp/cog-review/stderr.log
-          echo "CLAUDE_EXIT=$?" >> "$GITHUB_ENV"
+          CLAUDE_RC=$?
+          set -e
+          echo "CLAUDE_EXIT=$CLAUDE_RC" >> "$GITHUB_ENV"
           # Redact the literal token from anything downstream may read/post.
           # Uses a Perl \Q...\E literal quote so token metacharacters can't
           # form a regex. GitHub also masks the secret in logs automatically;
