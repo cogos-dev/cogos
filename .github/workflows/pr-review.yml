@@ -17,10 +17,11 @@ name: PR Review Gate
 # pull_request_target no-checkout hardening, which is deliberately out of
 # scope for this pilot (see .github/pr-review-rubric.md).
 #
-# Fail-closed contract: the cog-review check-run reaches `success` only on an
-# explicit `approve` verdict. request_changes → failure; anything else —
-# parse errors, missing credentials, reviewer silence — lands `neutral`,
-# which does NOT satisfy a required status check. Silence is not approval.
+# Fail-closed contract: the cog-review check-run reaches `success` ONLY on an
+# explicit `approve` verdict. Everything else — request_changes, comment,
+# parse errors, missing credentials, sandbox-canary failure — lands `failure`,
+# a BLOCKING conclusion. (GitHub treats a `neutral` required check as PASSING,
+# so neutral would be fail-OPEN — never use it here.) Silence is not approval.
 
 on:
   pull_request:
@@ -107,9 +108,10 @@ jobs:
           fetch-depth: 0
 
       # Secrets are invisible to `if:` expressions, so credential gating is a
-      # step. Missing token → neutral check-run explaining setup, job ends
-      # green (the gate is "not configured", which fail-closed blocks merge if
-      # the check is required — but does not paint CI red on every PR).
+      # step. Missing token → failure check-run explaining setup (neutral would
+      # pass a required check — fail open — so an unconfigured reviewer must
+      # block, not wave PRs through). The job itself still ends green; the
+      # blocking signal is the check-run conclusion, not the job status.
       - name: Gate on reviewer credentials
         id: cred
         env:
@@ -174,8 +176,9 @@ jobs:
       # is never trusted statically: this step proves it live by asking the
       # sandboxed agent to read /proc/version (always present on the runner).
       # Only an explicit DENIED refusal passes; file content coming back, an
-      # empty reply, or a crashed canary all fail closed — review skipped,
-      # neutral check posted, no approval spent.
+      # empty reply, or a crashed canary all fail closed — review skipped, a
+      # `failure` check posted (neutral would pass a required check), no
+      # approval spent.
       - name: Verify reviewer sandbox (deny-list canary)
         id: canary
         if: steps.cred.outputs.skip != 'true'
@@ -299,10 +302,18 @@ jobs:
               --model "$COG_REVIEW_MODEL" \
               > /tmp/cog-review/raw.json 2> /tmp/cog-review/stderr.log
             CLAUDE_RC=$?
-            if [ "$CLAUDE_RC" = "0" ] && jq -e '.result' /tmp/cog-review/raw.json >/dev/null 2>&1; then
-              break
+            # Accept only when the envelope's .result actually parses to a
+            # .verdict — the SAME extraction the publish step uses. Checking
+            # merely that .result exists would break early on a prose/malformed
+            # .result (rc=0 but no verdict), i.e. exactly the "unparseable
+            # output" case this retry is meant to cover.
+            if [ "$CLAUDE_RC" = "0" ]; then
+              RES=$(jq -r '.result // empty' /tmp/cog-review/raw.json 2>/dev/null | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//')
+              if printf '%s' "$RES" | jq -e '.verdict' >/dev/null 2>&1; then
+                break
+              fi
             fi
-            echo "::warning::cog-review reviewer attempt $attempt failed (rc=$CLAUDE_RC or unparseable); retrying" >&2
+            echo "::warning::cog-review reviewer attempt $attempt failed (rc=$CLAUDE_RC or output has no parseable .verdict); retrying" >&2
             sleep $((attempt * 5))
           done
           set -e
