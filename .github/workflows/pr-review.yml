@@ -24,7 +24,13 @@ name: PR Review Gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` fires on title/body changes: without it, a PR could pass the
+    # Conventional-Commits title check, then have its title edited to a
+    # non-compliant string via the UI (no push, no re-run), leaving a stale
+    # green check that a squash-merge bakes in as the commit subject. The
+    # cheap mechanical job re-validates on edit; the expensive cog-review job
+    # skips edits (the diff is unchanged, so its verdict still stands).
+    types: [opened, synchronize, reopened, ready_for_review, edited]
 
 permissions:
   contents: read
@@ -79,7 +85,8 @@ jobs:
     # pull_request_target hardening. Skipping is explicit, not incidental.
     if: >-
       github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.action != 'edited'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
