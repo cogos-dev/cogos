@@ -1605,8 +1605,10 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	ctx = withDispatchCycleID(ctx, cycleID)
 
 	// RFC-identity-embedding I1/I2: resolve the caller subject for honest
-	// attribution in both bound and anonymous states. No capability gating here;
-	// this is observability metadata only (Wave-6b adds CRD validation).
+	// attribution in both bound and anonymous states. Capability gating on
+	// this subject happens later, in dispatchSlot, behind
+	// cfg.IdentityNakedDefault (see dispatchSlot's own comment for the
+	// three-part gate) — subject resolution here is just attribution.
 	subject := req.Identity.Sub
 	if subject == "" {
 		subject = "anonymous"
