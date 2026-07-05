@@ -76,10 +76,14 @@ to advisory, and in one case (stale approvals) it degrades *unsafely*:
 5. **Do not exempt administrators / do not allow force-push to protected
    branches** beyond what stale-dismissal can cover.
 
-The local operator workflow (`pr-await-review.sh`) independently enforces the
-same posture in code — it merges only on a check-run `success` *plus* a genuine
-bot `APPROVED` review pinned to the current head — so a misconfiguration fails
-toward "escalate to a human," never toward "merge unreviewed."
+A reference verdict consumer ships in this repo at `scripts/pr-await-review.sh`
+for operator workflows that automate the file→await→react loop. It independently
+enforces the same posture in code — it signals merge-eligible only on a
+check-run `success` *plus* a genuine bot `APPROVED` review pinned to the current
+head — so a misconfiguration fails toward "escalate to a human," never toward
+"merge unreviewed." Note the honest limit: nothing in this repo *executes* the
+merge; a human clicking the merge button is bound only by the branch-protection
+settings above, which is why item 1–3 are load-bearing.
 
 ## Verdict semantics downstream
 
