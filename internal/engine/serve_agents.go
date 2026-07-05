@@ -13,6 +13,15 @@ type triggerAgentHTTPInput struct {
 	Wait   bool   `json:"wait"`
 }
 
+// agentDispatchHTTPInput mirrors dispatchToHarnessInput's async field onto
+// the HTTP surface (POST /v1/agents/{id}/dispatch) — sibling-path discipline
+// with the MCP tool's Async parameter. Embeds DispatchRequest so all other
+// fields decode exactly as before; Async is the only addition.
+type agentDispatchHTTPInput struct {
+	DispatchRequest
+	Async bool `json:"async,omitempty"`
+}
+
 type agentStatusCompat struct {
 	AgentSummary
 	Uptime          string                `json:"uptime,omitempty"`
@@ -29,6 +38,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	s.route(mux, "GET /v1/agents/{id}", s.handleAgentGet)
 	s.route(mux, "POST /v1/agents/{id}/tick", s.handleAgentTick)
 	s.route(mux, "POST /v1/agents/{id}/dispatch", s.handleAgentDispatch)
+	s.route(mux, "GET /v1/dispatch-jobs/{id}", s.handleDispatchJobGet)
 
 	// Legacy dashboard routes.
 	s.route(mux, "GET /v1/agent/status", s.handleAgentStatusCompat)
@@ -74,13 +84,14 @@ func (s *Server) handleAgentTick(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
-	var input DispatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+	var wrapped agentDispatchHTTPInput
+	if err := json.NewDecoder(r.Body).Decode(&wrapped); err != nil {
 		writeAgentJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "invalid_json",
 		})
 		return
 	}
+	input := wrapped.DispatchRequest
 	if input.AgentID == "" {
 		input.AgentID = r.PathValue("id")
 	}
@@ -88,12 +99,49 @@ func (s *Server) handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
 	// cap with this node's configured dispatch_timeout_cap_seconds
 	// (default 600). Nil-receiver-safe.
 	input.TimeoutCapSeconds = s.cfg.DispatchTimeoutCap()
+
+	if wrapped.Async {
+		if s.mcpServer == nil {
+			writeAgentJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "async dispatch requires the MCP server (job registry) to be wired",
+				"code":  "unavailable",
+			})
+			return
+		}
+		receipt := s.mcpServer.startAsyncDispatch(r.Context(), input)
+		writeAgentJSON(w, http.StatusAccepted, receipt)
+		return
+	}
+
 	resp, err := QueryDispatchToHarness(r.Context(), s.agentController, input)
 	if err != nil {
 		writeAgentHTTPError(w, err)
 		return
 	}
 	writeAgentJSON(w, http.StatusOK, resp)
+}
+
+// handleDispatchJobGet implements GET /v1/dispatch-jobs/{id} — the primary
+// poll surface for an async cog_dispatch_to_harness job (mirrored by the
+// cog_poll_dispatch MCP tool for callers without HTTP access).
+func (s *Server) handleDispatchJobGet(w http.ResponseWriter, r *http.Request) {
+	if s.mcpServer == nil {
+		writeAgentJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"error": "dispatch job registry is not wired (MCP server not configured)",
+			"code":  "unavailable",
+		})
+		return
+	}
+	jobID := r.PathValue("id")
+	rec, ok := s.mcpServer.dispatchJobs.Get(jobID)
+	if !ok {
+		writeAgentJSON(w, http.StatusNotFound, map[string]any{
+			"error": fmt.Sprintf("no such dispatch job %q", jobID),
+			"code":  "not_found",
+		})
+		return
+	}
+	writeAgentJSON(w, http.StatusOK, dispatchJobStatusFromRecord(rec))
 }
 
 func (s *Server) handleAgentStatusCompat(w http.ResponseWriter, r *http.Request) {
