@@ -118,9 +118,12 @@ jobs:
         run: |
           if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            # failure, NOT neutral: GitHub treats a neutral required check as
+            # PASSING, so neutral here would let PRs merge with no reviewer
+            # configured — fail OPEN. Only an explicit approve may pass.
             gh api "repos/$REPO_FULL/check-runs" \
               -f name='cog-review' -f head_sha="$HEAD_SHA" \
-              -f status='completed' -f conclusion='neutral' \
+              -f status='completed' -f conclusion='failure' \
               -f 'output[title]=Reviewer not configured' \
               -f 'output[summary]=CLAUDE_CODE_OAUTH_TOKEN secret is not set. Mint one with `claude setup-token` and add it as a repo/org secret to enable the AI review gate.'
           else
@@ -238,9 +241,11 @@ jobs:
           else
             echo "sandbox=fail" >> "$GITHUB_OUTPUT"
             echo "::error::Sandbox canary failed: expected both tools (Read, Grep) DENIED, got denied=$DENIED_N allowed=$ALLOWED_N. Skipping review (fail closed)."
+            # failure, NOT neutral (neutral passes a required check) — an
+            # unproven sandbox must block the merge, not wave it through.
             gh api "repos/$REPO_FULL/check-runs" \
               -f name='cog-review' -f head_sha="$HEAD_SHA" \
-              -f status='completed' -f conclusion='neutral' \
+              -f status='completed' -f conclusion='failure' \
               -f 'output[title]=Reviewer sandbox verification failed' \
               -f 'output[summary]=The deny-list canary could not prove Read and Grep denial is in effect on /proc/version. Review skipped; no verdict issued. Fail closed.'
           fi
@@ -276,14 +281,30 @@ jobs:
           # Glob is excluded because it ignores --settings path denies
           # (round-6 finding). Any tool added here must also be added to
           # REVIEW_TOOLS so the deny-gen + canary cover it.
-          claude -p "$(cat /tmp/cog-review/prompt.md)" \
-            --output-format json \
-            --max-turns 40 \
-            --allowedTools "Read" "Grep" \
-            --settings "$DENY" \
-            --model "$COG_REVIEW_MODEL" \
-            > /tmp/cog-review/raw.json 2> /tmp/cog-review/stderr.log
-          CLAUDE_RC=$?
+          #
+          # Bounded retry: the reviewer occasionally returns a non-zero exit or
+          # unparseable output (observed transient Sonnet blips). Now that
+          # non-approve fails CLOSED (blocks the merge), a single transient
+          # flake would wedge a PR until re-run — so retry up to 3 attempts,
+          # accepting the first output that parses to a .verdict. This does not
+          # weaken fail-closed: a genuine request_changes parses on attempt 1
+          # and is kept; only unparseable/empty/error output is retried.
+          CLAUDE_RC=1
+          for attempt in 1 2 3; do
+            claude -p "$(cat /tmp/cog-review/prompt.md)" \
+              --output-format json \
+              --max-turns 40 \
+              --allowedTools "Read" "Grep" \
+              --settings "$DENY" \
+              --model "$COG_REVIEW_MODEL" \
+              > /tmp/cog-review/raw.json 2> /tmp/cog-review/stderr.log
+            CLAUDE_RC=$?
+            if [ "$CLAUDE_RC" = "0" ] && jq -e '.result' /tmp/cog-review/raw.json >/dev/null 2>&1; then
+              break
+            fi
+            echo "::warning::cog-review reviewer attempt $attempt failed (rc=$CLAUDE_RC or unparseable); retrying" >&2
+            sleep $((attempt * 5))
+          done
           set -e
           echo "CLAUDE_EXIT=$CLAUDE_RC" >> "$GITHUB_ENV"
           # Redact the literal token from anything downstream may read/post.
@@ -295,7 +316,7 @@ jobs:
 
       - name: Publish verdict (review + check run)
         # always() so a timed-out or crashed reviewer still posts an explicit
-        # error->neutral verdict instead of vanishing (fail closed WITH a
+        # error->failure verdict instead of vanishing (fail closed WITH a
         # signal). Skipped when the gate is unconfigured (no token) or the
         # canary already posted its own fail-closed check.
         if: always() && steps.cred.outputs.skip != 'true' && steps.canary.outputs.sandbox != 'fail'
@@ -343,14 +364,19 @@ jobs:
           SUMMARY=$(printf '%s' "$REVIEW" | jq -r '.summary')
 
           # Verdict maps to BOTH channels: a GitHub-native review (the
-          # authority: satisfies/blocks required-approvals) and a check-run
-          # (the fail-closed machine signal + marker carrier). error posts no
-          # review at all — an infra hiccup must never spend approval.
+          # authority: satisfies/blocks required-approvals) and a check-run.
+          # ONLY approve -> success; EVERYTHING else -> failure. GitHub treats
+          # a `neutral` required check as PASSING, so the old neutral mappings
+          # (comment, error) were fail-OPEN — a soft/absent verdict let the PR
+          # merge. Fail closed: merge requires an explicit clean approve. A
+          # `comment` still posts a COMMENT review (its notes are visible) but
+          # its check blocks. error posts no review — an infra hiccup must
+          # never spend approval — and its check blocks.
           case "$VERDICT" in
             approve)          CONCLUSION="success"; EVENT="APPROVE" ;;
             request_changes)  CONCLUSION="failure"; EVENT="REQUEST_CHANGES" ;;
-            comment)          CONCLUSION="neutral"; EVENT="COMMENT" ;;
-            *)                CONCLUSION="neutral"; VERDICT="error"; EVENT="" ;;
+            comment)          CONCLUSION="failure"; EVENT="COMMENT" ;;
+            *)                CONCLUSION="failure"; VERDICT="error"; EVENT="" ;;
           esac
 
           # Per-assignment fallbacks: normalization above should make these
