@@ -419,6 +419,99 @@ func TestToolPollDispatch_UnknownJobIDReturnsClearError(t *testing.T) {
 	}
 }
 
+// TestStartAsyncDispatch_ReceiptAndLedgerCarryNonEmptyCycleID is the
+// regression test for the confirmed cog-review finding on startAsyncDispatch
+// (mcp_server.go): it used to call m.dispatchJobs.Create("") unconditionally,
+// so the CycleID this PR's own docs describe (surfaced in the receipt +
+// correlatable against harness.dispatch.start/end via the
+// harness.dispatch.job.issued ledger event) was ALWAYS empty and never
+// surfaced anywhere.
+//
+// This exercises the REAL call site — toolDispatchToHarness's async branch,
+// which is what dispatchToHarnessAsync/startAsyncDispatch actually run
+// behind — rather than calling reg.Create("cycle-1") directly (that unit
+// test already exists in TestDispatchJobRegistry_LifecyclePendingToDone and
+// would keep passing even with the mint-a-real-id fix reverted, since it
+// never touches startAsyncDispatch).
+func TestStartAsyncDispatch_ReceiptAndLedgerCarryNonEmptyCycleID(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
+
+	block := make(chan struct{})
+	disp := &blockingDispatcher{
+		release: block,
+		canned:  &DispatchBatchResult{Results: []DispatchResult{{Index: 0, Success: true, Content: "done"}}},
+	}
+	server := NewMCPServerWithAgentController(cfg, makeNucleus("Cog", "tester"), process, disp)
+
+	result, _, err := server.toolDispatchToHarness(context.Background(), nil, dispatchToHarnessInput{
+		Task:  "do the thing",
+		Async: true,
+	})
+	if err != nil {
+		t.Fatalf("toolDispatchToHarness (async): %v", err)
+	}
+
+	var receipt dispatchJobReceipt
+	decodeMCPJSONForAgentTests(t, result, &receipt)
+	if receipt.JobID == "" {
+		t.Fatal("expected non-empty job_id in async receipt")
+	}
+	if receipt.CycleID == "" {
+		t.Fatal("receipt.CycleID is empty — startAsyncDispatch minted no correlation id (Create(\"\") regression)")
+	}
+
+	// The registry record itself must carry the same id (not just the
+	// receipt) — this is what a poller sees via GET /v1/dispatch-jobs/{id}
+	// or cog_poll_dispatch.
+	rec, ok := server.dispatchJobs.Get(receipt.JobID)
+	if !ok {
+		t.Fatalf("job %q not found in registry immediately after creation", receipt.JobID)
+	}
+	if rec.CycleID != receipt.CycleID {
+		t.Fatalf("registry CycleID %q does not match receipt CycleID %q", rec.CycleID, receipt.CycleID)
+	}
+
+	// The harness.dispatch.job.issued ledger event must carry the same
+	// cycle_id — this is the correlation surface the PR's docs promise
+	// (correlatable against harness.dispatch.start/end emitted later by
+	// LocalHarnessController.DispatchToHarness for this same dispatch).
+	ledgerResult, err := QueryLedger(root, LedgerQuery{EventType: "harness.dispatch.job.issued", Limit: 10})
+	if err != nil {
+		t.Fatalf("QueryLedger: %v", err)
+	}
+	found := false
+	for _, ev := range ledgerResult.Events {
+		// EmitLedgerEvent files everything under event["payload"] verbatim
+		// (it only special-cases type/source/timestamp), so the fields set
+		// on startAsyncDispatch's "payload" map land at ev.Data["payload"],
+		// not ev.Data directly.
+		payload, _ := ev.Data["payload"].(map[string]any)
+		jobID, _ := payload["job_id"].(string)
+		if jobID != receipt.JobID {
+			continue
+		}
+		found = true
+		cycleID, _ := payload["cycle_id"].(string)
+		if cycleID == "" {
+			t.Fatalf("harness.dispatch.job.issued event for job %q has empty cycle_id", jobID)
+		}
+		if cycleID != receipt.CycleID {
+			t.Fatalf("ledger cycle_id %q does not match receipt CycleID %q", cycleID, receipt.CycleID)
+		}
+	}
+	if !found {
+		t.Fatalf("no harness.dispatch.job.issued ledger event found for job %q", receipt.JobID)
+	}
+
+	// Unblock the fake dispatcher and wait out the goroutine (see
+	// waitForTerminalJob's comment on why this matters for t.TempDir cleanup).
+	close(block)
+	waitForTerminalJob(t, server, receipt.JobID)
+}
+
 // TestQueryDispatchToHarness_SyncPathUnaffectedByAsyncField is the flag-off
 // mirror: Async=false (the zero value / default) must behave byte-for-byte
 // like before this change — synchronous, returning a DispatchBatchResult

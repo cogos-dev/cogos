@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"gopkg.in/yaml.v3"
 )
@@ -2128,15 +2129,25 @@ func (m *MCPServer) dispatchToHarnessAsync(ctx context.Context, dr DispatchReque
 // this job's CycleID; harness.dispatch.start/end carry the dispatcher's) so
 // either can be used to locate the other via time-window correlation.
 func (m *MCPServer) startAsyncDispatch(ctx context.Context, dr DispatchRequest) dispatchJobReceipt {
-	jobID := m.dispatchJobs.Create("")
+	// Mint the registry's own correlation id up front. This is NOT the same
+	// id as the harness-internal cycleID DispatchToHarness mints later
+	// (local_agent_harness.go:1604) — that one doesn't exist yet at this
+	// layer, before the dispatch has even started. This id just needs to be
+	// non-empty and stable across the receipt + the job.issued ledger event
+	// so a caller (or a bus consumer correlating harness.dispatch.job.issued
+	// against harness.dispatch.start/end) has something to key on; see the
+	// package doc above this function for how the two ids relate.
+	cycleID := uuid.NewString()
+	jobID := m.dispatchJobs.Create(cycleID)
 	rec, _ := m.dispatchJobs.Get(jobID)
 
 	_ = EmitLedgerEvent(m.cfg, map[string]any{
 		"type":   "harness.dispatch.job.issued",
 		"source": "mcp-dispatch-async",
 		"payload": map[string]any{
-			"job_id": jobID,
-			"task":   truncateDigest(dr.Task),
+			"job_id":   jobID,
+			"cycle_id": cycleID,
+			"task":     truncateDigest(dr.Task),
 		},
 	})
 
