@@ -136,6 +136,13 @@ type MCPServer struct {
 	// directly (package-boundary guard).  When non-nil, also stored in
 	// pkgFTSRepairIndexer so the free-function lazy-repair path can reach it.
 	constellationIndexer ConstellationIndexer
+
+	// dispatchJobs backs the async cog_dispatch_to_harness path (Async=true
+	// on dispatchToHarnessInput) and GET /v1/dispatch-jobs/{id}. Constructed
+	// unconditionally in NewMCPServerWithAgentController — never nil — so
+	// toolDispatchToHarness and the HTTP poll handler don't need a nil check
+	// before every use. See dispatch_jobs.go.
+	dispatchJobs *DispatchJobRegistry
 }
 
 // channelSessionBackend is the narrow surface the mod3 session-family MCP
@@ -173,6 +180,7 @@ func NewMCPServerWithAgentController(cfg *Config, nucleus *Nucleus, process *Pro
 		cogdocSvc:        NewCogDocService(cfg, process),
 		agentController:  ctrl,
 		deferredHandlers: make(map[string]deferredToolHandler),
+		dispatchJobs:     NewDispatchJobRegistry(),
 	}
 
 	m.registerTools()
@@ -307,7 +315,7 @@ func (m *MCPServer) registerTools() {
 
 	mcp.AddTool(m.server, m.trackTool(&mcp.Tool{
 		Name:        "cog_dispatch_to_harness",
-		Description: "Phase 2 transport: dispatch a task into the kernel-interior agent harness with structured return, optional concurrency (n=1..4), named tool scope, per-call tool narrowing, optional system-prompt override, and pluggable model routing (default: the resolved provider's configured default model — provider resolution follows harness_provider config and process-state routing; explicit provider/model params override). Synchronous: blocks until every slot completes, errors, or hits its per-slot timeout (default 240s; max = the kernel's dispatch timeout cap, dispatch_timeout_cap_seconds in kernel.yaml, default 600s — over-cap requests are rejected before any slot runs). Returns one DispatchResult per slot with content (the agent's final respond text), tool-call digests, duration, and turn count. Use this for the foveal->peripheral handoff — offload validation, rewriting, modality matching to the resident swarm instead of paying with Anthropic tokens. Named scopes (RFC-016): \"consolidation\" (default, 11 substrate tools: memory/field/coherence/identity; respond excluded from base), \"consolidation_with_respond\" (+ respond), \"consolidation_no_respond\" (no respond), \"audit\" (consolidation + cog_read_file + cog_grep_files), \"search\" (cog_resolve_uri/cog_search_memory/cog_query_field), \"observe\" (consolidation reads, no emit), \"emit\" (cog_emit_event only). Unknown scope names error immediately. Backward-compat note: cog_trigger_agent_loop still wakes the singleton with no payload; this tool is the new payload-bearing path.",
+		Description: "Phase 2 transport: dispatch a task into the kernel-interior agent harness with structured return, optional concurrency (n=1..4), named tool scope, per-call tool narrowing, optional system-prompt override, and pluggable model routing (default: the resolved provider's configured default model — provider resolution follows harness_provider config and process-state routing; explicit provider/model params override). Synchronous by default: blocks until every slot completes, errors, or hits its per-slot timeout (default 240s; max = the kernel's dispatch timeout cap, dispatch_timeout_cap_seconds in kernel.yaml, default 600s — over-cap requests are rejected before any slot runs). Returns one DispatchResult per slot with content (the agent's final respond text), tool-call digests, duration, and turn count. Set async=true to instead get an immediate {job_id, status:\"pending\"} receipt and poll via cog_poll_dispatch or GET /v1/dispatch-jobs/{id} — use this when the dispatch may outlive the caller's own request window. Use this for the foveal->peripheral handoff — offload validation, rewriting, modality matching to the resident swarm instead of paying with Anthropic tokens. Named scopes (RFC-016): \"consolidation\" (default, 11 substrate tools: memory/field/coherence/identity; respond excluded from base), \"consolidation_with_respond\" (+ respond), \"consolidation_no_respond\" (no respond), \"audit\" (consolidation + cog_read_file + cog_grep_files), \"search\" (cog_resolve_uri/cog_search_memory/cog_query_field), \"observe\" (consolidation reads, no emit), \"emit\" (cog_emit_event only). Unknown scope names error immediately. Backward-compat note: cog_trigger_agent_loop still wakes the singleton with no payload; this tool is the new payload-bearing path.",
 	}), m.toolDispatchToHarness)
 
 	// Kernel-native session/handoff tools (mcp_sessions.go). The porcelain
@@ -391,6 +399,11 @@ func (m *MCPServer) registerTools() {
 		Name:        "cog_trigger_agent_loop",
 		Description: "Manually invoke one homeostatic cycle of the specified agent, outside the regular ticker. Equivalent to POST /v1/agents/{id}/tick. Returns immediately with a trigger receipt; cycle runs async unless wait=true. Refuses if a cycle is already in flight (overlap guard). Fallback: kernel API POST /v1/agents/primary/tick (local port 6931)",
 	}, m.toolTriggerAgentLoop)
+
+	trackToolDeferred(m, &mcp.Tool{
+		Name:        "cog_poll_dispatch",
+		Description: "Poll the status of an async cog_dispatch_to_harness job (one issued with async=true). Returns {job_id, status: pending|running|done|failed, cycle_id, result, error, created_at, updated_at}. result/error populate only once status is terminal (done/failed). Jobs are retained for a bounded window after completion (~30m) then lazily reclaimed — an unknown job_id after that window returns a clear not-found error. Convenience wrapper; the primary poll surface is GET /v1/dispatch-jobs/{id} (local port 6931).",
+	}, m.toolPollDispatch)
 
 	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_tail_kernel_log",
@@ -882,6 +895,33 @@ type dispatchToHarnessInput struct {
 	Aud          string                 `json:"aud,omitempty" jsonschema:"OIDC-shaped identity claim: audience (e.g. \"cogos.kernel\")."`
 	Claims       map[string]interface{} `json:"claims,omitempty" jsonschema:"Free-form OIDC claim bag forwarded to the dispatch's trace metadata."`
 	TargetNode   string                 `json:"target_node,omitempty" jsonschema:"Phase 2 S4: when set, forward this dispatch to the named peer node over the authenticated BEP cluster channel. Requires cluster.enabled=true and the peer to be connected. Empty (default) runs on the local harness."`
+	Async        bool                   `json:"async,omitempty" jsonschema:"When true, return a job handle immediately ({job_id, status:\"pending\"}) instead of blocking until the dispatch completes. Poll the job via GET /v1/dispatch-jobs/{id} or the cog_poll_dispatch tool. Default false (synchronous, unchanged behavior)."`
+}
+
+// dispatchJobReceipt is the immediate response for an async dispatch — the
+// job handle a caller polls until it reaches a terminal state.
+type dispatchJobReceipt struct {
+	JobID   string `json:"job_id"`
+	Status  string `json:"status"`
+	CycleID string `json:"cycle_id,omitempty"`
+}
+
+// dispatchJobStatusResponse is the poll response shape for both the MCP
+// cog_poll_dispatch tool and GET /v1/dispatch-jobs/{id}. Result/Error are
+// populated only once Status is terminal (done/failed).
+type dispatchJobStatusResponse struct {
+	JobID     string               `json:"job_id"`
+	Status    string               `json:"status"`
+	CycleID   string               `json:"cycle_id,omitempty"`
+	Result    *DispatchBatchResult `json:"result,omitempty"`
+	Error     string               `json:"error,omitempty"`
+	CreatedAt string               `json:"created_at,omitempty"`
+	UpdatedAt string               `json:"updated_at,omitempty"`
+}
+
+// pollDispatchInput is the wire shape for cog_poll_dispatch.
+type pollDispatchInput struct {
+	JobID string `json:"job_id" jsonschema:"Required. The job_id returned by an async (Async=true) cog_dispatch_to_harness call."`
 }
 
 // readToolCallsInput mirrors ToolCallQuery for the MCP surface. Time bounds
@@ -2027,6 +2067,9 @@ func (m *MCPServer) toolTriggerAgentLoop(ctx context.Context, req *mcp.CallToolR
 // task-parameterized transport. See engine/agent_dispatch.go for the
 // underlying contract and the project_cogos_foveal_and_peripheral.md memory
 // note for the architectural framing.
+//
+// Async=true (dispatchToHarnessInput.Async) switches this from a blocking
+// call to a job-handle receipt: see dispatch_jobs.go and toolPollDispatch.
 func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallToolRequest, input dispatchToHarnessInput) (*mcp.CallToolResult, any, error) {
 	dr := DispatchRequest{
 		AgentID:        input.AgentID,
@@ -2050,11 +2093,123 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 		},
 		TargetNode: input.TargetNode,
 	}
+
+	if input.Async {
+		return m.dispatchToHarnessAsync(ctx, dr)
+	}
+
 	result, err := QueryDispatchToHarnessRouted(ctx, m.agentController, m.clusterRouter, dr)
 	if err != nil {
 		return agentErrorResult(err, "curl -X POST http://localhost:6931/v1/agents/primary/dispatch -d @body.json")
 	}
 	return m.cappedMarshal(result)
+}
+
+// dispatchToHarnessAsync is the MCP-tool-facing wrapper around
+// startAsyncDispatch — see that function for the mechanism.
+func (m *MCPServer) dispatchToHarnessAsync(ctx context.Context, dr DispatchRequest) (*mcp.CallToolResult, any, error) {
+	receipt := m.startAsyncDispatch(ctx, dr)
+	return marshalResult(receipt)
+}
+
+// startAsyncDispatch registers a job, spawns the real dispatch under a
+// context detached from the caller's request (see dispatch_jobs.go doc
+// comment — #432/e4e6aca: the request context dies the instant the calling
+// handler returns, and the goroutine must not inherit that cancellation),
+// and returns the job handle immediately. Shared by both transports that
+// accept async=true: the MCP tool (dispatchToHarnessAsync) and the HTTP
+// handler (Server.handleAgentDispatch, serve_agents.go).
+//
+// The job's CycleID is a registry-minted correlation id, not the harness-
+// internal cycle id LocalHarnessController.DispatchToHarness mints for its
+// own ledger events (local_agent_harness.go:1580) — that id is generated
+// inside the dispatcher and isn't visible at this layer before the call
+// starts. Both ids end up in the ledger (harness.dispatch.job.issued carries
+// this job's CycleID; harness.dispatch.start/end carry the dispatcher's) so
+// either can be used to locate the other via time-window correlation.
+func (m *MCPServer) startAsyncDispatch(ctx context.Context, dr DispatchRequest) dispatchJobReceipt {
+	jobID := m.dispatchJobs.Create("")
+	rec, _ := m.dispatchJobs.Get(jobID)
+
+	_ = EmitLedgerEvent(m.cfg, map[string]any{
+		"type":   "harness.dispatch.job.issued",
+		"source": "mcp-dispatch-async",
+		"payload": map[string]any{
+			"job_id": jobID,
+			"task":   truncateDigest(dr.Task),
+		},
+	})
+
+	detached, cancel := detachedDispatchContext(ctx, dr.TimeoutSeconds)
+	agentController := m.agentController
+	clusterRouter := m.clusterRouter
+	registry := m.dispatchJobs
+	cfg := m.cfg
+
+	go func() {
+		defer cancel()
+		registry.MarkRunning(jobID)
+		result, err := QueryDispatchToHarnessRouted(detached, agentController, clusterRouter, dr)
+		if err != nil {
+			registry.Fail(jobID, err.Error())
+			_ = EmitLedgerEvent(cfg, map[string]any{
+				"type":   "harness.dispatch.job.completed",
+				"source": "mcp-dispatch-async",
+				"payload": map[string]any{
+					"job_id": jobID,
+					"status": "failed",
+					"error":  err.Error(),
+				},
+			})
+			return
+		}
+		registry.Complete(jobID, result)
+		_ = EmitLedgerEvent(cfg, map[string]any{
+			"type":   "harness.dispatch.job.completed",
+			"source": "mcp-dispatch-async",
+			"payload": map[string]any{
+				"job_id": jobID,
+				"status": "done",
+			},
+		})
+	}()
+
+	receipt := dispatchJobReceipt{JobID: jobID, Status: string(DispatchJobPending)}
+	if rec != nil {
+		receipt.CycleID = rec.CycleID
+	}
+	return receipt
+}
+
+// toolPollDispatch implements cog_poll_dispatch — the MCP convenience poll
+// surface for an async cog_dispatch_to_harness job. The primary poll surface
+// is GET /v1/dispatch-jobs/{id} (serve_agents.go); this tool exists so a
+// caller that only has MCP available doesn't need the HTTP port.
+func (m *MCPServer) toolPollDispatch(ctx context.Context, req *mcp.CallToolRequest, input pollDispatchInput) (*mcp.CallToolResult, any, error) {
+	jobID := strings.TrimSpace(input.JobID)
+	if jobID == "" {
+		return fallbackResult("job_id is required", "curl http://localhost:6931/v1/dispatch-jobs/<job_id>")
+	}
+	rec, ok := m.dispatchJobs.Get(jobID)
+	if !ok {
+		return fallbackResult(fmt.Sprintf("no such dispatch job %q (unknown, or expired past the %s retention window)", jobID, dispatchJobTTL),
+			"curl http://localhost:6931/v1/dispatch-jobs/"+jobID)
+	}
+	return m.cappedMarshal(dispatchJobStatusFromRecord(rec))
+}
+
+// dispatchJobStatusFromRecord converts a DispatchJobRecord into the wire
+// response shape shared by the MCP poll tool and the HTTP poll route.
+func dispatchJobStatusFromRecord(rec *DispatchJobRecord) dispatchJobStatusResponse {
+	return dispatchJobStatusResponse{
+		JobID:     rec.JobID,
+		Status:    string(rec.State),
+		CycleID:   rec.CycleID,
+		Result:    rec.Result,
+		Error:     rec.Err,
+		CreatedAt: rec.CreatedAt.Format(time.RFC3339),
+		UpdatedAt: rec.UpdatedAt.Format(time.RFC3339),
+	}
 }
 
 // agentErrorResult translates AgentControllerError into the MCP fallback
