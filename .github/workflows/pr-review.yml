@@ -172,6 +172,10 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Canary is mechanical (one tool call, echo DENIED) — smallest tier.
+          # Permission enforcement is CLI-layer, so the model choice does not
+          # weaken the proof. Override via repo variable.
+          COG_CANARY_MODEL: ${{ vars.COG_CANARY_MODEL || 'claude-haiku-4-5-20251001' }}
         run: |
           set -uo pipefail
           # Double-slash = absolute path in CC permission rules (verified:
@@ -184,7 +188,8 @@ jobs:
           printf '%s' "$DENY" | jq -e . > /dev/null  # malformed JSON dies loudly here
           { echo 'DENY<<COG_DENY_EOF'; printf '%s\n' "$DENY"; echo 'COG_DENY_EOF'; } >> "$GITHUB_ENV"
           CANARY=$(claude -p 'Use the Read tool to read the file /proc/version. Output its first line verbatim if the read succeeds, or exactly the word DENIED if the tool call is refused.' \
-            --allowedTools "Read" --settings "$DENY" --max-turns 3 2>/dev/null || true)
+            --allowedTools "Read" --settings "$DENY" --max-turns 3 \
+            --model "$COG_CANARY_MODEL" 2>/dev/null || true)
           if printf '%s' "$CANARY" | grep -q 'DENIED' && ! printf '%s' "$CANARY" | grep -qi 'linux'; then
             echo "sandbox=ok" >> "$GITHUB_OUTPUT"
           else
@@ -207,21 +212,22 @@ jobs:
           # GITHUB_ENV) blocking /proc, /sys, and credential stores. Literal-
           # token redaction below is the backstop; encoded exfiltration
           # remains a residual risk until fork-PR mode (phase 2) runs this in
-          # a network-isolated container. Model override via repo variable,
-          # default to the CLI's default (models are a parameter, not an
-          # identity).
+          # a network-isolated container. Model pinned explicitly: a gate
+          # should be deterministic, not track the account default across CLI
+          # versions/plan changes — and review runs bill the operator's
+          # subscription, so the tier is a deliberate choice (Sonnet =
+          # bounded-judgment work). Swappable via repo variable; the model is
+          # a parameter, not an identity.
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          COG_REVIEW_MODEL: ${{ vars.COG_REVIEW_MODEL }}
+          COG_REVIEW_MODEL: ${{ vars.COG_REVIEW_MODEL || 'claude-sonnet-5' }}
         run: |
           set -uo pipefail
-          MODEL_ARGS=()
-          [ -n "${COG_REVIEW_MODEL:-}" ] && MODEL_ARGS=(--model "$COG_REVIEW_MODEL")
           claude -p "$(cat /tmp/cog-review/prompt.md)" \
             --output-format json \
             --max-turns 40 \
             --allowedTools "Read" "Grep" "Glob" \
             --settings "$DENY" \
-            "${MODEL_ARGS[@]}" \
+            --model "$COG_REVIEW_MODEL" \
             > /tmp/cog-review/raw.json 2> /tmp/cog-review/stderr.log
           echo "CLAUDE_EXIT=$?" >> "$GITHUB_ENV"
           # Redact the literal token from anything downstream may read/post.
