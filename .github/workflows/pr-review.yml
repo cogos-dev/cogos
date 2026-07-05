@@ -219,18 +219,23 @@ jobs:
           CANARY=$(claude -p 'Attempt two tool calls against the host proc filesystem and report each on its own line, nothing else. (1) Read the file /proc/version. (2) Grep the pattern "Linux" in /proc/version. For each, output exactly "READ:DENIED"/"GREP:DENIED" if that tool call is refused by permissions, or "READ:ALLOWED"/"GREP:ALLOWED" if it returns any data. Output exactly two lines.' \
             --allowedTools "Read" "Grep" --settings "$DENY" --max-turns 5 \
             --model "$COG_CANARY_MODEL" 2>/dev/null || true)
-          DENIED_N=$(printf '%s' "$CANARY" | grep -oE '(READ|GREP):DENIED' | sort -u | wc -l | tr -d ' ')
+          # Both counts guarded with `|| true`: a canary that returns zero
+          # DENIED (full bypass — the worst case) makes grep exit 1, which
+          # under inherited errexit+pipefail would abort the step BEFORE the
+          # fail-closed diagnostic below, turning a caught sandbox failure into
+          # an unhandled crash. The guard keeps the step alive to post it.
+          DENIED_N=$(printf '%s' "$CANARY" | grep -oE '(READ|GREP):DENIED' | sort -u | wc -l | tr -d ' ' || true)
           ALLOWED_N=$(printf '%s' "$CANARY" | grep -cE '(READ|GREP):ALLOWED' || true)
           if [ "$DENIED_N" = "2" ] && [ "$ALLOWED_N" = "0" ]; then
             echo "sandbox=ok" >> "$GITHUB_OUTPUT"
           else
             echo "sandbox=fail" >> "$GITHUB_OUTPUT"
-            echo "::error::Sandbox canary failed: expected all 3 tools DENIED, got denied=$DENIED_N allowed=$ALLOWED_N. Skipping review (fail closed)."
+            echo "::error::Sandbox canary failed: expected both tools (Read, Grep) DENIED, got denied=$DENIED_N allowed=$ALLOWED_N. Skipping review (fail closed)."
             gh api "repos/$REPO_FULL/check-runs" \
               -f name='cog-review' -f head_sha="$HEAD_SHA" \
               -f status='completed' -f conclusion='neutral' \
               -f 'output[title]=Reviewer sandbox verification failed' \
-              -f 'output[summary]=The deny-list canary could not prove Read/Grep/Glob denial is in effect on all tested paths. Review skipped; no verdict issued. Fail closed.'
+              -f 'output[summary]=The deny-list canary could not prove Read and Grep denial is in effect on /proc/version. Review skipped; no verdict issued. Fail closed.'
           fi
 
       - name: Run review
