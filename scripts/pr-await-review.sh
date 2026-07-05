@@ -87,6 +87,16 @@ done
 APPROVED_REVIEW=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
   --jq "[.[] | select(.user.login == \"$BOT_LOGIN\" and .state == \"APPROVED\" and .commit_id == \"$HEAD_SHA\")] | last // empty")
 
+# --- Changes-requested check (server-set): a bot CHANGES_REQUESTED review at
+# head. The gate maps request_changes AND comment/error/canary-fail/no-token
+# ALL to check-run conclusion=failure (fail closed), so `failure` alone can no
+# longer distinguish "real findings to fix" (reconcile) from "no actionable
+# verdict" (escalate). The review STATE — also server-set and unforgeable —
+# does: CHANGES_REQUESTED means genuine findings; a COMMENTED review or NO
+# review (errors post none) means escalate to a human. ---
+CHANGES_REQUESTED_REVIEW=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+  --jq "[.[] | select(.user.login == \"$BOT_LOGIN\" and .state == \"CHANGES_REQUESTED\" and .commit_id == \"$HEAD_SHA\")] | last // empty")
+
 # --- Marker extraction is DISPLAY-ONLY (untrusted). The real marker is the
 # LAST line of the gate's body/summary (the workflow appends it after all
 # model-authored text), so take the last match, not the first — an injected
@@ -140,7 +150,16 @@ case "$CONCLUSION" in
     emit "$CONCLUSION" "$VERDICT" "escalate" 4 "$VERDICT_JSON"
     ;;
   failure)
-    emit "$CONCLUSION" "$VERDICT" "reconcile" 2 "$VERDICT_JSON"
+    # Only a genuine CHANGES_REQUESTED review means "findings to fix".
+    # comment / error / canary-fail / no-token also land here (fail closed)
+    # but carry no actionable findings — escalate to a human instead of
+    # telling the caller to push phantom fixes.
+    if [ -n "$CHANGES_REQUESTED_REVIEW" ]; then
+      echo "cog-review: request_changes (bot CHANGES_REQUESTED @ ${HEAD_SHA:0:7})" >&2
+      emit "$CONCLUSION" "$VERDICT" "reconcile" 2 "$VERDICT_JSON"
+    fi
+    echo "cog-review: blocking failure with NO changes-requested review (comment/error/canary/no-token) @ ${HEAD_SHA:0:7}; escalating" >&2
+    emit "$CONCLUSION" "$VERDICT" "escalate" 4 "$VERDICT_JSON"
     ;;
   *)
     emit "$CONCLUSION" "$VERDICT" "escalate" 4 "$VERDICT_JSON"

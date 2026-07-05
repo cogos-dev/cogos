@@ -92,11 +92,21 @@ Two channels carry every verdict. The GitHub review is the authority surface:
 on a solo-maintainer repo this is the only way to require approvals at all,
 since authors cannot approve their own PRs), `request_changes` → a
 REQUEST_CHANGES review, `comment` → a COMMENT review; infra errors post no
-review, because an error must never spend approval. The check-run `cog-review`
-maps approve → success, request_changes → failure, anything else → neutral;
-branch protection treats only success as passing, so silence and errors fail
-closed. Consumers of the verdict must trust only reviews authored by
-`github-actions[bot]` whose `commit_id` equals the head they care about — that
-pair cannot be forged by comment text. The merge action itself always belongs
-to a person or their delegated operator workflow — the gate can approve and
-block, it cannot act.
+review, because an error must never spend approval.
+
+The check-run `cog-review` is where fail-closed actually lives, and it is
+sharper than it looks: **GitHub treats a `neutral` required check as PASSING,
+not blocking.** So the mapping is `approve` → success and **everything else
+(`request_changes`, `comment`, reviewer error, sandbox-canary failure,
+unconfigured token) → `failure`** — a blocking conclusion. Merge requires an
+explicit clean approve; a soft, absent, or errored verdict blocks. (An earlier
+version mapped the soft/error cases to `neutral` and documented them as "fail
+closed" — they were fail *open*; corrected once the check became required.)
+The reviewer call retries a few times so a transient blip doesn't wedge a PR
+under this stricter mapping. Consumers of the verdict must trust only reviews
+authored by `github-actions[bot]` whose `commit_id` equals the head they care
+about — that pair cannot be forged by comment text. The merge action itself
+always belongs to a person or their delegated operator workflow — the gate can
+approve and block, it cannot act. `enforce_admins: false` on the protected
+branch is the deliberate release valve: an admin can override a blocked gate
+(e.g. a persistent reviewer outage), and GitHub records the override visibly.
