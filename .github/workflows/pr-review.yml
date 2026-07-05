@@ -178,29 +178,52 @@ jobs:
           COG_CANARY_MODEL: ${{ vars.COG_CANARY_MODEL || 'claude-haiku-4-5-20251001' }}
         run: |
           set -uo pipefail
-          # Double-slash = absolute path in CC permission rules (verified:
-          # single-slash deny of /etc/** was a no-op; double-slash DENIED).
-          DENY='{"permissions":{"deny":['
-          DENY+='"Read(//proc/**)","Grep(//proc/**)","Glob(//proc/**)",'
-          DENY+='"Read(//sys/**)","Grep(//sys/**)","Glob(//sys/**)",'
-          DENY+='"Read(//home/runner/.claude/**)","Grep(//home/runner/.claude/**)","Glob(//home/runner/.claude/**)",'
-          DENY+='"Read(//home/runner/.config/**)","Glob(//home/runner/.config/**)",'
-          DENY+='"Read(**/.credentials.json)","Read(**/.git/config)","Read(//home/runner/.netrc)"]}}'
+          # DENY-LIST GENERATED FROM (paths x tools), NOT hand-written
+          # (rounds 4+5 self-review: a hand-maintained matrix kept missing
+          # tool/path combinations — Glob one round, Grep on credential paths
+          # the next). Every sensitive path gets EVERY allowed tool denied, so
+          # coverage is complete by construction and a new allowed tool or a
+          # new path can't silently leave a hole. Double-slash = absolute in
+          # CC permission rules (verified: single-slash /etc/** was a no-op).
+          # REVIEW_TOOLS here MUST stay in sync with the review step's
+          # --allowedTools; both derive from this one list.
+          REVIEW_TOOLS=(Read Grep Glob)
+          SENSITIVE_PATHS=(
+            "//proc/**" "//sys/**"
+            "//home/runner/.claude/**" "//home/runner/.config/**"
+            "//home/runner/.ssh/**" "//home/runner/.netrc"
+            "//home/runner/.aws/**" "//home/runner/.docker/**"
+            "**/.credentials.json" "**/.git/config" "**/.env" "**/.npmrc"
+          )
+          rules=()
+          for p in "${SENSITIVE_PATHS[@]}"; do
+            for t in "${REVIEW_TOOLS[@]}"; do
+              rules+=("\"$t($p)\"")
+            done
+          done
+          DENY=$(printf '{"permissions":{"deny":[%s]}}' "$(IFS=,; echo "${rules[*]}")")
           printf '%s' "$DENY" | jq -e . > /dev/null  # malformed JSON dies loudly here
           { echo 'DENY<<COG_DENY_EOF'; printf '%s\n' "$DENY"; echo 'COG_DENY_EOF'; } >> "$GITHUB_ENV"
-          CANARY=$(claude -p 'Use the Read tool to read the file /proc/version. Output its first line verbatim if the read succeeds, or exactly the word DENIED if the tool call is refused.' \
-            --allowedTools "Read" --settings "$DENY" --max-turns 3 \
+          # Canary now exercises EVERY allowed tool, not just Read: a leak via
+          # Grep or Glob is the exact gap round 5 found. /proc/version always
+          # exists on the runner, so an ALLOWED result means real content came
+          # back. Pass only if ALL tools refuse; any tool returning data, an
+          # unexpected reply, or a crash fails closed.
+          CANARY=$(claude -p 'Attempt three tool calls against the host proc filesystem and report each on its own line, nothing else. (1) Read the file /proc/version. (2) Grep the pattern "Linux" in /proc/version. (3) Glob the pattern /proc/*. For each, output exactly "READ:DENIED"/"GREP:DENIED"/"GLOB:DENIED" if that tool call is refused by permissions, or "READ:ALLOWED"/"GREP:ALLOWED"/"GLOB:ALLOWED" if it returns any data. Output exactly three lines.' \
+            --allowedTools "Read" "Grep" "Glob" --settings "$DENY" --max-turns 6 \
             --model "$COG_CANARY_MODEL" 2>/dev/null || true)
-          if printf '%s' "$CANARY" | grep -q 'DENIED' && ! printf '%s' "$CANARY" | grep -qi 'linux'; then
+          DENIED_N=$(printf '%s' "$CANARY" | grep -oE '(READ|GREP|GLOB):DENIED' | sort -u | wc -l | tr -d ' ')
+          ALLOWED_N=$(printf '%s' "$CANARY" | grep -cE '(READ|GREP|GLOB):ALLOWED' || true)
+          if [ "$DENIED_N" = "3" ] && [ "$ALLOWED_N" = "0" ]; then
             echo "sandbox=ok" >> "$GITHUB_OUTPUT"
           else
             echo "sandbox=fail" >> "$GITHUB_OUTPUT"
-            echo "::error::Deny-list canary did not come back DENIED — reviewer sandbox unproven. Skipping review (fail closed)."
+            echo "::error::Sandbox canary failed: expected all 3 tools DENIED, got denied=$DENIED_N allowed=$ALLOWED_N. Skipping review (fail closed)."
             gh api "repos/$REPO_FULL/check-runs" \
               -f name='cog-review' -f head_sha="$HEAD_SHA" \
               -f status='completed' -f conclusion='neutral' \
               -f 'output[title]=Reviewer sandbox verification failed' \
-              -f 'output[summary]=The deny-list canary could not prove path denies are in effect. Review skipped; no verdict issued. Fail closed.'
+              -f 'output[summary]=The deny-list canary could not prove Read/Grep/Glob denial is in effect on all tested paths. Review skipped; no verdict issued. Fail closed.'
           fi
 
       - name: Run review
