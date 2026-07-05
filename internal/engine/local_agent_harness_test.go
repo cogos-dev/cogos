@@ -837,9 +837,13 @@ routing:
 
 // TestDispatchToHarness_Legacy26bDowngradeWarningPerSlot is a regression test
 // ensuring that the "26b route unavailable, degraded to e4b" per-slot warning
-// from the legacy path still appears in each DispatchResult.Error even when
-// Success=true. This was silently dropped in an earlier iteration of the
-// state-routing patch; this test pins the contract.
+// from the legacy path still appears in each DispatchResult — in the Note
+// field, NOT Error. The warning was silently dropped in an earlier iteration
+// of the state-routing patch; it then rode along in Error, which made
+// success=true slots look failed to callers that only check that field
+// (observed live 2026-07-04: a successful dispatch carrying the provider-probe
+// fallback note in error). This test pins the current contract: warning
+// present in Note, Error empty on success.
 func TestDispatchToHarness_Legacy26bDowngradeWarningPerSlot(t *testing.T) {
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
@@ -888,10 +892,15 @@ func TestDispatchToHarness_Legacy26bDowngradeWarningPerSlot(t *testing.T) {
 	if !res.Success {
 		t.Errorf("Success = false; want true (26b fallback to e4b should still succeed)")
 	}
-	// Per-slot Error must carry the downgrade warning so callers that inspect
+	// Per-slot Note must carry the downgrade warning so callers that inspect
 	// individual slot results can see that the requested model was not honored.
-	if res.Error == "" {
-		t.Errorf("Error is empty; want downgrade warning (e.g. %q)", "26b route unavailable, degraded to e4b")
+	// It must NOT be in Error: this is a success, and informational routing
+	// notes in the error field made successful slots look failed.
+	if res.Note == "" {
+		t.Errorf("Note is empty; want downgrade warning (e.g. %q)", "26b route unavailable, degraded to e4b")
+	}
+	if res.Error != "" {
+		t.Errorf("Error = %q; want empty on a successful slot (warnings belong in Note)", res.Error)
 	}
 	if res.ModelUsed != DispatchModelE4B {
 		t.Errorf("ModelUsed = %q; want DispatchModelE4B", res.ModelUsed)

@@ -21,18 +21,32 @@ import (
 // abort on client cancel — see CompleteCancelSafeIfSupported/provider_openai.go),
 // and the retry that followed stacked a second zombie generation on top.
 // 240s covers the observed 2-4 min realistic worst case with headroom while
-// staying under dispatchTimeoutMax (300s) and h.httpClient.Timeout (which
+// staying under the dispatch timeout cap (600s default, config-driven via
+// dispatch_timeout_cap_seconds) and h.httpClient.Timeout (which
 // providers.yaml should set to at least this value for local endpoints —
 // see NewOpenAICompatProvider's timeout resolution).
 const dispatchTimeoutDefault = 240
 
-// dispatchTimeoutMax caps the per-slot budget. 300s accommodates cold-start
-// load of larger local models (gemma4:e4b at ~110s on M4 Pro) plus the
-// localHarnessCycleTimeout (300s) for tool-loop dispatches that run multiple
-// Ollama round-trips. The previous 120s cap was lifted from the legacy
-// TriggerAgent wait limit, but eval sweeps and Reconcilable-driven
-// dispatches need headroom for cold cycles.
-const dispatchTimeoutMax = 300
+// dispatchTimeoutCapDefault is the per-slot budget ceiling applied when no
+// dispatch_timeout_cap_seconds is configured in kernel.yaml. Aliases the
+// exported config default so there is exactly one number; Normalize itself
+// stays config-free — transport adapters stamp the configured cap onto
+// DispatchRequest.TimeoutCapSeconds (see Config.DispatchTimeoutCap).
+//
+// Operator directive (2026-07-04): "expand the timeout caps to at least 5m.
+// With agentic workflows that will likely get pushed even further out, so the
+// timeout should be a parameter, not hardcoded." 600s covers cold-start load
+// of larger local models plus multi-turn tool-loop dispatches; anything
+// beyond it is an operator decision expressed in config, not a code change.
+// The previous hardcoded caps (120s lifted from the legacy TriggerAgent wait
+// limit, then 300s post-#432) both aged out the same way — a fixed number
+// can't track the workload mix.
+//
+// Requests above the effective cap are REJECTED loudly at Normalize time
+// (invalid_input) rather than silently clamped: a caller that asked for 20
+// minutes and silently got 10 would misinterpret the resulting timeout as a
+// task failure. Same fail-loud posture as #430's unservable-model handling.
+const dispatchTimeoutCapDefault = DefaultDispatchTimeoutCapSeconds
 
 // dispatchNDefault is the parallel fan-out when 0 is passed. Mirrors the
 // "single dispatch" baseline so a minimal call shape behaves like a normal
@@ -80,8 +94,17 @@ func (r *DispatchRequest) Normalize() error {
 	if r.TimeoutSeconds <= 0 {
 		r.TimeoutSeconds = dispatchTimeoutDefault
 	}
-	if r.TimeoutSeconds > dispatchTimeoutMax {
-		r.TimeoutSeconds = dispatchTimeoutMax
+	timeoutCap := r.TimeoutCapSeconds
+	if timeoutCap <= 0 {
+		timeoutCap = dispatchTimeoutCapDefault
+	}
+	if r.TimeoutSeconds > timeoutCap {
+		return &AgentControllerError{
+			Code: "invalid_input",
+			Message: fmt.Sprintf(
+				"timeout_seconds=%d exceeds the dispatch timeout cap (%ds); raise dispatch_timeout_cap_seconds in kernel.yaml or lower the request",
+				r.TimeoutSeconds, timeoutCap),
+		}
 	}
 	if r.N <= 0 {
 		r.N = dispatchNDefault
