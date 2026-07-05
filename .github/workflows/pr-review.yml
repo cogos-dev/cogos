@@ -182,12 +182,19 @@ jobs:
           # (rounds 4+5 self-review: a hand-maintained matrix kept missing
           # tool/path combinations — Glob one round, Grep on credential paths
           # the next). Every sensitive path gets EVERY allowed tool denied, so
-          # coverage is complete by construction and a new allowed tool or a
-          # new path can't silently leave a hole. Double-slash = absolute in
+          # coverage is complete by construction. Double-slash = absolute in
           # CC permission rules (verified: single-slash /etc/** was a no-op).
-          # REVIEW_TOOLS here MUST stay in sync with the review step's
-          # --allowedTools; both derive from this one list.
-          REVIEW_TOOLS=(Read Grep Glob)
+          #
+          # Glob is NOT an allowed tool: round-6 canary caught that Glob
+          # ignores --settings path denies entirely (Read/Grep DENIED, Glob
+          # ALLOWED against the same //path/** rule — verified locally). Fail
+          # closed: only grant tools whose sandbox we can prove. Read (verify
+          # premises) + Grep (find call-sites / the "wired?" check) are both
+          # provably deniable and cover the reviewer's real needs; Glob only
+          # enumerated filenames anyway. REVIEW_TOOLS is the single source for
+          # the deny generation, the canary, AND the review step's
+          # --allowedTools — they cannot drift.
+          REVIEW_TOOLS=(Read Grep)
           SENSITIVE_PATHS=(
             "//proc/**" "//sys/**"
             "//home/runner/.claude/**" "//home/runner/.config/**"
@@ -204,17 +211,17 @@ jobs:
           DENY=$(printf '{"permissions":{"deny":[%s]}}' "$(IFS=,; echo "${rules[*]}")")
           printf '%s' "$DENY" | jq -e . > /dev/null  # malformed JSON dies loudly here
           { echo 'DENY<<COG_DENY_EOF'; printf '%s\n' "$DENY"; echo 'COG_DENY_EOF'; } >> "$GITHUB_ENV"
-          # Canary now exercises EVERY allowed tool, not just Read: a leak via
-          # Grep or Glob is the exact gap round 5 found. /proc/version always
-          # exists on the runner, so an ALLOWED result means real content came
-          # back. Pass only if ALL tools refuse; any tool returning data, an
-          # unexpected reply, or a crash fails closed.
-          CANARY=$(claude -p 'Attempt three tool calls against the host proc filesystem and report each on its own line, nothing else. (1) Read the file /proc/version. (2) Grep the pattern "Linux" in /proc/version. (3) Glob the pattern /proc/*. For each, output exactly "READ:DENIED"/"GREP:DENIED"/"GLOB:DENIED" if that tool call is refused by permissions, or "READ:ALLOWED"/"GREP:ALLOWED"/"GLOB:ALLOWED" if it returns any data. Output exactly three lines.' \
-            --allowedTools "Read" "Grep" "Glob" --settings "$DENY" --max-turns 6 \
+          # Canary exercises EVERY allowed tool (Read, Grep), not just one — a
+          # leak via any allowed tool is the gap rounds 5-6 found.
+          # /proc/version always exists on the runner, so an ALLOWED result
+          # means real content came back. Pass only if BOTH tools refuse; any
+          # tool returning data, an unexpected reply, or a crash fails closed.
+          CANARY=$(claude -p 'Attempt two tool calls against the host proc filesystem and report each on its own line, nothing else. (1) Read the file /proc/version. (2) Grep the pattern "Linux" in /proc/version. For each, output exactly "READ:DENIED"/"GREP:DENIED" if that tool call is refused by permissions, or "READ:ALLOWED"/"GREP:ALLOWED" if it returns any data. Output exactly two lines.' \
+            --allowedTools "Read" "Grep" --settings "$DENY" --max-turns 5 \
             --model "$COG_CANARY_MODEL" 2>/dev/null || true)
-          DENIED_N=$(printf '%s' "$CANARY" | grep -oE '(READ|GREP|GLOB):DENIED' | sort -u | wc -l | tr -d ' ')
-          ALLOWED_N=$(printf '%s' "$CANARY" | grep -cE '(READ|GREP|GLOB):ALLOWED' || true)
-          if [ "$DENIED_N" = "3" ] && [ "$ALLOWED_N" = "0" ]; then
+          DENIED_N=$(printf '%s' "$CANARY" | grep -oE '(READ|GREP):DENIED' | sort -u | wc -l | tr -d ' ')
+          ALLOWED_N=$(printf '%s' "$CANARY" | grep -cE '(READ|GREP):ALLOWED' || true)
+          if [ "$DENIED_N" = "2" ] && [ "$ALLOWED_N" = "0" ]; then
             echo "sandbox=ok" >> "$GITHUB_OUTPUT"
           else
             echo "sandbox=fail" >> "$GITHUB_OUTPUT"
@@ -253,10 +260,14 @@ jobs:
           # aborts the step before exit-capture and before the redaction
           # backstop — the exact class the backstop exists for.
           set +e
+          # --allowedTools MUST match the canary's REVIEW_TOOLS (Read Grep):
+          # Glob is excluded because it ignores --settings path denies
+          # (round-6 finding). Any tool added here must also be added to
+          # REVIEW_TOOLS so the deny-gen + canary cover it.
           claude -p "$(cat /tmp/cog-review/prompt.md)" \
             --output-format json \
             --max-turns 40 \
-            --allowedTools "Read" "Grep" "Glob" \
+            --allowedTools "Read" "Grep" \
             --settings "$DENY" \
             --model "$COG_REVIEW_MODEL" \
             > /tmp/cog-review/raw.json 2> /tmp/cog-review/stderr.log
