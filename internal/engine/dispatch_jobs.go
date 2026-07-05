@@ -65,12 +65,44 @@ type DispatchJobRecord struct {
 }
 
 // snapshot returns a defensive copy safe to hand to a caller outside the
-// registry's lock.
+// registry's lock. `cp := *r` alone only copies the struct's own fields —
+// Result is a *DispatchBatchResult, so a shallow copy would still share the
+// pointee with whatever Complete() stored in the registry. A caller mutating
+// rec.Result.Results[i] (or appending to rec.Result.Notes) would silently
+// corrupt the registry's copy for every other Get() — exactly the aliasing
+// bug TestDispatchJobRegistry_GetReturnsDefensiveCopy is meant to guard
+// against, just one level deeper than that test currently reaches. Deep-copy
+// Result (and its nested Results/ToolCalls/Notes slices, all value-typed
+// leaves) so the returned record is safe to mutate freely.
 func (r *DispatchJobRecord) snapshot() *DispatchJobRecord {
 	if r == nil {
 		return nil
 	}
 	cp := *r
+	cp.Result = cp.Result.deepCopy()
+	return &cp
+}
+
+// deepCopy returns a copy of b with its own backing arrays for Results (and
+// each result's ToolCalls) and Notes, so mutating the copy can never be
+// observed by a concurrent reader holding the original. nil-receiver-safe.
+func (b *DispatchBatchResult) deepCopy() *DispatchBatchResult {
+	if b == nil {
+		return nil
+	}
+	cp := *b
+	if b.Results != nil {
+		cp.Results = make([]DispatchResult, len(b.Results))
+		for i, res := range b.Results {
+			if res.ToolCalls != nil {
+				res.ToolCalls = append([]DispatchToolCallSummary(nil), res.ToolCalls...)
+			}
+			cp.Results[i] = res
+		}
+	}
+	if b.Notes != nil {
+		cp.Notes = append([]string(nil), b.Notes...)
+	}
 	return &cp
 }
 
@@ -194,14 +226,43 @@ func isTerminal(s DispatchJobState) bool {
 // no-timeout-specified behavior matches the synchronous path's.
 const dispatchAsyncDefaultTimeoutSeconds = dispatchTimeoutDefault
 
+// dispatchAsyncQueueHeadroomSeconds covers the time an async dispatch may
+// spend BLOCKED ON ollamaMu (local_agent_harness.go) before its per-slot
+// budget even starts ticking.
+//
+// QueryDispatchToHarnessRouted -> DispatchToHarness acquires ollamaMu before
+// any per-slot context is created (dispatchSlot's own context.WithTimeout is
+// derived from this same outer ctx, further downstream). If the outer
+// deadline set here also has to cover that queueing wait, a kernel that's
+// mid-metabolic-cycle (documented worst case ~2-4 minutes under load per
+// dispatchTimeoutDefault's #432 forensics) can burn the caller's entire
+// requested budget just waiting for the lock — so the async dispatch fails
+// with deadline-exceeded in precisely the busy-kernel case async dispatch
+// exists to survive, while the equivalent synchronous call (whose caller
+// controls its own wait) succeeds once the lock frees up.
+//
+// Fix: give the detached context's own deadline headroom above the caller's
+// requested per-slot budget, sized to the same worst-case queueing window
+// already documented for the mutex. This keeps DispatchToHarness's locking
+// untouched (no restructuring to "start the per-slot clock after Lock()",
+// which would require plumbing a second context boundary through every
+// provider-resolution branch above the lock) while ensuring the per-slot
+// budget the caller asked for is actually available once the slot starts
+// running, not eaten by time spent waiting in line for a busy accelerator.
+const dispatchAsyncQueueHeadroomSeconds = 240
+
 // detachedDispatchContext returns a context that has severed cancellation
 // from parent (see package doc above / #432 e4e6aca) but still carries a
 // bounded deadline of its own. seconds<=0 falls back to
-// dispatchAsyncDefaultTimeoutSeconds.
+// dispatchAsyncDefaultTimeoutSeconds. The deadline is stamped at
+// seconds+dispatchAsyncQueueHeadroomSeconds so a busy-kernel wait on
+// ollamaMu doesn't cannibalize the per-slot budget the caller requested
+// (see dispatchAsyncQueueHeadroomSeconds doc).
 func detachedDispatchContext(parent context.Context, seconds int) (context.Context, context.CancelFunc) {
 	if seconds <= 0 {
 		seconds = dispatchAsyncDefaultTimeoutSeconds
 	}
 	detached := context.WithoutCancel(parent)
-	return context.WithTimeout(detached, time.Duration(seconds)*time.Second)
+	budget := time.Duration(seconds+dispatchAsyncQueueHeadroomSeconds) * time.Second
+	return context.WithTimeout(detached, budget)
 }

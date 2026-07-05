@@ -88,6 +88,87 @@ func TestDispatchJobRegistry_GetReturnsDefensiveCopy(t *testing.T) {
 	}
 }
 
+// TestDispatchJobRegistry_GetResultIsDeepCopy is the regression test for
+// FINDING 4: TestDispatchJobRegistry_GetReturnsDefensiveCopy above only
+// mutates the top-level State field of the returned record, which is a
+// value type on DispatchJobRecord and was always safe (cp := *r copies it).
+// It never exercised Result, a *DispatchBatchResult pointer — a plain
+// `cp := *r` shallow copy leaves cp.Result pointing at the SAME
+// DispatchBatchResult (and the same nested Results/ToolCalls/Notes slices)
+// still stored in the registry, so the "defensive copy" claim the test name
+// makes was never actually verified for the field most likely to be mutated
+// by a real caller (e.g. a poll handler appending to Results or Notes).
+//
+// This test mutates the batch result returned by Get and confirms a second
+// Get is unaffected, at every level: the Result pointer itself, the Results
+// slice, an individual DispatchResult's ToolCalls slice, and the Notes
+// slice.
+func TestDispatchJobRegistry_GetResultIsDeepCopy(t *testing.T) {
+	t.Parallel()
+	reg := NewDispatchJobRegistry()
+	jobID := reg.Create("")
+
+	original := &DispatchBatchResult{
+		Results: []DispatchResult{
+			{
+				Index:   0,
+				Success: true,
+				Content: "original content",
+				ToolCalls: []DispatchToolCallSummary{
+					{Name: "cog_resolve_uri", ArgsDigest: "orig-args"},
+				},
+			},
+		},
+		TotalDurationSec: 1.5,
+		Notes:            []string{"original note"},
+	}
+	reg.Complete(jobID, original)
+
+	rec, ok := reg.Get(jobID)
+	if !ok {
+		t.Fatal("job not found after Complete")
+	}
+
+	// Mutate every level of the returned copy.
+	if rec.Result == original {
+		t.Fatal("Get returned the same *DispatchBatchResult pointer stored via Complete; not a defensive copy")
+	}
+	rec.Result.TotalDurationSec = 99
+	rec.Result.Results[0].Content = "mutated content"
+	rec.Result.Results[0].ToolCalls[0].ArgsDigest = "mutated-args"
+	rec.Result.Notes[0] = "mutated note"
+	rec.Result.Notes = append(rec.Result.Notes, "appended note")
+	rec.Result.Results = append(rec.Result.Results, DispatchResult{Index: 1})
+
+	rec2, ok := reg.Get(jobID)
+	if !ok {
+		t.Fatal("job not found on second Get")
+	}
+	if rec2.Result.TotalDurationSec != 1.5 {
+		t.Errorf("TotalDurationSec leaked mutation: got %v, want 1.5", rec2.Result.TotalDurationSec)
+	}
+	if len(rec2.Result.Results) != 1 {
+		t.Fatalf("Results length leaked mutation: got %d, want 1", len(rec2.Result.Results))
+	}
+	if rec2.Result.Results[0].Content != "original content" {
+		t.Errorf("Results[0].Content leaked mutation: got %q, want %q", rec2.Result.Results[0].Content, "original content")
+	}
+	if rec2.Result.Results[0].ToolCalls[0].ArgsDigest != "orig-args" {
+		t.Errorf("Results[0].ToolCalls[0].ArgsDigest leaked mutation: got %q, want %q", rec2.Result.Results[0].ToolCalls[0].ArgsDigest, "orig-args")
+	}
+	if len(rec2.Result.Notes) != 1 || rec2.Result.Notes[0] != "original note" {
+		t.Errorf("Notes leaked mutation: got %v, want [%q]", rec2.Result.Notes, "original note")
+	}
+
+	// Also confirm the ORIGINAL passed into Complete was never touched —
+	// guards against a future refactor that copies on write into the
+	// registry instead of on read out of it (equally valid, but must
+	// actually happen somewhere).
+	if original.TotalDurationSec != 1.5 || original.Results[0].Content != "original content" {
+		t.Error("the original DispatchBatchResult passed to Complete was mutated by a Get-side copy; snapshot must not alias it")
+	}
+}
+
 // TestDispatchJobRegistry_LazyGCReclaimsExpiredTerminalJobs verifies the TTL
 // sweep: a terminal job older than the TTL is removed on the next Create
 // call (lazy GC, no background ticker).
@@ -130,6 +211,95 @@ func TestDispatchJobRegistry_LazyGCDoesNotReclaimPending(t *testing.T) {
 
 	if _, ok := reg.Get(pendingJob); !ok {
 		t.Fatal("pending job was reclaimed by GC; only terminal jobs should be TTL-eligible")
+	}
+}
+
+// --- detachedDispatchContext deadline sizing (FINDING 3) --------------------
+
+// TestDetachedDispatchContext_DeadlineHasQueueHeadroom is the regression test
+// for FINDING 3: detachedDispatchContext previously stamped the async
+// goroutine's deadline as exactly req.TimeoutSeconds from "now" — the same
+// instant startAsyncDispatch fires, BEFORE the dispatch has even reached
+// DispatchToHarness's ollamaMu.Lock() (local_agent_harness.go), let alone
+// acquired it. QueryDispatchToHarnessRouted -> DispatchToHarness -> the
+// per-slot context.WithTimeout in dispatchSlot are all derived from this one
+// outer deadline, so a busy kernel (metabolic cycle mid-run, holding
+// ollamaMu for the documented 2-4 minute worst case — see
+// dispatchTimeoutDefault's #432 forensics) burns the caller's entire
+// requested budget just queueing for the lock. The per-slot work then starts
+// with little-to-no time left and fails deadline-exceeded — precisely the
+// busy-kernel case async dispatch exists to survive, while the equivalent
+// synchronous call (whose caller supplies its own patience) succeeds once
+// the lock frees up.
+//
+// This test only exercises the deadline arithmetic in isolation (no real
+// ollamaMu contention — that needs a live LocalHarnessController and a
+// concurrent metabolic cycle, out of scope for a fast unit test) but it
+// directly catches a regression to the pre-fix "deadline == now +
+// TimeoutSeconds" shape, which is the root cause the finding identifies.
+func TestDetachedDispatchContext_DeadlineHasQueueHeadroom(t *testing.T) {
+	t.Parallel()
+
+	requestedSeconds := 30
+	ctx, cancel := detachedDispatchContext(context.Background(), requestedSeconds)
+	defer cancel()
+	after := time.Now()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("detachedDispatchContext returned a context with no deadline")
+	}
+
+	// A plain context.WithTimeout(parent, requestedSeconds) deadline lands at
+	// before/after + requestedSeconds give or take nanoseconds of scheduling
+	// jitter — nowhere near a full minute of slack. Requiring at least 60s of
+	// headroom (well under dispatchAsyncQueueHeadroomSeconds=240) is a bright
+	// line that only a real headroom-add can cross, so this fails cleanly
+	// against the pre-fix "no headroom at all" shape instead of passing on
+	// jitter alone.
+	const minHeadroomForTest = 60 * time.Second
+	noHeadroomDeadline := after.Add(time.Duration(requestedSeconds) * time.Second)
+	if !deadline.After(noHeadroomDeadline.Add(minHeadroomForTest)) {
+		t.Fatalf(
+			"deadline has no meaningful queueing headroom above the requested %ds budget: "+
+				"deadline=%s, no-headroom deadline would be ~%s (delta=%s, want >= %s) — "+
+				"a busy-kernel ollamaMu wait can now consume the entire per-slot "+
+				"budget before any dispatch work starts",
+			requestedSeconds, deadline, noHeadroomDeadline, deadline.Sub(noHeadroomDeadline), minHeadroomForTest)
+	}
+
+	// Sanity bound: the headroom shouldn't be unbounded either — confirm the
+	// deadline still lands within [before, after] + requested + headroom, so
+	// a future change can't silently balloon this into an effectively-infinite
+	// timeout.
+	maxExpected := after.Add(time.Duration(requestedSeconds+dispatchAsyncQueueHeadroomSeconds) * time.Second)
+	if deadline.After(maxExpected) {
+		t.Fatalf("deadline %s exceeds requested+headroom bound %s", deadline, maxExpected)
+	}
+}
+
+// TestDetachedDispatchContext_DefaultTimeoutAlsoGetsHeadroom confirms the
+// headroom applies on the no-explicit-timeout fallback path too (seconds<=0
+// -> dispatchAsyncDefaultTimeoutSeconds), not just the caller-specified case.
+func TestDetachedDispatchContext_DefaultTimeoutAlsoGetsHeadroom(t *testing.T) {
+	t.Parallel()
+
+	after := time.Now()
+	ctx, cancel := detachedDispatchContext(context.Background(), 0)
+	defer cancel()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("detachedDispatchContext returned a context with no deadline")
+	}
+
+	const minHeadroomForTest = 60 * time.Second
+	noHeadroomDeadline := after.Add(time.Duration(dispatchAsyncDefaultTimeoutSeconds) * time.Second)
+	if !deadline.After(noHeadroomDeadline.Add(minHeadroomForTest)) {
+		t.Fatalf(
+			"default-timeout deadline has no meaningful queueing headroom: deadline=%s, "+
+				"no-headroom deadline would be ~%s (delta=%s, want >= %s)",
+			deadline, noHeadroomDeadline, deadline.Sub(noHeadroomDeadline), minHeadroomForTest)
 	}
 }
 
