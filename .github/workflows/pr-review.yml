@@ -268,8 +268,18 @@ jobs:
           # anywhere — display or embedded marker — so exactly one genuine
           # marker (the one this step appends) can ever exist in the output.
           REVIEW=$(printf '%s' "$REVIEW" | jq -c 'walk(if type=="string" then (gsub("-->";"--&gt;") | gsub("<!--";"&lt;!--")) else . end)')
+          # NORMALIZE (round-2 self-review finding): the model can return
+          # valid JSON with a valid .verdict but non-array .findings (e.g. the
+          # string "none"). Downstream map() calls would then throw under
+          # set -e BEFORE the review/check-run post — no verdict would land,
+          # violating the "check-run always lands" contract. Coerce the two
+          # array fields structurally so every consumer can trust their shape.
+          REVIEW=$(printf '%s' "$REVIEW" | jq -c '
+            .findings = (if (.findings | type) == "array" then .findings else [] end)
+            | .unverified_notes = (if (.unverified_notes | type) == "array" then .unverified_notes else [] end)
+            | .summary = (if (.summary | type) == "string" then .summary else "(no summary)" end)')
           VERDICT=$(printf '%s' "$REVIEW" | jq -r '.verdict // "error"')
-          SUMMARY=$(printf '%s' "$REVIEW" | jq -r '.summary // "(no summary)"')
+          SUMMARY=$(printf '%s' "$REVIEW" | jq -r '.summary')
 
           # Verdict maps to BOTH channels: a GitHub-native review (the
           # authority: satisfies/blocks required-approvals) and a check-run
