@@ -506,10 +506,42 @@ func TestStartAsyncDispatch_ReceiptAndLedgerCarryNonEmptyCycleID(t *testing.T) {
 		t.Fatalf("no harness.dispatch.job.issued ledger event found for job %q", receipt.JobID)
 	}
 
-	// Unblock the fake dispatcher and wait out the goroutine (see
-	// waitForTerminalJob's comment on why this matters for t.TempDir cleanup).
+	// Unblock the fake dispatcher and wait out the goroutine. waitForTerminalJob
+	// only guarantees the REGISTRY has reached a terminal state
+	// (registry.Complete/Fail) — startAsyncDispatch's goroutine emits the
+	// harness.dispatch.job.completed ledger event (a second AppendEvent call
+	// into this same t.TempDir() workspace) AFTER that, so a bare
+	// waitForTerminalJob can still race t.TempDir()'s RemoveAll cleanup against
+	// that trailing ledger write. Also wait for the completed ledger event
+	// (root, not the registry) so this test doesn't reintroduce that flake.
 	close(block)
 	waitForTerminalJob(t, server, receipt.JobID)
+	waitForLedgerEvent(t, root, "harness.dispatch.job.completed", receipt.JobID)
+}
+
+// waitForLedgerEvent polls the ledger at workspaceRoot until an event of the
+// given type carrying data.payload.job_id == jobID appears, or a 5s deadline
+// elapses (test failure on timeout). Use this after waitForTerminalJob when a
+// test also needs to observe (or simply outlive) a ledger write that a
+// background goroutine performs strictly after the registry reaches a
+// terminal state — see startAsyncDispatch's Complete/Fail-then-EmitLedgerEvent
+// ordering.
+func waitForLedgerEvent(t *testing.T, workspaceRoot, eventType, jobID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		res, err := QueryLedger(workspaceRoot, LedgerQuery{EventType: eventType, Limit: 20})
+		if err == nil {
+			for _, ev := range res.Events {
+				payload, _ := ev.Data["payload"].(map[string]any)
+				if id, _ := payload["job_id"].(string); id == jobID {
+					return
+				}
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no %q ledger event observed for job %q within 5s", eventType, jobID)
 }
 
 // TestQueryDispatchToHarness_SyncPathUnaffectedByAsyncField is the flag-off
