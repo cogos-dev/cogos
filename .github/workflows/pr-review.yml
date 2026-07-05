@@ -268,15 +268,20 @@ jobs:
           # anywhere — display or embedded marker — so exactly one genuine
           # marker (the one this step appends) can ever exist in the output.
           REVIEW=$(printf '%s' "$REVIEW" | jq -c 'walk(if type=="string" then (gsub("-->";"--&gt;") | gsub("<!--";"&lt;!--")) else . end)')
-          # NORMALIZE (round-2 self-review finding): the model can return
-          # valid JSON with a valid .verdict but non-array .findings (e.g. the
-          # string "none"). Downstream map() calls would then throw under
-          # set -e BEFORE the review/check-run post — no verdict would land,
-          # violating the "check-run always lands" contract. Coerce the two
-          # array fields structurally so every consumer can trust their shape.
+          # NORMALIZE (rounds 2+3 self-review findings): the model can return
+          # valid JSON with a valid .verdict but findings in ANY shape — a
+          # non-array ("none"), an array of strings (["looks fine"]), objects
+          # with missing/mistyped keys. Round 2 fixed only the container type;
+          # round 3 caught the element shape. Close the WHOLE class: coerce
+          # container AND every element to the exact rendered shape, so no
+          # model output can crash the publish step downstream.
           REVIEW=$(printf '%s' "$REVIEW" | jq -c '
-            .findings = (if (.findings | type) == "array" then .findings else [] end)
-            | .unverified_notes = (if (.unverified_notes | type) == "array" then .unverified_notes else [] end)
+            .findings = ((.findings // []) | (if type == "array" then . else [] end) | map(
+              if type == "object"
+              then {file: ((.file // "?") | tostring), line: ((.line // 0) | tostring),
+                    issue: ((.issue // "") | tostring), scenario: ((.scenario // "") | tostring)}
+              else {file: "?", line: "0", issue: tostring, scenario: ""} end))
+            | .unverified_notes = ((.unverified_notes // []) | (if type == "array" then . else [] end) | map(tostring))
             | .summary = (if (.summary | type) == "string" then .summary else "(no summary)" end)')
           VERDICT=$(printf '%s' "$REVIEW" | jq -r '.verdict // "error"')
           SUMMARY=$(printf '%s' "$REVIEW" | jq -r '.summary')
@@ -292,9 +297,13 @@ jobs:
             *)                CONCLUSION="neutral"; VERDICT="error"; EVENT="" ;;
           esac
 
-          FINDINGS_MD=$(printf '%s' "$REVIEW" | jq -r '(.findings // []) | if length == 0 then "_none_" else map("- **\(.file):\(.line)** — \(.issue)\n  - Failure scenario: \(.scenario)") | join("\n") end')
-          NOTES_MD=$(printf '%s' "$REVIEW" | jq -r '(.unverified_notes // []) | if length == 0 then "_none_" else map("- \(.)") | join("\n") end')
-          FINDINGS_N=$(printf '%s' "$REVIEW" | jq -r '(.findings // []) | length')
+          # Per-assignment fallbacks: normalization above should make these
+          # infallible, but the publish contract ("a verdict always lands")
+          # must hold by CONSTRUCTION, not by enumerating model-output shapes
+          # — a render failure degrades the display, never the post.
+          FINDINGS_MD=$(printf '%s' "$REVIEW" | jq -r '(.findings // []) | if length == 0 then "_none_" else map("- **\(.file):\(.line)** — \(.issue)\n  - Failure scenario: \(.scenario)") | join("\n") end') || FINDINGS_MD="_(findings could not be rendered — see workflow log)_"
+          NOTES_MD=$(printf '%s' "$REVIEW" | jq -r '(.unverified_notes // []) | if length == 0 then "_none_" else map("- \(.)") | join("\n") end') || NOTES_MD="_(notes could not be rendered)_"
+          FINDINGS_N=$(printf '%s' "$REVIEW" | jq -r '(.findings // []) | length') || FINDINGS_N="?"
           TRUNC_NOTE=""
           [ "${TRUNCATED:-false}" = "true" ] && TRUNC_NOTE=$'\n> ⚠ Diff exceeded 400KB; the reviewer saw a truncated version. Treat coverage as partial.\n'
 
