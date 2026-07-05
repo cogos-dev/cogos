@@ -60,15 +60,64 @@ func TestQueryDispatchToHarness_NormalizationDefaults(t *testing.T) {
 
 func TestQueryDispatchToHarness_ClampsRanges(t *testing.T) {
 	disp := &fakeAgentDispatcher{cannedOk: true}
-	req := DispatchRequest{Task: "x", N: 99, TimeoutSeconds: 99999}
+	req := DispatchRequest{Task: "x", N: 99, TimeoutSeconds: 500}
 	if _, err := QueryDispatchToHarness(context.Background(), disp, req); err != nil {
 		t.Fatalf("query: %v", err)
 	}
 	if disp.lastReq.N != 4 {
 		t.Errorf("N not clamped to 4, got %d", disp.lastReq.N)
 	}
-	if disp.lastReq.TimeoutSeconds != 300 {
-		t.Errorf("TimeoutSeconds not clamped to 300, got %d", disp.lastReq.TimeoutSeconds)
+	// Timeouts are no longer silently clamped: in-cap values pass through
+	// verbatim; over-cap values are rejected loudly (see the cap tests below).
+	if disp.lastReq.TimeoutSeconds != 500 {
+		t.Errorf("in-cap TimeoutSeconds altered, got %d, want 500", disp.lastReq.TimeoutSeconds)
+	}
+}
+
+// TestQueryDispatchToHarness_TimeoutOverDefaultCapFailsLoudly: with no cap
+// stamped (TimeoutCapSeconds zero), the built-in default cap
+// (dispatchTimeoutCapDefault, 600s) applies, and a request above it is
+// REJECTED with invalid_input naming the config key — never silently clamped.
+// A caller that asked for 20 minutes and silently got 10 would misread the
+// resulting timeout as a task failure. Operator directive 2026-07-04: the cap
+// is an operator parameter (dispatch_timeout_cap_seconds), not a hardcoded
+// limit.
+func TestQueryDispatchToHarness_TimeoutOverDefaultCapFailsLoudly(t *testing.T) {
+	disp := &fakeAgentDispatcher{cannedOk: true}
+	req := DispatchRequest{Task: "x", TimeoutSeconds: dispatchTimeoutCapDefault + 1}
+	_, err := QueryDispatchToHarness(context.Background(), disp, req)
+	if err == nil {
+		t.Fatal("expected over-cap timeout to be rejected, got nil error")
+	}
+	ace, ok := err.(*AgentControllerError)
+	if !ok || ace.Code != "invalid_input" {
+		t.Fatalf("expected invalid_input AgentControllerError, got %T: %v", err, err)
+	}
+	if !strings.Contains(ace.Message, "dispatch_timeout_cap_seconds") {
+		t.Errorf("over-cap error should point at the config key, got %q", ace.Message)
+	}
+}
+
+// TestQueryDispatchToHarness_ConfiguredCapHonored: a config-stamped cap
+// (TimeoutCapSeconds, from dispatch_timeout_cap_seconds) is the effective
+// ceiling in both directions — it admits requests the default cap would
+// reject, and rejects requests the default cap would admit.
+func TestQueryDispatchToHarness_ConfiguredCapHonored(t *testing.T) {
+	// Raised cap: 900s passes under a 1200s configured cap (default would reject).
+	disp := &fakeAgentDispatcher{cannedOk: true}
+	req := DispatchRequest{Task: "x", TimeoutSeconds: 900, TimeoutCapSeconds: 1200}
+	if _, err := QueryDispatchToHarness(context.Background(), disp, req); err != nil {
+		t.Fatalf("query with raised cap: %v", err)
+	}
+	if disp.lastReq.TimeoutSeconds != 900 {
+		t.Errorf("TimeoutSeconds altered, got %d, want 900", disp.lastReq.TimeoutSeconds)
+	}
+	// Tightened cap: 400s is rejected under a 300s configured cap (default
+	// would admit it).
+	disp2 := &fakeAgentDispatcher{cannedOk: true}
+	req2 := DispatchRequest{Task: "x", TimeoutSeconds: 400, TimeoutCapSeconds: 300}
+	if _, err := QueryDispatchToHarness(context.Background(), disp2, req2); err == nil {
+		t.Fatal("expected 400s to be rejected under a 300s configured cap")
 	}
 }
 

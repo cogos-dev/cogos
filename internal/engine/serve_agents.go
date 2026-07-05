@@ -84,6 +84,10 @@ func (s *Server) handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
 	if input.AgentID == "" {
 		input.AgentID = r.PathValue("id")
 	}
+	// Kernel policy, not a caller parameter: overwrite any client-supplied
+	// cap with this node's configured dispatch_timeout_cap_seconds
+	// (default 600). Nil-receiver-safe.
+	input.TimeoutCapSeconds = s.cfg.DispatchTimeoutCap()
 	resp, err := QueryDispatchToHarness(r.Context(), s.agentController, input)
 	if err != nil {
 		writeAgentHTTPError(w, err)

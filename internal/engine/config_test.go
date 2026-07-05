@@ -96,6 +96,44 @@ digest_paths:
 	}
 }
 
+// TestLoadConfigDispatchTimeoutCap covers the config-driven dispatch timeout
+// cap (operator directive 2026-07-04: the cap is an operator parameter, not
+// hardcoded). Default (no key) resolves to DefaultDispatchTimeoutCapSeconds;
+// a dispatch_timeout_cap_seconds entry in kernel.yaml overrides it; the
+// accessor is nil-receiver-safe because transport adapters call it
+// unconditionally.
+func TestLoadConfigDispatchTimeoutCap(t *testing.T) {
+	t.Parallel()
+
+	// Default: no key in kernel.yaml.
+	rootDefault := makeWorkspace(t)
+	cfgDefault, err := LoadConfig(rootDefault, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := cfgDefault.DispatchTimeoutCap(); got != DefaultDispatchTimeoutCapSeconds {
+		t.Errorf("default DispatchTimeoutCap() = %d; want %d", got, DefaultDispatchTimeoutCapSeconds)
+	}
+
+	// Configured: kernel.yaml raises the cap.
+	rootRaised := makeWorkspace(t)
+	writeTestFile(t, filepath.Join(rootRaised, ".cog", "config", "kernel.yaml"),
+		"dispatch_timeout_cap_seconds: 1800\n")
+	cfgRaised, err := LoadConfig(rootRaised, 0)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := cfgRaised.DispatchTimeoutCap(); got != 1800 {
+		t.Errorf("configured DispatchTimeoutCap() = %d; want 1800", got)
+	}
+
+	// Nil receiver: falls back to the default rather than panicking.
+	var nilCfg *Config
+	if got := nilCfg.DispatchTimeoutCap(); got != DefaultDispatchTimeoutCapSeconds {
+		t.Errorf("nil-receiver DispatchTimeoutCap() = %d; want %d", got, DefaultDispatchTimeoutCapSeconds)
+	}
+}
+
 // TestLoadConfigBindAddrFromYAML verifies that a `bind_addr: 0.0.0.0`
 // entry in kernel.yaml parses and applies to Config. Regression test for
 // cogos#12 (BindAddr declared but never wired).

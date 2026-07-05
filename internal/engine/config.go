@@ -26,6 +26,14 @@ const (
 	// or kernel.yaml default_budget is provided. Matches the default provider
 	// context_window in providers.yaml.
 	DefaultBudget = 32768
+	// DefaultDispatchTimeoutCapSeconds is the ceiling on a dispatch's
+	// timeout_seconds when kernel.yaml sets no dispatch_timeout_cap_seconds.
+	// Aliased by dispatchTimeoutCapDefault (agent_dispatch_query.go) so
+	// Normalize stays config-free while sharing this single number.
+	// Operator directive 2026-07-04: the cap is an operator parameter, not a
+	// hardcoded limit — agentic workflows push dispatch budgets past any
+	// fixed number.
+	DefaultDispatchTimeoutCapSeconds = 600
 )
 
 // hasUsableCogConfig reports whether dir looks like a real workspace root for
@@ -161,6 +169,14 @@ type Config struct {
 	// falls back to the current Ollama-probe path.
 	HarnessProvider string
 
+	// DispatchTimeoutCapSeconds is the maximum timeout_seconds a
+	// cog_dispatch_to_harness call (or the HTTP dispatch endpoint) will
+	// accept. Requests above the cap are rejected with invalid_input, never
+	// silently clamped. 0 means use DefaultDispatchTimeoutCapSeconds (600).
+	// Configurable via dispatch_timeout_cap_seconds in kernel.yaml — raise it
+	// for long-running agentic dispatch workloads instead of patching code.
+	DispatchTimeoutCapSeconds int
+
 	localModelConfigured bool
 
 	// IdentityNakedDefault controls per-session identity embedding at the
@@ -188,30 +204,33 @@ type Config struct {
 
 // kernelConfigSection holds settings that can appear at the top level or inside v3:.
 type kernelConfigSection struct {
-	Port                  int               `yaml:"port"`
-	BindAddr              string            `yaml:"bind_addr"`
-	ConsolidationInterval int               `yaml:"consolidation_interval"`
-	HeartbeatInterval     int               `yaml:"heartbeat_interval"`
-	SalienceDaysWindow    int               `yaml:"salience_days_window"`
-	OutputReserve         int               `yaml:"output_reserve"`
-	MaxFovealDocs         int               `yaml:"max_foveal_docs"`
-	SalienceFloor         *float64          `yaml:"salience_floor"`
-	DefaultBudget         int               `yaml:"default_budget"`
-	ExcludeSubstrings     []string          `yaml:"exclude_substrings"`
-	TRMWeightsPath        string            `yaml:"trm_weights_path"`
-	TRMEmbeddingsPath     string            `yaml:"trm_embeddings_path"`
-	TRMChunksPath         string            `yaml:"trm_chunks_path"`
-	OllamaEmbedEndpoint   string            `yaml:"ollama_embed_endpoint"`
-	OllamaEmbedModel      string            `yaml:"ollama_embed_model"`
-	ToolCallValidation    *bool             `yaml:"tool_call_validation_enabled"`
-	EnableSkillExec       *bool             `yaml:"enable_skill_exec"`
-	EnableServiceControl  *bool             `yaml:"enable_service_control"`
-	IdentityNakedDefault  *bool             `yaml:"identity_naked_default,omitempty"`
-	LocalModel            string            `yaml:"local_model"`
-	HarnessProvider       string            `yaml:"harness_provider"`
-	DigestPaths           map[string]string `yaml:"digest_paths"`
-	KernelLogPath         string            `yaml:"kernel_log_path"`
-	Mod3URL               string            `yaml:"mod3_url"`
+	Port                  int      `yaml:"port"`
+	BindAddr              string   `yaml:"bind_addr"`
+	ConsolidationInterval int      `yaml:"consolidation_interval"`
+	HeartbeatInterval     int      `yaml:"heartbeat_interval"`
+	SalienceDaysWindow    int      `yaml:"salience_days_window"`
+	OutputReserve         int      `yaml:"output_reserve"`
+	MaxFovealDocs         int      `yaml:"max_foveal_docs"`
+	SalienceFloor         *float64 `yaml:"salience_floor"`
+	DefaultBudget         int      `yaml:"default_budget"`
+	ExcludeSubstrings     []string `yaml:"exclude_substrings"`
+	TRMWeightsPath        string   `yaml:"trm_weights_path"`
+	TRMEmbeddingsPath     string   `yaml:"trm_embeddings_path"`
+	TRMChunksPath         string   `yaml:"trm_chunks_path"`
+	OllamaEmbedEndpoint   string   `yaml:"ollama_embed_endpoint"`
+	OllamaEmbedModel      string   `yaml:"ollama_embed_model"`
+	ToolCallValidation    *bool    `yaml:"tool_call_validation_enabled"`
+	EnableSkillExec       *bool    `yaml:"enable_skill_exec"`
+	EnableServiceControl  *bool    `yaml:"enable_service_control"`
+	IdentityNakedDefault  *bool    `yaml:"identity_naked_default,omitempty"`
+	LocalModel            string   `yaml:"local_model"`
+	HarnessProvider       string   `yaml:"harness_provider"`
+	// DispatchTimeoutCapSeconds caps dispatch timeout_seconds requests.
+	// 0 means use DefaultDispatchTimeoutCapSeconds (600).
+	DispatchTimeoutCapSeconds int               `yaml:"dispatch_timeout_cap_seconds,omitempty"`
+	DigestPaths               map[string]string `yaml:"digest_paths"`
+	KernelLogPath             string            `yaml:"kernel_log_path"`
+	Mod3URL                   string            `yaml:"mod3_url"`
 	// CoreInferencePath is an optional override for the core-inference.yaml file path.
 	// When empty, LoadConfig uses workspaceRoot/.cog/config/core-inference.yaml.
 	// Reserved for future use — not yet wired into the loader.
@@ -363,6 +382,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	if s.HarnessProvider != "" {
 		cfg.HarnessProvider = s.HarnessProvider
 	}
+	if s.DispatchTimeoutCapSeconds != 0 {
+		cfg.DispatchTimeoutCapSeconds = s.DispatchTimeoutCapSeconds
+	}
 	if len(s.DigestPaths) > 0 {
 		if cfg.DigestPaths == nil {
 			cfg.DigestPaths = make(map[string]string, len(s.DigestPaths))
@@ -397,6 +419,17 @@ func (c *Config) ContextGating() (maxDocs int, salienceFloor float64) {
 		salienceFloor = DefaultSalienceFloor
 	}
 	return maxDocs, salienceFloor
+}
+
+// DispatchTimeoutCap returns the effective ceiling for dispatch
+// timeout_seconds. Falls back to DefaultDispatchTimeoutCapSeconds (600) when
+// unset. Nil-receiver-safe: transport adapters stamp this onto every
+// DispatchRequest, including in tests that run without a Config.
+func (c *Config) DispatchTimeoutCap() int {
+	if c == nil || c.DispatchTimeoutCapSeconds <= 0 {
+		return DefaultDispatchTimeoutCapSeconds
+	}
+	return c.DispatchTimeoutCapSeconds
 }
 
 // EffectiveBudget returns the token budget to use for context assembly when no

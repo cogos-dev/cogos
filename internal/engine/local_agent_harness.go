@@ -1266,6 +1266,11 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 	if req.AgentID != "" && req.AgentID != c.agentID {
 		return nil, ErrAgentNotFound
 	}
+	// The timeout cap is the executing node's policy: re-stamp from this
+	// node's config regardless of what the transport (MCP/HTTP/BEP wire)
+	// carried, so a remote sender's looser cap can't override local config.
+	// DispatchTimeoutCap is nil-receiver-safe (default 600).
+	req.TimeoutCapSeconds = c.cfg.DispatchTimeoutCap()
 	if err := req.Normalize(); err != nil {
 		return nil, err
 	}
@@ -1808,15 +1813,11 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	// preferred local model") that the caller may need to surface per-result.
 	// These are distinct from batch-level state-routing diagnostics, which live
 	// in batch.Notes and must not be set here.
-	// Preserve any existing res.Error (e.g. unsupported client tool calls)
-	// rather than clobbering it; append the note instead.
-	if slotNote != "" {
-		if res.Error == "" {
-			res.Error = slotNote
-		} else {
-			res.Error += "; " + slotNote
-		}
-	}
+	// Informational, not an error: it goes in the dedicated Note field, never
+	// Error — a routing fallback on a success=true slot previously rode along
+	// in Error and made successful dispatches look failed to callers that only
+	// check that field.
+	res.Note = slotNote
 	return res
 }
 
