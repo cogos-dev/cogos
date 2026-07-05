@@ -200,6 +200,146 @@ func TestDispatchSlot_CapabilityGating_FlagOn_DeniedToolFiltered(t *testing.T) {
 	}
 }
 
+// TestDispatchSlot_CapabilityGating_DoesNotCorruptSharedRegistry is the
+// regression test for the FINDING 1+2 blocker: registry.Definitions()
+// (tool_loop.go) returns c.dispatchTools' own backing slice by reference,
+// and filterToolsByCapability (serve_kernel_agent_tools.go) compacts
+// creq.Tools IN PLACE (`out := creq.Tools[:0]`). Without copying the
+// definitions slice before handing it to CompletionRequest.Tools, a single
+// gated dispatch permanently truncates the shared c.dispatchTools registry —
+// every dispatch afterward, gated or not, sees the same missing tool.
+//
+// Denies the FIRST tool in the default "consolidation" scope order
+// (cog_resolve_uri, index 0) rather than the last, because a fix that only
+// happens to work when the compaction removes the tail element (no shift
+// needed) would still corrupt the shared slice for any other position.
+func TestDispatchSlot_CapabilityGating_DoesNotCorruptSharedRegistry(t *testing.T) {
+	ctrl, captured, _ := dispatchGatingHarness(t)
+
+	firstToolName := harnessToolScopes[defaultHarnessScopeName][0]
+	if firstToolName != "cog_resolve_uri" {
+		t.Fatalf("test assumes cog_resolve_uri is index 0 of %q scope, got %q — update the test", defaultHarnessScopeName, firstToolName)
+	}
+	fullToolCount := len(harnessToolScopes[defaultHarnessScopeName])
+
+	// Dispatch 1: gating flag ON, gater denies the first tool for this subject.
+	ctrl.cfg.IdentityNakedDefault = true
+	gater := newFakeCapabilityGater()
+	gater.deny["bound-user/"+firstToolName] = struct{}{}
+	ctrl.mcpSrv.SetCapabilityResolver(gater)
+
+	if _, err := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "gated dispatch",
+		Provider:       "test-harness",
+		N:              1,
+		TimeoutSeconds: 10,
+		Identity:       DispatchIdentity{Sub: "bound-user"},
+	}); err != nil {
+		t.Fatalf("gated DispatchToHarness: %v", err)
+	}
+
+	calls := captured.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 provider call after gated dispatch, got %d", len(calls))
+	}
+	gatedTools := calls[0]
+	if len(gatedTools) != fullToolCount-1 {
+		t.Fatalf("gated dispatch: expected %d tools (one denied), got %d: %v", fullToolCount-1, len(gatedTools), gatedTools)
+	}
+	for _, name := range gatedTools {
+		if name == firstToolName {
+			t.Fatalf("gated dispatch: denied tool %q still present: %v", firstToolName, gatedTools)
+		}
+	}
+
+	// Dispatch 2: gating flag OFF (default) — must see the FULL, unmodified
+	// tool list. If dispatchSlot handed filterToolsByCapability the shared
+	// registry slice by reference, dispatch 1's in-place compaction already
+	// dropped firstToolName from c.dispatchTools permanently, and this
+	// second — ungated — dispatch would incorrectly come up one tool short.
+	ctrl.cfg.IdentityNakedDefault = false
+
+	if _, err := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "ungated dispatch",
+		Provider:       "test-harness",
+		N:              1,
+		TimeoutSeconds: 10,
+		Identity:       DispatchIdentity{Sub: "bound-user"},
+	}); err != nil {
+		t.Fatalf("ungated DispatchToHarness: %v", err)
+	}
+
+	calls = captured.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 provider calls total, got %d", len(calls))
+	}
+	ungatedTools := calls[1]
+	if len(ungatedTools) != fullToolCount {
+		t.Fatalf("shared registry corrupted by prior gated dispatch: expected %d tools, got %d: %v", fullToolCount, len(ungatedTools), ungatedTools)
+	}
+	found := false
+	for _, name := range ungatedTools {
+		if name == firstToolName {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("shared registry corrupted: %q missing from ungated dispatch's tool list: %v", firstToolName, ungatedTools)
+	}
+}
+
+// TestDispatchSlot_CapabilityGating_ConcurrentFanOutRaceClean is the -race
+// guard for FINDING 2: N>1 fan-out slots run in parallel goroutines
+// (local_agent_harness.go DispatchToHarness's `for i := 0; i < req.N; i++ {
+// go func...}`), each calling dispatchSlot -> registry.Definitions() against
+// the SAME shared c.dispatchTools. Before the copy-before-filter fix, a gated
+// slot's in-place compaction of creq.Tools raced against every other
+// concurrently-running slot reading/writing that identical backing array —
+// a data race `go test -race` catches directly, independent of the
+// single-goroutine ordering bug the other regression test exercises.
+func TestDispatchSlot_CapabilityGating_ConcurrentFanOutRaceClean(t *testing.T) {
+	ctrl, captured, _ := dispatchGatingHarness(t)
+	ctrl.cfg.IdentityNakedDefault = true
+	gater := newFakeCapabilityGater()
+	gater.deny["bound-user/cog_resolve_uri"] = struct{}{}
+	ctrl.mcpSrv.SetCapabilityResolver(gater)
+
+	batch, err := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "fan out",
+		Provider:       "test-harness",
+		N:              4,
+		TimeoutSeconds: 10,
+		Identity:       DispatchIdentity{Sub: "bound-user"},
+	})
+	if err != nil {
+		t.Fatalf("DispatchToHarness: %v", err)
+	}
+	if len(batch.Results) != 4 {
+		t.Fatalf("expected 4 results, got %d", len(batch.Results))
+	}
+	for i, res := range batch.Results {
+		if !res.Success {
+			t.Errorf("slot %d did not succeed: %+v", i, res)
+		}
+	}
+
+	calls := captured.snapshot()
+	if len(calls) != 4 {
+		t.Fatalf("expected 4 provider calls, got %d", len(calls))
+	}
+	fullToolCount := len(harnessToolScopes[defaultHarnessScopeName])
+	for i, tools := range calls {
+		if len(tools) != fullToolCount-1 {
+			t.Errorf("slot %d: expected %d tools (one denied), got %d: %v", i, fullToolCount-1, len(tools), tools)
+		}
+		for _, name := range tools {
+			if name == "cog_resolve_uri" {
+				t.Errorf("slot %d: denied tool cog_resolve_uri present: %v", i, tools)
+			}
+		}
+	}
+}
+
 // TestDispatchSlot_CapabilityGating_FlagOff_Unchanged mirrors the chat
 // path's own stated contract: IdentityNakedDefault=false (the default) must
 // leave tool injection byte-for-byte unchanged, even with a gater wired that

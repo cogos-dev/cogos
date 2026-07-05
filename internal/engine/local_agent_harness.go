@@ -1689,7 +1689,20 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	// identical fan-out slots share a KV-cache prefix. Hash (systemPrompt +
 	// task + sorted tool names); append idx only for per-slot log uniqueness —
 	// the prefix up to the dash is cache-relevant and identical across slots.
-	tools := registry.Definitions()
+	//
+	// registry.Definitions() returns the registry's own backing slice by
+	// reference (tool_loop.go KernelToolRegistry.Definitions), and registry
+	// here is c.dispatchTools — constructed once at controller-construction
+	// time and shared across every fan-out slot and every subsequent
+	// dispatch. filterToolsByCapability below compacts creq.Tools IN PLACE
+	// (serve_kernel_agent_tools.go: `out := creq.Tools[:0]`); handing it the
+	// live registry slice would let one gated dispatch permanently truncate
+	// the shared registry for every later dispatch, gated or not, and races
+	// under concurrent fan-out (N>1). Copy into a fresh slice first — the
+	// same "allocate fresh slices so we don't accidentally alias" discipline
+	// injectKernelAgentTools already applies to the chat path.
+	tools := make([]ToolDefinition, len(registry.Definitions()))
+	copy(tools, registry.Definitions())
 	toolNames := make([]string, len(tools))
 	for i, t := range tools {
 		toolNames[i] = t.Name
