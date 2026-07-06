@@ -102,6 +102,42 @@ func TestBuildOpenAIRequestNoSystemPrompt(t *testing.T) {
 	}
 }
 
+// TestBuildOpenAIRequestStreamOptions guards inference-pipeline-robustness FIX 2:
+// a streaming request must set stream_options.include_usage so the server emits a
+// usage-bearing terminal chunk; a non-streaming request must not set it (usage is
+// in the response body there). A missing include_usage is what left every
+// cancel-safe streaming completion reporting usage 0/0.
+func TestBuildOpenAIRequestStreamOptions(t *testing.T) {
+	t.Parallel()
+	streaming := buildOpenAIRequest("m", &CompletionRequest{}, true, 0)
+	if streaming.StreamOptions == nil {
+		t.Fatal("streaming request: StreamOptions is nil; want include_usage set")
+	}
+	if !streaming.StreamOptions.IncludeUsage {
+		t.Error("streaming request: include_usage = false; want true")
+	}
+	// It must serialize into the wire body under the OpenAI key.
+	b, err := json.Marshal(streaming)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"stream_options":{"include_usage":true}`) {
+		t.Errorf("marshaled body missing stream_options: %s", b)
+	}
+
+	nonStreaming := buildOpenAIRequest("m", &CompletionRequest{}, false, 0)
+	if nonStreaming.StreamOptions != nil {
+		t.Error("non-streaming request: StreamOptions should be nil (usage is in the response body)")
+	}
+	nb, err := json.Marshal(nonStreaming)
+	if err != nil {
+		t.Fatalf("marshal non-streaming: %v", err)
+	}
+	if strings.Contains(string(nb), "stream_options") {
+		t.Errorf("non-streaming body should omit stream_options: %s", nb)
+	}
+}
+
 func TestBuildOpenAIRequestOptions(t *testing.T) {
 	t.Parallel()
 	temp := 0.7
@@ -486,6 +522,69 @@ func TestOpenAIAvailableCachesDeadlineExceededAsUnavailable(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Errorf("upstream hit %d times; want 1 (timeout result should be cached, not re-probed)", got)
+	}
+}
+
+// TestOpenAIProbeBoundedByInternalTimeout is the regression guard for
+// inference-pipeline-robustness FIX 1: probeAvailable must cap its own HTTP call
+// at probeHTTPTimeout, independent of the (much larger) client timeout, so a
+// hung-but-accepting upstream can't hold availMu for the full client timeout and
+// block the router's probeAll goroutine / Route()'s inline fallback behind
+// availMu.Lock().
+//
+// The provider's client timeout is set to an hour; against a server that accepts
+// the connection and then hangs, an uncapped probe would block for that hour.
+// The internal probeHTTPTimeout bound must make Available() return false in ~10s.
+// A second concurrent caller (which blocks on availMu behind the first) must also
+// be released within the same bound — proving the mutex hold is bounded too.
+func TestOpenAIProbeBoundedByInternalTimeout(t *testing.T) {
+	t.Parallel()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // accept then hang, like a wedged LM Studio
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	// Client timeout of an hour: only the internal probeHTTPTimeout can bound this.
+	p := NewOpenAICompatProvider("openai-compat", ProviderConfig{
+		Endpoint: srv.URL,
+		Model:    "any",
+		Timeout:  3600,
+	})
+
+	// Two concurrent callers: the second must queue on availMu behind the first.
+	type result struct {
+		avail   bool
+		elapsed time.Duration
+	}
+	results := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			start := time.Now()
+			avail := p.Available(context.Background())
+			results <- result{avail: avail, elapsed: time.Since(start)}
+		}()
+	}
+
+	// Generous ceiling: probeHTTPTimeout (10s) for the first probe + the second
+	// caller's turn under availMu, plus slack. Far below the 1h client timeout, so
+	// a pass proves the internal cap — not the client timeout — bounded the hold.
+	bound := 2*probeHTTPTimeout + 5*time.Second
+	deadline := time.After(bound)
+	for i := 0; i < 2; i++ {
+		select {
+		case res := <-results:
+			if res.avail {
+				t.Errorf("Available() = true against a hung server; want false")
+			}
+			if res.elapsed >= p.timeout {
+				t.Errorf("probe took %v (>= client timeout %v); internal probeHTTPTimeout did not bound it",
+					res.elapsed, p.timeout)
+			}
+		case <-deadline:
+			t.Fatalf("Available() did not return within %v — probeAvailable is not internally bounded (availMu held for the client timeout)", bound)
+		}
 	}
 }
 
@@ -1274,6 +1373,69 @@ func TestOpenAICompleteCancelSafeAggregatesContent(t *testing.T) {
 	}
 	if resp.ProviderMeta.Provider != "openai-compat" {
 		t.Errorf("ProviderMeta.Provider = %q; want openai-compat", resp.ProviderMeta.Provider)
+	}
+}
+
+// TestOpenAICompleteCancelSafeUsageFromTerminalChunk is the regression guard for
+// inference-pipeline-robustness FIX 2. It models LM Studio's include_usage wire
+// behavior exactly: content chunks with usage:null, then a FINAL chunk carrying
+// usage with an EMPTY choices array (the shape a server sends only when the
+// request set stream_options.include_usage). The server also asserts the request
+// actually carried that flag. Before the fix, buildOpenAIRequest never set
+// stream_options, so LM Studio sent no usage chunk and every cancel-safe
+// completion reported usage 0/0.
+func TestOpenAICompleteCancelSafeUsageFromTerminalChunk(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload openaiChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// The whole point of the fix: the streaming request must ask for usage.
+		if payload.StreamOptions == nil || !payload.StreamOptions.IncludeUsage {
+			http.Error(w, "request did not set stream_options.include_usage", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		// Content chunks carry no usage (usage:null), just like LM Studio.
+		stop := "stop"
+		for _, delta := range []string{"Hel", "lo"} {
+			chunk := openaiStreamChunk{Choices: []openaiStreamChoice{{Index: 0, Delta: openaiStreamDelta{Content: delta}}}}
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		}
+		// Finish-reason chunk (still no usage).
+		finish := openaiStreamChunk{Choices: []openaiStreamChoice{{Index: 0, Delta: openaiStreamDelta{}, FinishReason: &stop}}}
+		fb, _ := json.Marshal(finish)
+		fmt.Fprintf(w, "data: %s\n\n", fb)
+		flusher.Flush()
+		// Terminal usage chunk: usage present, choices EMPTY — the include_usage shape.
+		usageChunk := openaiStreamChunk{
+			Choices: []openaiStreamChoice{},
+			Usage:   &openaiUsageResponse{PromptTokens: 42, CompletionTokens: 17, TotalTokens: 59},
+		}
+		ub, _ := json.Marshal(usageChunk)
+		fmt.Fprintf(w, "data: %s\n\n", ub)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "test-model")
+	resp, err := p.CompleteCancelSafe(context.Background(), &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("CompleteCancelSafe: %v", err)
+	}
+	if resp.Content != "Hello" {
+		t.Errorf("Content = %q; want Hello", resp.Content)
+	}
+	if resp.Usage.InputTokens != 42 || resp.Usage.OutputTokens != 17 {
+		t.Errorf("Usage = %+v; want {InputTokens:42, OutputTokens:17} from the terminal usage chunk", resp.Usage)
 	}
 }
 

@@ -134,8 +134,18 @@ func (p *OllamaProvider) Available(ctx context.Context) bool {
 
 // probeAvailable performs the live check backing Available(): GET /api/tags and
 // confirm the configured model is present. Call via Available() for TTL caching.
+//
+// The probe caps its own HTTP call at probeHTTPTimeout rather than inheriting
+// p.client.Timeout. Available() holds availMu across this call so concurrent
+// callers collapse into one probe (#441); without this internal bound a
+// hung-but-accepting upstream would let one caller hold availMu for the full
+// client timeout, blocking the router's probeAll goroutine and Route()'s inline
+// fallback behind availMu.Lock() (inference-pipeline-robustness FIX 1; mirrors
+// ClaudeOAuthProvider.probeAvailable).
 func (p *OllamaProvider) probeAvailable(ctx context.Context) bool {
-	models, err := p.listModels(ctx)
+	pctx, cancel := context.WithTimeout(ctx, probeHTTPTimeout)
+	defer cancel()
+	models, err := p.listModels(pctx)
 	if err != nil {
 		return false
 	}

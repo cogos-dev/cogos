@@ -202,6 +202,27 @@ func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provi
 		caps := p.Capabilities()
 		capsMet := caps.HasAllCapabilities(req.Metadata.RequiredCapabilities)
 		avail := r.available(ctx, p)
+		// Compat-aware fallback (inference-pipeline-robustness FIX 3): a request
+		// carrying an explicit ModelOverride, when its primary is down, falls
+		// through the chain still carrying that override. A bare local-model id
+		// like "ornith-1.0-35b" must not be fired at a LOCAL model-serving sibling
+		// (lmstudio/ollama/mlx) that hasn't loaded it — that 404s opaquely — so
+		// providerCanServe skips such a candidate and lets the router reach the
+		// sibling that does serve it. Frontier providers (anthropic, claude-oauth,
+		// and the claude-code / codex CLIs) are model-agnostic within their family
+		// and honour any override verbatim, so providerCanServe keeps them
+		// eligible — this preserves degraded-mode frontier failover, e.g. a
+		// "sonnet" override reaching a backup claude-oauth or the claude-code CLI
+		// after the preferred frontier drops (the case the flight review flagged).
+		//
+		// The gate applies to FALLBACK candidates only (i > 0). The preferred
+		// provider at position 0 was resolved explicitly (PreferProvider / alias
+		// table already validated the override against it — e.g. "opus" → this
+		// provider), so it is never skipped: that preserves all managed-frontier
+		// routing where the override intentionally differs from the provider's
+		// configured model. Only the involuntary carry-over into a fallback that
+		// can't serve the override is filtered.
+		canServe := i == 0 || providerCanServe(p, req.ModelOverride)
 
 		score := ProviderScore{
 			Provider:        p.Name(),
@@ -215,7 +236,7 @@ func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provi
 		score.AdjustedScore = score.RawScore - score.SwapPenalty
 		scores = append(scores, score)
 
-		if avail && capsMet && selected == nil {
+		if avail && capsMet && canServe && selected == nil {
 			selected = p
 			if i > 0 {
 				fallbackUsed = true
@@ -292,6 +313,18 @@ const probeTimeout = 2 * time.Second
 // that do a live reachability check — OpenAICompatProvider, ClaudeOAuthProvider
 // — reuse this; MLXSupervisedProvider already keeps an equivalent probe cache.
 const availCacheTTL = 30 * time.Second
+
+// probeHTTPTimeout is the internal ceiling a provider's probeAvailable() puts on
+// its own reachability HTTP call, independent of the provider's (much larger)
+// request timeout. Available() holds a per-provider mutex across probeAvailable
+// so concurrent callers collapse into one probe (#441); without an internal
+// bound, a hung-but-accepting upstream would let a single /v1/providers request
+// hold that mutex for the full client timeout (300s on the lmstudio providers),
+// blocking the router's probeAll goroutine and Route()'s inline fallback — whose
+// own probeTimeout bounds the probe, not the availMu.Lock() behind it (flight
+// review, inference-pipeline-robustness FIX 1). ClaudeOAuthProvider already caps
+// its probe at this ceiling; OpenAICompatProvider and OllamaProvider now match.
+const probeHTTPTimeout = 10 * time.Second
 
 // probeAll probes every registered provider concurrently, each bounded by
 // probeTimeout, and atomically swaps in the resulting snapshot. A cycle costs
@@ -433,6 +466,91 @@ func computeScore(p Provider, req *CompletionRequest) float64 {
 		score += 0.1
 	}
 	return score
+}
+
+// providerCanServe reports whether provider p can serve an explicit
+// ModelOverride. It backs the compat-aware fallback in Route (FIX 3): a
+// ModelOverride must not be carried into a FALLBACK provider that can't honour
+// it. Route applies this only to candidates past the preferred one (i > 0); the
+// preferred provider was resolved explicitly and is always eligible.
+//
+// The gate is scoped to the ACTUAL hazard: a bare model id fired at a
+// LOCAL MODEL-SERVING provider (ollama, lmstudio/openai-compat, mlx) that only
+// serves models it has loaded — such a provider 404s on an id it hasn't loaded,
+// so a mismatched override there is an opaque failure and it must be skipped.
+//
+// Frontier providers are model-AGNOSTIC within their model family and honour
+// req.ModelOverride verbatim (Anthropic API / claude-oauth pass the override
+// straight through; the claude-code and codex CLIs pass it to `--model`). They
+// each advertise only their single configured model in ModelsAvailable, yet
+// happily serve any sibling id, so they must NEVER be gated by the advertised
+// list — otherwise a "sonnet" request whose preferred claude-oauth is down would
+// skip every backup frontier provider (a second claude-oauth, the anthropic
+// provider, or the claude-code CLI) and fail with "no available provider",
+// silently breaking exactly the degraded-mode frontier failover the router
+// exists for. This is the class the flight review flagged in the first cut.
+//
+// The frontier set is identified structurally, not by name:
+//   - !IsLocal  → a remote API provider (anthropic, claude-oauth): family-
+//     agnostic, honours any override → eligible.
+//   - AgenticHarness → a local CLI harness (claude-code, codex): also family-
+//     agnostic and IsLocal, so IsLocal alone would wrongly gate it → eligible.
+//
+// Only a local, non-agentic model-serving provider is gated by its advertised
+// models.
+//
+// Rules, chosen to preserve today's routing whenever no override is in play:
+//   - Empty override → always true (default routing; the provider uses its own
+//     configured model). This is the common case and must stay unchanged.
+//   - Frontier provider (see above) → always true; it honours the override.
+//   - Local model-serving provider whose Model()/ModelsAvailable includes the
+//     override (exact or prefix, mirroring the /v1/models match in the provider
+//     probes) → true.
+//   - Local model-serving provider that declares NO specific model at all (empty
+//     Model() and empty ModelsAvailable — generic endpoints) → true, so a
+//     provider that never advertised a model isn't newly excluded.
+//   - Otherwise (a local model-serving provider advertises specific models and
+//     the override is none of them) → false: skip it so a bare local-model id
+//     can't be fired at a provider that hasn't loaded it and would fail opaquely.
+func providerCanServe(p Provider, modelOverride string) bool {
+	if modelOverride == "" {
+		return true
+	}
+	caps := p.Capabilities()
+	// Frontier providers (remote APIs and local agentic CLIs) are model-agnostic
+	// within their family and honour any override verbatim — never gate them.
+	if !caps.IsLocal || caps.AgenticHarness {
+		return true
+	}
+	declaredAny := false
+	if m := p.Model(); m != "" {
+		declaredAny = true
+		if modelMatches(m, modelOverride) {
+			return true
+		}
+	}
+	for _, m := range caps.ModelsAvailable {
+		if m == "" {
+			continue
+		}
+		declaredAny = true
+		if modelMatches(m, modelOverride) {
+			return true
+		}
+	}
+	// A local model-serving provider that advertises no model is treated as
+	// model-agnostic and left eligible; one that advertises specific models but
+	// not this one is skipped.
+	return !declaredAny
+}
+
+// modelMatches reports whether an advertised model id serves the requested one,
+// using the same exact-or-prefix rule the provider availability probes apply to
+// /v1/models entries (e.g. "gemma-4-26b" advertised serves a "gemma-4" request).
+func modelMatches(advertised, requested string) bool {
+	return advertised == requested ||
+		strings.HasPrefix(advertised, requested) ||
+		strings.HasPrefix(requested, advertised)
 }
 
 func routeReason(escalated, fallback bool) string {

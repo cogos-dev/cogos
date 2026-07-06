@@ -158,8 +158,18 @@ func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
 // probeAvailable performs the live reachability check backing Available():
 // GET /v1/models, then confirm the configured model (if any) is present. Call
 // via Available() to get TTL caching; calling this directly bypasses the cache.
+//
+// The probe caps its own HTTP call at probeHTTPTimeout rather than inheriting
+// p.client.Timeout (300s on the lmstudio providers). Available() holds availMu
+// across this call so concurrent callers collapse into one probe (#441); without
+// this internal bound a hung-but-accepting upstream would let a single
+// /v1/providers request hold availMu for the full client timeout, blocking the
+// router's probeAll goroutine and Route()'s inline fallback behind availMu.Lock()
+// (inference-pipeline-robustness FIX 1; mirrors ClaudeOAuthProvider.probeAvailable).
 func (p *OpenAICompatProvider) probeAvailable(ctx context.Context) bool {
-	models, err := p.listModels(ctx)
+	pctx, cancel := context.WithTimeout(ctx, probeHTTPTimeout)
+	defer cancel()
+	models, err := p.listModels(pctx)
 	if err != nil {
 		return false
 	}
@@ -270,16 +280,27 @@ type openaiModel struct {
 }
 
 type openaiChatRequest struct {
-	Model       string                 `json:"model"`
-	Messages    []openaiMessage        `json:"messages"`
-	Stream      bool                   `json:"stream"`
-	MaxTokens   int                    `json:"max_tokens,omitempty"`
-	Temperature *float64               `json:"temperature,omitempty"`
-	TopP        *float64               `json:"top_p,omitempty"`
-	Stop        []string               `json:"stop,omitempty"`
-	Tools       []openaiTool           `json:"tools,omitempty"`
-	ToolChoice  interface{}            `json:"tool_choice,omitempty"` // string or object
-	Options     map[string]interface{} `json:"-"`                     // not sent, internal only
+	Model         string                 `json:"model"`
+	Messages      []openaiMessage        `json:"messages"`
+	Stream        bool                   `json:"stream"`
+	StreamOptions *openaiStreamOptions   `json:"stream_options,omitempty"` // only sent when streaming; requests a usage-bearing terminal chunk
+	MaxTokens     int                    `json:"max_tokens,omitempty"`
+	Temperature   *float64               `json:"temperature,omitempty"`
+	TopP          *float64               `json:"top_p,omitempty"`
+	Stop          []string               `json:"stop,omitempty"`
+	Tools         []openaiTool           `json:"tools,omitempty"`
+	ToolChoice    interface{}            `json:"tool_choice,omitempty"` // string or object
+	Options       map[string]interface{} `json:"-"`                     // not sent, internal only
+}
+
+// openaiStreamOptions carries the OpenAI `stream_options` object. include_usage
+// asks the server (OpenAI, LM Studio, vLLM) to emit a final SSE chunk carrying
+// token usage with an empty choices array. Without it, streaming completions
+// report no usage at all, so the cancel-safe streaming path (CompleteCancelSafe,
+// which every non-streaming compat completion now routes through per #432) would
+// surface usage 0/0 on every request (inference-pipeline-robustness FIX 2).
+type openaiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openaiMessage struct {
@@ -415,6 +436,16 @@ func buildOpenAIRequest(model string, req *CompletionRequest, stream bool, maxTo
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
 		Stop:        req.Stop,
+	}
+
+	// Request usage on the terminal SSE chunk. Non-streaming responses always
+	// carry usage in the body, but the cancel-safe path (CompleteCancelSafe)
+	// routes every non-streaming compat completion through Stream() (#432), and
+	// a plain streaming request omits usage unless include_usage is set — so
+	// without this the SSE aggregator's usage stays nil and every completion
+	// reports 0/0 (inference-pipeline-robustness FIX 2).
+	if stream {
+		or.StreamOptions = &openaiStreamOptions{IncludeUsage: true}
 	}
 
 	if maxTokens > 0 {
