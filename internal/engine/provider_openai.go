@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -37,6 +38,14 @@ const (
 	// servers (vLLM, llama.cpp, remote hosts, etc.).
 	openaiCompatDefaultEndpoint = "http://localhost:1234"
 	openaiCompatDefaultMaxToks  = 4096
+
+	// openaiCompatAvailTTL bounds how long a reachability probe (GET /v1/models)
+	// is cached by Available(). Without it, the router's periodic availability
+	// ticker — and the per-request /v1/providers handler — issue a live models
+	// listing to the upstream server every few seconds, which floods LM Studio's
+	// request log even when the kernel is idle (#441). 30s matches the
+	// eclipseProbeCache TTL-debounce in serve.go.
+	openaiCompatAvailTTL = 30 * time.Second
 )
 
 // OpenAICompatProvider implements Provider against any OpenAI-compatible server.
@@ -49,6 +58,14 @@ type OpenAICompatProvider struct {
 	timeout        time.Duration
 	client         *http.Client
 	defaultOptions map[string]interface{} // extra fields merged into every request body
+
+	// availMu guards the Available() TTL cache (#441). The router's probeAll and
+	// the per-request /v1/providers handler can call Available() concurrently;
+	// the mutex is held across the probe so concurrent callers collapse into a
+	// single GET /v1/models rather than fanning out N identical requests.
+	availMu     sync.Mutex
+	availResult bool
+	availAt     time.Time
 }
 
 // NewOpenAICompatProvider creates an OpenAICompatProvider from a ProviderConfig.
@@ -118,8 +135,26 @@ func (p *OpenAICompatProvider) Name() string { return p.name }
 // Model returns the configured model identifier.
 func (p *OpenAICompatProvider) Model() string { return p.model }
 
-// Available checks if the server is reachable and has at least one model.
+// Available reports whether the server is reachable and has a usable model.
+// The result is cached for openaiCompatAvailTTL so the router's periodic
+// availability probe (and the per-request /v1/providers handler) don't issue a
+// live GET /v1/models to the upstream on every call (#441). The mutex is held
+// across the probe so concurrent callers collapse into a single request.
 func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if !p.availAt.IsZero() && time.Since(p.availAt) < openaiCompatAvailTTL {
+		return p.availResult
+	}
+	p.availResult = p.probeAvailable(ctx)
+	p.availAt = time.Now()
+	return p.availResult
+}
+
+// probeAvailable performs the live reachability check backing Available():
+// GET /v1/models, then confirm the configured model (if any) is present. Call
+// via Available() to get TTL caching; calling this directly bypasses the cache.
+func (p *OpenAICompatProvider) probeAvailable(ctx context.Context) bool {
 	models, err := p.listModels(ctx)
 	if err != nil {
 		return false

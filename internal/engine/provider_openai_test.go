@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -403,6 +404,33 @@ func TestOpenAIAvailableServerDown(t *testing.T) {
 	})
 	if p.Available(context.Background()) {
 		t.Error("Available() = true; want false when server is down")
+	}
+}
+
+// TestOpenAIAvailableCachesWithinTTL is the regression guard for #441: repeated
+// Available() calls within openaiCompatAvailTTL must be served from the cache
+// and hit the upstream /v1/models exactly once, not on every call.
+func TestOpenAIAvailableCachesWithinTTL(t *testing.T) {
+	t.Parallel()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			hits.Add(1)
+		}
+		_ = json.NewEncoder(w).Encode(openaiModelsResponseJSON("gemma-2-9b"))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "gemma-2-9b")
+
+	// First call probes the upstream; the next 5 must be cache hits.
+	for i := 0; i < 6; i++ {
+		if !p.Available(context.Background()) {
+			t.Fatalf("Available() = false on call %d; want true", i)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("upstream /v1/models hit %d times; want 1 (calls within TTL should be cached)", got)
 	}
 }
 
