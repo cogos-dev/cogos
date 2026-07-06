@@ -408,8 +408,8 @@ func TestOpenAIAvailableServerDown(t *testing.T) {
 }
 
 // TestOpenAIAvailableCachesWithinTTL is the regression guard for #441: repeated
-// Available() calls within openaiCompatAvailTTL must be served from the cache
-// and hit the upstream /v1/models exactly once, not on every call.
+// Available() calls within availCacheTTL must be served from the cache and hit
+// the upstream /v1/models exactly once, not on every call.
 func TestOpenAIAvailableCachesWithinTTL(t *testing.T) {
 	t.Parallel()
 	var hits atomic.Int64
@@ -431,6 +431,28 @@ func TestOpenAIAvailableCachesWithinTTL(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Errorf("upstream /v1/models hit %d times; want 1 (calls within TTL should be cached)", got)
+	}
+}
+
+// TestOpenAIAvailableCancelledContextDoesNotPoisonCache guards the #441-review
+// fix: a probe that fails only because the caller's context was cancelled must
+// not be cached as a negative, or it would mark a healthy provider unavailable
+// to every other caller for the whole TTL.
+func TestOpenAIAvailableCancelledContextDoesNotPoisonCache(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(openaiModelsResponseJSON("gemma-2-9b"))
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "gemma-2-9b")
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = p.Available(cancelled) // probe fails on the cancelled ctx; must not cache false
+
+	if !p.Available(context.Background()) {
+		t.Error("Available() = false after a cancelled probe — the cancelled context poisoned the cache")
 	}
 }
 

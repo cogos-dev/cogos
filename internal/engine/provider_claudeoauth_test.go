@@ -255,6 +255,37 @@ func TestClaudeOAuthAvailable(t *testing.T) {
 	}
 }
 
+// TestClaudeOAuthAvailableCachesWithinTTL guards #441 for the OAuth provider:
+// repeated Available() calls within availCacheTTL hit the upstream /v1/models
+// exactly once (the remote, paid Anthropic endpoint in production).
+func TestClaudeOAuthAvailableCachesWithinTTL(t *testing.T) {
+	t.Parallel()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		if r.Header.Get("Authorization") == "" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{}})
+	}))
+	defer srv.Close()
+
+	p := newTestOAuthProvider(t, srv.URL, freshCred())
+	for i := 0; i < 6; i++ {
+		if !p.Available(context.Background()) {
+			t.Fatalf("Available() = false on call %d; want true", i)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("upstream /v1/models hit %d times; want 1 (calls within TTL should be cached)", got)
+	}
+}
+
 func TestClaudeOAuthAvailableNoCredential(t *testing.T) {
 	t.Parallel()
 	// No credential available — Available should return false.

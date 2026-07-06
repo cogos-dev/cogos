@@ -38,14 +38,6 @@ const (
 	// servers (vLLM, llama.cpp, remote hosts, etc.).
 	openaiCompatDefaultEndpoint = "http://localhost:1234"
 	openaiCompatDefaultMaxToks  = 4096
-
-	// openaiCompatAvailTTL bounds how long a reachability probe (GET /v1/models)
-	// is cached by Available(). Without it, the router's periodic availability
-	// ticker — and the per-request /v1/providers handler — issue a live models
-	// listing to the upstream server every few seconds, which floods LM Studio's
-	// request log even when the kernel is idle (#441). 30s matches the
-	// eclipseProbeCache TTL-debounce in serve.go.
-	openaiCompatAvailTTL = 30 * time.Second
 )
 
 // OpenAICompatProvider implements Provider against any OpenAI-compatible server.
@@ -136,17 +128,26 @@ func (p *OpenAICompatProvider) Name() string { return p.name }
 func (p *OpenAICompatProvider) Model() string { return p.model }
 
 // Available reports whether the server is reachable and has a usable model.
-// The result is cached for openaiCompatAvailTTL so the router's periodic
-// availability probe (and the per-request /v1/providers handler) don't issue a
-// live GET /v1/models to the upstream on every call (#441). The mutex is held
-// across the probe so concurrent callers collapse into a single request.
+// The result is cached for availCacheTTL so the router's periodic availability
+// probe (and the per-request /v1/providers handler) don't issue a live
+// GET /v1/models to the upstream on every call (#441). The mutex is held across
+// the probe so concurrent callers collapse into a single request.
 func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
 	p.availMu.Lock()
 	defer p.availMu.Unlock()
-	if !p.availAt.IsZero() && time.Since(p.availAt) < openaiCompatAvailTTL {
+	if !p.availAt.IsZero() && time.Since(p.availAt) < availCacheTTL {
 		return p.availResult
 	}
-	p.availResult = p.probeAvailable(ctx)
+	fresh := p.probeAvailable(ctx)
+	// Don't let a caller's cancelled/expired context poison the shared cache: a
+	// probe that failed only because the caller went away (e.g. an HTTP client
+	// disconnecting on /v1/providers, which passes r.Context()) says nothing
+	// about provider health. Skip the cache write so the next caller re-probes,
+	// instead of marking a healthy provider unavailable to everyone for the TTL.
+	if !fresh && ctx.Err() != nil {
+		return p.availResult
+	}
+	p.availResult = fresh
 	p.availAt = time.Now()
 	return p.availResult
 }
