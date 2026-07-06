@@ -117,10 +117,16 @@ func writeAheadKernelTOML(root, version, assetName, sum string) (kernelTOMLSnaps
 	}
 	// atomicWriteConfigFile writes via os.CreateTemp (0o600) + rename, so restore
 	// the file's prior mode — a config SOT silently narrowing from 0o644 to 0o600
-	// can surprise a non-root reader (e.g. the shell install path).
-	if err := os.Chmod(path, snap.priorPerm); err != nil {
-		return snap, fmt.Errorf("restore mode on %s: %w", path, err)
-	}
+	// can surprise a non-root reader (e.g. the shell install path). Best-effort:
+	// the atomic write above has already committed the new content (rename is
+	// all-or-nothing), so a failed mode restore must NOT be returned as an error.
+	// If it were, the caller would treat write-ahead as "nothing written" and
+	// abort WITHOUT rollback, leaving kernel.toml recording a version that was
+	// never installed — the exact #442 drift. Consequence of best-effort: this
+	// function now returns a non-nil error only from paths that ran BEFORE the
+	// atomic commit (patch failure, write failure), so an error always means
+	// kernel.toml is unchanged and the caller's abort-without-rollback is safe.
+	_ = os.Chmod(path, snap.priorPerm)
 	return snap, nil
 }
 
@@ -136,11 +142,11 @@ func rollbackKernelTOML(snap kernelTOMLSnapshot) error {
 	if err := atomicWriteConfigFile(snap.path, snap.prior); err != nil {
 		return fmt.Errorf("restore %s: %w", snap.path, err)
 	}
-	// Restore the original mode too (atomicWriteConfigFile lands 0o600); rollback
-	// must return the file to its exact pre-write-ahead state, mode included.
-	if err := os.Chmod(snap.path, snap.priorPerm); err != nil {
-		return fmt.Errorf("restore mode on %s: %w", snap.path, err)
-	}
+	// Restore the original mode too (atomicWriteConfigFile lands 0o600). Best-effort
+	// for the same reason as the write-ahead path: the content restore above is what
+	// undoes the drift; a failed mode restore must not report the rollback (which
+	// already returned the file to its prior bytes) as failed.
+	_ = os.Chmod(snap.path, snap.priorPerm)
 	return nil
 }
 
