@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 )
@@ -108,6 +109,53 @@ func NewForkRegistry() *ForkRegistry {
 		children: make(map[string][]forkEntry),
 		byChild:  make(map[string]forkEntry),
 	}
+}
+
+// ReplayForkRegistry reads bus_sessions events through the given manager and
+// reconstructs the in-memory fork lineage (parent→children map, byChild
+// ancestor index). session.fork events live on BusSessions alongside
+// session.register/heartbeat/end — the fork body's lineage fields
+// (ParentSessionID, ChildSessionID, ForkPoint, PinnedUntil) are the only
+// durable record of a fork relationship; before this function existed,
+// ForkRegistry was reinitialized empty at every startup (serve.go), so all
+// lineage was lost across a restart even though the bus event itself
+// persisted.
+//
+// Mirrors ReplaySessionRegistry: sorted ascending by Seq for deterministic
+// replay order, and safe to call with a nil manager or registry (no-op).
+// Uses the event's own timestamp as forkTime so PinnedUntil / default
+// 7-day-from-fork-point expiry match what was computed at fork time,
+// not wall-clock-at-restart.
+func ReplayForkRegistry(mgr *BusSessionManager, fr *ForkRegistry) error {
+	if mgr == nil || fr == nil {
+		return nil
+	}
+	events, err := mgr.ReadEvents(BusSessions)
+	if err != nil {
+		slog.Warn("session.fork: replay read failed", "bus", BusSessions, "err", err)
+		return err
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Seq < events[j].Seq
+	})
+	replayed := 0
+	for _, evt := range events {
+		if evt.Type != string(KindSessionFork) {
+			continue
+		}
+		body := parseSessionForkPayload(evt.Payload)
+		if body == nil {
+			continue
+		}
+		forkTime, err := parseBusTS(evt.Ts)
+		if err != nil {
+			forkTime = time.Now().UTC()
+		}
+		fr.Record(*body, forkTime)
+		replayed++
+	}
+	slog.Info("session.fork: replay complete", "forks", replayed, "events", len(events))
+	return nil
 }
 
 // Record adds a fork relationship to the registry.

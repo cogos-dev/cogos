@@ -28,6 +28,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -659,6 +660,45 @@ func ReplaySessionRegistry(mgr *BusSessionManager, reg *SessionRegistry) error {
 			}
 			reg.mu.Unlock()
 
+		case string(KindSessionFork):
+			// RFC-0005 fork event. The child session is never separately
+			// registered via EvtSessionRegister — cog_fork_session and the
+			// HTTP fork handler both call SessionRegistry.ApplyRegister with
+			// appendFn=nil (the fork bus event IS the durable record of the
+			// child's existence). Without this case, the child row is
+			// present only in the in-memory registry and is silently
+			// dropped on cold restart. Reconstruct the child row here from
+			// the fork body, mirroring deriveChildState's derivation logic
+			// (mcp_fork_session.go) so replay and live-path produce the same
+			// shape.
+			body := parseSessionForkPayload(evt.Payload)
+			if body == nil || body.ChildSessionID == "" {
+				continue
+			}
+			regAt := evt.Ts
+			registeredAt, _ := parseBusTS(regAt)
+			child := SessionState{
+				SessionID:    body.ChildSessionID,
+				Role:         "fork-child",
+				RegisteredAt: registeredAt,
+				LastSeen:     registeredAt,
+			}
+			reg.mu.Lock()
+			if parent, ok := reg.rows[body.ParentSessionID]; ok {
+				child.Workspace = parent.Workspace
+				child.Role = parent.Role
+				child.Model = parent.Model
+				child.Hostname = parent.Hostname
+			}
+			reg.mu.Unlock()
+			if body.Overlay.Role != nil && body.Overlay.Role.Role != "" {
+				child.Role = body.Overlay.Role.Role
+			}
+			reg.mu.Lock()
+			row := child
+			reg.rows[body.ChildSessionID] = &row
+			reg.mu.Unlock()
+
 		case EvtSessionEnd:
 			payload := evt.Payload
 			if payload == nil {
@@ -820,6 +860,31 @@ func parseSessionPayload(fromField string, p map[string]interface{}) *SessionSta
 		state.Extras[k] = v
 	}
 	return state
+}
+
+// parseSessionForkPayload reconstructs a SessionForkBody from a session.fork
+// bus event's payload map. The payload is written by both fork call sites
+// (mcp_fork_session.go, serve_fork_session.go) via json.Marshal(body) then
+// json.Unmarshal into map[string]interface{} — so a JSON round-trip back
+// into the struct is exact and tolerates the nested Overlay/PinnedUntil
+// shapes without hand-picking each field (unlike parseSessionPayload, which
+// deals with a looser bridge-authored shape).
+func parseSessionForkPayload(p map[string]interface{}) *SessionForkBody {
+	if p == nil {
+		return nil
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return nil
+	}
+	var body SessionForkBody
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil
+	}
+	if body.ChildSessionID == "" {
+		return nil
+	}
+	return &body
 }
 
 // parseHandoffOffer reconstructs a HandoffState from a bus.offer payload.
