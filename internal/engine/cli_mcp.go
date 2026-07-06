@@ -129,12 +129,24 @@ func runMCPServeEngine(args []string, defaultWorkspace string, stderr io.Writer)
 	// Wire session-management backends so cog_register_session /
 	// cog_list_sessions / cog_offer_handoff / cog_list_handoffs / etc. work
 	// over stdio (same registries the HTTP path uses, just no live Server).
+	//
+	// forkRegistry mirrors serve.go's wiring (SetForkRegistry) so
+	// cog_fork_session over stdio also gets a live lineage index — without
+	// this, the stdio MCP path silently skipped fork-registry updates
+	// entirely (m.forkRegistry stayed nil; see the nil-safe check in
+	// mcp_fork_session.go). ReplaySessionRegistry's session.fork case and
+	// ReplayForkRegistry both read the durable session.fork bus events so a
+	// restart of this process reconstructs prior forks instead of starting
+	// blank.
 	busSessions := NewBusSessionManager(cfg.WorkspaceRoot)
 	sessionRegistry := NewSessionRegistry()
 	handoffRegistry := NewHandoffRegistry()
+	forkRegistry := NewForkRegistry()
 	_ = ReplaySessionRegistry(busSessions, sessionRegistry)
 	_ = ReplayHandoffRegistry(busSessions, handoffRegistry)
+	_ = ReplayForkRegistry(busSessions, forkRegistry)
 	server.SetSessionsBackend(busSessions, sessionRegistry, handoffRegistry)
+	server.SetForkRegistry(forkRegistry)
 
 	// Wire a signal-aware context so shells (or hosts like Claude Desktop)
 	// that send SIGINT/SIGTERM on shutdown get a clean exit.

@@ -252,8 +252,17 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// Replay bus_sessions + bus_handoffs into the in-memory registries so
 	// the kernel starts with an accurate derived view. Bus is authoritative
 	// either way; this just warms the read path.
+	//
+	// ReplaySessionRegistry's session.fork case reconstructs fork-child rows
+	// (cog_fork_session / POST /v1/sessions/{id}/fork register the child with
+	// appendFn=nil — the fork bus event is the child's only durable record).
+	// ReplayForkRegistry separately rebuilds the parent→children lineage
+	// index consumed by ForkChildren/ForkAncestors, which was otherwise
+	// reinitialized empty on every restart (s.forkRegistry = NewForkRegistry()
+	// above) with no path back from the bus.
 	_ = ReplaySessionRegistry(s.busSessions, s.sessionRegistry)
 	_ = ReplayHandoffRegistry(s.busSessions, s.handoffRegistry)
+	_ = ReplayForkRegistry(s.busSessions, s.forkRegistry)
 
 	// Resolve the bind address. Default stays 127.0.0.1 (loopback-only);
 	// callers may override via Config.BindAddr to listen on all interfaces

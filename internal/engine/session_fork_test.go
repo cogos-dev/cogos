@@ -631,3 +631,169 @@ func TestMCP_ForkSession_RoundTrip(t *testing.T) {
 		t.Errorf("child %q not in forkRegistry after MCP fork; got %v", forkOut.ChildSessionID, children)
 	}
 }
+
+// ─── Cold-restart durability tests ───────────────────────────────────────────
+//
+// Regression coverage for the durability gap: cog_fork_session /
+// POST /v1/sessions/{id}/fork register the child session with
+// appendFn=nil (ApplyRegister never appends its own bus event — the
+// session.fork event written just before IS the child's only durable
+// record). Before this fix:
+//   - ReplaySessionRegistry's switch had no case for "session.fork", so the
+//     child row existed only in the live in-memory registry and vanished on
+//     restart even though the bus event persisted.
+//   - ForkRegistry had no replay path at all and was unconditionally
+//     reinitialized empty (NewForkRegistry()) at every startup, so lineage
+//     (ForkChildren / ForkAncestors) never survived a restart.
+//
+// These tests boot a fresh *Server rooted at the same workspace (mirrors
+// TestReplayOnStartup's pattern), which is exactly how the kernel
+// reconstructs its warm caches from the bus on a real process restart.
+
+func TestReplayOnStartup_ForkSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	nucleus := &Nucleus{Name: "test"}
+	proc := NewProcess(cfg, nucleus)
+	srv1 := NewServer(cfg, nucleus, proc)
+	ts1 := httptest.NewServer(srv1.Handler())
+	t.Cleanup(func() { ts1.Close() })
+
+	registerParent(t, ts1, "restart-parent-a")
+
+	resp := postJSON(t, ts1.URL+"/v1/sessions/restart-parent-a/fork", map[string]any{
+		"overlay": map[string]any{
+			"role": map[string]any{"role": "btw-aside"},
+		},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		resp.Body.Close()
+		t.Fatalf("fork status = %d, want 201", resp.StatusCode)
+	}
+	var out forkSessionHTTPResponse
+	decodeJSON(t, resp, &out)
+	if out.ChildSessionID == "" {
+		t.Fatal("child_session_id is empty")
+	}
+
+	// Sanity: pre-restart, both registries reflect the fork.
+	if _, ok := srv1.sessionRegistry.Get(out.ChildSessionID); !ok {
+		t.Fatalf("precondition failed: child %q not in live registry before restart", out.ChildSessionID)
+	}
+	preChildren := srv1.forkRegistry.ForkChildren("restart-parent-a", time.Now().UTC())
+	if len(preChildren) == 0 {
+		t.Fatal("precondition failed: forkRegistry empty before restart")
+	}
+
+	ts1.Close()
+
+	// Boot a fresh Server rooted at the same workspace — this is the
+	// process-restart path: NewServer constructs brand-new, empty
+	// sessionRegistry / forkRegistry instances and replays them from the
+	// bus (ReplaySessionRegistry, ReplayForkRegistry) before serving.
+	srv2 := NewServer(cfg, nucleus, proc)
+
+	// 1. Parent row reconstructs from its session.register event.
+	parentRow, ok := srv2.sessionRegistry.Get("restart-parent-a")
+	if !ok || parentRow == nil {
+		t.Fatal("parent session not replayed after restart")
+	}
+	if parentRow.Ended {
+		t.Error("parent session should not be marked ended after replay")
+	}
+
+	// 2. Child row reconstructs from the session.fork event alone (it was
+	// never registered via a session.register event — ApplyRegister was
+	// called with appendFn=nil at fork time).
+	childRow, ok := srv2.sessionRegistry.Get(out.ChildSessionID)
+	if !ok || childRow == nil {
+		t.Fatalf("child session %q not replayed after restart (durability bug: fork event dropped)", out.ChildSessionID)
+	}
+	if childRow.Role != "btw-aside" {
+		t.Errorf("child.Role after replay = %q, want btw-aside (overlay should be honored)", childRow.Role)
+	}
+	if childRow.Workspace != parentRow.Workspace {
+		t.Errorf("child.Workspace after replay = %q, want inherited %q", childRow.Workspace, parentRow.Workspace)
+	}
+
+	// 3. Fork lineage (ForkRegistry) reconstructs from the same event.
+	childrenAfter := srv2.forkRegistry.ForkChildren("restart-parent-a", time.Now().UTC())
+	found := false
+	for _, c := range childrenAfter {
+		if c == out.ChildSessionID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("forkRegistry.ForkChildren(parent) after restart = %v, want to include %q", childrenAfter, out.ChildSessionID)
+	}
+
+	ancestors := srv2.forkRegistry.ForkAncestors(out.ChildSessionID)
+	if len(ancestors) == 0 {
+		t.Error("forkRegistry.ForkAncestors(child) after restart is empty, want at least the parent")
+	} else if ancestors[0].SessionID != "restart-parent-a" {
+		t.Errorf("ancestors[0].SessionID after restart = %q, want restart-parent-a", ancestors[0].SessionID)
+	}
+}
+
+// TestReplayOnStartup_ForkPinnedUntilSurvivesRestart covers the
+// pin_duration / PinnedUntil field specifically: it must be replayed
+// verbatim so GC expiry semantics (RFC-0005 §Garbage collection) match what
+// was computed at fork time, not a default recomputed at restart.
+func TestReplayOnStartup_ForkPinnedUntilSurvivesRestart(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	nucleus := &Nucleus{Name: "test"}
+	proc := NewProcess(cfg, nucleus)
+	srv1 := NewServer(cfg, nucleus, proc)
+	ts1 := httptest.NewServer(srv1.Handler())
+	t.Cleanup(func() { ts1.Close() })
+
+	registerParent(t, ts1, "restart-parent-pin")
+
+	resp := postJSON(t, ts1.URL+"/v1/sessions/restart-parent-pin/fork", map[string]any{
+		"pin_duration": "P30D",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		resp.Body.Close()
+		t.Fatalf("fork status = %d, want 201", resp.StatusCode)
+	}
+	var out forkSessionHTTPResponse
+	decodeJSON(t, resp, &out)
+	if out.PinnedUntil == "" {
+		t.Fatal("precondition failed: pinned_until not set pre-restart")
+	}
+	wantPinnedUntil, err := time.Parse(time.RFC3339, out.PinnedUntil)
+	if err != nil {
+		t.Fatalf("parse pinned_until: %v", err)
+	}
+
+	ts1.Close()
+	srv2 := NewServer(cfg, nucleus, proc)
+
+	// A reference time far short of the 7-day default retention but still
+	// before the 30-day pin: if PinnedUntil didn't survive replay, the
+	// entry would already look expired at the default retention window and
+	// ForkChildren would incorrectly exclude it long before 30 days are up.
+	// Use "just before the 30-day pin" as the check, and "just after the
+	// unpinned 7-day default" to prove the pin (not the default) is in effect.
+	checkAt := time.Now().UTC().Add(10 * 24 * time.Hour) // > default 7d, < pinned 30d
+	if checkAt.After(wantPinnedUntil) {
+		t.Fatalf("test setup invariant broken: checkAt %v is after pinnedUntil %v", checkAt, wantPinnedUntil)
+	}
+
+	children := srv2.forkRegistry.ForkChildren("restart-parent-pin", checkAt)
+	found := false
+	for _, c := range children {
+		if c == out.ChildSessionID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("forkRegistry.ForkChildren(parent, +10d) after restart = %v, want to include %q "+
+			"(PinnedUntil=P30D should have survived replay, not fallen back to the 7-day default)",
+			children, out.ChildSessionID)
+	}
+}
