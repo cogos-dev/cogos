@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,6 +250,144 @@ func TestRunApplyRenameFailRestoresFromBak(t *testing.T) {
 	got, _ := os.ReadFile(filepath.Join(binDir, "cogos"))
 	if string(got) != string(origContent) {
 		t.Errorf("rename-fail path must restore original from .bak; got %q", got)
+	}
+}
+
+// ─── #442: write-ahead kernel.toml maintenance ───────────────────────────────
+
+// seedKernelTOML writes a kernel.toml under u.root/.cog/conf and returns its
+// path. The seeded darwin checksum is intentionally wrong so a successful
+// write-ahead is observable as the CORRECTED value on disk.
+func seedKernelTOML(t *testing.T, u *selfUpdater) string {
+	t.Helper()
+	path := filepath.Join(u.root, kernelTOMLRel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The checksums section is keyed by the platform key (asset name minus the
+	// "cogos-" prefix / ".exe" suffix), matching the shipped kernel.toml layout.
+	platKey, ok := kernelTOMLPlatformKey(assetName())
+	if !ok {
+		t.Fatalf("cannot derive platform key from %q", assetName())
+	}
+	body := "[kernel]\nversion = \"v0.16.4\"\n\n[kernel.checksums]\n" +
+		platKey + " = \"STALE\"\nlinux-amd64 = \"keepme\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestRunApplyWriteAheadRecordsKernelTOMLOnSuccess asserts the ledger-first
+// contract: on a successful update, kernel.toml carries the new version + the
+// current platform's real checksum, with other platforms preserved.
+func TestRunApplyWriteAheadRecordsKernelTOMLOnSuccess(t *testing.T) {
+	u, _ := newTestUpdater(t, "v0.16.5")
+	ktPath := seedKernelTOML(t, u)
+	payload, sum := newPayload(t, "v0.16.5")
+
+	u.download = func(ctx context.Context, url, dst string) error {
+		return os.WriteFile(dst, payload, 0o644)
+	}
+	u.fetchText = func(ctx context.Context, url string) (string, error) {
+		return fmt.Sprintf("%s  %s\n%s  linux-amd64\n", sum, assetName(), suHashBytes([]byte("x"))), nil
+	}
+	if err := runApplyWithStubResolve(u); err != nil {
+		t.Fatalf("runApply: %v", err)
+	}
+
+	got, _ := os.ReadFile(ktPath)
+	s := string(got)
+	platKey, _ := kernelTOMLPlatformKey(assetName())
+	if !strings.Contains(s, `version = "v0.16.5"`) {
+		t.Errorf("kernel.toml version must be updated write-ahead:\n%s", s)
+	}
+	if !strings.Contains(s, platKey+` = "`+sum+`"`) {
+		t.Errorf("kernel.toml current-platform checksum must be the real sum:\n%s", s)
+	}
+	if strings.Contains(s, `STALE`) {
+		t.Errorf("stale checksum must be gone:\n%s", s)
+	}
+	if !strings.Contains(s, `linux-amd64 = "keepme"`) {
+		t.Errorf("other-platform checksum must be preserved:\n%s", s)
+	}
+}
+
+// TestRunApplyWriteAheadRollsBackKernelTOMLOnHealthFail asserts that when the
+// health poll fails after the swap, kernel.toml is restored to its pre-update
+// bytes (recorded version never claims the failed target).
+func TestRunApplyWriteAheadRollsBackKernelTOMLOnHealthFail(t *testing.T) {
+	u, _ := newTestUpdater(t, "v0.16.5")
+	ktPath := seedKernelTOML(t, u)
+	before, _ := os.ReadFile(ktPath)
+	payload, sum := newPayload(t, "v0.16.5")
+
+	u.download = func(ctx context.Context, url, dst string) error {
+		return os.WriteFile(dst, payload, 0o644)
+	}
+	u.fetchText = func(ctx context.Context, url string) (string, error) {
+		return fmt.Sprintf("%s  %s\n", sum, assetName()), nil
+	}
+	u.healthPoll = func(time.Duration) error { return fmt.Errorf("never healthy") }
+	u.rollbackPoll = func(time.Duration, string) error { return nil }
+
+	if err := runApplyWithStubResolve(u); err == nil {
+		t.Fatal("expected health-fail to surface as error (rolled back)")
+	}
+
+	after, _ := os.ReadFile(ktPath)
+	if string(after) != string(before) {
+		t.Errorf("kernel.toml must be rolled back to pre-update bytes on health failure.\n got:\n%s\nwant:\n%s", after, before)
+	}
+}
+
+// TestRunApplyWriteAheadRollsBackKernelTOMLOnChecksumFail asserts the ledger is
+// restored when the downloaded binary fails checksum verification (the record
+// was written before the download, so it must be un-written).
+func TestRunApplyWriteAheadRollsBackKernelTOMLOnChecksumFail(t *testing.T) {
+	u, _ := newTestUpdater(t, "v0.16.5")
+	ktPath := seedKernelTOML(t, u)
+	before, _ := os.ReadFile(ktPath)
+	payload, _ := newPayload(t, "v0.16.5")
+
+	u.download = func(ctx context.Context, url, dst string) error {
+		return os.WriteFile(dst, payload, 0o644)
+	}
+	// checksums.txt advertises a sum that does not match the downloaded payload.
+	u.fetchText = func(ctx context.Context, url string) (string, error) {
+		return fmt.Sprintf("%s  %s\n", suHashBytes([]byte("mismatch")), assetName()), nil
+	}
+	if err := runApplyWithStubResolve(u); err == nil {
+		t.Fatal("expected checksum-fail error")
+	}
+	after, _ := os.ReadFile(ktPath)
+	if string(after) != string(before) {
+		t.Errorf("kernel.toml must be rolled back on checksum failure.\n got:\n%s\nwant:\n%s", after, before)
+	}
+}
+
+// TestRunApplyAbortsWhenChecksumEntryMissing asserts the write-ahead refuses to
+// proceed (and touches nothing) when the release checksums.txt lacks an entry
+// for the current platform — there is no sha to record.
+func TestRunApplyAbortsWhenChecksumEntryMissing(t *testing.T) {
+	u, _ := newTestUpdater(t, "v0.16.5")
+	ktPath := seedKernelTOML(t, u)
+	before, _ := os.ReadFile(ktPath)
+	payload, _ := newPayload(t, "v0.16.5")
+
+	u.download = func(ctx context.Context, url, dst string) error {
+		return os.WriteFile(dst, payload, 0o644)
+	}
+	// checksums.txt has only some OTHER platform, not the current one.
+	u.fetchText = func(ctx context.Context, url string) (string, error) {
+		return "deadbeef  cogos-some-otherplatform\n", nil
+	}
+	if err := runApplyWithStubResolve(u); err == nil {
+		t.Fatal("expected abort when no checksum entry exists for the current platform")
+	}
+	after, _ := os.ReadFile(ktPath)
+	if string(after) != string(before) {
+		t.Errorf("kernel.toml must be untouched when the write-ahead cannot resolve a checksum.\n got:\n%s\nwant:\n%s", after, before)
 	}
 }
 
