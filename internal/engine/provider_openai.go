@@ -139,12 +139,15 @@ func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
 		return p.availResult
 	}
 	fresh := p.probeAvailable(ctx)
-	// Don't let a caller's cancelled/expired context poison the shared cache: a
-	// probe that failed only because the caller went away (e.g. an HTTP client
+	// A negative caused only by the CALLER going away (an HTTP client
 	// disconnecting on /v1/providers, which passes r.Context()) says nothing
-	// about provider health. Skip the cache write so the next caller re-probes,
-	// instead of marking a healthy provider unavailable to everyone for the TTL.
-	if !fresh && ctx.Err() != nil {
+	// about provider health, so don't cache it. But a context DEADLINE is the
+	// router's own probeTimeout firing on a slow/hung provider — that is a real
+	// "unavailable" signal and must be cached, or a hung provider would stay
+	// cached as available forever (every 10s tick would re-hit the deadline and
+	// discard the negative). So skip the write only for context.Canceled, not
+	// context.DeadlineExceeded (#441 review).
+	if !fresh && ctx.Err() == context.Canceled {
 		return p.availResult
 	}
 	p.availResult = fresh

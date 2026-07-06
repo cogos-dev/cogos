@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -75,6 +76,14 @@ type OllamaProvider struct {
 	contextWindow int // num_ctx to send per request; 0 = Ollama default (4096)
 	timeout       time.Duration
 	client        *http.Client
+
+	// availMu guards the Available() TTL cache (#441): the router's 10s
+	// availability ticker probes this provider with a live GET /api/tags. Cache
+	// the result for availCacheTTL, holding the mutex across the probe so
+	// concurrent callers collapse into a single request.
+	availMu     sync.Mutex
+	availResult bool
+	availAt     time.Time
 }
 
 // NewOllamaProvider creates an OllamaProvider from a ProviderConfig.
@@ -101,8 +110,31 @@ func NewOllamaProvider(name string, cfg ProviderConfig) *OllamaProvider {
 func (p *OllamaProvider) Name() string  { return p.name }
 func (p *OllamaProvider) Model() string { return p.model }
 
-// Available checks if Ollama is running and the configured model is loaded.
+// Available checks if Ollama is running and the configured model is loaded. The
+// result is cached for availCacheTTL so the router's periodic availability probe
+// doesn't issue a live GET /api/tags on every call (#441). The mutex is held
+// across the probe so concurrent callers collapse into a single request.
 func (p *OllamaProvider) Available(ctx context.Context) bool {
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if !p.availAt.IsZero() && time.Since(p.availAt) < availCacheTTL {
+		return p.availResult
+	}
+	fresh := p.probeAvailable(ctx)
+	// Skip caching only for a caller-initiated cancellation; a context deadline
+	// is the router's probeTimeout on a slow provider and must be cached as
+	// unavailable (#441 review).
+	if !fresh && ctx.Err() == context.Canceled {
+		return p.availResult
+	}
+	p.availResult = fresh
+	p.availAt = time.Now()
+	return p.availResult
+}
+
+// probeAvailable performs the live check backing Available(): GET /api/tags and
+// confirm the configured model is present. Call via Available() for TTL caching.
+func (p *OllamaProvider) probeAvailable(ctx context.Context) bool {
 	models, err := p.listModels(ctx)
 	if err != nil {
 		return false

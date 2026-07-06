@@ -604,9 +604,11 @@ func (p *ClaudeOAuthProvider) Available(ctx context.Context) bool {
 		return p.availResult
 	}
 	fresh := p.probeAvailable(ctx)
-	// Don't cache a negative caused only by the caller's cancelled/expired
-	// context (#441 review) — it says nothing about provider health.
-	if !fresh && ctx.Err() != nil {
+	// Skip caching only for a caller-initiated cancellation (client disconnect);
+	// a context deadline is the router's probeTimeout firing on a slow provider
+	// and must be cached as unavailable, else a hung provider stays cached as
+	// available forever (#441 review).
+	if !fresh && ctx.Err() == context.Canceled {
 		return p.availResult
 	}
 	p.availResult = fresh
