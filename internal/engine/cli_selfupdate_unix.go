@@ -139,7 +139,10 @@ func (u *selfUpdater) run() error {
 	return u.runApply(ctx)
 }
 
-// runApply performs the download→verify→swap→restart→health→rollback core.
+// runApply performs the write-ahead→download→verify→swap→restart→health→rollback
+// core. kernel.toml is the ledger: its version + current-platform checksum are
+// recorded BEFORE the binary is downloaded, and rolled back together with the
+// binary if any later step fails (issue #442).
 func (u *selfUpdater) runApply(ctx context.Context) error {
 	binPath := filepath.Join(u.binDir, "cogos")
 	bakPath := binPath + ".bak"
@@ -151,8 +154,40 @@ func (u *selfUpdater) runApply(ctx context.Context) error {
 		return fmt.Errorf("resolve %s: %w", u.toTag, err)
 	}
 
+	// WRITE-AHEAD (ledger-first) — fetch checksums.txt and record the target
+	// version + current-platform sha256 into kernel.toml BEFORE downloading the
+	// binary. The checksum we verify against below is the one we just wrote, so
+	// kernel.toml is the authority the swap reconciles toward, not a copy
+	// patched afterward. Fetching checksums up front (previously fetched after
+	// the download) is the only reordering the write-ahead requires.
+	sums, err := u.fetchText(ctx, target.ChecksumURL)
+	if err != nil {
+		return fmt.Errorf("download checksums: %w", err)
+	}
+	wantSum, ok := checksumFor(target.AssetName, sums)
+	if !ok {
+		return fmt.Errorf("no checksum entry for %s in release checksums.txt", target.AssetName)
+	}
+	ktSnap, err := writeAheadKernelTOML(u.root, u.toTag, target.AssetName, wantSum)
+	if err != nil {
+		// The ledger write itself failed: nothing downloaded, running binary
+		// untouched. Surface the error; the reconcile loop retries next tick.
+		return fmt.Errorf("write-ahead kernel.toml: %w (running binary untouched)", err)
+	}
+	if ktSnap.existed {
+		u.logf("write-ahead: recorded %s + %s checksum in %s", u.toTag, target.AssetName, ktSnap.path)
+	}
+	// rollbackLedger restores kernel.toml to its pre-write-ahead bytes and logs
+	// loudly on failure (a stuck-ahead kernel.toml is the exact drift #442 fixes).
+	rollbackLedger := func() {
+		if rerr := rollbackKernelTOML(ktSnap); rerr != nil {
+			u.logf("FATAL: kernel.toml rollback failed: %v; recorded version may be ahead of the running binary at %s", rerr, ktSnap.path)
+		}
+	}
+
 	// Pre-flight disk check: require ≥ 2× the running binary size free.
 	if err := u.preflightDisk(binPath); err != nil {
+		rollbackLedger()
 		return err
 	}
 
@@ -160,25 +195,25 @@ func (u *selfUpdater) runApply(ctx context.Context) error {
 	u.logf("downloading %s", target.AssetURL)
 	if err := u.download(ctx, target.AssetURL, newPath); err != nil {
 		_ = os.Remove(newPath)
+		rollbackLedger()
 		return fmt.Errorf("download binary: %w", err)
 	}
-	// From here on, always clean up newPath on any abort before the swap.
+	// From here on, always clean up newPath (and roll back the ledger) on any
+	// abort before the swap.
 	cleanupNew := func() { _ = os.Remove(newPath) }
 
-	// GATE L — checksum verify against checksums.txt.
-	sums, err := u.fetchText(ctx, target.ChecksumURL)
-	if err != nil {
+	// GATE L — checksum verify against the sha256 recorded write-ahead in
+	// kernel.toml (== the current platform's entry in the release checksums.txt).
+	if err := verifyChecksumAgainst(newPath, wantSum); err != nil {
 		cleanupNew()
-		return fmt.Errorf("download checksums: %w", err)
-	}
-	if err := verifyChecksum(newPath, target.AssetName, sums); err != nil {
-		cleanupNew()
+		rollbackLedger()
 		return fmt.Errorf("checksum verify: %w (running binary untouched)", err)
 	}
 
 	// Step 10 — make the new binary executable.
 	if err := os.Chmod(newPath, 0o755); err != nil {
 		cleanupNew()
+		rollbackLedger()
 		return fmt.Errorf("chmod new binary: %w", err)
 	}
 
@@ -186,16 +221,19 @@ func (u *selfUpdater) runApply(ctx context.Context) error {
 	got, err := u.smokeTest(newPath)
 	if err != nil {
 		cleanupNew()
+		rollbackLedger()
 		return fmt.Errorf("smoke-test new binary: %w (running binary untouched)", err)
 	}
 	if !versionFieldEqual(got, u.toTag) {
 		cleanupNew()
+		rollbackLedger()
 		return fmt.Errorf("downloaded binary reports %q, expected %s (running binary untouched)", got, u.toTag)
 	}
 
 	// Step 12 — backup the current binary by COPY (old binary stays in place).
 	if err := copyFileMode(binPath, bakPath, 0o755); err != nil {
 		cleanupNew()
+		rollbackLedger()
 		return fmt.Errorf("backup current binary: %w (running binary untouched)", err)
 	}
 
@@ -205,9 +243,11 @@ func (u *selfUpdater) runApply(ctx context.Context) error {
 		// Swap failed; restore from .bak to be safe (binPath may be intact, but
 		// restore is idempotent and known-good).
 		if rerr := os.Rename(bakPath, binPath); rerr != nil {
+			rollbackLedger()
 			u.logf("FATAL: swap failed (%v) AND restore failed (%v); manually run: cp %s %s", err, rerr, bakPath, binPath)
 			return fmt.Errorf("swap failed and restore failed: %w", err)
 		}
+		rollbackLedger()
 		return fmt.Errorf("atomic swap failed, restored from backup: %w", err)
 	}
 	u.logf("swapped binary to %s (backup at %s)", u.toTag, bakPath)
@@ -215,16 +255,17 @@ func (u *selfUpdater) runApply(ctx context.Context) error {
 	// Step 14 — restart the kernel.
 	if err := u.kickstart(); err != nil {
 		u.logf("kickstart failed after swap: %v; rolling back", err)
-		return u.rollback(binPath, bakPath, fmt.Errorf("kickstart: %w", err))
+		return u.rollback(binPath, bakPath, ktSnap, fmt.Errorf("kickstart: %w", err))
 	}
 
 	// GATE O — health poll: require status ok AND version == target within 30s.
 	if err := u.healthPoll(healthDeadline); err != nil {
 		u.logf("health did not converge to %s within %s: %v; rolling back", u.toTag, healthDeadline, err)
-		return u.rollback(binPath, bakPath, err)
+		return u.rollback(binPath, bakPath, ktSnap, err)
 	}
 
-	// Success — remove the backup, release lock (deferred), exit 0.
+	// Success — remove the backup, release lock (deferred), exit 0. kernel.toml
+	// already records the now-running version (written write-ahead).
 	if err := os.Remove(bakPath); err != nil && !os.IsNotExist(err) {
 		u.logf("warning: could not remove backup %s: %v", bakPath, err)
 	}
@@ -232,8 +273,18 @@ func (u *selfUpdater) runApply(ctx context.Context) error {
 	return nil
 }
 
-// rollback restores the backup binary and re-validates health. GATE P.
-func (u *selfUpdater) rollback(binPath, bakPath string, cause error) error {
+// rollback restores the backup binary AND the write-ahead kernel.toml entry,
+// then re-validates health. GATE P. kernel.toml is rolled back first so the
+// recorded version never claims the failed target once the old binary is back.
+func (u *selfUpdater) rollback(binPath, bakPath string, ktSnap kernelTOMLSnapshot, cause error) error {
+	// Roll the ledger back first: if this fails we still restore the binary, but
+	// we log loudly because a stuck-ahead kernel.toml is the drift #442 fixes.
+	if kerr := rollbackKernelTOML(ktSnap); kerr != nil {
+		u.logf("FATAL: kernel.toml rollback failed during binary rollback: %v; recorded version may be ahead of the restored binary at %s", kerr, ktSnap.path)
+	} else if ktSnap.existed {
+		u.logf("rolled back kernel.toml to the pre-update version at %s", ktSnap.path)
+	}
+
 	if err := os.Rename(bakPath, binPath); err != nil {
 		u.logf("FATAL: rollback restore failed: %v; the operator must manually run: cp %s %s", err, bakPath, binPath)
 		return fmt.Errorf("rollback restore failed (original cause: %v): %w", cause, err)
@@ -495,6 +546,24 @@ func verifyChecksum(path, assetName, checksums string) error {
 	}
 	if !strings.EqualFold(got, want) {
 		return fmt.Errorf("sha256 mismatch for %s: got %s, want %s", assetName, got, want)
+	}
+	return nil
+}
+
+// verifyChecksumAgainst computes sha256(path) and matches it against a single
+// expected hex digest (the one recorded write-ahead in kernel.toml). Used by the
+// #442 write-ahead path, which has already extracted the current-platform digest
+// via checksumFor and does not need to re-parse the full checksums.txt.
+func verifyChecksumAgainst(path, want string) error {
+	if want == "" {
+		return fmt.Errorf("empty expected checksum")
+	}
+	got, err := sha256File(path)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("sha256 mismatch: got %s, want %s", got, want)
 	}
 	return nil
 }
