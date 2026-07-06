@@ -533,6 +533,14 @@ type ClaudeOAuthProvider struct {
 	client    *http.Client
 	lc        *CredentialLifecycle
 
+	// availMu guards the Available() TTL cache (#441): the router's 10s
+	// availability ticker probes this provider with a live GET /v1/models against
+	// the (remote, paid) Anthropic endpoint. Cache the result for availCacheTTL,
+	// holding the mutex across the probe so concurrent callers collapse into one.
+	availMu     sync.Mutex
+	availResult bool
+	availAt     time.Time
+
 	// fallback is invoked on a persistent 429 (subscription burst rate-limit
 	// with overage disabled). Typically a claude-code CLI provider that reaches
 	// the same Max subscription via the official client. nil disables fallback.
@@ -584,11 +592,34 @@ func NewClaudeOAuthProvider(name string, cfg ProviderConfig, fallback Provider) 
 func (p *ClaudeOAuthProvider) Name() string  { return p.name }
 func (p *ClaudeOAuthProvider) Model() string { return p.model }
 
-// Available reports whether the provider can serve requests. It does a
-// lightweight GET /v1/models behind the credential lifecycle so the token is
-// refreshed if needed. Returns false on any error (credential missing, network
-// unreachable, or non-2xx response).
+// Available reports whether the provider can serve requests. The result is
+// cached for availCacheTTL so the router's periodic availability ticker (and the
+// per-request /v1/providers handler) don't fire a live GET /v1/models at the
+// remote Anthropic endpoint on every call (#441). The mutex is held across the
+// probe so concurrent callers collapse into a single request.
 func (p *ClaudeOAuthProvider) Available(ctx context.Context) bool {
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if !p.availAt.IsZero() && time.Since(p.availAt) < availCacheTTL {
+		return p.availResult
+	}
+	fresh := p.probeAvailable(ctx)
+	// Skip caching only for a caller-initiated cancellation (client disconnect);
+	// a context deadline is the router's probeTimeout firing on a slow provider
+	// and must be cached as unavailable, else a hung provider stays cached as
+	// available forever (#441 review).
+	if !fresh && ctx.Err() == context.Canceled {
+		return p.availResult
+	}
+	p.availResult = fresh
+	p.availAt = time.Now()
+	return p.availResult
+}
+
+// probeAvailable performs the live reachability check backing Available(): a
+// GET /v1/models behind the credential lifecycle (refreshing the token if
+// needed). Call via Available() for TTL caching.
+func (p *ClaudeOAuthProvider) probeAvailable(ctx context.Context) bool {
 	availCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -1020,7 +1051,6 @@ func (p *ClaudeOAuthProvider) Stream(ctx context.Context, req *CompletionRequest
 	if err != nil {
 		return nil, fmt.Errorf("claude-oauth: marshal stream request: %w", err)
 	}
-
 
 	// Proactive refresh before the request.
 	token, err := p.lc.FreshToken(ctx)

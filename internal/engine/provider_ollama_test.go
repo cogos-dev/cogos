@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -180,6 +181,35 @@ func TestOllamaCapabilitiesContextWindow(t *testing.T) {
 
 // ── Available ─────────────────────────────────────────────────────────────────
 
+// TestOllamaAvailableCachesWithinTTL guards #441 for the Ollama provider:
+// repeated Available() calls within availCacheTTL hit the upstream /api/tags
+// exactly once, not on every call.
+func TestOllamaAvailableCachesWithinTTL(t *testing.T) {
+	t.Parallel()
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"models": []map[string]any{{"name": "qwen2.5:9b"}},
+		})
+	}))
+	defer srv.Close()
+
+	p := NewOllamaProvider("ollama", ProviderConfig{Endpoint: srv.URL, Model: "qwen2.5:9b"})
+	for i := 0; i < 6; i++ {
+		if !p.Available(context.Background()) {
+			t.Fatalf("Available() = false on call %d; want true", i)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("upstream /api/tags hit %d times; want 1 (calls within TTL should be cached)", got)
+	}
+}
+
 func TestOllamaAvailableModelPresent(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +279,7 @@ func TestOllamaListModels(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"models": []map[string]any{
 				{"name": "llama3:8b"},
-				{"name": ""},          // should be filtered out
+				{"name": ""}, // should be filtered out
 				{"name": "gemma4:e4b"},
 			},
 		})

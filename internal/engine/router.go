@@ -286,6 +286,13 @@ func (r *SimpleRouter) available(ctx context.Context, p Provider) bool {
 // fallback) so one unreachable endpoint can't stall a whole probe cycle.
 const probeTimeout = 2 * time.Second
 
+// availCacheTTL bounds how long a provider's Available() result is cached, so
+// the defaultAvailTTL ticker (and the per-request /v1/providers handler) don't
+// fire a live GET /v1/models at the upstream on every probe (#441). Providers
+// that do a live reachability check — OpenAICompatProvider, ClaudeOAuthProvider
+// — reuse this; MLXSupervisedProvider already keeps an equivalent probe cache.
+const availCacheTTL = 30 * time.Second
+
 // probeAll probes every registered provider concurrently, each bounded by
 // probeTimeout, and atomically swaps in the resulting snapshot. A cycle costs
 // roughly the slowest single probe — not the sum — and never blocks Route.

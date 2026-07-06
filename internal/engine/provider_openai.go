@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,6 +50,14 @@ type OpenAICompatProvider struct {
 	timeout        time.Duration
 	client         *http.Client
 	defaultOptions map[string]interface{} // extra fields merged into every request body
+
+	// availMu guards the Available() TTL cache (#441). The router's probeAll and
+	// the per-request /v1/providers handler can call Available() concurrently;
+	// the mutex is held across the probe so concurrent callers collapse into a
+	// single GET /v1/models rather than fanning out N identical requests.
+	availMu     sync.Mutex
+	availResult bool
+	availAt     time.Time
 }
 
 // NewOpenAICompatProvider creates an OpenAICompatProvider from a ProviderConfig.
@@ -118,8 +127,38 @@ func (p *OpenAICompatProvider) Name() string { return p.name }
 // Model returns the configured model identifier.
 func (p *OpenAICompatProvider) Model() string { return p.model }
 
-// Available checks if the server is reachable and has at least one model.
+// Available reports whether the server is reachable and has a usable model.
+// The result is cached for availCacheTTL so the router's periodic availability
+// probe (and the per-request /v1/providers handler) don't issue a live
+// GET /v1/models to the upstream on every call (#441). The mutex is held across
+// the probe so concurrent callers collapse into a single request.
 func (p *OpenAICompatProvider) Available(ctx context.Context) bool {
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if !p.availAt.IsZero() && time.Since(p.availAt) < availCacheTTL {
+		return p.availResult
+	}
+	fresh := p.probeAvailable(ctx)
+	// A negative caused only by the CALLER going away (an HTTP client
+	// disconnecting on /v1/providers, which passes r.Context()) says nothing
+	// about provider health, so don't cache it. But a context DEADLINE is the
+	// router's own probeTimeout firing on a slow/hung provider — that is a real
+	// "unavailable" signal and must be cached, or a hung provider would stay
+	// cached as available forever (every 10s tick would re-hit the deadline and
+	// discard the negative). So skip the write only for context.Canceled, not
+	// context.DeadlineExceeded (#441 review).
+	if !fresh && ctx.Err() == context.Canceled {
+		return p.availResult
+	}
+	p.availResult = fresh
+	p.availAt = time.Now()
+	return p.availResult
+}
+
+// probeAvailable performs the live reachability check backing Available():
+// GET /v1/models, then confirm the configured model (if any) is present. Call
+// via Available() to get TTL caching; calling this directly bypasses the cache.
+func (p *OpenAICompatProvider) probeAvailable(ctx context.Context) bool {
 	models, err := p.listModels(ctx)
 	if err != nil {
 		return false
