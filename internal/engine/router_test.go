@@ -85,6 +85,291 @@ func TestRouterFallbackWhenPrimaryUnavailable(t *testing.T) {
 	}
 }
 
+// TestRouterFallbackSkipsProvidersThatCannotServeOverride is the regression
+// guard for inference-pipeline-robustness FIX 3. When the primary local provider
+// (serving ornith-1.0-35b) is down, the fallback carries the ModelOverride into
+// the chain. A LOCAL model-serving sibling that has a DIFFERENT model loaded
+// (gemma) would 404 on the ornith id, so the router must skip it and reach the
+// sibling that actually serves ornith-1.0-35b. Only local model-serving
+// providers are gated this way — see TestRouterFallbackReachesFrontierBackup
+// for the complementary guarantee that frontier fallbacks stay eligible.
+func TestRouterFallbackSkipsProvidersThatCannotServeOverride(t *testing.T) {
+	t.Parallel()
+	r := NewSimpleRouter(RoutingConfig{
+		Default:       "lmstudio-darkstar",
+		FallbackChain: []string{"lmstudio-darkstar", "lmstudio-gemma", "lmstudio-eclipse"},
+	})
+
+	// Primary: serves ornith-1.0-35b but is down.
+	darkstar := NewStubProvider("lmstudio-darkstar", "")
+	darkstar.model = "ornith-1.0-35b"
+	darkstar.available = false
+
+	// Local model-serving sibling with a DIFFERENT model loaded. It would 404 on
+	// an ornith id, so it MUST be skipped for an ornith override.
+	gemma := NewStubProvider("lmstudio-gemma", "gemma reply")
+	gemma.model = "gemma-4-26b"
+	gemma.capabilities = ProviderCapabilities{
+		Capabilities:    []Capability{CapStreaming, CapToolUse, CapJSON},
+		ModelsAvailable: []string{"gemma-4-26b"},
+		IsLocal:         true,
+	}
+
+	// Sibling local provider that DOES serve ornith-1.0-35b.
+	eclipse := NewStubProvider("lmstudio-eclipse", "ornith reply")
+	eclipse.model = "ornith-1.0-35b"
+
+	r.RegisterProvider(darkstar)
+	r.RegisterProvider(gemma)
+	r.RegisterProvider(eclipse)
+
+	p, dec, err := r.Route(context.Background(), &CompletionRequest{
+		ModelOverride: "ornith-1.0-35b",
+		Metadata:      RequestMetadata{RequestID: "fix3-1"},
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if p.Name() != "lmstudio-eclipse" {
+		t.Errorf("selected = %q; want lmstudio-eclipse (lmstudio-gemma must be skipped — it has a different model loaded and can't serve ornith-1.0-35b)", p.Name())
+	}
+	if !dec.FallbackUsed {
+		t.Error("FallbackUsed should be true")
+	}
+}
+
+// TestRouterFallbackReachesFrontierBackup is the missing coverage the flight
+// review flagged: a frontier provider reached as a FALLBACK (i > 0) with a
+// differing-but-serviceable Claude-family override must be SELECTED, not skipped.
+// A "sonnet" request resolves to a preferred claude-oauth (configured for opus)
+// that is DOWN; the router must fall to a backup frontier provider carrying the
+// sonnet override and select it, because frontier providers honour the override
+// verbatim within their family. Before the fix, providerCanServe gated every
+// frontier fallback and this returned "no available provider".
+func TestRouterFallbackReachesFrontierBackup(t *testing.T) {
+	t.Parallel()
+
+	// Two flavours of frontier backup, plus a local agentic CLI, all reachable
+	// only as fallbacks (i > 0). Each must be selectable for a differing override.
+	newFrontier := func(name, model string, models []string, local, agentic bool) *StubProvider {
+		p := NewStubProvider(name, name+" reply")
+		p.model = model
+		p.capabilities = ProviderCapabilities{
+			Capabilities:    []Capability{CapStreaming, CapToolUse, CapJSON},
+			ModelsAvailable: models,
+			IsLocal:         local,
+			AgenticHarness:  agentic,
+		}
+		return p
+	}
+
+	cases := []struct {
+		name       string
+		backupName string
+		backup     *StubProvider
+	}{
+		{
+			// A second claude-oauth / the anthropic provider: remote, !IsLocal,
+			// advertises a date-stamped id that does not match the short override.
+			name:       "remote anthropic backup",
+			backupName: "anthropic",
+			backup:     newFrontier("anthropic", "claude-sonnet-4-20250514", []string{"claude-sonnet-4-20250514"}, false, false),
+		},
+		{
+			// The claude-code CLI fallback: IsLocal AND AgenticHarness, advertises
+			// only short aliases that don't match the date-stamped override.
+			name:       "local claude-code CLI backup",
+			backupName: "claude-code",
+			backup:     newFrontier("claude-code", "sonnet", []string{"sonnet", "opus", "haiku"}, true, true),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := NewSimpleRouter(RoutingConfig{
+				Default:       "claude-oauth",
+				FallbackChain: []string{"claude-oauth", tc.backupName},
+			})
+
+			// Preferred frontier, configured for opus, is DOWN.
+			primary := newFrontier("claude-oauth", "claude-opus-4-7", []string{"claude-opus-4-7"}, false, false)
+			primary.available = false
+
+			r.RegisterProvider(primary)
+			r.RegisterProvider(tc.backup)
+
+			p, dec, err := r.Route(context.Background(), &CompletionRequest{
+				ModelOverride: "claude-sonnet-4-6",
+				Metadata:      RequestMetadata{RequestID: "fix3-frontier"},
+			})
+			if err != nil {
+				t.Fatalf("Route: %v (frontier backup must be reachable as a fallback)", err)
+			}
+			if p.Name() != tc.backupName {
+				t.Errorf("selected = %q; want %q (frontier fallback must serve the differing Claude-family override, not be skipped)", p.Name(), tc.backupName)
+			}
+			if !dec.FallbackUsed {
+				t.Error("FallbackUsed should be true — primary was down, backup reached as fallback")
+			}
+		})
+	}
+}
+
+// TestRouterFallbackNoOverridePreservesBehavior confirms the compat-aware skip
+// does not change routing when there is no ModelOverride: the first available
+// provider in the chain wins even if its Model() differs from the primary's.
+func TestRouterFallbackNoOverridePreservesBehavior(t *testing.T) {
+	t.Parallel()
+	r := NewSimpleRouter(RoutingConfig{
+		Default:       "lmstudio-darkstar",
+		FallbackChain: []string{"lmstudio-darkstar", "claude-oauth", "lmstudio-eclipse"},
+	})
+
+	darkstar := NewStubProvider("lmstudio-darkstar", "")
+	darkstar.model = "ornith-1.0-35b"
+	darkstar.available = false
+
+	oauth := NewStubProvider("claude-oauth", "claude reply")
+	oauth.model = "claude-opus-4-7"
+	oauth.capabilities = ProviderCapabilities{
+		Capabilities:    []Capability{CapStreaming, CapJSON},
+		ModelsAvailable: []string{"claude-opus-4-7"},
+		IsLocal:         false,
+	}
+
+	eclipse := NewStubProvider("lmstudio-eclipse", "ornith reply")
+	eclipse.model = "ornith-1.0-35b"
+
+	r.RegisterProvider(darkstar)
+	r.RegisterProvider(oauth)
+	r.RegisterProvider(eclipse)
+
+	// No ModelOverride: claude-oauth is the next available candidate and must be
+	// selected exactly as before the fix (the skip only applies to overrides).
+	p, dec, err := r.Route(context.Background(), &CompletionRequest{
+		Metadata: RequestMetadata{RequestID: "fix3-2"},
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if p.Name() != "claude-oauth" {
+		t.Errorf("selected = %q; want claude-oauth (no override → first available wins, unchanged)", p.Name())
+	}
+	if !dec.FallbackUsed {
+		t.Error("FallbackUsed should be true")
+	}
+}
+
+// TestRouterPreferredProviderNotSkippedForDifferingOverride guards the
+// managed-frontier case (FIX 3): the compat-aware skip applies only to fallback
+// candidates, never the preferred provider. A "sonnet"/"opus"-style request
+// resolves to a frontier provider with a ModelOverride that intentionally
+// differs from that provider's configured model; the router must still select
+// it (position 0), not skip it because Model() != override.
+func TestRouterPreferredProviderNotSkippedForDifferingOverride(t *testing.T) {
+	t.Parallel()
+	r := NewSimpleRouter(RoutingConfig{
+		Default:       "lmstudio-darkstar",
+		FallbackChain: []string{"lmstudio-darkstar"},
+	})
+
+	// Frontier provider configured for opus but asked (via override) for sonnet —
+	// it is model-agnostic within its family and honours the override.
+	oauth := NewStubProvider("claude-oauth", "sonnet reply")
+	oauth.model = "claude-opus-4-7"
+	oauth.capabilities = ProviderCapabilities{
+		Capabilities:    []Capability{CapStreaming, CapJSON},
+		ModelsAvailable: []string{"claude-opus-4-7"},
+		IsLocal:         false,
+	}
+	r.RegisterProvider(oauth)
+
+	// Request explicitly prefers claude-oauth with a differing override.
+	p, dec, err := r.Route(context.Background(), &CompletionRequest{
+		ModelOverride: "claude-sonnet-4-6",
+		Metadata: RequestMetadata{
+			RequestID:      "fix3-3",
+			PreferProvider: "claude-oauth",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if p.Name() != "claude-oauth" {
+		t.Errorf("selected = %q; want claude-oauth (preferred provider must not be skipped for a differing override)", p.Name())
+	}
+	if dec.FallbackUsed {
+		t.Error("FallbackUsed should be false — claude-oauth is the preferred provider")
+	}
+}
+
+// TestProviderCanServe locks the compat-aware fallback predicate (FIX 3). The
+// gate is scoped to LOCAL, NON-AGENTIC model-serving providers; frontier
+// providers (remote APIs and local agentic CLIs) are always eligible because
+// they honour an arbitrary override verbatim within their model family.
+func TestProviderCanServe(t *testing.T) {
+	t.Parallel()
+
+	// Local model-serving provider (lmstudio/ollama/mlx shape): IsLocal, not an
+	// agentic harness, advertises exactly the model it has loaded.
+	localServing := NewStubProvider("lmstudio-eclipse", "")
+	localServing.model = "ornith-1.0-35b"
+	localServing.capabilities = ProviderCapabilities{
+		ModelsAvailable: []string{"ornith-1.0-35b"},
+		IsLocal:         true,
+	}
+
+	// Remote frontier provider (anthropic / claude-oauth shape): !IsLocal,
+	// advertises only its configured model but honours any Claude-family id.
+	remoteFrontier := NewStubProvider("claude-oauth", "")
+	remoteFrontier.model = "claude-opus-4-7"
+	remoteFrontier.capabilities = ProviderCapabilities{
+		ModelsAvailable: []string{"claude-opus-4-7"},
+		IsLocal:         false,
+	}
+
+	// Local agentic CLI (claude-code / codex shape): IsLocal AND AgenticHarness.
+	// IsLocal alone would wrongly gate it; the AgenticHarness carve-out keeps it
+	// eligible because it passes ModelOverride straight to `--model`.
+	agenticCLI := NewStubProvider("claude-code", "")
+	agenticCLI.model = "sonnet"
+	agenticCLI.capabilities = ProviderCapabilities{
+		ModelsAvailable: []string{"sonnet", "opus", "haiku"},
+		IsLocal:         true,
+		AgenticHarness:  true,
+	}
+
+	// Local model-serving provider that advertises no model at all.
+	localAgnostic := NewStubProvider("generic-local", "")
+	localAgnostic.capabilities = ProviderCapabilities{IsLocal: true}
+
+	cases := []struct {
+		name     string
+		p        Provider
+		override string
+		want     bool
+	}{
+		{"empty override always serves (local serving)", localServing, "", true},
+		{"empty override always serves (remote frontier)", remoteFrontier, "", true},
+		{"exact model match on local serving", localServing, "ornith-1.0-35b", true},
+		{"non-matching override on local serving provider is skipped", localServing, "gemma-4-26b", false},
+		{"prefix: request family, local serving provider serves variant", localServing, "ornith-1.0", true},
+		{"remote frontier serves any Claude-family override (never gated)", remoteFrontier, "claude-sonnet-4-6", true},
+		{"remote frontier serves even a non-family override (honours verbatim)", remoteFrontier, "ornith-1.0-35b", true},
+		{"local agentic CLI serves an override outside its advertised list", agenticCLI, "claude-sonnet-4-6", true},
+		{"local model-agnostic provider serves any override", localAgnostic, "ornith-1.0-35b", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := providerCanServe(tc.p, tc.override); got != tc.want {
+				t.Errorf("providerCanServe(%q, %q) = %v; want %v", tc.p.Name(), tc.override, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRouterErrorWhenNoneAvailable(t *testing.T) {
 	t.Parallel()
 	r := NewSimpleRouter(RoutingConfig{Default: "p"})
