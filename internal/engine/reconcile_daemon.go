@@ -288,6 +288,16 @@ func (d *ReconcileDaemon) State() ReconcileDaemonState {
 	return d.state
 }
 
+// PollInterval returns the daemon's resolved tick interval (First
+// Instruments Module C, M3 — GET /v1/kernel/rates reads this so the live
+// rate-ratio table reflects the daemon's ACTUAL PollInterval, not a static
+// config guess). cfg is set once at construction via withDefaults(), so
+// this is safe to read without the daemon's mu (immutable after
+// NewReconcileDaemon).
+func (d *ReconcileDaemon) PollInterval() time.Duration {
+	return d.cfg.PollInterval
+}
+
 // ─── Isolated-registry helpers ───────────────────────────────────────────────
 //
 // When cfg.Providers is nil these helpers delegate to the global registry,
