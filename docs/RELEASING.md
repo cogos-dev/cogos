@@ -18,6 +18,8 @@
   - darwin/amd64, darwin/arm64 (macOS Intel + Apple Silicon)
   - windows/amd64, windows/arm64
 - SHA-256 checksums generated
+- `checksums.txt` signed keylessly with Sigstore/cosign (see
+  [release-signing.md](release-signing.md) for what's signed and how to verify)
 - GitHub Release created with binaries attached and auto-generated release notes
 
 ## Installing from a release
