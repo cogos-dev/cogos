@@ -20,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/filelock"
 )
 
 // TestCrossProcessUpsertRace drives two separate *Index instances against the
@@ -514,5 +516,84 @@ func TestTurnsLockPathDoesNotCollideWithMetaLockPath(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("UpsertSession(\"_meta\", ...) did not return within 2s — likely self-deadlocked on a turnsLockPath/metaLockPath collision")
+	}
+}
+
+// TestReadsNotBlockedByPeerHoldingCrossProcessLock is the regression test for
+// cog-review's fifth-round finding on PR #458: an earlier version of
+// UpsertSession/DeleteSession held idx.mu.Lock() (the in-process
+// sync.RWMutex also taken by GetMeta/ListSessions/GetTurn/Search) across the
+// blocking cross-process filelock.Acquire calls, so a daemon write blocked
+// waiting on a peer process's lock also froze every concurrent MCP read on
+// the same Index for up to ~2×metaLockTimeout. This simulates "a peer
+// process holds the per-session lock" by acquiring turnsLockPath directly
+// (bypassing the Index API, the way a genuinely separate OS process would
+// hold it) and asserts that concurrent GetMeta/ListSessions/Search calls on
+// the same Index still return promptly rather than blocking for the
+// contending UpsertSession call's lock-wait.
+func TestReadsNotBlockedByPeerHoldingCrossProcessLock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	idx, err := NewIndex(dir)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	const sessionID = "contended-session"
+	now := time.Now()
+	if err := idx.UpsertSession(
+		SessionMeta{SessionID: sessionID, TurnCount: 1, FirstTurnAt: now, LastTurnAt: now},
+		[]Turn{{UUID: sessionID, SessionID: sessionID, TurnIndex: 0, Role: "user", Timestamp: now, Text: "hello world"}},
+	); err != nil {
+		t.Fatalf("seed UpsertSession: %v", err)
+	}
+
+	// Simulate a peer process holding the per-session lock for longer than
+	// this test's read-latency budget, by acquiring it directly rather than
+	// through a concurrent UpsertSession call (avoids a timing race on which
+	// goroutine acquires first).
+	peerLock, err := filelock.Acquire(idx.turnsLockPath(sessionID), 2*time.Second)
+	if err != nil {
+		t.Fatalf("peer filelock.Acquire: %v", err)
+	}
+	defer peerLock.Release()
+
+	// A concurrent UpsertSession for the SAME sessionID will now block
+	// waiting for peerLock, up to metaLockTimeout (5s). It runs in the
+	// background; this test does not wait for it to finish.
+	go func() {
+		_ = idx.UpsertSession(
+			SessionMeta{SessionID: sessionID, TurnCount: 1, FirstTurnAt: now, LastTurnAt: now},
+			[]Turn{{UUID: sessionID, SessionID: sessionID, TurnIndex: 0, Role: "user", Timestamp: now, Text: "contended write"}},
+		)
+	}()
+
+	// Give the goroutine above a moment to actually reach and block on
+	// filelock.Acquire before asserting reads are unaffected.
+	time.Sleep(100 * time.Millisecond)
+
+	const readBudget = 500 * time.Millisecond
+	checks := []struct {
+		name string
+		run  func()
+	}{
+		{"GetMeta", func() { idx.GetMeta(sessionID) }},
+		{"ListSessions", func() { idx.ListSessions(time.Time{}, time.Time{}, "") }},
+		{"Search", func() { idx.Search("hello", time.Time{}, time.Time{}, "", "", 0) }},
+		{"GetTurn", func() { idx.GetTurn(sessionID, 0) }},
+	}
+	for _, c := range checks {
+		done := make(chan struct{})
+		go func() {
+			c.run()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// OK — returned promptly, not blocked by the peer's held lock.
+		case <-time.After(readBudget):
+			t.Fatalf("%s did not return within %v while a peer held the per-session cross-process lock — idx.mu is being held across the blocking lock acquisition again", c.name, readBudget)
+		}
 	}
 }

@@ -198,9 +198,9 @@ func (idx *Index) LoadIfChanged() (bool, error) {
 // whatever the peer already removed. See writeMetaFileLocked for why a
 // snapshot-merge (rather than a delta-merge) is unsound.
 //
-// UpsertSession and DeleteSession additionally hold ONE per-sessionID lock
-// (turnsLockPath) across their ENTIRE body — both the turns-file operation
-// and the _meta.json write — rather than acquiring it twice as two separate,
+// UpsertSession and DeleteSession additionally hold ONE per-sessionID
+// cross-process lock (turnsLockPath) across both the turns-file operation
+// and the _meta.json write, rather than acquiring it twice as two separate,
 // independently-released critical sections. cog-review (PR #458, third
 // pass) found that with two separate acquisitions, a concurrent
 // DeleteSession(sid) on one Index instance and UpsertSession(sid, ...) on
@@ -215,18 +215,25 @@ func (idx *Index) LoadIfChanged() (bool, error) {
 // DeleteSession(sid) for the identical sessionID fully mutually exclusive
 // end-to-end, closing that interleaving. Different sessionIDs still use
 // different lock files and proceed with no contention.
+//
+// idx.mu is deliberately NOT held across the cross-process locking/disk I/O
+// above — only around the brief in-memory map mutation at the very end.
+// cog-review (PR #458, fifth pass) found that an earlier version held
+// idx.mu.Lock() for the whole call, meaning the up-to-2×metaLockTimeout
+// (≈10s) a writer could block waiting on a peer process's cross-process lock
+// also blocked every concurrent GetMeta/ListSessions/GetTurn/Search call
+// (which take idx.mu.RLock()) on the SAME in-process Index — e.g. the
+// daemon's MCP handlers (cog_search_conversations et al., all sharing one
+// Provider.index) would freeze for that whole window whenever a CLI
+// reconcile process was mid-write. Disk I/O and cross-process coordination
+// now happen with idx.mu unheld; only the final idx.sessions/idx.turns
+// mutation takes the lock, and only briefly.
 func (idx *Index) UpsertSession(meta SessionMeta, turns []Turn) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
 	lock, err := filelock.Acquire(idx.turnsLockPath(meta.SessionID), metaLockTimeout)
 	if err != nil {
 		return fmt.Errorf("conversations/index: acquire session lock for %s: %w", meta.SessionID, err)
 	}
 	defer lock.Release()
-
-	idx.sessions[meta.SessionID] = meta
-	idx.turns[meta.SessionID] = turns
 
 	// Persist turns file (lock for this sessionID already held above).
 	if err := idx.writeTurnsFileLocked(meta.SessionID, turns); err != nil {
@@ -241,31 +248,44 @@ func (idx *Index) UpsertSession(meta SessionMeta, turns []Turn) error {
 	// which can be for different sessionIDs at once). Only this call's own
 	// upsert is applied as a delta on top of the current on-disk state — see
 	// writeMetaFileLocked.
-	return idx.writeMetaFileLocked(metaDelta{upserts: map[string]SessionMeta{meta.SessionID: meta}})
+	if err := idx.writeMetaFileLocked(metaDelta{upserts: map[string]SessionMeta{meta.SessionID: meta}}); err != nil {
+		return err
+	}
+
+	// Commit the in-memory view last, under a short-lived write lock — no
+	// disk I/O or cross-process locking happens while idx.mu is held.
+	idx.mu.Lock()
+	idx.sessions[meta.SessionID] = meta
+	idx.turns[meta.SessionID] = turns
+	idx.mu.Unlock()
+	return nil
 }
 
 // DeleteSession removes a session from memory and disk.
 //
 // See UpsertSession's doc comment for why this holds one turnsLockPath(sessionID)
-// lock across both the turns-file removal and the _meta.json write, rather
-// than two separate acquisitions.
+// cross-process lock across both the turns-file removal and the _meta.json
+// write (rather than two separate acquisitions), and why idx.mu is held only
+// briefly at the end rather than across the whole call.
 func (idx *Index) DeleteSession(sessionID string) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
 	lock, err := filelock.Acquire(idx.turnsLockPath(sessionID), metaLockTimeout)
 	if err != nil {
 		return fmt.Errorf("conversations/index: acquire session lock for %s: %w", sessionID, err)
 	}
 	defer lock.Release()
 
-	delete(idx.sessions, sessionID)
-	delete(idx.turns, sessionID)
-
 	if err := idx.removeTurnsFileLocked(sessionID); err != nil {
 		return fmt.Errorf("conversations/index: remove turns file: %w", err)
 	}
-	return idx.writeMetaFileLocked(metaDelta{deletes: []string{sessionID}})
+	if err := idx.writeMetaFileLocked(metaDelta{deletes: []string{sessionID}}); err != nil {
+		return err
+	}
+
+	idx.mu.Lock()
+	delete(idx.sessions, sessionID)
+	delete(idx.turns, sessionID)
+	idx.mu.Unlock()
+	return nil
 }
 
 // removeTurnsFileLocked deletes sessionID's turns file. Callers must already
@@ -493,7 +513,13 @@ func (idx *Index) turnsPath(sessionID string) string {
 }
 
 // writeMetaFileLocked persists delta (this call's own upserts/deletes) into
-// _meta.json. Callers must hold idx.mu (write lock).
+// _meta.json. Callers must NOT hold idx.mu — this method takes its own
+// short-lived idx.mu R/W locks internally, separately from the blocking
+// cross-process metaLockPath acquisition, so that a peer-process write
+// contending on metaLockPath never also blocks concurrent in-process readers
+// (GetMeta/ListSessions/GetTurn/Search) that only need idx.mu.RLock(). See
+// UpsertSession's doc comment for the availability regression this avoids
+// (cog-review, PR #458, fifth pass).
 //
 // The write is atomic (tmp + rename, same pattern as
 // BusSessionManager.saveRegistry in internal/engine/bus_session.go) — a plain
@@ -529,18 +555,22 @@ func (idx *Index) turnsPath(sessionID string) string {
 // cog_list_conversations would then list a session that
 // cog_get_turn/cog_search could never actually serve.
 //
-// The fix: after computing merged, compare it against idx.sessions as the
-// caller already left it (delta pre-applied by UpsertSession/DeleteSession
-// before calling here). If they're equal, no peer wrote anything this
-// process doesn't already fully know about (turns included) — the common
-// sole-writer case — so it's safe to keep the LoadIfChanged fast-path
-// bookkeeping (lastMeta{Mtime,Size,Hash}) in sync with what was just written,
-// same as before this fix. If they differ, a peer's content is present in
-// merged that idx.sessions doesn't have turns for; leave idx.sessions and the
-// lastMeta bookkeeping untouched by this call, so the next LoadIfChanged
-// detects the file changed out from under its recorded baseline and performs
-// a full reload — sessions map AND turns map together — keeping the two maps
-// consistent with each other at the cost of that one reload.
+// The fix: after computing merged, compare it against what idx.sessions will
+// be once the caller applies its own delta (UpsertSession/DeleteSession
+// apply the in-memory mutation after this call returns, not before — see
+// their doc comments — so this method computes the expected post-delta view
+// itself from a fresh idx.mu.RLock() snapshot plus delta, rather than reading
+// idx.sessions as literally-currently-mutated). If they're equal, no peer
+// wrote anything this process doesn't already fully know about (turns
+// included) — the common sole-writer case — so it's safe to keep the
+// LoadIfChanged fast-path bookkeeping (lastMeta{Mtime,Size,Hash}) in sync
+// with what was just written, same as before this fix. If they differ, a
+// peer's content is present in merged that idx.sessions doesn't have turns
+// for; leave the lastMeta bookkeeping untouched by this call, so the next
+// LoadIfChanged detects the file changed out from under its recorded
+// baseline and performs a full reload — sessions map AND turns map together —
+// keeping the two maps consistent with each other at the cost of that one
+// reload.
 func (idx *Index) writeMetaFileLocked(delta metaDelta) error {
 	lock, err := filelock.Acquire(idx.metaLockPath(), metaLockTimeout)
 	if err != nil {
@@ -583,23 +613,44 @@ func (idx *Index) writeMetaFileLocked(delta metaDelta) error {
 		return err
 	}
 
-	// Only adopt merged (and the fast-path bookkeeping) when it exactly
-	// matches idx.sessions as the caller left it — i.e. no peer content is
-	// present that this process's idx.turns doesn't already cover. See the
-	// func comment above for why an unconditional adopt reintroduces the
-	// sessions/turns split-brain cog-review flagged on PR #458.
-	if sessionMapsEqual(merged, idx.sessions) {
+	// Compute what idx.sessions will look like once the caller applies its
+	// own delta (which happens after this method returns — see
+	// UpsertSession/DeleteSession), from a fresh idx.mu.RLock() snapshot.
+	// This is a short, non-blocking critical section — no disk I/O or
+	// cross-process locking happens while idx.mu is held.
+	idx.mu.RLock()
+	expected := make(map[string]SessionMeta, len(idx.sessions))
+	for k, v := range idx.sessions {
+		expected[k] = v
+	}
+	idx.mu.RUnlock()
+	for k, v := range delta.upserts {
+		expected[k] = v
+	}
+	for _, k := range delta.deletes {
+		delete(expected, k)
+	}
+
+	// Only refresh the fast-path bookkeeping when merged exactly matches the
+	// expected post-delta idx.sessions — i.e. no peer content is present that
+	// this process's idx.turns doesn't already cover. See the func comment
+	// above for why an unconditional refresh reintroduces the sessions/turns
+	// split-brain cog-review flagged on PR #458. Bookkeeping fields are
+	// mutated under their own short idx.mu.Lock(), separate from the
+	// RLock() snapshot above.
+	if sessionMapsEqual(merged, expected) {
+		idx.mu.Lock()
 		idx.lastMetaHash = sha256Hex(b)
 		if fi, statErr := os.Stat(idx.metaPath()); statErr == nil {
 			idx.lastMetaMtime = fi.ModTime()
 			idx.lastMetaSize = fi.Size()
 		}
+		idx.mu.Unlock()
 	}
-	// else: leave idx.sessions/lastMeta* exactly as they were. idx.sessions
-	// still holds this call's own delta (applied by the caller), which is
-	// consistent with idx.turns; the on-disk file now also carries the
-	// peer's content, which the next LoadIfChanged's content-hash check will
-	// notice (it no longer matches lastMetaHash) and reload properly.
+	// else: leave lastMeta* exactly as they were, so the next LoadIfChanged's
+	// content-hash check notices the file changed out from under its
+	// recorded baseline (it no longer matches lastMetaHash) and reloads
+	// properly — sessions map AND turns map together.
 	return nil
 }
 
