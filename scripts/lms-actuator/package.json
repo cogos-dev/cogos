@@ -1,0 +1,16 @@
+{
+  "name": "cogos-lms-actuator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CogOS lms-model-state actuator — loads/unloads LM Studio models over the @lmstudio/sdk websocket bridge. Invoked by internal/engine/provider_lms_model_state.go ApplyPlan.",
+  "bin": {
+    "lms-actuator": "./lms-actuator.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@lmstudio/sdk": "^1.5.0"
+  }
+}

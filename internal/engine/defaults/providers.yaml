@@ -21,6 +21,37 @@
 #     model: "google/gemma-2-9b-it"
 #     timeout: 300
 #     context_window: 32768
+#
+# ── OPT-IN: lms-model-state reconciler (ADR-103) ─────────────────────────────
+# An LM Studio dispatch backend can additionally opt into declarative
+# model/context-state reconciliation: the kernel keeps the declared model loaded
+# at the declared context length via the Node @lmstudio/sdk actuator
+# (scripts/lms-actuator/). This is OFF BY DEFAULT — it activates only when a
+# backend declares `options.model_state.manage: true`. See
+# docs/inference/lms-model-state.md.
+#
+# The block below is COMMENTED OUT deliberately. Enabling it will cause the
+# autonomic ticker to load/unload models on that backend. Uncomment ONLY after
+# `cd scripts/lms-actuator && npm install` and operator live-verification of the
+# actuator against the target backend. Note: context_length: 262144 is VERIFIED
+# for the Eclipse 24 GB card (do NOT use the refuted 65536 ceiling).
+#
+#   eclipse:
+#     type: openai              # OpenAI-compatible dispatch (LM Studio REST)
+#     enabled: true
+#     endpoint: "http://192.168.10.191:1234"
+#     api_key_env: ECLIPSE_API_KEY   # Bearer token; also used by the reconciler
+#     model: "ornith-1.0-35b"
+#     timeout: 300
+#     context_window: 262144
+#     options:
+#       model_state:
+#         manage: true          # <-- the opt-in switch; false/absent ⇒ Suspended
+#         model: "ornith-1.0-35b"
+#         context_length: 262144  # VERIFIED loaded + serving on the 24GB card
+#         parallel: 1
+#         keep_warm: true
+#         jit_evict: false       # true ⇒ unload a non-target model that crowds the card
 
 providers:
   lmstudio-darkstar:
