@@ -226,6 +226,34 @@ func (k *Kernel) LastCycleSerial(providerType string) (int, bool) {
 	return k.kernel.ReconcileDaemon().LastCycleSerial(providerType)
 }
 
+// ConsolidationEvents returns a read-only snapshot of observed dormant-
+// consolidation completions for this kernel's Process (First Instruments
+// Module E, M11). See engine.Process.ConsolidationEvents.
+func (k *Kernel) ConsolidationEvents() []engine.ConsolidationEvent {
+	return k.kernel.Process().ConsolidationEvents()
+}
+
+// HeartbeatEvents returns a read-only snapshot of observed heartbeat events
+// (past the StateActive gate) for this kernel's Process (First Instruments
+// Module E, M12). See engine.Process.HeartbeatEvents.
+func (k *Kernel) HeartbeatEvents() []engine.HeartbeatEvent {
+	return k.kernel.Process().HeartbeatEvents()
+}
+
+// ActiveExpiryObservations returns a read-only snapshot of observed
+// active-window-expiry events for this kernel's Process (First Instruments
+// Module E, M13). See engine.Process.ActiveExpiryObservations.
+func (k *Kernel) ActiveExpiryObservations() []engine.ActiveExpiryObservation {
+	return k.kernel.Process().ActiveExpiryObservations()
+}
+
+// RecordActiveExpiryObservation lets a test-owned poller of a session's
+// IsActive record an M13 observation on this kernel's Process (First
+// Instruments Module E). See engine.Process.RecordActiveExpiryObservation.
+func (k *Kernel) RecordActiveExpiryObservation(obs engine.ActiveExpiryObservation) {
+	k.kernel.Process().RecordActiveExpiryObservation(obs)
+}
+
 // WaitForCycle blocks until providerType's cycle-completion counter reaches
 // at least minSerial, or ctx is done. Polls LastCycleSerial rather than any
 // provider-owned test state, so it works against a real production provider
