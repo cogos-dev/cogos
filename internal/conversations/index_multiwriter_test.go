@@ -362,3 +362,115 @@ func TestCrossProcessSameSessionTurnsFileRace(t *testing.T) {
 		t.Fatalf("turns file has %d entries, want exactly 1 (one writer's full replace, not a merge/tear)", len(turns))
 	}
 }
+
+// TestCrossProcessDeleteUpsertSameSessionNoSplitBrain is the regression test
+// for cog-review's third finding on PR #458: DeleteSession(sid) on one Index
+// instance racing UpsertSession(sid, ...) on another, for the IDENTICAL
+// sessionID, must never leave _meta.json listing a session whose turns file
+// is missing (or vice versa) on disk. The original fix took the per-session
+// turns lock and the global meta lock as two SEPARATE, independently
+// released critical sections, which left a window: instance B's turns write
+// completes and releases the turns lock; instance A acquires that freed
+// lock, removes the turns file, and moves on to the meta lock; B then writes
+// sid back into _meta.json. The fix holds ONE per-sessionID lock across both
+// the turns operation and the meta write in each of UpsertSession and
+// DeleteSession, so the two calls for the same sessionID are fully mutually
+// exclusive end-to-end.
+//
+// This drives many rounds of concurrent delete-vs-upsert on the same
+// sessionID from two Index instances and asserts, after each round settles,
+// that the on-disk state is one of exactly two consistent outcomes:
+// (a) sid absent from _meta.json AND its turns file absent, or
+// (b) sid present in _meta.json AND its turns file present and valid.
+// A split-brain (present in one but not the other) fails the test.
+func TestCrossProcessDeleteUpsertSameSessionNoSplitBrain(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const sessionID = "delete-upsert-race"
+	now := time.Now()
+
+	idxA, err := NewIndex(dir)
+	if err != nil {
+		t.Fatalf("NewIndex A: %v", err)
+	}
+	idxB, err := NewIndex(dir)
+	if err != nil {
+		t.Fatalf("NewIndex B: %v", err)
+	}
+
+	const rounds = 50
+	for r := 0; r < rounds; r++ {
+		// Seed the session so there's something for the delete side to race
+		// against on this round.
+		if err := idxB.UpsertSession(
+			SessionMeta{SessionID: sessionID, TurnCount: 1, FirstTurnAt: now, LastTurnAt: now},
+			[]Turn{{UUID: sessionID, SessionID: sessionID, TurnIndex: 0, Role: "user", Timestamp: now, Text: "seed"}},
+		); err != nil {
+			t.Fatalf("round %d: seed UpsertSession: %v", r, err)
+		}
+
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := idxA.DeleteSession(sessionID); err != nil {
+				errs <- err
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := idxB.UpsertSession(
+				SessionMeta{SessionID: sessionID, TurnCount: 1, FirstTurnAt: now, LastTurnAt: now},
+				[]Turn{{UUID: sessionID, SessionID: sessionID, TurnIndex: 0, Role: "user", Timestamp: now, Text: "round " + strconv.Itoa(r)}},
+			); err != nil {
+				errs <- err
+			}
+		}()
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: writer error: %v", r, err)
+		}
+
+		// Check on-disk consistency for this round.
+		raw, err := os.ReadFile(idxA.metaPath())
+		if err != nil {
+			t.Fatalf("round %d: read _meta.json: %v", r, err)
+		}
+		var onDisk map[string]SessionMeta
+		if err := json.Unmarshal(raw, &onDisk); err != nil {
+			t.Fatalf("round %d: _meta.json is not valid JSON: %v", r, err)
+		}
+		_, listedInMeta := onDisk[sessionID]
+
+		verify, err := NewIndex(dir)
+		if err != nil {
+			t.Fatalf("round %d: NewIndex for verify: %v", r, err)
+		}
+		// os.Stat, not loadTurnsFile, so presence/absence is unambiguous
+		// regardless of turns-list length (loadTurnsFile returns nil for
+		// both "file missing" and "file present but empty array").
+		_, statErr := os.Stat(verify.turnsPath(sessionID))
+		hasTurnsFile := statErr == nil
+		if statErr != nil && !os.IsNotExist(statErr) {
+			t.Fatalf("round %d: stat turns file: %v", r, statErr)
+		}
+		if _, parseErr := verify.loadTurnsFile(sessionID); parseErr != nil {
+			t.Fatalf("round %d: turns file corrupted: %v", r, parseErr)
+		}
+
+		if listedInMeta != hasTurnsFile {
+			t.Fatalf("round %d: split-brain — sid listed in _meta.json=%v but turns file present=%v", r, listedInMeta, hasTurnsFile)
+		}
+
+		// Re-sync both instances' in-memory view for the next round.
+		if _, err := idxA.LoadIfChanged(); err != nil {
+			t.Fatalf("round %d: idxA LoadIfChanged: %v", r, err)
+		}
+		if _, err := idxB.LoadIfChanged(); err != nil {
+			t.Fatalf("round %d: idxB LoadIfChanged: %v", r, err)
+		}
+	}
+}
