@@ -377,6 +377,11 @@ func (p *Process) LightCones() *LightConeManager {
 func (p *Process) SetTRM(trm *MambaTRM, idx *EmbeddingIndex) {
 	p.trm = trm
 	p.embeddingIndex = idx
+	// Stop any prior manager's background TTL sweeper before replacing it, so a
+	// second SetTRM call doesn't leak the previous sweeper goroutine.
+	if p.lightCones != nil {
+		p.lightCones.Close()
+	}
 	p.lightCones = NewLightConeManager(trm)
 }
 

@@ -1109,10 +1109,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		assembleScopeOpts = append(assembleScopeOpts, WithMemoryScope(bound.MemoryNamespace))
 	}
 
+	// Foveation / light-cone key: derive a STABLE per-conversation key, not the
+	// per-request UUID (creq.Metadata.RequestID). The old UUID key made the light
+	// cone never persist and leaked one orphaned entry per request. Do NOT use
+	// block.SessionID here — it is Process.SessionID() (process-wide) and would
+	// bleed light-cone state across every concurrent conversation/user. See
+	// foveation_session_key.go.
+	foveationKey := foveationSessionKey(r.Header.Get(foveationKeyHeader), req.User, clientMsgs)
+
 	if useFullEmbodiment {
 		assembleOpts := []AssembleOption{
 			WithContext(r.Context()),
-			WithConversationID(creq.Metadata.RequestID),
+			WithConversationID(foveationKey),
 			WithManifestMode(true),
 			WithPreviousTurnSpeculative(previousSpeculative),
 		}

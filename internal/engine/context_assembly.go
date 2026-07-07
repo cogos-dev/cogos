@@ -4,13 +4,21 @@
 // decomposes them, scores conversation turns alongside CogDocs, and renders
 // everything into a stability-ordered token stream within the configured budget.
 //
-// Stability zones (ordered for KV cache optimization):
+// Stability zones (ordered for prefix-cache reuse; see ADR-103 amendment to
+// ADR-066/071 — "foveation placement under prefix-cache runtimes"):
 //
-//	Zone 0: Nucleus (identity card) — most stable, always present
-//	Zone 1: CogDocs + client system prompt — shifts slowly per query
+//	Zone 0: Nucleus (identity card) — most stable, always present  → leading system
+//	Zone 1a: client system prompt — session-stable                 → leading system
 //	Zone 2: Conversation history — scored by recency + relevance, evictable
-//	Zone 3: Current message — always present
+//	Zone 1b: CogDoc manifest — VOLATILE (re-scored per turn)        → TRAILING, folded
+//	Zone 3: Current message + trailing foveal block                → final user message
 //	[Reserve: OutputReserve tokens for model generation]
+//
+// The volatile foveal manifest (Zone 1b) renders LAST, folded into the final user
+// message, so its per-turn churn does not invalidate the prefix cache for the whole
+// conversation behind it. A plain prefix cache has no layer-level KV manager
+// (ADR-066 Phase 5 / ADR-069 were never built), so "most-stable-first" here means
+// the churning block comes trailing, not leading.
 //
 // Token budget is approximated as chars/4.
 // Default budget: 32768 tokens (matches provider context_window from providers.yaml).
@@ -77,8 +85,9 @@ type ContextPackage struct {
 	// PreviousTurnSpeculative is the barge-in-truncated suffix from the
 	// previous turn — text the model generated but that was never played to
 	// the user. Non-empty only when the previous turn was interrupted.
-	// Injected into the system prompt as an agent-private block so the model
-	// knows what it "almost said" without the user having heard it.
+	// Injected as an agent-private block so the model knows what it "almost said"
+	// without the user having heard it. Post ADR-103 this rides in the trailing
+	// foveal block folded into the final user message, not the system prompt.
 	PreviousTurnSpeculative string
 }
 
@@ -115,11 +124,11 @@ type ScoredMessage struct {
 	// provider conversion can reconstruct Anthropic tool_use/tool_result blocks.
 	// Dropping these reduced every history turn to {role, content}, which sent
 	// role:"tool" results to Anthropic verbatim (rejected: "Unexpected role tool").
-	ContentParts []ContentPart
-	Name         string
-	ToolCallID   string
-	ToolCalls    []ToolCall
-	Tokens       int
+	ContentParts   []ContentPart
+	Name           string
+	ToolCallID     string
+	ToolCalls      []ToolCall
+	Tokens         int
 	TurnIndex      int     // 0 = oldest
 	RecencyScore   float64 // 1.0 = most recent, decays toward 0
 	RelevanceScore float64 // keyword overlap with current query
@@ -509,12 +518,33 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 
 // FormatForProvider renders a ContextPackage as (systemPrompt, messages) for the provider.
 //
-// The system prompt is stability-ordered for KV cache optimization:
-// nucleus → client system prompt → CogDocs (by salience descending).
+// Placement is stability-ordered for prefix-cache reuse (ADR-066/071 amendment
+// 2026-07-07, "foveation placement under prefix-cache runtimes"):
 //
-// Messages are in chronological order: conversation history → current message.
+//	systemPrompt = nucleus → "# Client Context"   (Zone 0 + the session-stable
+//	                                                half of Zone 1 ONLY)
+//	messages     = conversation history (chronological)
+//	               → FINAL user message with the volatile foveal block
+//	                 (workspace manifest + previous-turn-speculative) folded in
+//	                 as a TRAILING injection AFTER the user's own text.
+//
+// Rationale: the foveal doc manifest is re-scored per turn and thus churns. When
+// it sat at the FRONT of the token stream (leading system), any churn invalidated
+// the prefix cache for EVERYTHING behind it — i.e. the whole conversation had to
+// re-prefill each turn. A plain llama.cpp/LM Studio prefix cache has no KV manager
+// (ADR-066 Phase 5 / ADR-069 block mesh were never built), so "most-stable-first"
+// means the volatile block must render LAST, after the stable conversation prefix.
+// This mirrors the Claude Code hook path (serve_foveated.go), where the volatile
+// foveated context is delivered as trailing additionalContext.
+//
+// Wire safety: the block is folded INTO the final user message (not added as a
+// new trailing message), so the sequence still ends with a user turn (satisfies
+// the Anthropic normalizer's I7 trailing-user guard) and introduces no tool_result
+// blocks (I4 block-order untouched). It is appended after the user's text so it is
+// clearly a trailing injection.
 func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
-	// === System prompt (Zone 0 + Zone 1) ===
+	// === System prompt (Zone 0 + the STABLE half of Zone 1) ===
+	// Only session-stable content lives here now: nucleus + client system prompt.
 	var sb strings.Builder
 
 	if pkg.NucleusText != "" {
@@ -529,38 +559,20 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 		sb.WriteString(pkg.ClientSystem)
 	}
 
-	if len(pkg.FovealDocs) > 0 {
-		if sb.Len() > 0 {
-			sb.WriteString("\n\n---\n")
-		}
-		if docsUseManifest(pkg.FovealDocs) {
-			sb.WriteString(renderWorkspaceManifest(pkg.FovealDocs))
-		} else {
-			sb.WriteString("# Workspace Context\n\n")
-			for _, doc := range pkg.FovealDocs {
-				fmt.Fprintf(&sb, "## %s\n\n", doc.Title)
-				sb.WriteString(doc.Content)
-				sb.WriteString("\n\n")
-			}
-		}
-	}
-
-	// Inject speculative-output block as agent-private context (Slice 4).
-	// This block is visible only to the model — it is NOT shown to the user.
-	// It carries the suffix of the previous response that was generated but
-	// never delivered because the user barged in. The model can use it to
-	// decide whether to repeat, continue, or drop the unsaid content.
-	if pkg.PreviousTurnSpeculative != "" {
-		if sb.Len() > 0 {
-			sb.WriteString("\n\n---\n")
-		}
-		sb.WriteString("<previous-turn-speculative>\n")
-		sb.WriteString("The following text was generated in your previous response but was NOT delivered to the user (they interrupted before it could be spoken). You may choose to naturally resume, re-state, or drop this content based on their new message.\n\n")
-		sb.WriteString(pkg.PreviousTurnSpeculative)
-		sb.WriteString("\n</previous-turn-speculative>")
-	}
-
 	systemPrompt := sb.String()
+
+	// TODO(ADR-103): deferred cache-retool tiers — hysteresis / session-stable
+	// doc re-render, contiguous-oldest history eviction (keep the evictable region
+	// a suffix so it doesn't fracture the prefix), tiered content loading, and
+	// cache_control breakpoints for the Anthropic path. This change lands only the
+	// leading→trailing placement + salience strip (the load-bearing prefill fix).
+
+	// === Trailing foveal block (the VOLATILE half of Zone 1 + Zone 3 speculative) ===
+	// Built separately so it can be folded into the final user message instead of
+	// leading the system prompt. Content is byte-identical to what previously led
+	// the system prompt (same headers, same manifest render, same speculative
+	// wrapper) — only its POSITION moved.
+	foveal := pkg.renderTrailingFovealBlock()
 
 	// === Messages (Zone 2 + Zone 3) ===
 	var msgs []ProviderMessage
@@ -575,7 +587,17 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 		})
 	}
 	if pkg.CurrentMessage != nil {
-		msgs = append(msgs, *pkg.CurrentMessage)
+		cur := *pkg.CurrentMessage
+		if foveal != "" {
+			foldTrailingFoveal(&cur, foveal)
+		}
+		msgs = append(msgs, cur)
+	} else if foveal != "" {
+		// No current user message (last client message wasn't a user turn). Rather
+		// than resurrect the leading-system placement, attach the foveal block to a
+		// standalone trailing user message so it still renders after the stable
+		// prefix and the sequence ends on a user turn (I7-safe).
+		msgs = append(msgs, ProviderMessage{Role: "user", Content: foveal})
 	}
 
 	// Tool-pairing repair is now handled by the wire-layer normalizer
@@ -584,6 +606,74 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 	// The pre-conversion repairToolPairing call here is subsumed and removed.
 
 	return systemPrompt, msgs
+}
+
+// renderTrailingFovealBlock renders the volatile foveal payload — the workspace
+// manifest (Zone 1) and the previous-turn-speculative block (Zone 3) — as a single
+// string with the SAME headers/wrappers previously used at the head of the system
+// prompt. Returns "" when there is nothing volatile to inject.
+//
+// Placement (leading system → trailing user) changed; content did not.
+func (pkg *ContextPackage) renderTrailingFovealBlock() string {
+	var sb strings.Builder
+
+	if len(pkg.FovealDocs) > 0 {
+		if docsUseManifest(pkg.FovealDocs) {
+			sb.WriteString(renderWorkspaceManifest(pkg.FovealDocs))
+		} else {
+			sb.WriteString("# Workspace Context\n\n")
+			for _, doc := range pkg.FovealDocs {
+				fmt.Fprintf(&sb, "## %s\n\n", doc.Title)
+				sb.WriteString(doc.Content)
+				sb.WriteString("\n\n")
+			}
+		}
+	}
+
+	// Speculative-output block as agent-private context (Slice 4). Visible only to
+	// the model — NOT shown to the user. Carries the suffix of the previous response
+	// that was generated but never delivered (user barged in). Wrapper/wording are
+	// unchanged from the previous leading-system placement.
+	if pkg.PreviousTurnSpeculative != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n---\n")
+		}
+		sb.WriteString("<previous-turn-speculative>\n")
+		sb.WriteString("The following text was generated in your previous response but was NOT delivered to the user (they interrupted before it could be spoken). You may choose to naturally resume, re-state, or drop this content based on their new message.\n\n")
+		sb.WriteString(pkg.PreviousTurnSpeculative)
+		sb.WriteString("\n</previous-turn-speculative>")
+	}
+
+	return sb.String()
+}
+
+// foldTrailingFoveal appends the foveal block to the final user message AFTER the
+// user's own text. It updates both representations so the injection survives every
+// downstream wire conversion:
+//
+//   - Content (string): used by the OpenAI-compat provider and by the Anthropic
+//     provider whenever the message has no image parts.
+//   - ContentParts: only when the message carries image parts, since the Anthropic
+//     provider then renders from ContentParts and IGNORES Content (hasImageParts
+//     branch in buildAnthropicRequest). A trailing text part is appended so the
+//     injection is not silently dropped on the multimodal path.
+//
+// The block is separated from the user's text by a blank line. It is plain text
+// (no tool_result), so the Anthropic normalizer's I4 block-order pass never
+// reorders it, and because it stays inside the final user message the sequence
+// still ends on a user turn (I7).
+func foldTrailingFoveal(m *ProviderMessage, foveal string) {
+	if foveal == "" {
+		return
+	}
+	if strings.TrimSpace(m.Content) != "" {
+		m.Content = m.Content + "\n\n" + foveal
+	} else {
+		m.Content = foveal
+	}
+	if hasImageParts(m.ContentParts) {
+		m.ContentParts = append(m.ContentParts, ContentPart{Type: "text", Text: foveal})
+	}
 }
 
 // scoreConversation scores conversation turns by recency and query relevance.
@@ -1106,7 +1196,14 @@ func renderWorkspaceManifest(docs []FovealDoc) string {
 		if uri == "" {
 			uri = doc.Path
 		}
-		fmt.Fprintf(&sb, "- %s — %s [salience: %.2f]\n", uri, doc.Summary, doc.Salience)
+		// NOTE (ADR-066/071 amendment, prefix-cache placement): the live
+		// [salience: %.2f] float was removed here. It was recomputed every turn,
+		// so an IDENTICAL doc selection rendered DIFFERENT bytes each turn — pure
+		// churn that defeats a prefix cache even after the block was moved trailing.
+		// Salience still ranks/evicts docs upstream (FovealDoc.Salience); it is
+		// simply not rendered into the model-visible manifest. Keep URI + summary,
+		// which are stable for a fixed selection.
+		fmt.Fprintf(&sb, "- %s — %s\n", uri, doc.Summary)
 	}
 
 	var schemaNotes []string
@@ -1170,7 +1267,9 @@ func buildManifestDocWithEstimator(doc FovealDoc, workspaceRoot string, estimate
 	doc.Content = ""
 	doc.Summary = summary
 	doc.SchemaIssues = missingSchemaIssues(source)
-	doc.Tokens = estimateTokens(fmt.Sprintf("- %s — %s [salience: %.2f]", firstNonBlank(uri, doc.Path), summary, doc.Salience))
+	// Token estimate must mirror the rendered manifest line in renderWorkspaceManifest
+	// (salience float removed for prefix-cache byte-stability — see that function).
+	doc.Tokens = estimateTokens(fmt.Sprintf("- %s — %s", firstNonBlank(uri, doc.Path), summary))
 	return doc, nil
 }
 
