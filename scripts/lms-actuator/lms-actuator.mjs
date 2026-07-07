@@ -9,7 +9,7 @@
 // Usage:
 //   node lms-actuator.mjs <load|unload|set-context> \
 //        --host <ip> --port <1234> --model <id> \
-//        [--context-length N] [--parallel P] [--ttl SECONDS] [--dry-run]
+//        [--context-length N] [--ttl SECONDS] [--dry-run]
 //
 // Auth: the LM Studio remote-access passkey/token is read from the environment
 // variable LMS_ACTUATOR_TOKEN (never passed on argv). It is threaded to the SDK

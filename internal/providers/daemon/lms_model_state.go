@@ -142,9 +142,9 @@ type msProviderFileCfg struct {
 }
 
 type msProviderEntryCfg struct {
-	Endpoint  string        `yaml:"endpoint"`
-	APIKeyEnv string        `yaml:"api_key_env"`
-	Options   msOptionsCfg  `yaml:"options"`
+	Endpoint  string       `yaml:"endpoint"`
+	APIKeyEnv string       `yaml:"api_key_env"`
+	Options   msOptionsCfg `yaml:"options"`
 }
 
 type msOptionsCfg struct {

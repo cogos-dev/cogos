@@ -153,6 +153,33 @@ the job reverts it). Resolution when the reconciler is trusted: scope the launch
 job to boot-only (or retire it) so the reconciler is the single writer. **This
 ADR does not touch that job** — it only documents the hazard.
 
+## Head-of-line blocking in the self-heal loop (accepted tradeoff)
+
+`autonomic_ticker.healDegradedProviders` runs each provider's `ApplyPlan`
+**synchronously and sequentially** within one tick. `lms-model-state`'s
+`ApplyPlan` can block for up to `lmsApplyTimeout` (180s) because
+`@lmstudio/sdk` `load()` does not return until the model is fully resident, and a
+262144-context load on a 24 GB card is not instant. A slow load therefore stalls
+the *entire* self-heal pass — including `mlx-supervised` process-restart healing
+for every provider iterated after it — for the duration of that load.
+
+This is a **latency** concern, not a correctness bug, and it is bounded:
+
+- The blocking-load-vs-ticker-recheck race is handled correctly. Once a load is
+  dispatched, LM Studio reports `state == "loading"`, so `Health()` returns
+  `Progressing` and `healDegradedProviders`' `needsHeal` predicate is false — no
+  duplicate load fires on the next tick.
+- The stall only occurs while a managed backend is actually mid-load, which is
+  rare (opt-in, and only during genuine drift-correction), and is naturally
+  bounded by `lmsApplyTimeout`.
+
+Accepted as-is for the initial ship. If it becomes a problem in practice, the
+options are (a) run the `lms-model-state` apply on its own worker goroutine with
+the provider marked in-flight, so one slow load does not freeze self-healing for
+the other reconcilers, or (b) lower `lmsApplyTimeout` and let the `Progressing`
+state carry the wait across ticks. Both are deferred until the reconciler is
+operator-trusted and enabled on a live node.
+
 ## Consequences
 
 - The kernel gains a declarative handle on LM Studio model/context state, closing

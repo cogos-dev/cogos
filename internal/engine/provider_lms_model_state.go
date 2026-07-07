@@ -74,7 +74,7 @@ type lmsModelStateConfig struct {
 	Manage        bool   // opt-in switch; false ⇒ Suspended, empty plan
 	Model         string // target model id that should be loaded
 	ContextLength int    // desired loaded_context_length (0 ⇒ don't manage context)
-	Parallel      int    // desired parallel slots (advisory; passed to actuator)
+	Parallel      int    // advisory metadata only, reported in BuildState — NOT actuated (LM Studio SDK load config has no per-load parallelism knob; parallelism is a server/JIT setting)
 	KeepWarm      bool   // hint: keep loaded even when idle (advisory metadata)
 	JITEvict      bool   // if true, unload a non-target model that crowds the card
 }
@@ -319,7 +319,6 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 			Details: map[string]any{
 				"model":          target.Model,
 				"context_length": target.ContextLength,
-				"parallel":       target.Parallel,
 				"reason":         "target model not loaded",
 			},
 		})
@@ -394,9 +393,8 @@ func (p *LMSModelStateProvider) ApplyPlan(ctx context.Context, plan *reconcile.P
 		}
 
 		ctxLen := detailInt(action.Details, "context_length")
-		parallel := detailInt(action.Details, "parallel")
 
-		if err := p.invokeActuator(ctx, op, model, ctxLen, parallel); err != nil {
+		if err := p.invokeActuator(ctx, op, model, ctxLen); err != nil {
 			results = append(results, reconcile.Result{
 				Phase: "apply", Action: string(action.Action), Name: action.Name,
 				Status: reconcile.ApplyFailed, Error: err.Error(),
@@ -415,7 +413,7 @@ func (p *LMSModelStateProvider) ApplyPlan(ctx context.Context, plan *reconcile.P
 // invokeActuator runs the load/unload/set-context operation. It builds the
 // command (SDK actuator by default; lms CLI on a local backend) with the token
 // injected via the environment, never argv.
-func (p *LMSModelStateProvider) invokeActuator(ctx context.Context, op, model string, ctxLen, parallel int) error {
+func (p *LMSModelStateProvider) invokeActuator(ctx context.Context, op, model string, ctxLen int) error {
 	if model == "" {
 		return fmt.Errorf("lms-model-state %q: %s: empty model id", p.name, op)
 	}
@@ -423,7 +421,7 @@ func (p *LMSModelStateProvider) invokeActuator(ctx context.Context, op, model st
 	applyCtx, cancel := context.WithTimeout(ctx, lmsApplyTimeout)
 	defer cancel()
 
-	cmd, err := p.buildActuatorCmd(applyCtx, op, model, ctxLen, parallel)
+	cmd, emitsJSON, err := p.buildActuatorCmd(applyCtx, op, model, ctxLen)
 	if err != nil {
 		return err
 	}
@@ -438,31 +436,43 @@ func (p *LMSModelStateProvider) invokeActuator(ctx context.Context, op, model st
 		return fmt.Errorf("lms-model-state %q: actuator %s failed: %w (stderr: %s)",
 			p.name, op, err, strings.TrimSpace(stderr.String()))
 	}
+	// Defense-in-depth: even on exit 0, honour the SDK actuator's {"ok":...}
+	// contract so an ok==false result printed with a zero exit (a dropped-await
+	// JS footgun) is not mistaken for a successful heal. The lms CLI fast-path
+	// prints plain text and is exempt (emitsJSON == false).
+	if emitsJSON {
+		if perr := parseActuatorResult(stdout.String()); perr != nil {
+			return fmt.Errorf("lms-model-state %q: actuator %s: %w", p.name, op, perr)
+		}
+	}
 	return nil
 }
 
 // buildActuatorCmd assembles the exec.Cmd against an already-timed context.
 // SDK actuator by default; on a local backend the lms CLI fast-path is used when
 // the binary exists. The caller owns the context's cancel.
-func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model string, ctxLen, parallel int) (*exec.Cmd, error) {
-	// Local fast-path: lms CLI (localhost only).
+// The returned emitsJSON is true only for the SDK actuator path, whose contract
+// is to print a final {"ok":...} result line; the lms CLI fast-path prints plain
+// human text, so its output must not be JSON-parsed.
+func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model string, ctxLen int) (cmd *exec.Cmd, emitsJSON bool, err error) {
+	// Local fast-path: lms CLI (localhost only). Plain-text output, not JSON.
 	if p.local && p.lmsCLI != "" && statOK(p.lmsCLI) {
 		if op == "unload" {
-			return exec.CommandContext(ctx, p.lmsCLI, "unload", model), nil
+			return exec.CommandContext(ctx, p.lmsCLI, "unload", model), false, nil
 		}
 		args := []string{"load", model}
 		if ctxLen > 0 {
 			args = append(args, "--context-length", fmt.Sprintf("%d", ctxLen))
 		}
-		return exec.CommandContext(ctx, p.lmsCLI, args...), nil
+		return exec.CommandContext(ctx, p.lmsCLI, args...), false, nil
 	}
 
 	// SDK actuator (remote, or local without the CLI). Requires the script.
 	if p.actuatorScript == "" {
-		return nil, fmt.Errorf("lms-model-state %q: SDK actuator script not resolved", p.name)
+		return nil, false, fmt.Errorf("lms-model-state %q: SDK actuator script not resolved", p.name)
 	}
 	if _, statErr := os.Stat(p.actuatorScript); statErr != nil {
-		return nil, fmt.Errorf("lms-model-state %q: SDK actuator not installed at %s (run: cd %s && npm install)",
+		return nil, false, fmt.Errorf("lms-model-state %q: SDK actuator not installed at %s (run: cd %s && npm install)",
 			p.name, p.actuatorScript, filepath.Dir(p.actuatorScript))
 	}
 
@@ -475,10 +485,45 @@ func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model 
 	if ctxLen > 0 {
 		args = append(args, "--context-length", fmt.Sprintf("%d", ctxLen))
 	}
-	if parallel > 0 {
-		args = append(args, "--parallel", fmt.Sprintf("%d", parallel))
+	// NOTE: `parallel` is intentionally NOT threaded to the actuator. LM Studio's
+	// @lmstudio/sdk load config (v1.5.0) has no per-load parallelism knob —
+	// parallelism is a server/JIT setting, not a load-config field — so passing it
+	// would be a silent no-op. It remains a declared model_state field only for
+	// state reporting (BuildState attributes), not for actuation.
+	return exec.CommandContext(ctx, p.nodeBin, args...), true, nil
+}
+
+// actuatorResult is the JSON contract emitted on the SDK actuator's final stdout
+// line. Success is reported ONLY when the child exits 0 AND ok==true.
+type actuatorResult struct {
+	Ok    bool   `json:"ok"`
+	Error string `json:"error"`
+}
+
+// parseActuatorResult validates the SDK actuator's stdout. Defense-in-depth
+// against a future actuator change that prints {"ok":false} while exiting 0
+// (a dropped await / swallowed catch): treat ok==false — or output with no
+// parseable result line at all — as a failure even on a zero exit code.
+func parseActuatorResult(stdout string) error {
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var res actuatorResult
+		if err := json.Unmarshal([]byte(line), &res); err != nil {
+			continue // not the JSON result line; keep scanning upward
+		}
+		if !res.Ok {
+			if res.Error != "" {
+				return fmt.Errorf("actuator reported failure: %s", res.Error)
+			}
+			return fmt.Errorf("actuator reported ok=false")
+		}
+		return nil
 	}
-	return exec.CommandContext(ctx, p.nodeBin, args...), nil
+	return fmt.Errorf("actuator produced no parseable {\"ok\":...} result line")
 }
 
 // BuildState projects one Resource for this backend describing the loaded model.

@@ -338,7 +338,6 @@ func TestApplyPlanInvokesActuatorWithArgvAndEnv(t *testing.T) {
 			Details: map[string]any{
 				"model":          "target-model",
 				"context_length": 262144,
-				"parallel":       4,
 			},
 		}},
 	}
@@ -350,10 +349,12 @@ func TestApplyPlanInvokesActuatorWithArgvAndEnv(t *testing.T) {
 		t.Fatalf("expected one succeeded result, got %#v", results)
 	}
 	log := readActuatorLog(t, p.actuatorScript)
-	// argv assertions: op, host, port, model, context-length, parallel.
+	// argv assertions: op, host, port, model, context-length.
+	// NOTE: --parallel is intentionally absent: LM Studio's SDK load config has no
+	// per-load parallelism knob, so the actuator does not accept/forward it.
 	for _, want := range []string{
 		"load", "--host 192.168.10.191", "--port 1234",
-		"--model target-model", "--context-length 262144", "--parallel 4",
+		"--model target-model", "--context-length 262144",
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("actuator argv missing %q; log:\n%s", want, log)
@@ -368,6 +369,41 @@ func TestApplyPlanInvokesActuatorWithArgvAndEnv(t *testing.T) {
 		if strings.Contains(argvLine, "tok") {
 			t.Errorf("token leaked into argv: %q", argvLine)
 		}
+	}
+}
+
+// A future actuator footgun: prints {"ok":false} but exits 0 (dropped await /
+// swallowed catch). ApplyPlan must NOT report ApplySucceeded — the result-line
+// parse folds the actuator's error into an ApplyFailed.
+func TestApplyPlanFailsOnOkFalseWithZeroExit(t *testing.T) {
+	p := makeLMSProvider(t, "http://192.168.10.191:1234", "target-model", 262144)
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"echo '{\"ok\":false,\"error\":\"load timed out\"}'\n" +
+		"exit 0\n"
+	path := filepath.Join(dir, "fake-actuator-okfalse.sh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake actuator: %v", err)
+	}
+	p.actuatorScript = path
+
+	plan := &reconcile.Plan{
+		ResourceType: lmsModelStateType,
+		Actions: []reconcile.Action{{
+			Action:  reconcile.ActionUpdate,
+			Name:    p.name + "/load",
+			Details: map[string]any{"model": "target-model", "context_length": 262144},
+		}},
+	}
+	results, err := p.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != reconcile.ApplyFailed {
+		t.Fatalf("expected ApplyFailed on ok=false/exit-0, got %#v", results)
+	}
+	if !strings.Contains(results[0].Error, "load timed out") {
+		t.Errorf("expected actuator error folded into result, got %q", results[0].Error)
 	}
 }
 

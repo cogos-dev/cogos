@@ -16,7 +16,7 @@ npm install
 ```bash
 node lms-actuator.mjs <load|unload|set-context|list> \
      --host <ip> --port 1234 --model <id> \
-     [--context-length N] [--parallel P] [--ttl SECONDS] [--dry-run]
+     [--context-length N] [--ttl SECONDS] [--dry-run]
 ```
 
 - Auth token is read from the `LMS_ACTUATOR_TOKEN` environment variable and
