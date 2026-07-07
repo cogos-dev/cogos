@@ -390,6 +390,75 @@ func TestDispatch_LMStudioUnreachableDegradesToE4B(t *testing.T) {
 	}
 }
 
+// TestEndpointReachable_CallerCancelDoesNotPoisonCache verifies that a probe
+// failure caused by the CALLER's context being cancelled (e.g. an HTTP client
+// disconnecting mid-dispatch, per serve_agents.go's r.Context() plumbing)
+// does NOT write a negative result into the shared reachByURL cache. Without
+// this guard, one caller's disconnect poisons endpointReachable for every
+// other in-flight dispatch against the same URL for reachabilityCacheTTL.
+func TestEndpointReachable_CallerCancelDoesNotPoisonCache(t *testing.T) {
+	// A blocking handler so the probe is still in-flight when we cancel.
+	block := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(block)
+
+	d := &HarnessDispatcher{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() {
+		done <- d.endpointReachable(ctx, server.URL)
+	}()
+	// Give the probe goroutine time to start the request, then cancel the
+	// CALLER's context (not the probe's own timeout).
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatalf("expected endpointReachable to return false on caller-cancel, got true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("endpointReachable did not return after caller cancel")
+	}
+
+	d.mu.Lock()
+	_, cached := d.reachByURL[server.URL]
+	d.mu.Unlock()
+	if cached {
+		t.Errorf("expected no cache entry after caller-context cancel, but one was written")
+	}
+}
+
+// TestEndpointReachable_GenuineRefusalWritesCache verifies the companion
+// case: a real probe failure (connection refused, not a caller cancel) must
+// still populate reachByURL, or a genuinely-down endpoint would be re-probed
+// on every dispatch instead of being cached negative for reachabilityCacheTTL.
+func TestEndpointReachable_GenuineRefusalWritesCache(t *testing.T) {
+	d := &HarnessDispatcher{}
+	const unreachable = "http://127.0.0.1:1" // port 1 closed by convention
+
+	ok := d.endpointReachable(context.Background(), unreachable)
+	if ok {
+		t.Fatalf("expected endpointReachable=false for a closed port")
+	}
+
+	d.mu.Lock()
+	entry, cached := d.reachByURL[unreachable]
+	d.mu.Unlock()
+	if !cached {
+		t.Fatalf("expected a genuine refusal to write the reachability cache")
+	}
+	if entry.ok {
+		t.Errorf("expected cached entry to be negative, got ok=true")
+	}
+}
+
 // TestDispatch_SystemPromptOverride confirms the per-call SystemPrompt
 // reaches the model in the system message slot.
 func TestDispatch_SystemPromptOverride(t *testing.T) {

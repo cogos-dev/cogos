@@ -304,6 +304,17 @@ func (d *HarnessDispatcher) endpointReachable(ctx context.Context, url string) b
 	}
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
+		// A negative caused only by the CALLER's ctx going away (e.g. an HTTP
+		// client disconnecting mid-request, since ctx traces back to r.Context()
+		// via DispatchToHarness) says nothing about endpoint health, so don't
+		// poison the shared reachByURL cache for every other in-flight dispatch.
+		// A probeCtx deadline (reachabilityProbeTimeout firing on a slow/hung
+		// endpoint) is a real "unreachable" signal and must still be cached —
+		// same distinction the three providers' Available() already make
+		// (provider_openai.go, provider_ollama.go, provider_claudeoauth.go).
+		if ctx.Err() == context.Canceled {
+			return false
+		}
 		log.Printf("[dispatch] endpoint probe failed (%s): %v", url, err)
 		d.cacheReachability(url, false)
 		return false
