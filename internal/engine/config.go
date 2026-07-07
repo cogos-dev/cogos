@@ -143,6 +143,14 @@ type Config struct {
 	// operations. Set enable_service_control: true in kernel.yaml to opt in.
 	EnableServiceControl bool
 
+	// EnableConfigMutation gates the config-mutation HTTP endpoints:
+	// GET/PATCH /v1/config and POST /v1/config/rollback.
+	// Default false: live config read/mutation/rollback via HTTP is disabled by
+	// default because any local process on the same host could otherwise read
+	// or rewrite kernel.yaml. Set enable_config_mutation: true in kernel.yaml
+	// to opt in.
+	EnableConfigMutation bool
+
 	// DigestPaths maps stream tailer adapter names to JSONL file/directory paths.
 	// Empty map means external digestion is disabled.
 	DigestPaths map[string]string
@@ -222,6 +230,7 @@ type kernelConfigSection struct {
 	ToolCallValidation    *bool    `yaml:"tool_call_validation_enabled"`
 	EnableSkillExec       *bool    `yaml:"enable_skill_exec"`
 	EnableServiceControl  *bool    `yaml:"enable_service_control"`
+	EnableConfigMutation  *bool    `yaml:"enable_config_mutation"`
 	IdentityNakedDefault  *bool    `yaml:"identity_naked_default,omitempty"`
 	LocalModel            string   `yaml:"local_model"`
 	HarnessProvider       string   `yaml:"harness_provider"`
@@ -371,6 +380,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.EnableServiceControl != nil {
 		cfg.EnableServiceControl = *s.EnableServiceControl
+	}
+	if s.EnableConfigMutation != nil {
+		cfg.EnableConfigMutation = *s.EnableConfigMutation
 	}
 	if s.IdentityNakedDefault != nil {
 		cfg.IdentityNakedDefault = *s.IdentityNakedDefault

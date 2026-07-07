@@ -16,10 +16,17 @@ import (
 )
 
 // newMCPForTest builds an MCPServer wired to a fresh workspace + process.
+// EnableConfigMutation defaults to true here since these tests exercise
+// config read/write/rollback behavior itself, not the gate — mirroring
+// newTestServer's HTTP-side callers (TestHandleConfigGet_IncludesDefaults
+// et al.) which set srv.cfg.EnableConfigMutation = true explicitly. Gate
+// behavior itself is covered by TestConfigMutationMCP_GateDisabled/
+// GateEnabled in serve_config_gate_test.go.
 func newMCPForTest(t *testing.T) (*MCPServer, string) {
 	t.Helper()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
+	cfg.EnableConfigMutation = true
 	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
 	return NewMCPServer(cfg, makeNucleus("Cog", "tester"), process), root
 }
@@ -103,6 +110,7 @@ func TestResourceConfig_Reads(t *testing.T) {
 func TestHandleConfigGet_IncludesDefaults(t *testing.T) {
 	t.Parallel()
 	srv := newTestServer(t)
+	srv.cfg.EnableConfigMutation = true
 	seedKernelYAML(t, srv.cfg.WorkspaceRoot, "port: 6931\n")
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/config?include_defaults=1&include_raw_yaml=1", nil)
@@ -134,6 +142,7 @@ func TestHandleConfigGet_IncludesDefaults(t *testing.T) {
 func TestHandleConfigPatch_Success(t *testing.T) {
 	t.Parallel()
 	srv := newTestServer(t)
+	srv.cfg.EnableConfigMutation = true
 	seedKernelYAML(t, srv.cfg.WorkspaceRoot, "port: 6931\n")
 
 	body := map[string]any{
@@ -160,6 +169,7 @@ func TestHandleConfigPatch_Success(t *testing.T) {
 func TestHandleConfigPatch_ValidationFailure(t *testing.T) {
 	t.Parallel()
 	srv := newTestServer(t)
+	srv.cfg.EnableConfigMutation = true
 	seedKernelYAML(t, srv.cfg.WorkspaceRoot, "port: 6931\n")
 
 	body := map[string]any{

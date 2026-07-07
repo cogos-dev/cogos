@@ -230,6 +230,11 @@ func (k *Kernel) Stop() error {
 func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error) {
 	bootCfg := applyBootOptions(opts)
 
+	// L5-HTTP-AUTHZ: warn loudly (never block) if the HTTP surface is about
+	// to bind non-loopback with no auth token configured. See
+	// boot_bindaddr_warning.go for the rationale.
+	warnIfUnauthenticatedNonLoopback(cfg)
+
 	// Load nucleus (identity core).
 	nucleus, err := LoadNucleus(cfg)
 	if err != nil {
