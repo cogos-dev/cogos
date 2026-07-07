@@ -907,6 +907,20 @@ func maybeRegisterModelStateReconciler(name string, pc ProviderConfig) {
 	if !ms.Manage {
 		return
 	}
+	// liveState comes from LM Studio's native /api/v0/models, served only by LM
+	// Studio backends. vllm/llamacpp share the "openai" dispatch case but have no
+	// /api/v0 endpoint, so a model_state block copied onto one would register a
+	// reconciler that can only ever probe-fail. Restrict to LM-Studio-capable
+	// types (a generic "openai" that is really vllm would still degrade to
+	// Suspended, but excluding the explicit vllm/llamacpp types avoids the footgun).
+	switch pc.Type {
+	case "lmstudio", "openai", "openai-compat":
+		// may serve /api/v0/models
+	default:
+		slog.Debug("router: lms-model-state not applicable for provider type; skipping",
+			"name", name, "type", pc.Type)
+		return
+	}
 	token := ""
 	if pc.APIKeyEnv != "" {
 		token = os.Getenv(pc.APIKeyEnv)

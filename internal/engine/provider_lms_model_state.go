@@ -310,6 +310,42 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 	// not-loaded duplicate row cannot shadow the real loaded one.
 	targetRow := findModelRow(rows, target.Model)
 
+	// Never disturb an in-flight load. While state=="loading" the loaded context
+	// is unknown (nil loaded_context_length), which must NOT be read as a
+	// wrong-context mismatch. BOTH callers of ComputePlan reach here — the
+	// autonomic ticker (which gates on Health and skips Progressing) AND the
+	// always-on ReconcileDaemon (which does not gate on Health) — so this guard
+	// in ComputePlan is the single, caller-independent defense against the
+	// load-interrupt race: return an empty plan and let the load finish. Health()
+	// reports Progressing separately. Loads can exceed the daemon poll interval
+	// (e.g. 262144 ≈ multi-minute), so interrupting them would prevent the model
+	// from ever finishing loading.
+	if targetRow != nil && targetRow.State == "loading" {
+		return plan, nil
+	}
+
+	// jit_evict FIRST: any eviction must precede the load so VRAM is actually
+	// freed before we load the target onto the card (otherwise ApplyPlan would
+	// load onto a still-crowded card and fail, deferring convergence a cycle).
+	// Only when explicitly enabled — this is destructive-adjacent.
+	if target.JITEvict {
+		for i := range rows {
+			r := &rows[i]
+			if r.State == "loaded" && r.Type != "embeddings" && !modelIDMatch(r.ID, target.Model) {
+				plan.Actions = append(plan.Actions, reconcile.Action{
+					Action:       reconcile.ActionUpdate,
+					ResourceType: lmsModelStateType,
+					Name:         p.name + "/unload",
+					Details: map[string]any{
+						"model":  r.ID,
+						"reason": "jit_evict — non-target model loaded, crowds the card",
+					},
+				})
+				plan.Summary.Updates++
+			}
+		}
+	}
+
 	switch {
 	case targetRow == nil || targetRow.State == "not-loaded":
 		plan.Actions = append(plan.Actions, reconcile.Action{
@@ -337,26 +373,6 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 			},
 		})
 		plan.Summary.Updates++
-	}
-
-	// jit_evict: if a *different* model is loaded and crowds the card, propose
-	// unloading it. Only when explicitly enabled — this is destructive-adjacent.
-	if target.JITEvict {
-		for i := range rows {
-			r := &rows[i]
-			if r.State == "loaded" && r.Type != "embeddings" && !modelIDMatch(r.ID, target.Model) {
-				plan.Actions = append(plan.Actions, reconcile.Action{
-					Action:       reconcile.ActionUpdate,
-					ResourceType: lmsModelStateType,
-					Name:         p.name + "/unload",
-					Details: map[string]any{
-						"model":  r.ID,
-						"reason": "jit_evict — non-target model loaded, crowds the card",
-					},
-				})
-				plan.Summary.Updates++
-			}
-		}
 	}
 
 	return plan, nil
@@ -741,8 +757,12 @@ func modelIDMatch(rowID, want string) bool {
 // A nil loaded_context_length (not-loaded/absent) is treated as a mismatch when
 // a target is set — but callers gate this behind a state=="loaded" check.
 func contextMismatch(r *lmsModelRow, target int) bool {
+	// Unknown loaded context (nil during loading / not-loaded, or a nil row) is
+	// NOT a mismatch: we cannot compare, and treating it as one would trigger a
+	// disruptive unload+reload against an in-flight load. Callers gate on
+	// state=="loading"/"not-loaded" before reaching here; this is defense-in-depth.
 	if r == nil || r.LoadedContextLength == nil {
-		return true
+		return false
 	}
 	return *r.LoadedContextLength != target
 }

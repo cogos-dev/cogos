@@ -225,6 +225,49 @@ func TestComputePlanJITEvict(t *testing.T) {
 	}
 }
 
+func TestComputePlanLoadingNotDisrupted(t *testing.T) {
+	// A model mid-load reports state=="loading" with a nil loaded context. The
+	// plan MUST be empty so the load can finish — never an unload+reload, which
+	// (under the 30s ReconcileDaemon poll vs a multi-minute load) would restart
+	// the load every cycle and prevent it from ever completing.
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	rows := []lmsModelRow{{ID: "target", State: "loading", LoadedContextLength: nil}}
+	plan, err := p.ComputePlan(&p.target, rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 0 {
+		t.Fatalf("expected empty plan while target is loading, got %#v", plan.Actions)
+	}
+}
+
+func TestComputePlanJITEvictUnloadBeforeLoad(t *testing.T) {
+	// When both a fresh load and a jit_evict are due in one cycle, the eviction
+	// MUST be planned before the load so VRAM is freed before we load onto the card.
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.JITEvict = true
+	rows := []lmsModelRow{{ID: "crowder", State: "loaded", LoadedContextLength: ip(8192)}}
+	plan, err := p.ComputePlan(&p.target, rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unloadIdx, loadIdx := -1, -1
+	for i, a := range plan.Actions {
+		if strings.HasSuffix(a.Name, "/unload") {
+			unloadIdx = i
+		}
+		if strings.HasSuffix(a.Name, "/load") {
+			loadIdx = i
+		}
+	}
+	if unloadIdx == -1 || loadIdx == -1 {
+		t.Fatalf("expected both /unload and /load actions, got %#v", plan.Actions)
+	}
+	if unloadIdx > loadIdx {
+		t.Fatalf("eviction must precede load: unload at %d, load at %d (%#v)", unloadIdx, loadIdx, plan.Actions)
+	}
+}
+
 func TestComputePlanOptOutEmpty(t *testing.T) {
 	p := makeLMSProvider(t, "http://x", "target", 262144)
 	p.target.Manage = false

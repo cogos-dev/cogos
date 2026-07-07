@@ -165,10 +165,17 @@ for every provider iterated after it — for the duration of that load.
 
 This is a **latency** concern, not a correctness bug, and it is bounded:
 
-- The blocking-load-vs-ticker-recheck race is handled correctly. Once a load is
-  dispatched, LM Studio reports `state == "loading"`, so `Health()` returns
-  `Progressing` and `healDegradedProviders`' `needsHeal` predicate is false — no
-  duplicate load fires on the next tick.
+- The blocking-load-vs-recheck race is handled in `ComputePlan` itself, not only
+  at the ticker. Once a load is dispatched LM Studio reports `state == "loading"`
+  with a nil `loaded_context_length`; `ComputePlan` returns an **empty plan** for
+  any `state == "loading"` target (and `contextMismatch` treats unknown context as
+  no-mismatch), so no unload+reload is ever emitted mid-load. This guard is
+  caller-independent, which matters because there are two callers with different
+  gating: the autonomic ticker's `healDegradedProviders` gates on `Health()` (which
+  returns `Progressing` for a loading target, so `needsHeal` is false), **but the
+  always-on `ReconcileDaemon` calls `ComputePlan`/`ApplyPlan` directly with no
+  `Health()` gate** — so the guard had to live in `ComputePlan` or a multi-minute
+  load (e.g. 262144) would be restarted every daemon poll and never finish.
 - The stall only occurs while a managed backend is actually mid-load, which is
   rare (opt-in, and only during genuine drift-correction), and is naturally
   bounded by `lmsApplyTimeout`.
