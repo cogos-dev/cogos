@@ -357,6 +357,35 @@ func TestReplayDeterminism(t *testing.T) {
 	}
 }
 
+// TestHashString_UsesRealSHA256 pins hashString to the real crypto/sha256 algorithm
+// with a known test vector, so a regression back to the old placeholder
+// (`return []byte(s)`, i.e. string identity) fails this test even though such a
+// regression would still produce a deterministic, discriminating "hash" and would
+// therefore NOT be caught by TestVerifyReplayDeterminism or
+// TestVerifyReplayDeterminism_DetectsDivergence above (both only check relative
+// determinism/discrimination, not the actual algorithm).
+func TestHashString_UsesRealSHA256(t *testing.T) {
+	// echo -n "cogos-replay-hash-fixture" | shasum -a 256
+	const input = "cogos-replay-hash-fixture"
+	const wantHex = "8ac0b24e3327e98ef4bd1945585ff5426d43969239fd62c6687de8f6708010b3"
+
+	got := fmt.Sprintf("%x", hashString(input))
+
+	if len(got) != 64 {
+		t.Fatalf("hashString(%q) produced a %d-char hex string, want 64 (32 bytes, sha256 digest size) -- got %q; a placeholder byte-identity implementation would produce len(input) bytes instead", input, len(got), got)
+	}
+
+	if got != wantHex {
+		t.Errorf("hashString(%q) = %s, want %s (known sha256 digest) -- if this fails after reverting to `return []byte(s)`, that confirms the placeholder no longer matches a real hash", input, got, wantHex)
+	}
+
+	// A placeholder byte-identity "hash" fails the length check above already, but
+	// also assert directly that the output is not simply the input bytes.
+	if string(hashString(input)) == input {
+		t.Error("hashString returned its input verbatim -- placeholder regression (crypto/sha256 was expected)")
+	}
+}
+
 // TestVerifyReplayDeterminism exercises VerifyReplayDeterminism end-to-end against a
 // real ledger fixture (a session directory with a few events.jsonl entries), replayed
 // twice, and asserts the two DAG-build+sort+hash runs agree on identical on-disk state.
