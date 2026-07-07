@@ -456,11 +456,35 @@ func writeFileAtomic(path string, data []byte) error {
 // writePinBaseline writes a baseline pin to .cog/state/eval-baselines.json.
 // The file is a JSON map[string]string: experiment_id → run_id.
 // Implements cog_pin_baseline's storage logic (design memo Q1 / Q10).
+// pinBaselineLockPath returns the advisory cross-process lock file guarding
+// the read-modify-write cycle on eval-baselines.json.
+func pinBaselineLockPath(root string) string {
+	return filepath.Join(root, ".cog", "state", "eval-baselines.json.lock")
+}
+
+// writePinBaseline writes a baseline pin to .cog/state/eval-baselines.json.
+// The file is a JSON map[string]string: experiment_id -> run_id.
+// Implements cog_pin_baseline's storage logic (design memo Q1 / Q10).
+//
+// This was originally left unlocked/non-atomic on the (incorrect) claim
+// that no concurrent reader/writer exists — cog-review's re-review round on
+// this PR corrected that: internal/eval/provider_impl.go's LoadConfig reads
+// eval-baselines.json on every reconcile cycle (both the daemon's own loop
+// and `cogos reconcile eval`), and two concurrent cog_pin_baseline MCP calls
+// race each other with no serialization at all. Same bug class, same fix:
+// atomic tmp+rename write plus a cross-process filelock spanning the full
+// read-modify-write cycle.
 func writePinBaseline(root, experimentID, runID string) error {
 	stateDir := filepath.Join(root, ".cog", "state")
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", stateDir, err)
 	}
+
+	lock, err := filelock.Acquire(pinBaselineLockPath(root), dispatchTriggersLockTimeout)
+	if err != nil {
+		return fmt.Errorf("acquire pin-baseline lock: %w", err)
+	}
+	defer lock.Release()
 
 	pinsPath := filepath.Join(stateDir, "eval-baselines.json")
 	pins := map[string]string{}
@@ -474,7 +498,7 @@ func writePinBaseline(root, experimentID, runID string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(pinsPath, b, 0o644)
+	return writeFileAtomic(pinsPath, b)
 }
 
 // evalErrorResult builds a CallToolResult carrying an error message.

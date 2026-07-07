@@ -1,15 +1,24 @@
-// dispatch_triggers_multiwriter_test.go — cross-process write-race
-// regression test for eval-dispatch-triggers.json, the sibling of issue
-// #449's _meta.json race flagged by cog-review on PR #458 (fifth review
-// pass, head 9d0aa2e): writeDispatchTrigger (called from the cog_run_experiment
-// MCP tool handler) and readAndClearDispatchTriggers (called by the daemon's
-// eval ComputePlan cycle) both did a plain os.WriteFile with no atomic
-// tmp+rename and no cross-process lock, so a concurrent trigger-add and
-// trigger-drain could interleave and silently drop the just-added trigger,
-// or clobber the clear back to non-empty.
+// eval_sidecar_multiwriter_test.go — cross-process write-race regression
+// tests for the eval package's two JSON state sidecars, both siblings of
+// issue #449's _meta.json race flagged by cog-review on PR #458:
+//
+//   - eval-dispatch-triggers.json (fifth review pass, head 9d0aa2e):
+//     writeDispatchTrigger (cog_run_experiment MCP handler) and
+//     readAndClearDispatchTriggers (daemon eval ComputePlan cycle) both did a
+//     plain os.WriteFile with no atomic tmp+rename and no cross-process lock.
+//   - eval-baselines.json (sixth review pass, head c5726e2): writePinBaseline
+//     (cog_pin_baseline MCP handler) had the identical unlocked, non-atomic
+//     os.WriteFile read-modify-write; an earlier round of this PR incorrectly
+//     judged it out of scope on the claim that no concurrent reader/writer
+//     exists, which cog-review corrected — provider_impl.go's LoadConfig
+//     reads this file every reconcile cycle, and concurrent cog_pin_baseline
+//     calls race each other with no serialization at all.
 package eval
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -118,5 +127,64 @@ func TestDispatchTriggers_WriteDuringClearDoesNotLoseEitherSide(t *testing.T) {
 	}
 	if len(final) > 1 {
 		t.Errorf("unexpected extra triggers remained: %v", final)
+	}
+}
+
+// TestWritePinBaseline_ConcurrentWritesAllSurvive drives N goroutines each
+// calling writePinBaseline for a distinct experimentID against the same root
+// concurrently, and asserts every pin survives on disk — i.e. no interleaved
+// writer silently dropped a peer's just-written pin (the race cog-review's
+// sixth review pass confirmed was live: two concurrent cog_pin_baseline MCP
+// calls with no serialization).
+func TestWritePinBaseline_ConcurrentWritesAllSurvive(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	const numWriters = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, numWriters)
+	wg.Add(numWriters)
+	for i := 0; i < numWriters; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			expID := "exp-" + strconv.Itoa(i)
+			runID := "run-" + strconv.Itoa(i)
+			if err := writePinBaseline(dir, expID, runID); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("writePinBaseline error: %v", err)
+	}
+
+	pinsPath := filepath.Join(dir, ".cog", "state", "eval-baselines.json")
+	data, err := os.ReadFile(pinsPath)
+	if err != nil {
+		t.Fatalf("read pins file: %v", err)
+	}
+	var pins map[string]string
+	if err := json.Unmarshal(data, &pins); err != nil {
+		t.Fatalf("pins file is not valid JSON after concurrent writers: %v\ncontent: %s", err, data)
+	}
+
+	if len(pins) != numWriters {
+		missing := 0
+		for i := 0; i < numWriters; i++ {
+			if _, ok := pins["exp-"+strconv.Itoa(i)]; !ok {
+				missing++
+			}
+		}
+		t.Fatalf("pins count = %d, want %d (missing %d) — concurrent writers clobbered each other", len(pins), numWriters, missing)
+	}
+	for i := 0; i < numWriters; i++ {
+		expID := "exp-" + strconv.Itoa(i)
+		want := "run-" + strconv.Itoa(i)
+		if got := pins[expID]; got != want {
+			t.Errorf("%s = %q, want %q", expID, got, want)
+		}
 	}
 }
