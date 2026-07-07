@@ -423,17 +423,17 @@ func (m *MCPServer) registerTools() {
 	// Config mutation API (Agent O design — closes Agent F gaps #5 + #19).
 	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_read_config",
-		Description: "Read the kernel config (.cog/config/kernel.yaml). Returns the effective resolved config (defaults + file overrides). Optional include_raw_yaml returns the raw file bytes; include_defaults also returns the hardcoded defaults for diffing. kernel.yaml only — sibling configs (providers.yaml, secrets.yaml) are out of scope.",
+		Description: "Read the kernel config (.cog/config/kernel.yaml). Returns the effective resolved config (defaults + file overrides). Optional include_raw_yaml returns the raw file bytes; include_defaults also returns the hardcoded defaults for diffing. kernel.yaml only — sibling configs (providers.yaml, secrets.yaml) are out of scope. Gated by Config.EnableConfigMutation (default false, parity with the REST /v1/config surface); returns a disabled error when the gate is off.",
 	}, m.toolReadConfig)
 
 	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_write_config",
-		Description: "Merge a patch into the kernel config (.cog/config/kernel.yaml) using RFC 7396 JSON merge-patch semantics: fields omitted from the patch are left unchanged; explicit null removes a field and restores the default on next boot. Validated before persisting — returns violations without writing on failure. Atomic write + rotating .bak-<timestamp> backups (keeps 10). Takes effect on next daemon restart (requires_restart: true in response). Fallback: edit .cog/config/kernel.yaml and run `./scripts/cog restart`. No authentication — the kernel assumes a trusted local caller.",
+		Description: "Merge a patch into the kernel config (.cog/config/kernel.yaml) using RFC 7396 JSON merge-patch semantics: fields omitted from the patch are left unchanged; explicit null removes a field and restores the default on next boot. Validated before persisting — returns violations without writing on failure. Atomic write + rotating .bak-<timestamp> backups (keeps 10). Takes effect on next daemon restart (requires_restart: true in response). Fallback: edit .cog/config/kernel.yaml and run `./scripts/cog restart`. Gated by Config.EnableConfigMutation (default false); set enable_config_mutation: true in kernel.yaml to opt in. No further authentication beyond the gate — the kernel assumes a trusted local caller once enabled.",
 	}, m.toolWriteConfig)
 
 	trackToolDeferred(m, &mcp.Tool{
 		Name:        "cog_rollback_config",
-		Description: "Restore kernel.yaml from a prior .bak-<timestamp> backup. Pass list_only=true to enumerate available backups without restoring. If backup is empty, the most recent backup is used. Atomic restore; response carries updated backup list.",
+		Description: "Restore kernel.yaml from a prior .bak-<timestamp> backup. Pass list_only=true to enumerate available backups without restoring. If backup is empty, the most recent backup is used. Atomic restore; response carries updated backup list. Gated by Config.EnableConfigMutation (default false), same as cog_read_config/cog_write_config.",
 	}, m.toolRollbackConfig)
 
 	trackToolDeferred(m, &mcp.Tool{
@@ -2468,7 +2468,31 @@ type rollbackConfigInput struct {
 	ListOnly bool   `json:"list_only,omitempty" jsonschema:"If true, return the list of backups without restoring"`
 }
 
+// requireConfigMutationMCP checks the EnableConfigMutation gate for the MCP
+// transport. Returns a non-nil (*mcp.CallToolResult, any, error) triple when
+// the gate is closed — callers should return it immediately — and a nil
+// triple when the gate is open and the caller should proceed. Mirrors the
+// HTTP gate's error shape (requireConfigMutation in serve_config.go) so a
+// caller sees the same {"error":"disabled","detail":"..."} body regardless
+// of transport; unlike the HTTP path this is surfaced as an MCP tool error
+// (IsError: true) rather than a 403 status code.
+func (m *MCPServer) requireConfigMutationMCP() (*mcp.CallToolResult, any, error) {
+	if m.cfg != nil && m.cfg.EnableConfigMutation {
+		return nil, nil, nil
+	}
+	b, _ := json.Marshal(map[string]string{
+		"error":  "disabled",
+		"detail": "config access via MCP is disabled; set enable_config_mutation: true in kernel.yaml",
+	})
+	res, _, _ := textResult(string(b))
+	res.IsError = true
+	return res, nil, nil
+}
+
 func (m *MCPServer) toolReadConfig(ctx context.Context, req *mcp.CallToolRequest, input readConfigInput) (*mcp.CallToolResult, any, error) {
+	if res, data, err := m.requireConfigMutationMCP(); res != nil {
+		return res, data, err
+	}
 	snapshot, err := ReadConfigSnapshot(m.cfg.WorkspaceRoot, input.IncludeRawYAML, input.IncludeDefaults)
 	if err != nil {
 		// Parse error — still surface whatever we could read but tag the error.
@@ -2485,6 +2509,9 @@ func (m *MCPServer) toolReadConfig(ctx context.Context, req *mcp.CallToolRequest
 }
 
 func (m *MCPServer) toolWriteConfig(ctx context.Context, req *mcp.CallToolRequest, input writeConfigInput) (*mcp.CallToolResult, any, error) {
+	if res, data, err := m.requireConfigMutationMCP(); res != nil {
+		return res, data, err
+	}
 	result, err := WriteConfigPatch(m.cfg.WorkspaceRoot, input.Patch, WriteConfigOptions{
 		Scope:  input.Scope,
 		DryRun: input.DryRun,
@@ -2496,6 +2523,9 @@ func (m *MCPServer) toolWriteConfig(ctx context.Context, req *mcp.CallToolReques
 }
 
 func (m *MCPServer) toolRollbackConfig(ctx context.Context, req *mcp.CallToolRequest, input rollbackConfigInput) (*mcp.CallToolResult, any, error) {
+	if res, data, err := m.requireConfigMutationMCP(); res != nil {
+		return res, data, err
+	}
 	result, err := RollbackConfig(m.cfg.WorkspaceRoot, RollbackOptions{
 		Backup:   input.Backup,
 		ListOnly: input.ListOnly,

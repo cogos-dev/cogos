@@ -1,22 +1,33 @@
 // serve_config_gate_test.go — outside-in httptest coverage for the
 // EnableConfigMutation gate on GET/PATCH /v1/config and POST
-// /v1/config/rollback (L5-HTTP-AUTHZ, ledger L5).
+// /v1/config/rollback (L5-HTTP-AUTHZ, ledger L5), plus the matching MCP
+// transport gate on cog_read_config/cog_write_config/cog_rollback_config
+// (mcp_server.go) added in the same PR after cog-review flagged that the
+// REST gate alone left the MCP tool surface unprotected.
 //
 // Covers:
-//  1. Gate — 403 for all three routes when EnableConfigMutation=false (default).
-//  2. Gated-on — 200 for all three routes when EnableConfigMutation=true.
+//  1. Gate — 403 for all three REST routes when EnableConfigMutation=false
+//     (default).
+//  2. Gated-on — 200 for all three REST routes when EnableConfigMutation=true.
 //  3. Boot warning — non-loopback BindAddr with no auth token configured logs
 //     a warning; loopback BindAddr does not.
+//  4. MCP gate — cog_read_config/cog_write_config/cog_rollback_config return
+//     an IsError result with {"error":"disabled",...} when the gate is off,
+//     and reach the real handler when the gate is on — same gate, second
+//     transport.
 package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // newConfigGateTestServer returns an HTTP handler backed by a Server whose
@@ -211,4 +222,125 @@ func TestIsLoopbackBindAddr(t *testing.T) {
 			t.Errorf("isLoopbackBindAddr(%q) = true; want false", addr)
 		}
 	}
+}
+
+// ── MCP transport gate ───────────────────────────────────────────────────────
+
+// newConfigGateTestMCPServer returns an MCPServer whose EnableConfigMutation
+// gate is set as requested, wired to a fresh temp workspace (no kernel.yaml
+// present) so ReadConfigSnapshot/WriteConfigPatch/RollbackConfig have a valid
+// root to operate against once the gate is open.
+func newConfigGateTestMCPServer(t *testing.T, enableConfigMutation bool) *MCPServer {
+	t.Helper()
+	root := t.TempDir()
+	cfg := makeConfig(t, root)
+	cfg.EnableConfigMutation = enableConfigMutation
+	nucleus := makeNucleus("Test", "tester")
+	process := NewProcess(cfg, nucleus)
+	t.Cleanup(func() {
+		if b := process.Broker(); b != nil {
+			_ = b.Close()
+		}
+	})
+	return NewMCPServer(cfg, nucleus, process)
+}
+
+// TestConfigMutationMCP_GateDisabled verifies all three MCP config tools
+// return an IsError result carrying {"error":"disabled",...} — the same
+// shape as the REST gate's 403 body — when EnableConfigMutation is false
+// (the default). Closes the gap cog-review found: the REST gate alone left
+// cog_read_config/cog_write_config/cog_rollback_config reachable over the
+// same HTTP bind address via POST /mcp with no check at all.
+func TestConfigMutationMCP_GateDisabled(t *testing.T) {
+	t.Parallel()
+	server := newConfigGateTestMCPServer(t, false)
+
+	t.Run("read", func(t *testing.T) {
+		t.Parallel()
+		result, _, err := server.toolReadConfig(context.Background(), nil, readConfigInput{})
+		assertMCPGateDisabled(t, result, err)
+	})
+
+	t.Run("write", func(t *testing.T) {
+		t.Parallel()
+		result, _, err := server.toolWriteConfig(context.Background(), nil, writeConfigInput{
+			Patch: map[string]any{"port": float64(7000)},
+		})
+		assertMCPGateDisabled(t, result, err)
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		t.Parallel()
+		result, _, err := server.toolRollbackConfig(context.Background(), nil, rollbackConfigInput{ListOnly: true})
+		assertMCPGateDisabled(t, result, err)
+	})
+}
+
+// assertMCPGateDisabled checks the shared gate-error shape returned by
+// requireConfigMutationMCP.
+func assertMCPGateDisabled(t *testing.T, result *mcp.CallToolResult, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil || !result.IsError {
+		t.Fatalf("result.IsError = false; want true (gate should reject)")
+	}
+	var resp map[string]string
+	decodeMCPJSON(t, result, &resp)
+	if resp["error"] != "disabled" {
+		t.Errorf("error = %q; want \"disabled\"", resp["error"])
+	}
+	if !strings.Contains(resp["detail"], "enable_config_mutation") {
+		t.Errorf("detail = %q; want mention of enable_config_mutation", resp["detail"])
+	}
+}
+
+// TestConfigMutationMCP_GateEnabled verifies all three MCP config tools reach
+// their real handlers (no IsError, normal result shape) when
+// EnableConfigMutation is true.
+func TestConfigMutationMCP_GateEnabled(t *testing.T) {
+	t.Parallel()
+	server := newConfigGateTestMCPServer(t, true)
+
+	t.Run("read", func(t *testing.T) {
+		t.Parallel()
+		result, _, err := server.toolReadConfig(context.Background(), nil, readConfigInput{})
+		if err != nil {
+			t.Fatalf("toolReadConfig: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("result.IsError = true; want gate-open passthrough, got %+v", result)
+		}
+		var decoded ReadConfigResult
+		decodeMCPJSON(t, result, &decoded)
+		if decoded.Path == "" {
+			t.Errorf("path missing from read result")
+		}
+	})
+
+	t.Run("write", func(t *testing.T) {
+		t.Parallel()
+		result, _, err := server.toolWriteConfig(context.Background(), nil, writeConfigInput{
+			Patch:  map[string]any{"port": float64(7000)},
+			DryRun: true,
+		})
+		if err != nil {
+			t.Fatalf("toolWriteConfig: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("result.IsError = true; want gate-open passthrough, got %+v", result)
+		}
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		t.Parallel()
+		result, _, err := server.toolRollbackConfig(context.Background(), nil, rollbackConfigInput{ListOnly: true})
+		if err != nil {
+			t.Fatalf("toolRollbackConfig: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("result.IsError = true; want gate-open passthrough (list_only, no backups yet), got %+v", result)
+		}
+	})
 }

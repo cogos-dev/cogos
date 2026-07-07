@@ -16,10 +16,17 @@ import (
 )
 
 // newMCPForTest builds an MCPServer wired to a fresh workspace + process.
+// EnableConfigMutation defaults to true here since these tests exercise
+// config read/write/rollback behavior itself, not the gate — mirroring
+// newTestServer's HTTP-side callers (TestHandleConfigGet_IncludesDefaults
+// et al.) which set srv.cfg.EnableConfigMutation = true explicitly. Gate
+// behavior itself is covered by TestConfigMutationMCP_GateDisabled/
+// GateEnabled in serve_config_gate_test.go.
 func newMCPForTest(t *testing.T) (*MCPServer, string) {
 	t.Helper()
 	root := makeWorkspace(t)
 	cfg := makeConfig(t, root)
+	cfg.EnableConfigMutation = true
 	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
 	return NewMCPServer(cfg, makeNucleus("Cog", "tester"), process), root
 }
