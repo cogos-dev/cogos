@@ -101,6 +101,20 @@ func runReconcileCmd(args []string, defaultWorkspace string) {
 		os.Exit(1)
 	}
 
+	// Acquire the cross-process state lock for the full
+	// LoadState → ComputePlan → ApplyPlan → BuildState → WriteState cycle so
+	// this CLI invocation can't race the daemon's own reconcile-loop cycle
+	// for the same providerType (same bug class as issue #449's _meta.json
+	// race; see pkg/substrate/reconcile/state.go doc comment). Held across
+	// the whole cycle, including the dry-run/read-only path, for simplicity —
+	// a stale read under contention is harmless, a racing write is not.
+	stateLock, lockErr := reconcile.AcquireStateLock(root, providerType)
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "error: acquire state lock for %s: %v\n", providerType, lockErr)
+		os.Exit(1)
+	}
+	defer stateLock.Release()
+
 	// Load persisted state.
 	state, _ := reconcile.LoadState(root, providerType)
 

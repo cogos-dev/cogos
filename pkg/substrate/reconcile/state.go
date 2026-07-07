@@ -4,7 +4,24 @@
 //
 // Each provider stores state at .cog/config/{resource_type}/.state.json
 // using the State format from types.go.
-
+//
+// LoadState and WriteState are individually safe (WriteState is atomic:
+// tmp + rename), but the reconcile cycle that uses them —
+// LoadState → ComputePlan → ApplyPlan → BuildState → WriteState, run by both
+// `cogos reconcile <type>` (internal/engine/cli_reconcile.go) and the
+// daemon's own periodic reconcile loop (internal/engine/reconcile_daemon.go)
+// against the identical un-namespaced state file — is a read-modify-write
+// cycle with no cross-process coordination. BuildState derives the entire
+// new Resources slice fresh from live state plus the existing state's
+// Serial/Lineage (it does not apply a delta on top of a re-read of disk), so
+// unlike the conversations index's _meta.json fix (issue #449, per-session
+// delta merge), there is no sound delta-merge here: two concurrent cycles'
+// WriteState calls race on a plain last-write-wins tmp+rename, and whichever
+// lands last silently discards the other cycle's Serial/Resources.
+//
+// Callers that run a full LoadState→WriteState cycle for a given
+// resourceType must wrap it in AcquireStateLock/Release (see doc comment)
+// to serialize concurrent cycles for the same resourceType across processes.
 package reconcile
 
 import (
@@ -15,11 +32,55 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/filelock"
 )
+
+// StateLockTimeout bounds how long AcquireStateLock waits to acquire the
+// cross-process lock before giving up. Mirrors metaLockTimeout in
+// internal/conversations/index.go (same bug class, same timeout budget).
+const StateLockTimeout = 5 * time.Second
 
 // StatePath returns the path to a provider's state file.
 func StatePath(root, resourceType string) string {
 	return filepath.Join(root, ".cog", "config", resourceType, ".state.json")
+}
+
+// StateLockPath returns the path to the advisory cross-process lock file
+// guarding a resource type's LoadState→WriteState reconcile cycle. A
+// sibling file, not the state file itself, so the lock's own lifecycle never
+// touches the JSON content file LoadState reads.
+func StateLockPath(root, resourceType string) string {
+	return StatePath(root, resourceType) + ".lock"
+}
+
+// AcquireStateLock takes the cross-process advisory lock for resourceType's
+// reconcile cycle. Callers must run their entire
+// LoadState → ComputePlan → ApplyPlan → BuildState → WriteState cycle while
+// holding the returned lock, then Release it — this is what serializes a
+// CLI-invoked `cogos reconcile <type>` run against the daemon's own
+// reconcile-loop cycle for the same resourceType, closing the same bug class
+// issue #449 fixed for the conversations index's _meta.json.
+//
+//	lock, err := reconcile.AcquireStateLock(root, resourceType)
+//	if err != nil {
+//	    return err
+//	}
+//	defer lock.Release()
+//	state, _ := reconcile.LoadState(root, resourceType)
+//	... ComputePlan / ApplyPlan / BuildState ...
+//	reconcile.WriteState(root, resourceType, newState)
+func AcquireStateLock(root, resourceType string) (*filelock.FileLock, error) {
+	lockPath := StateLockPath(root, resourceType)
+	// The lock must be acquirable before the state file (and its directory)
+	// necessarily exist — the very first reconcile cycle for a resourceType
+	// has no .state.json yet. WriteState creates the directory too, but that
+	// happens after LoadState/lock-acquire in the caller's cycle, so ensure
+	// it here rather than requiring every caller to mkdir before locking.
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+		return nil, fmt.Errorf("creating state dir for %s lock: %w", resourceType, err)
+	}
+	return filelock.Acquire(lockPath, StateLockTimeout)
 }
 
 // LoadState loads the state file for a given resource type.

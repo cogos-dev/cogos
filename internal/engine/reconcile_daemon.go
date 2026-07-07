@@ -600,6 +600,24 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		return fmt.Errorf("FetchLive %s: %w", providerType, err)
 	}
 
+	// Acquire the cross-process state lock for the full
+	// LoadState → ComputePlan → ApplyPlan → BuildState → WriteState cycle
+	// (steps 3-7 below) so this daemon cycle can't race a CLI-invoked
+	// `cogos reconcile <type>` run against the same providerType (same bug
+	// class as issue #449's _meta.json race; see
+	// pkg/substrate/reconcile/state.go doc comment). Released via defer so
+	// every early-return path below (ComputePlan/ApplyPlan/BuildState
+	// failures) still releases it. A lock-acquire failure (peer holds it
+	// past StateLockTimeout) is treated like any other phase failure: warn
+	// and skip this cycle, retried on the next tick.
+	lock, lockErr := reconcile.AcquireStateLock(d.cfg.WorkspaceRoot, providerType)
+	if lockErr != nil {
+		slog.Warn("reconcile-daemon: acquire state lock failed",
+			"provider", providerType, "err", lockErr)
+		return fmt.Errorf("acquire state lock %s: %w", providerType, lockErr)
+	}
+	defer lock.Release()
+
 	// Step 3: Load persisted state.
 	stateStart := time.Now()
 	state, stateErr := reconcile.LoadState(d.cfg.WorkspaceRoot, providerType)
