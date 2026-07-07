@@ -289,3 +289,76 @@ func TestPeerWriteDoesNotDesyncSessionsAndTurns(t *testing.T) {
 		t.Fatalf("after LoadIfChanged, idxA knows about peer session %q via sessions but still can't resolve its turns", "b-peer-only")
 	}
 }
+
+// TestCrossProcessSameSessionTurnsFileRace is the regression test for the
+// finding cog-review raised on PR #458's second review pass: writeTurnsFile
+// itself (not just _meta.json) needs an atomic write and a cross-process
+// lock, because two Index instances (standing in for the daemon's reconcile
+// ticker and a separately-invoked "cog reconcile conversations" CLI process)
+// can detect drift on the SAME sessionID's source JSONL in the same window
+// and both call UpsertSession(meta, turns) for that identical sessionID
+// concurrently — racing on the one turns file rather than two different
+// ones. Before the fix this could interleave/tear the write; loadTurnsFile
+// would then fail to json.Unmarshal the corrupted file and Load() drops the
+// session's meta+turns from the index entirely (index.go's Load: a
+// per-session parse error deletes that session from the in-memory sessions
+// map) — a stronger data-loss outcome than a merely-missing field.
+//
+// This test can't deterministically force the interleaving (the lock
+// serializes the writers), but it repeatedly drives many concurrent
+// same-sessionID writers under `-race` and asserts the turns file is always
+// valid, non-torn JSON afterward with the last writer's content —
+// serialization, not corruption.
+func TestCrossProcessSameSessionTurnsFileRace(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const sessionID = "shared-session"
+	const writers = 8
+	const itersPerWriter = 30
+
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	now := time.Now()
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			idx, err := NewIndex(dir)
+			if err != nil {
+				errs <- err
+				return
+			}
+			for i := 0; i < itersPerWriter; i++ {
+				turns := []Turn{
+					{UUID: sessionID, SessionID: sessionID, TurnIndex: 0, Role: "user", Timestamp: now, Text: "writer " + strconv.Itoa(w) + " iter " + strconv.Itoa(i)},
+				}
+				meta := SessionMeta{SessionID: sessionID, TurnCount: 1, FirstTurnAt: now, LastTurnAt: now}
+				if err := idx.UpsertSession(meta, turns); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("writer error: %v", err)
+	}
+
+	// The turns file must be valid, untorn JSON — never partially-written
+	// bytes from two interleaved writers.
+	verify, err := NewIndex(dir)
+	if err != nil {
+		t.Fatalf("NewIndex for verify: %v", err)
+	}
+	turns, err := verify.loadTurnsFile(sessionID)
+	if err != nil {
+		t.Fatalf("turns file is corrupted after concurrent same-session writers: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("turns file has %d entries, want exactly 1 (one writer's full replace, not a merge/tear)", len(turns))
+	}
+}

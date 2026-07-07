@@ -222,11 +222,29 @@ func (idx *Index) DeleteSession(sessionID string) error {
 	delete(idx.sessions, sessionID)
 	delete(idx.turns, sessionID)
 
-	turnsPath := idx.turnsPath(sessionID)
-	if err := os.Remove(turnsPath); err != nil && !os.IsNotExist(err) {
+	// Same per-session lock writeTurnsFile takes, so a concurrent peer
+	// UpsertSession for this exact sessionID can't recreate the turns file
+	// in between this Remove and the caller's write, and vice versa.
+	if err := idx.removeTurnsFile(sessionID); err != nil {
 		return fmt.Errorf("conversations/index: remove turns file: %w", err)
 	}
 	return idx.writeMetaFileLocked(metaDelta{deletes: []string{sessionID}})
+}
+
+// removeTurnsFile deletes sessionID's turns file under the same per-session
+// cross-process lock writeTurnsFile uses, so a delete can't race a
+// concurrent peer write of the same sessionID's turns file.
+func (idx *Index) removeTurnsFile(sessionID string) error {
+	lock, err := filelock.Acquire(idx.turnsLockPath(sessionID), metaLockTimeout)
+	if err != nil {
+		return fmt.Errorf("acquire turns lock for %s: %w", sessionID, err)
+	}
+	defer lock.Release()
+
+	if err := os.Remove(idx.turnsPath(sessionID)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // GetMeta returns the SessionMeta for a session, or false if not indexed.
@@ -578,12 +596,53 @@ func sessionMapsEqual(a, b map[string]SessionMeta) bool {
 	return true
 }
 
+// turnsLockPath is the advisory cross-process lock file guarding a single
+// session's turns file. Keyed per-session (not a single shared lock across
+// all sessions) so two different sessions' writers never contend on the same
+// lock — only two writers of the *same* sessionID, which is the actual race.
+func (idx *Index) turnsLockPath(sessionID string) string {
+	return idx.turnsPath(sessionID) + ".lock"
+}
+
+// writeTurnsFile persists the full turns list for sessionID.
+//
+// Same shape as writeMetaFileLocked and fixed for the same reason
+// (cog-review, PR #458): the daemon's reconcile ticker and a
+// separately-invoked "cog reconcile conversations" CLI process can both
+// detect drift on the same session's source JSONL in the same window and
+// each call UpsertSession(meta, turns) for the identical sessionID
+// concurrently, racing on this exact file. Unlike _meta.json (a shared map
+// needing a read-merge-write), each turns file is owned wholly by one
+// sessionID and every writer replaces the full content, so no on-disk merge
+// is needed here — only atomicity (tmp + rename, preventing a torn read on
+// loadTurnsFile) and a cross-process lock (preventing the interleaving
+// itself, so the two writes fully serialize rather than merely not tearing
+// each other's bytes). Without either, loadTurnsFile's json.Unmarshal can
+// fail on a corrupted file and Load drops the session's meta and turns
+// entirely (index.go's Load: on a per-session parse error it deletes the
+// session from the in-memory map rather than surfacing a partial result) —
+// a stronger data-loss outcome than #449's "last writer wins on one field".
 func (idx *Index) writeTurnsFile(sessionID string, turns []Turn) error {
+	lock, err := filelock.Acquire(idx.turnsLockPath(sessionID), metaLockTimeout)
+	if err != nil {
+		return fmt.Errorf("conversations/index: acquire turns lock for %s: %w", sessionID, err)
+	}
+	defer lock.Release()
+
 	b, err := json.MarshalIndent(turns, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(idx.turnsPath(sessionID), b, 0o644)
+	path := idx.turnsPath(sessionID)
+	tmp := path + fmt.Sprintf(".tmp.%d", time.Now().UnixNano())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (idx *Index) loadTurnsFile(sessionID string) ([]Turn, error) {
