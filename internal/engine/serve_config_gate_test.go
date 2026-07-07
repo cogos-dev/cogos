@@ -344,3 +344,46 @@ func TestConfigMutationMCP_GateEnabled(t *testing.T) {
 		}
 	})
 }
+
+// TestResourceConfigMCP_GateDisabled verifies the cogos://config MCP
+// resource returns an error (mentioning "disabled") when EnableConfigMutation
+// is false. Regression test for the second cog-review round on PR #460: the
+// resource read the same ReadConfigSnapshot data via the untouched Resources
+// API, bypassing the gate the three cog_*_config tools had just been given.
+func TestResourceConfigMCP_GateDisabled(t *testing.T) {
+	t.Parallel()
+	server := newConfigGateTestMCPServer(t, false)
+	fakeReq := &mcp.ReadResourceRequest{Params: &mcp.ReadResourceParams{URI: "cogos://config"}}
+	result, err := server.resourceConfig(context.Background(), fakeReq)
+	if err == nil {
+		t.Fatalf("resourceConfig returned no error with gate disabled; result=%+v", result)
+	}
+	if !strings.Contains(err.Error(), "disabled") {
+		t.Errorf("error = %q; want mention of \"disabled\"", err.Error())
+	}
+	if !strings.Contains(err.Error(), "enable_config_mutation") {
+		t.Errorf("error = %q; want mention of enable_config_mutation", err.Error())
+	}
+	if result != nil {
+		t.Errorf("result = %+v; want nil when gated off", result)
+	}
+}
+
+// TestResourceConfigMCP_GateEnabled verifies the cogos://config MCP resource
+// reaches ReadConfigSnapshot (no error, effective_config present) when
+// EnableConfigMutation is true.
+func TestResourceConfigMCP_GateEnabled(t *testing.T) {
+	t.Parallel()
+	server := newConfigGateTestMCPServer(t, true)
+	fakeReq := &mcp.ReadResourceRequest{Params: &mcp.ReadResourceParams{URI: "cogos://config"}}
+	result, err := server.resourceConfig(context.Background(), fakeReq)
+	if err != nil {
+		t.Fatalf("resourceConfig: %v", err)
+	}
+	if len(result.Contents) != 1 {
+		t.Fatalf("contents len = %d; want 1", len(result.Contents))
+	}
+	if !strings.Contains(result.Contents[0].Text, "effective_config") {
+		t.Errorf("resource text missing effective_config; got %s", result.Contents[0].Text)
+	}
+}

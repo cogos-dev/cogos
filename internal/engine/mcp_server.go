@@ -543,7 +543,7 @@ func (m *MCPServer) registerResources() {
 	m.server.AddResource(&mcp.Resource{
 		URI:         "cogos://config",
 		Name:        "Kernel Config",
-		Description: "Effective kernel configuration (kernel.yaml resolved against defaults)",
+		Description: "Effective kernel configuration (kernel.yaml resolved against defaults). Gated by Config.EnableConfigMutation (default false), same as cog_read_config/cog_write_config/cog_rollback_config; returns a disabled error when the gate is off.",
 		MIMEType:    "application/json",
 	}, m.resourceConfig)
 
@@ -2536,7 +2536,20 @@ func (m *MCPServer) toolRollbackConfig(ctx context.Context, req *mcp.CallToolReq
 	return marshalResult(result)
 }
 
+// resourceConfig serves the cogos://config MCP resource. Gated by
+// Config.EnableConfigMutation, same as the three cog_*_config tools — a
+// cog-review re-review round (PR #460) found this resource read the exact
+// same ReadConfigSnapshot data via the untouched Resources API, bypassing
+// the gate the tools had just been given. MCP resources have no IsError /
+// structured-error-body convention (unlike CallToolResult); the established
+// pattern in this file (see resourceState above) is to return a plain Go
+// error, which the MCP SDK surfaces as a protocol-level error to the
+// caller — so this uses the same "disabled" wording as the tool/HTTP gates
+// rather than a JSON body.
 func (m *MCPServer) resourceConfig(_ context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	if m.cfg == nil || !m.cfg.EnableConfigMutation {
+		return nil, fmt.Errorf("disabled: config access via MCP is disabled; set enable_config_mutation: true in kernel.yaml")
+	}
 	snapshot, _ := ReadConfigSnapshot(m.cfg.WorkspaceRoot, false, true)
 	b, err := json.Marshal(snapshot)
 	if err != nil {
