@@ -144,6 +144,14 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    # id-token: write is the OIDC permission cosign's keyless flow needs to
+    # mint a short-lived Fulcio signing cert bound to this workflow's identity
+    # (repo + ref + workflow path). No signing key is generated or stored —
+    # the identity IS the key material, which is the point: nothing to leak,
+    # rotate, or scope wrong. See docs/release-signing.md for the trust model.
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -155,6 +163,46 @@ jobs:
         run: |
           cd dist && sha256sum cogos-* > checksums.txt
           ls -lh
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Sign checksums.txt, not each binary individually. checksums.txt
+      # already binds every artifact's content (sha256) into one file; one
+      # signature over that file transitively covers every listed binary at
+      # far lower cost than N per-binary signatures. A consumer verifies the
+      # signature once, then trusts the checksums to validate whichever
+      # binary they downloaded (see docs/release-signing.md).
+      #
+      # Keyless: no --key flag. cosign sign-blob talks to Fulcio (cert
+      # authority) using the job's GitHub OIDC token, and to Rekor (public
+      # transparency log) to record the signing event — both public-good
+      # Sigstore infra, no secrets configured in this repo. --yes skips the
+      # interactive confirmation prompt (this is a non-interactive CI job).
+      - name: Sign checksums.txt (Sigstore keyless)
+        working-directory: dist
+        run: |
+          cosign sign-blob \
+            --yes \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem \
+            checksums.txt
+          ls -lh checksums.txt.sig checksums.txt.pem
+
+      # Fail loudly if verification against our own just-produced signature
+      # doesn't pass, rather than shipping a release with a broken signature
+      # nobody notices until a consumer's verify command fails. Pins the
+      # identity/issuer the same way docs/release-signing.md tells consumers
+      # to — if this regexp and the docs drift apart, this step is the guard.
+      - name: Verify signature (fail closed before publishing)
+        working-directory: dist
+        run: |
+          cosign verify-blob \
+            --certificate checksums.txt.pem \
+            --signature checksums.txt.sig \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
