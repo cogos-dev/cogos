@@ -180,8 +180,14 @@ func (m *busSessionManager) createMCPBus(sessionID, origin string) (string, erro
 }
 
 // registryLockTimeout bounds how long a registry writer waits for the
-// cross-process advisory lock before failing the operation.
+// cross-process advisory lock before failing the operation (registration:
+// correctness-critical, cold path).
 const registryLockTimeout = 5 * time.Second
+
+// registrySeqLockTimeout bounds the best-effort seq-metadata update on the
+// append hot path — short, because a skipped update self-heals on the next
+// append and a long wait would delay the append caller.
+const registrySeqLockTimeout = 500 * time.Millisecond
 
 // acquireRegistryLock takes the cross-process advisory lock guarding the
 // load-modify-save cycle on registry.json. The daemon's
@@ -332,15 +338,16 @@ func (m *busSessionManager) appendBusEvent(busID, eventType, from string, payloa
 	}
 	f.Close()
 
-	// Update registry
-	m.updateRegistrySeq(busID, newSeq, evt.Ts)
-
 	// Snapshot handlers while locked, then release BEFORE dispatching.
 	// This prevents deadlocks when handlers call appendBusEvent (e.g. tool
 	// router posting tool.result in response to tool.invoke).
 	handlers := make([]busEventHandler, len(m.eventHandlers))
 	copy(handlers, m.eventHandlers)
 	m.mu.Unlock()
+
+	// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
+	// cross-process filelock, and must never stall unrelated bus operations.
+	m.updateRegistrySeq(busID, newSeq, evt.Ts)
 
 	// Dispatch handlers outside the lock — safe because each handler
 	// that needs to write back to the bus will re-acquire the lock via
@@ -410,11 +417,12 @@ func (m *busSessionManager) appendBusEventRef(busID, eventType, from, digest, me
 	}
 	f.Close()
 
-	m.updateRegistrySeq(busID, newSeq, evt.Ts)
-
 	handlers := make([]busEventHandler, len(m.eventHandlers))
 	copy(handlers, m.eventHandlers)
 	m.mu.Unlock()
+
+	// Outside m.mu — see updateRegistrySeq's lock-ordering contract.
+	m.updateRegistrySeq(busID, newSeq, evt.Ts)
 
 	for _, h := range handlers {
 		h.handler(busID, &evt)
@@ -454,12 +462,22 @@ func (m *busSessionManager) getLastEvent(busID string) (int, string) {
 }
 
 // updateRegistrySeq updates the last event seq/timestamp in the registry.
+// Caller must NOT hold m.mu — this blocks (briefly) on the cross-process
+// registry filelock, and holding the in-process mutex across that wait would
+// let one contended peer stall every unrelated bus operation in this process.
+//
+// Best-effort + monotonic: seq metadata self-heals on the next append, so on
+// lock contention we skip (short registrySeqLockTimeout) rather than wait,
+// and the IfNewer guard makes an out-of-order update a harmless no-op instead
+// of a seq regression.
 func (m *busSessionManager) updateRegistrySeq(busID string, seq int, ts string) {
-	lock, err := m.acquireRegistryLock()
+	if err := os.MkdirAll(m.busesDir(), 0755); err != nil {
+		log.Printf("[bus] skipping registry seq update: %v", err)
+		return
+	}
+	lock, err := filelock.Acquire(m.registryPath()+".lock", registrySeqLockTimeout)
 	if err != nil {
-		// Best-effort metadata update: skipping is safer than an unserialized
-		// read-modify-write that can drop a concurrent writer's entry.
-		log.Printf("[bus] skipping registry seq update (lock unavailable): %v", err)
+		log.Printf("[bus] skipping registry seq update (lock contended): %v", err)
 		return
 	}
 	defer lock.Release()
@@ -467,6 +485,9 @@ func (m *busSessionManager) updateRegistrySeq(busID string, seq int, ts string) 
 	registry := m.loadRegistry()
 	for i, entry := range registry {
 		if entry.BusID == busID {
+			if entry.LastEventSeq >= seq {
+				return // stale out-of-order update; newer one already landed
+			}
 			registry[i].LastEventSeq = seq
 			registry[i].LastEventAt = ts
 			registry[i].EventCount = seq

@@ -173,15 +173,31 @@ func (m *BusSessionManager) EnsureBus(busID string) error {
 }
 
 // RegisterBus adds or updates a bus entry in the registry.
+//
+// Lock ordering: registry filelock BEFORE m.mu, never the reverse — acquiring
+// the cross-process lock while holding the in-process mutex would let one
+// contended peer process stall every unrelated bus operation in this process.
 func (m *BusSessionManager) RegisterBus(busID, sessionID, origin string) error {
+	lock, err := m.acquireRegistryLock()
+	if err != nil {
+		return fmt.Errorf("acquire registry lock: %w", err)
+	}
+	defer lock.Release()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.registerBusLocked(busID, sessionID, origin)
 }
 
 // registryLockTimeout bounds how long a registry writer waits for the
-// cross-process advisory lock before failing the operation.
+// cross-process advisory lock before failing the operation (registration:
+// correctness-critical, cold path).
 const registryLockTimeout = 5 * time.Second
+
+// registrySeqLockTimeout bounds the best-effort seq-metadata update on the
+// append hot path — short, because a skipped update self-heals on the next
+// append and a long wait would delay the AppendEvent caller.
+const registrySeqLockTimeout = 500 * time.Millisecond
 
 // acquireRegistryLock takes the cross-process advisory lock guarding the
 // load-modify-save cycle on registry.json. The root-package CLI writer
@@ -196,14 +212,10 @@ func (m *BusSessionManager) acquireRegistryLock() (*filelock.FileLock, error) {
 	return filelock.Acquire(m.RegistryPath()+".lock", registryLockTimeout)
 }
 
-// registerBusLocked is the locked-variant helper. Caller must hold m.mu.
+// registerBusLocked is the locked-variant helper. Caller must hold BOTH the
+// registry filelock (see acquireRegistryLock) and m.mu, acquired in that
+// order.
 func (m *BusSessionManager) registerBusLocked(busID, sessionID, origin string) error {
-	lock, err := m.acquireRegistryLock()
-	if err != nil {
-		return fmt.Errorf("acquire registry lock: %w", err)
-	}
-	defer lock.Release()
-
 	registry := m.loadRegistry()
 
 	for i, entry := range registry {
@@ -368,12 +380,14 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 		}
 	}
 
-	m.updateRegistrySeqLocked(busID, newSeq, evt.Ts)
-
 	// Snapshot handlers while locked, then dispatch OUTSIDE the lock.
 	handlers := make([]busEventHandler, len(m.eventHandlers))
 	copy(handlers, m.eventHandlers)
 	m.mu.Unlock()
+
+	// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
+	// cross-process filelock, and must never stall unrelated bus operations.
+	m.updateRegistrySeqIfNewer(busID, newSeq, evt.Ts)
 
 	for _, h := range handlers {
 		h.handler(busID, &evt)
@@ -441,14 +455,25 @@ func (m *BusSessionManager) LatestEventHash(busID string) (hash string, seq int6
 	return h, int64(s), nil
 }
 
-// updateRegistrySeqLocked updates the last event seq/timestamp in the registry.
-// Caller must hold m.mu.
-func (m *BusSessionManager) updateRegistrySeqLocked(busID string, seq int, ts string) {
-	lock, err := m.acquireRegistryLock()
+// updateRegistrySeqIfNewer updates the last event seq/timestamp in the
+// registry. Caller must NOT hold m.mu — this method blocks (briefly) on the
+// cross-process registry filelock, and holding the in-process mutex across
+// that wait would let one contended peer stall every unrelated bus operation
+// in this process (the exact hazard this PR fixes elsewhere).
+//
+// Best-effort + monotonic: the seq update is derivable metadata that
+// self-heals on the next append, so on lock contention we skip rather than
+// wait long (registrySeqLockTimeout), and because callers run outside m.mu
+// their updates can arrive out of order — the IfNewer guard makes a stale
+// update a harmless no-op instead of a seq regression.
+func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, ts string) {
+	if err := os.MkdirAll(m.BusesDir(), 0755); err != nil {
+		slog.Warn("bus: skipping registry seq update", "err", err, "bus_id", busID)
+		return
+	}
+	lock, err := filelock.Acquire(m.RegistryPath()+".lock", registrySeqLockTimeout)
 	if err != nil {
-		// Best-effort metadata update: skipping is safer than an unserialized
-		// read-modify-write that can drop a concurrent writer's entry.
-		slog.Warn("bus: skipping registry seq update (lock unavailable)", "err", err, "bus_id", busID)
+		slog.Warn("bus: skipping registry seq update (lock contended)", "err", err, "bus_id", busID)
 		return
 	}
 	defer lock.Release()
@@ -456,6 +481,9 @@ func (m *BusSessionManager) updateRegistrySeqLocked(busID string, seq int, ts st
 	registry := m.loadRegistry()
 	for i, entry := range registry {
 		if entry.BusID == busID {
+			if entry.LastEventSeq >= seq {
+				return // stale out-of-order update; newer one already landed
+			}
 			registry[i].LastEventSeq = seq
 			registry[i].LastEventAt = ts
 			registry[i].EventCount = seq
