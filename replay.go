@@ -6,6 +6,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -398,10 +399,10 @@ func ComputeReplayHash(events []*Event) string {
 	return hash
 }
 
-// hashString computes SHA256 hash of a string
+// hashString computes the SHA-256 hash of a string
 func hashString(s string) []byte {
-	// This is a placeholder - in real implementation, use crypto/sha256
-	return []byte(s) // Simplified for now
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
 }
 
 // VerifyReplayDeterminism verifies that two replays produce the same sequence

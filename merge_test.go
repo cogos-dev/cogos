@@ -357,6 +357,106 @@ func TestReplayDeterminism(t *testing.T) {
 	}
 }
 
+// TestVerifyReplayDeterminism exercises VerifyReplayDeterminism end-to-end against a
+// real ledger fixture (a session directory with a few events.jsonl entries), replayed
+// twice, and asserts the two DAG-build+sort+hash runs agree on identical on-disk state.
+func TestVerifyReplayDeterminism(t *testing.T) {
+	repo := setupTestRepo(t)
+	ledgerDir := filepath.Join(repo, ".cog", "ledger")
+
+	sessionID := "test-session-verify-determ"
+	events := []*Event{
+		{ID: "evt1", Type: "test", Timestamp: "2026-01-16T10:00:00Z", SessionID: sessionID, Seq: 1},
+		{ID: "evt2", Type: "test", Timestamp: "2026-01-16T10:00:01Z", SessionID: sessionID, Seq: 2},
+		{ID: "evt3", Type: "test", Timestamp: "2026-01-16T10:00:02Z", SessionID: sessionID, Seq: 3},
+	}
+	writeSessionEvents(t, ledgerDir, sessionID, events)
+
+	if err := VerifyReplayDeterminism(repo, []string{sessionID}); err != nil {
+		t.Errorf("VerifyReplayDeterminism failed on a stable fixture replayed twice: %v", err)
+	}
+}
+
+// TestVerifyReplayDeterminism_DetectsDivergence proves the wired-up hash actually
+// discriminates content: two fixtures whose event sequences genuinely differ must
+// produce different ComputeReplayHash outputs. Before the sha256 fix, hashString
+// returned its input verbatim, so this still "worked" only by accident (%x of the raw
+// bytes still differed) -- the real defect was that identical divergent inputs (e.g.
+// events differing only by non-string-formatted fields the canonical string doesn't
+// capture) could not be trusted as a genuine hash. This test locks in that changing the
+// event sequence changes the hash under the real crypto/sha256 implementation.
+func TestVerifyReplayDeterminism_DetectsDivergence(t *testing.T) {
+	repoA := setupTestRepo(t)
+	sessionA := "test-session-divergent-a"
+	writeSessionEvents(t, filepath.Join(repoA, ".cog", "ledger"), sessionA, []*Event{
+		{ID: "evt1", Type: "test", Timestamp: "2026-01-16T10:00:00Z", SessionID: sessionA, Seq: 1},
+		{ID: "evt2", Type: "test", Timestamp: "2026-01-16T10:00:01Z", SessionID: sessionA, Seq: 2},
+	})
+
+	repoB := setupTestRepo(t)
+	sessionB := "test-session-divergent-b"
+	writeSessionEvents(t, filepath.Join(repoB, ".cog", "ledger"), sessionB, []*Event{
+		{ID: "evt1", Type: "test", Timestamp: "2026-01-16T10:00:00Z", SessionID: sessionB, Seq: 1},
+		{ID: "evt2", Type: "other", Timestamp: "2026-01-16T10:00:01Z", SessionID: sessionB, Seq: 2},
+	})
+
+	dagA, err := BuildEventDAG(repoA, []string{sessionA})
+	if err != nil {
+		t.Fatalf("BuildEventDAG (A) failed: %v", err)
+	}
+	sortedA, err := TopologicalSort(dagA)
+	if err != nil {
+		t.Fatalf("TopologicalSort (A) failed: %v", err)
+	}
+
+	dagB, err := BuildEventDAG(repoB, []string{sessionB})
+	if err != nil {
+		t.Fatalf("BuildEventDAG (B) failed: %v", err)
+	}
+	sortedB, err := TopologicalSort(dagB)
+	if err != nil {
+		t.Fatalf("TopologicalSort (B) failed: %v", err)
+	}
+
+	hashA := ComputeReplayHash(sortedA)
+	hashB := ComputeReplayHash(sortedB)
+
+	if hashA == hashB {
+		t.Errorf("expected divergent event sequences to produce different hashes, both got %s", hashA)
+	}
+}
+
+// writeSessionEvents writes a slice of events to a session's events.jsonl ledger file,
+// creating the session directory if needed. Shared by the replay-determinism tests.
+func writeSessionEvents(t *testing.T, ledgerDir, sessionID string, events []*Event) {
+	t.Helper()
+
+	sessionDir := filepath.Join(ledgerDir, sessionID)
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		t.Fatalf("failed to create session dir: %v", err)
+	}
+
+	eventsFile := filepath.Join(sessionDir, "events.jsonl")
+	f, err := os.Create(eventsFile)
+	if err != nil {
+		t.Fatalf("failed to create events file: %v", err)
+	}
+	defer f.Close()
+
+	for _, event := range events {
+		data, err := event.MarshalJSON()
+		if err != nil {
+			t.Fatalf("failed to marshal event %s: %v", event.ID, err)
+		}
+		if _, err := f.Write(data); err != nil {
+			t.Fatalf("failed to write event %s: %v", event.ID, err)
+		}
+		if _, err := f.Write([]byte("\n")); err != nil {
+			t.Fatalf("failed to write newline: %v", err)
+		}
+	}
+}
+
 // TestConflictResolution tests the resolution workflow
 func TestConflictResolution(t *testing.T) {
 	conflict := Conflict{
