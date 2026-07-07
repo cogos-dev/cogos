@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,18 +126,29 @@ type ReconcileDaemon struct {
 	// fetchCount — a production provider under test has no such hook).
 	cycleSerialsMu sync.Mutex
 	cycleSerials   map[string]*atomic.Int64
+
+	// lastSummaries caches the most recent reconcile.Summary per provider,
+	// set right after each cycle's ComputePlan succeeds (First Instruments
+	// B2/M1-B). This is telemetry, not kernel state (§0): the Summary is
+	// already computed as part of the ordinary reconcile cycle; caching it
+	// costs nothing extra at tick boundaries and adds no new git/network
+	// round-trip. Used by LastCoherence to compute the graded reconcile-drift
+	// score C_B without re-running ComputePlan out of band.
+	lastSummariesMu sync.Mutex
+	lastSummaries   map[string]reconcile.Summary
 }
 
 // NewReconcileDaemon creates a ReconcileDaemon with the given config.
 // Call Start(ctx) to begin the loop.
 func NewReconcileDaemon(cfg ReconcileDaemonConfig) *ReconcileDaemon {
 	return &ReconcileDaemon{
-		cfg:          cfg.withDefaults(),
-		state:        ReconcileDaemonStarting,
-		triggered:    make(map[string]struct{}),
-		triggerCh:    make(chan struct{}, 1),
-		health:       newConvergenceTracker(cfg.Convergence),
-		cycleSerials: make(map[string]*atomic.Int64),
+		cfg:           cfg.withDefaults(),
+		state:         ReconcileDaemonStarting,
+		triggered:     make(map[string]struct{}),
+		triggerCh:     make(chan struct{}, 1),
+		health:        newConvergenceTracker(cfg.Convergence),
+		cycleSerials:  make(map[string]*atomic.Int64),
+		lastSummaries: make(map[string]reconcile.Summary),
 	}
 }
 
@@ -171,6 +183,87 @@ func (d *ReconcileDaemon) bumpCycleSerial(providerType string) {
 	}
 	d.cycleSerialsMu.Unlock()
 	counter.Add(1)
+}
+
+// ProviderCoherence is the per-provider reconcile-drift detail behind
+// LastCoherence's aggregate C_B (First Instruments M1-B).
+type ProviderCoherence struct {
+	ProviderType  string  `json:"provider_type"`
+	DriftFraction float64 `json:"drift_fraction"`
+	HasSummary    bool    `json:"has_summary"`
+	Creates       int     `json:"creates"`
+	Updates       int     `json:"updates"`
+	Deletes       int     `json:"deletes"`
+	Skipped       int     `json:"skipped"`
+	Total         int     `json:"total"`
+}
+
+// LastCoherence computes the M1-B graded reconcile-drift score C_B (IMPL-SPEC
+// B2) from the most recently cached per-provider Summary (populated at the
+// end of every ComputePlan in runOneCycle; telemetry, not kernel state,
+// §0). Side-effect-free: reads the cache only, runs no reconcile cycle.
+//
+//	drift_fraction_p := 0                              when Total()==0 (empty plan: nothing to
+//	                                                     reconcile ⇒ fully in-sync, not maximally drifted)
+//	                  := (Creates+Updates+Deletes)/Total()   otherwise  (== 1 - Skipped/Total())
+//	C_B = 1 - (1/P) * Σ_p drift_fraction_p
+//
+// C_B is in [0,1]; 1.0 iff every provider is all-Skipped OR has an empty
+// plan (Total()==0). Returns C_B==1.0 and an empty detail slice if no
+// provider has completed a cycle yet (vacuously coherent — nothing has been
+// observed to have drifted).
+//
+// Do NOT use Total()/(Skipped+Total()) — Summary.Total() already includes
+// Skipped (pkg/substrate/reconcile/types.go Total()), so that form ranges
+// [0.5,1], not [0,1] (verified degenerate per IMPL-SPEC B2).
+func (d *ReconcileDaemon) LastCoherence() (cB float64, perProvider []ProviderCoherence) {
+	d.lastSummariesMu.Lock()
+	snapshot := make(map[string]reconcile.Summary, len(d.lastSummaries))
+	for pt, s := range d.lastSummaries {
+		snapshot[pt] = s
+	}
+	d.lastSummariesMu.Unlock()
+
+	if len(snapshot) == 0 {
+		return 1.0, nil
+	}
+
+	// Deterministic provider ordering for a stable detail slice.
+	types := make([]string, 0, len(snapshot))
+	for pt := range snapshot {
+		types = append(types, pt)
+	}
+	sort.Strings(types)
+
+	perProvider = make([]ProviderCoherence, 0, len(types))
+	var driftSum float64
+	for _, pt := range types {
+		s := snapshot[pt]
+		total := s.Total()
+		var driftFraction float64
+		if total == 0 {
+			// Empty-plan boundary fix (IMPL-SPEC B2, blind-review-1): an idle
+			// provider with nothing to reconcile is fully in-sync, not
+			// maximally drifted. The naive (C+U+D)/Total() would be 0/0.
+			driftFraction = 0
+		} else {
+			driftFraction = float64(s.Creates+s.Updates+s.Deletes) / float64(total)
+		}
+		driftSum += driftFraction
+		perProvider = append(perProvider, ProviderCoherence{
+			ProviderType:  pt,
+			DriftFraction: driftFraction,
+			HasSummary:    true,
+			Creates:       s.Creates,
+			Updates:       s.Updates,
+			Deletes:       s.Deletes,
+			Skipped:       s.Skipped,
+			Total:         total,
+		})
+	}
+
+	cB = 1 - (driftSum / float64(len(types)))
+	return cB, perProvider
 }
 
 // ProviderConvergence returns the current per-provider reconcile anomaly
@@ -519,6 +612,15 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 			"provider", providerType, "err", err)
 		return fmt.Errorf("ComputePlan %s: %w", providerType, err)
 	}
+
+	// Cache this cycle's Summary for LastCoherence (First Instruments B2/
+	// M1-B). Telemetry, not kernel state (§0) — already computed above, so
+	// this adds no marginal cost. Cached unconditionally (both the
+	// early "in sync" exit and the full apply path below read the same
+	// already-computed plan.Summary).
+	d.lastSummariesMu.Lock()
+	d.lastSummaries[providerType] = plan.Summary
+	d.lastSummariesMu.Unlock()
 
 	// phaseAttrs records the per-phase timings on the cycle span. Called at both
 	// exits (early "in sync" return and full cycle) so traces always carry the

@@ -71,6 +71,12 @@ type Server struct {
 	agentController   AgentController // nil until SetAgentController is called
 	mcpServer         *MCPServer      // so SetAgentController can propagate to tools
 
+	// reconcileDaemon backs GET /v1/reconcile/coherence (First Instruments
+	// Module B, M1-B). nil until SetReconcileDaemon is called — the daemon is
+	// constructed after NewServer in engine.Boot, so this is wired
+	// post-construction rather than passed to NewServer.
+	reconcileDaemon *ReconcileDaemon
+
 	// Track 5 Phase 3 surface — per-bus event store, SSE broker, and
 	// consumer cursor registry. Scoped to the server so tests can create
 	// isolated instances.
@@ -196,6 +202,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "GET /v1/tool-calls", s.handleToolCalls)
 	s.route(mux, "GET /v1/conversation", s.handleConversation)
 	s.route(mux, "GET /v1/manifest", s.handleManifest)
+	s.route(mux, "GET /v1/reconcile/coherence", s.handleReconcileCoherence)
 	s.registerAgentRoutes(mux)
 	s.registerSkillRoutes(mux)
 
@@ -330,6 +337,17 @@ func (s *Server) SetAgentController(ctrl AgentController) {
 		lhc.SetDashboardBus(s.busSessions)
 		BindDashboardController(lhc)
 	}
+}
+
+// SetReconcileDaemon wires the kernel's ReconcileDaemon into the server so
+// GET /v1/reconcile/coherence (First Instruments Module B, M1-B) can read
+// LastCoherence(). Called from Boot() after the daemon is constructed. Nil
+// is safe (the handler reports coherent-by-default with an empty detail
+// slice, matching ReconcileDaemon.LastCoherence's own zero-observations
+// case) so this wiring is optional for callers that never registered a
+// daemon (e.g. hand-built *Server instances in unrelated tests).
+func (s *Server) SetReconcileDaemon(d *ReconcileDaemon) {
+	s.reconcileDaemon = d
 }
 
 // SetHarnessBackend wires the RBAC harness-binding layer into the server.

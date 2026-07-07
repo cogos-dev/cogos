@@ -315,6 +315,7 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		PollInterval:  bootCfg.pollInterval,
 	})
 	reconcileDaemon.Start(kernelCtx)
+	server.SetReconcileDaemon(reconcileDaemon)
 
 	// Wire ProjectionWatcher as an early-trigger source.
 	for _, kind := range AllProjectionKinds {
