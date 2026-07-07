@@ -8,7 +8,7 @@ imperative `com.cogos.lmstudio-baseline` launchd job.
 It is **orthogonal to dispatch**. Dispatch (chat completions) still flows through
 the existing `lmstudio` / `openai` provider on the same backend. This reconciler
 adds a second concern on top: model/context state. See
-[ADR-103](../adrs/103-lms-model-state-reconciler.md) for the design rationale.
+[ADR-104](../adrs/104-lms-model-state-reconciler.md) for the design rationale.
 
 > **This feature is OFF BY DEFAULT.** It activates only when a backend declares
 > `options.model_state.manage: true`. Absent that, nothing is registered and the

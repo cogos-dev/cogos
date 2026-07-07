@@ -1,4 +1,4 @@
-# ADR-103: `lms-model-state` — A Declarative Reconciler for LM Studio Model/Context State
+# ADR-104: `lms-model-state` — A Declarative Reconciler for LM Studio Model/Context State
 
 | Field   | Value |
 |---------|-------|

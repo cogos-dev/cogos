@@ -1,6 +1,6 @@
 # lms-actuator
 
-The mutating half of the CogOS `lms-model-state` reconciler (ADR-103). It
+The mutating half of the CogOS `lms-model-state` reconciler (ADR-104). It
 load/unload/re-loads LM Studio models at a target context length over the
 `@lmstudio/sdk` websocket bridge, on behalf of
 `internal/engine/provider_lms_model_state.go`'s `ApplyPlan`.

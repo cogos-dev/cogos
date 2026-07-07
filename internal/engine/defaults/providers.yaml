@@ -22,7 +22,7 @@
 #     timeout: 300
 #     context_window: 32768
 #
-# ── OPT-IN: lms-model-state reconciler (ADR-103) ─────────────────────────────
+# ── OPT-IN: lms-model-state reconciler (ADR-104) ─────────────────────────────
 # An LM Studio dispatch backend can additionally opt into declarative
 # model/context-state reconciliation: the kernel keeps the declared model loaded
 # at the declared context length via the Node @lmstudio/sdk actuator
