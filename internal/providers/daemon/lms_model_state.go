@@ -68,9 +68,13 @@ func (p *lmsModelStateProvider) Health() reconcile.ResourceStatus {
 	defer cancel()
 
 	var issues []string
+	var anyProgressing bool
 	for _, e := range entries {
-		if err := probeModelStateEntry(ctx, e); err != nil {
+		progressing, err := probeModelStateEntry(ctx, e)
+		if err != nil {
 			issues = append(issues, fmt.Sprintf("%s: %v", e.name, err))
+		} else if progressing {
+			anyProgressing = true
 		}
 	}
 
@@ -83,6 +87,18 @@ func (p *lmsModelStateProvider) Health() reconcile.ResourceStatus {
 			Health:    reconcile.HealthDegraded,
 			Operation: reconcile.OperationIdle,
 			Message:   strings.Join(issues, "; "),
+		}
+	}
+
+	if anyProgressing {
+		// A managed model is mid-load (state=="loading"). That is Progressing, not
+		// a problem — a high-context load can take minutes. Matches the engine
+		// provider's loading→Progressing mapping so proprioception doesn't false-alarm.
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusUnknown,
+			Health:    reconcile.HealthProgressing,
+			Operation: reconcile.OperationWaiting,
+			Message:   "model load in progress",
 		}
 	}
 
@@ -179,9 +195,16 @@ func parseModelStateEntriesFromYAML(data []byte) []modelStateEntry {
 	return entries
 }
 
-// probeModelStateEntry checks one backend: read /api/v0/models and confirm the
-// declared model is loaded at the declared context length. Read-only.
-func probeModelStateEntry(ctx context.Context, e modelStateEntry) error {
+// probeModelStateEntry checks one backend: read /api/v0/models and report whether
+// the declared model is loaded at the declared context. Read-only.
+//
+// Returns (progressing, err). progressing==true means the model is mid-load
+// (state=="loading"), which is Progressing — NOT a health issue: a high-context
+// load can take minutes and must never read as Degraded. A non-nil err is a real
+// problem (unreachable / wrong context / not loaded / absent). Mirrors the engine
+// provider's findModelRow (prefer the state=="loaded" row) and ComputePlan
+// (loading is not drift) so the daemon proprioception matches the engine's Health().
+func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) {
 	base := strings.TrimRight(e.endpoint, "/")
 	if base == "" {
 		base = "http://localhost:1234"
@@ -189,7 +212,7 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) error {
 	url := base + "/api/v0/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return false, fmt.Errorf("build request: %w", err)
 	}
 	if e.apiKeyEnv != "" {
 		if tok := os.Getenv(e.apiKeyEnv); tok != "" {
@@ -199,11 +222,11 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) error {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("unreachable: %v", err)
+		return false, fmt.Errorf("unreachable: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("/api/v0/models returned %d", resp.StatusCode)
+		return false, fmt.Errorf("/api/v0/models returned %d", resp.StatusCode)
 	}
 
 	var out struct {
@@ -214,24 +237,49 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) error {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fmt.Errorf("decode: %w", err)
+		return false, fmt.Errorf("decode: %w", err)
 	}
 
-	for _, m := range out.Data {
+	// Collect id-matching rows, preferring state=="loaded" so a not-loaded/loading
+	// duplicate row cannot shadow the real loaded one (LM Studio can return both).
+	loadedIdx, loadingIdx, otherIdx := -1, -1, -1
+	for i := range out.Data {
+		m := out.Data[i]
 		if m.ID != e.model && !strings.HasPrefix(m.ID, e.model) && !strings.HasPrefix(e.model, m.ID) {
 			continue
 		}
-		if m.State != "loaded" {
-			return fmt.Errorf("model %q state=%q (want loaded)", e.model, m.State)
+		switch m.State {
+		case "loaded":
+			if loadedIdx == -1 {
+				loadedIdx = i
+			}
+		case "loading":
+			if loadingIdx == -1 {
+				loadingIdx = i
+			}
+		default:
+			if otherIdx == -1 {
+				otherIdx = i
+			}
 		}
+	}
+
+	switch {
+	case loadedIdx != -1:
+		m := out.Data[loadedIdx]
 		if e.contextLength > 0 && (m.LoadedContextLength == nil || *m.LoadedContextLength != e.contextLength) {
 			got := "null"
 			if m.LoadedContextLength != nil {
 				got = fmt.Sprintf("%d", *m.LoadedContextLength)
 			}
-			return fmt.Errorf("model %q loaded at context %s (want %d)", e.model, got, e.contextLength)
+			return false, fmt.Errorf("model %q loaded at context %s (want %d)", e.model, got, e.contextLength)
 		}
-		return nil
+		return false, nil
+	case loadingIdx != -1:
+		return true, nil // mid-load — Progressing, not an issue
+	case otherIdx != -1:
+		return false, fmt.Errorf("model %q state=%q (want loaded)", e.model, out.Data[otherIdx].State)
+	default:
+		return false, fmt.Errorf("model %q not present", e.model)
 	}
-	return fmt.Errorf("model %q not present", e.model)
 }

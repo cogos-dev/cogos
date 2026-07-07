@@ -1,15 +1,80 @@
 // lms_model_state_test.go — unit tests for the daemon-side lms-model-state provider.
 //
-// Whitebox (package daemon). Exercises the model_state YAML parser and the
-// opt-in Health() gate. No live LM Studio; the network probe is not exercised
-// here (Health() over a real backend lives in the engine-layer tests).
+// Whitebox (package daemon). Exercises the model_state YAML parser, the opt-in
+// Health() gate, and the /api/v0/models probe (loading→progressing, prefer the
+// loaded row over a not-loaded duplicate) via httptest.
 package daemon
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
+
+// ── probeModelStateEntry: HTTP path (loading + duplicate-row ordering) ───────────
+
+type msRow struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
+	Ctx   *int   `json:"loaded_context_length"`
+}
+
+func msIntp(n int) *int { return &n }
+
+func msModelsServer(t *testing.T, rows ...msRow) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v0/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": rows})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestProbeModelStateEntry_LoadingIsProgressingNotError(t *testing.T) {
+	// A model mid-load (state=="loading", nil context) must report progressing,
+	// NOT a Degraded-inducing error — a high-context load can take minutes.
+	srv := msModelsServer(t, msRow{ID: "target", State: "loading", Ctx: nil})
+	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
+	progressing, err := probeModelStateEntry(context.Background(), e)
+	if err != nil {
+		t.Fatalf("loading must not be an error, got %v", err)
+	}
+	if !progressing {
+		t.Fatalf("loading must report progressing=true")
+	}
+}
+
+func TestProbeModelStateEntry_PrefersLoadedOverDuplicate(t *testing.T) {
+	// A not-loaded duplicate ordered BEFORE the loaded row must not shadow it.
+	srv := msModelsServer(t,
+		msRow{ID: "target", State: "not-loaded", Ctx: nil},
+		msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)},
+	)
+	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
+	progressing, err := probeModelStateEntry(context.Background(), e)
+	if err != nil {
+		t.Fatalf("loaded duplicate must satisfy the probe, got %v", err)
+	}
+	if progressing {
+		t.Fatalf("loaded-at-target must not report progressing")
+	}
+}
+
+func TestProbeModelStateEntry_WrongContextIsError(t *testing.T) {
+	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(65536)})
+	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
+	if _, err := probeModelStateEntry(context.Background(), e); err == nil {
+		t.Fatalf("wrong loaded context must be an error")
+	}
+}
 
 // ── parseModelStateEntriesFromYAML ──────────────────────────────────────────────
 
