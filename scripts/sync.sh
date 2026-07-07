@@ -8,8 +8,11 @@
 #
 # Projection sync mechanism for .cog/ <-> cog branch (OBSOLETE)
 
-# Note: Don't use 'set -euo pipefail' here as it affects the parent shell
-# The kernel manages its own error handling
+# no-pipefail: sourced library (not executed standalone) — 'set -e'/'pipefail'
+# here would mutate the *calling* shell's option state for every session that
+# sources this file, which is a correctness hazard, not a style choice.
+# (Pre-existing note, same reasoning: don't use 'set -euo pipefail' here as it
+# affects the parent shell; the kernel manages its own error handling.)
 
 # Get the hash of current .cog/ state
 cog_state_hash() {

@@ -79,6 +79,15 @@ jobs:
         with:
           version: v2.11
 
+      # Shell-hardening gate (ledger L15): every tracked scripts/*.sh file
+      # must declare `set -euo pipefail` (or `set -eu` for POSIX sh, which
+      # has no pipefail) or carry a documented `# no-pipefail: <reason>`
+      # opt-out — plus a shellcheck error-severity pass (0 pre-existing
+      # findings at error severity, so any hit is a real regression).
+      # ubuntu-latest ships shellcheck preinstalled.
+      - name: Shell hardening gate
+        run: ./scripts/check-shell-hardening.sh scripts
+
   e2e:
     runs-on: ubuntu-latest
     needs: build
