@@ -24,6 +24,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -31,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -124,107 +126,362 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(card)
 }
 
-// handleModels returns an OpenAI-compatible model list (G2 both-menu).
+// compatModelPermission mirrors the OpenAI model_permission object.
+type compatModelPermission struct {
+	ID            string `json:"id"`
+	Object        string `json:"object"`
+	Created       int64  `json:"created"`
+	AllowSampling bool   `json:"allow_sampling"`
+	AllowLogprobs bool   `json:"allow_logprobs"`
+	AllowView     bool   `json:"allow_view"`
+}
+
+// compatModel is a single entry in the /v1/models list. `tier` and
+// `description` are cogos extensions ignored by standard OpenAI clients.
+type compatModel struct {
+	ID          string                  `json:"id"`
+	Object      string                  `json:"object"`
+	Created     int64                   `json:"created"`
+	OwnedBy     string                  `json:"owned_by"`
+	Permission  []compatModelPermission `json:"permission"`
+	Tier        string                  `json:"tier,omitempty"`
+	Description string                  `json:"description,omitempty"`
+}
+
+type compatModelsResponse struct {
+	Object string        `json:"object"`
+	Data   []compatModel `json:"data"`
+}
+
+// mkCompatModel builds a compatModel with the boilerplate permission block.
+func mkCompatModel(id, owner, tier, description string, now int64) compatModel {
+	return compatModel{
+		ID: id, Object: "model", Created: now, OwnedBy: owner,
+		Tier:        tier,
+		Description: description,
+		Permission: []compatModelPermission{{
+			ID:            "modelperm-" + id,
+			Object:        "model_permission",
+			Created:       now,
+			AllowSampling: true,
+			AllowLogprobs: true,
+			AllowView:     true,
+		}},
+	}
+}
+
+// modelsPerProviderTimeout bounds each provider's live ListModels call during
+// /v1/models composition. One down or slow (or 401ing) backend must never fail
+// the endpoint nor block it beyond this budget — it is skipped (graceful
+// degradation).
+const modelsPerProviderTimeout = 2 * time.Second
+
+// modelsCacheTTL bounds how long a composed /v1/models list is reused before it
+// is recomposed (which fires the live per-provider probes). Keeps concurrent
+// callers from stampeding every backend on every request.
+const modelsCacheTTL = 45 * time.Second
+
+// modelsCacheEntry holds the last composed /v1/models list for one router and
+// when it was built. Recomposition happens under the entry's lock
+// (single-flight): concurrent callers on a cold/stale entry collapse into one
+// composition instead of each firing the live backend probes. This mirrors the
+// hold-lock-during-fetch rationale of the provider Available() TTL caches (#441).
+type modelsCacheEntry struct {
+	mu        sync.Mutex
+	data      []compatModel
+	fetchedAt time.Time
+}
+
+// modelsListCaches keys a modelsCacheEntry by the router it was composed from,
+// so that distinct routers (the daemon's single live router in production; many
+// independent routers in tests) never serve each other's stale menus. The outer
+// mutex guards only the map; the per-router probe/compose runs under the entry's
+// own lock. A nil router uses the shared zero-key entry.
 //
-// Menu order and fields:
-//  1. Intent aliases (owned_by "cogos"): foreground, deliberation, local.
-//     These are always present — they are software-defined names, not
-//     hardware-presence signals.
-//  2. Raw frontier model IDs (owned_by "anthropic"): claude-sonnet-4-6,
-//     claude-opus-4-7.
-//  3. eclipse-26b (owned_by "cogos", tier "lan-local") — ONLY when the
-//     eclipse provider is registered in the router. Gated on config presence;
-//     no live HTTP probe on every call.
+// Entries are intentionally NEVER evicted. In production this is bounded: the
+// daemon builds exactly one long-lived router, so the map holds a single entry
+// for the process lifetime. The unbounded shape only matters if the kernel ever
+// recreates routers at runtime (reload/reconcile) — should that land, evict the
+// stale router's entry on teardown (e.g. in SimpleRouter.Close) or re-key this
+// cache off the Server (one per daemon) instead of the Router. In tests each
+// freshly-constructed router leaks one entry, which is negligible for a test
+// process.
+var (
+	modelsListCachesMu sync.Mutex
+	modelsListCaches   = map[Router]*modelsCacheEntry{}
+)
+
+// modelsCacheFor returns the cache entry for a router, creating it on first use.
+func modelsCacheFor(router Router) *modelsCacheEntry {
+	modelsListCachesMu.Lock()
+	defer modelsListCachesMu.Unlock()
+	e, ok := modelsListCaches[router]
+	if !ok {
+		e = &modelsCacheEntry{}
+		modelsListCaches[router] = e
+	}
+	return e
+}
+
+// handleModels returns an OpenAI-compatible model list — a live view of the
+// providers/models actually registered and loaded, plus the always-on
+// software-defined intent aliases.
 //
-// Extension fields `tier` and `description` are ignored by standard OpenAI
-// clients; cogos-aware clients use them for UI display / routing decisions.
-// The alias IDs here MUST match the intentAliases table in resolve.go so that
-// selecting any entry from this menu resolves correctly on both gateway and
-// dispatch.
+// Menu shape:
+//  1. Intent aliases (owned_by "cogos"): foreground, deliberation (frontier),
+//     local. Gated on isFrontierConfigured / isLocalConfigured — software-defined
+//     names, not hardware-presence signals. These MUST match the intentAliases
+//     table in resolve.go so a selected entry resolves on both gateway and
+//     dispatch.
+//  2. Static frontier IDs (owned_by "anthropic", tier "frontier-managed"):
+//     claude-sonnet-4-6, claude-opus-4-7, claude-haiku-4-5-20251001. Retained so
+//     existing clients keep working even when the live Anthropic catalog probe
+//     is unavailable.
+//  3. Static eclipse-26b (tier "lan-local") when a provider actually serves the
+//     eclipse-26b model string (ProviderForModel) — retained for the same
+//     reason, and gated on the same predicate that admits it so it is never
+//     advertised-then-rejected.
+//  4. LIVE-enumerated IDs: each registered provider that implements ModelLister
+//     is probed (GET /v1/models) with a bounded per-provider timeout,
+//     concurrently. Frontier providers emit their claude ids BARE
+//     (owned_by "anthropic"); OpenAI-compat / local providers emit composite
+//     "<provider>/<model>" ids (owned_by "cogos:<provider>"). Embedding models
+//     are tagged (description "embedding"), never dropped. A provider whose probe
+//     errors or times out is skipped — the endpoint never 500s and never blocks
+//     beyond the per-provider budget.
+//
+// The composed list is deduped by final id and served from a ~45s TTL cache so
+// concurrent callers don't stampede every backend.
+//
+// THE ADMISSION-PARITY INVARIANT: every id emitted here satisfies
+// IsKnownModel(router, id) == true (resolve.go), so a client selecting any
+// advertised id never gets a boundary 400.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	s.logCompatDeprecated(r)
-	type modelPermission struct {
-		ID            string `json:"id"`
-		Object        string `json:"object"`
-		Created       int64  `json:"created"`
-		AllowSampling bool   `json:"allow_sampling"`
-		AllowLogprobs bool   `json:"allow_logprobs"`
-		AllowView     bool   `json:"allow_view"`
-	}
-	type model struct {
-		ID          string            `json:"id"`
-		Object      string            `json:"object"`
-		Created     int64             `json:"created"`
-		OwnedBy     string            `json:"owned_by"`
-		Permission  []modelPermission `json:"permission"`
-		Tier        string            `json:"tier,omitempty"`
-		Description string            `json:"description,omitempty"`
-	}
-	type response struct {
-		Object string  `json:"object"`
-		Data   []model `json:"data"`
-	}
 
-	now := time.Now().Unix()
-	mkModel := func(id, owner, tier, description string) model {
-		return model{
-			ID: id, Object: "model", Created: now, OwnedBy: owner,
-			Tier:        tier,
-			Description: description,
-			Permission: []modelPermission{{
-				ID:            "modelperm-" + id,
-				Object:        "model_permission",
-				Created:       now,
-				AllowSampling: true,
-				AllowLogprobs: true,
-				AllowView:     true,
-			}},
-		}
-	}
-
-	// Gate every entry on real provider availability. All checks are in-memory
-	// map lookups (no I/O) — same pattern as isEclipseConfigured.
-	frontierConfigured := isFrontierConfigured(s.router)
-	localConfigured := isLocalConfigured(s.router)
-	eclipseConfigured := isEclipseConfigured(s.router)
-
-	var data []model
-	if frontierConfigured {
-		// Intent aliases for frontier-managed tiers.
-		data = append(data,
-			mkModel("foreground", "cogos", "frontier-managed",
-				"interactive, full capability (managed Claude, Max sub)"),
-			mkModel("deliberation", "cogos", "frontier-managed",
-				"heavier reasoning (Opus)"),
-		)
-	}
-	if localConfigured {
-		// Intent alias for the local-sovereign tier.
-		data = append(data,
-			mkModel("local", "cogos", "local-sovereign",
-				"private, no egress (E4B on this node)"),
-		)
-	}
-	if frontierConfigured {
-		// Raw frontier model IDs.
-		data = append(data,
-			mkModel("claude-sonnet-4-6", "anthropic", "frontier-managed", ""),
-			mkModel("claude-opus-4-7", "anthropic", "frontier-managed", ""),
-			mkModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost"),
-		)
-	}
-	if eclipseConfigured {
-		data = append(data,
-			mkModel("eclipse-26b", "cogos", "lan-local",
-				"LAN-resident 26B model (Eclipse node)"),
-		)
-	}
+	data := composeModelsList(r.Context(), s.router)
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response{
+	_ = json.NewEncoder(w).Encode(compatModelsResponse{
 		Object: "list",
 		Data:   data,
 	})
+}
+
+// composeModelsList returns the /v1/models entries, served from the TTL cache
+// when fresh and recomposed under the cache lock (single-flight) when
+// cold/stale. The caller's ctx bounds the live provider probes; each probe is
+// additionally capped at modelsPerProviderTimeout.
+func composeModelsList(ctx context.Context, router Router) []compatModel {
+	entry := modelsCacheFor(router)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.data != nil && time.Since(entry.fetchedAt) < modelsCacheTTL {
+		return entry.data
+	}
+	data := buildModelsList(ctx, router)
+	entry.data = data
+	entry.fetchedAt = time.Now()
+	return data
+}
+
+// buildModelsList composes the model menu: intent aliases + static frontier /
+// eclipse ids (config-gated, in-memory) followed by the live-enumerated ids from
+// every ModelLister provider (bounded, concurrent, graceful-skip). Deduped by
+// final id, first occurrence wins so the static entries keep their curated
+// tier/description when a live probe would re-emit the same id.
+func buildModelsList(ctx context.Context, router Router) []compatModel {
+	now := time.Now().Unix()
+
+	// Gate the static/alias entries on real provider availability. All checks
+	// are in-memory map lookups (no I/O) — same pattern as isEclipseConfigured.
+	frontierConfigured := isFrontierConfigured(router)
+	localConfigured := isLocalConfigured(router)
+	// The static eclipse-26b id is admissible (IsKnownModel true) ONLY when a
+	// provider actually serves the eclipse-26b model string. Gating its emission
+	// on the same predicate keeps emit and admit in lockstep — emitting it merely
+	// because a provider named "eclipse"/"lmstudio" exists (isEclipseConfigured's
+	// broader name match) would advertise an id the kernel then 400s. The real
+	// eclipse model is surfaced via live enumeration as a composite id regardless.
+	eclipseServed := eclipseModelServed(router)
+
+	var data []compatModel
+	seen := make(map[string]bool)
+	add := func(m compatModel) {
+		if m.ID == "" || seen[m.ID] {
+			return
+		}
+		seen[m.ID] = true
+		data = append(data, m)
+	}
+
+	if frontierConfigured {
+		// Intent aliases for frontier-managed tiers.
+		add(mkCompatModel("foreground", "cogos", "frontier-managed",
+			"interactive, full capability (managed Claude, Max sub)", now))
+		add(mkCompatModel("deliberation", "cogos", "frontier-managed",
+			"heavier reasoning (Opus)", now))
+	}
+	if localConfigured {
+		// Intent alias for the local-sovereign tier.
+		add(mkCompatModel("local", "cogos", "local-sovereign",
+			"private, no egress (E4B on this node)", now))
+	}
+	if frontierConfigured {
+		// Static frontier model IDs — retained so clients keep working even when
+		// the live Anthropic catalog probe is unavailable.
+		add(mkCompatModel("claude-sonnet-4-6", "anthropic", "frontier-managed", "", now))
+		add(mkCompatModel("claude-opus-4-7", "anthropic", "frontier-managed", "", now))
+		add(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now))
+	}
+	if eclipseServed {
+		add(mkCompatModel("eclipse-26b", "cogos", "lan-local",
+			"LAN-resident 26B model (Eclipse node)", now))
+	}
+
+	// Live enumeration: probe every ModelLister provider concurrently, each
+	// bounded, skipping any that error/time out.
+	for _, m := range liveModelEntries(ctx, router, now) {
+		add(m)
+	}
+
+	return data
+}
+
+// liveModelEntries walks the router's providers, probing each ModelLister with a
+// bounded per-provider timeout, concurrently, and returns the composed live
+// entries. A provider whose probe errors or times out is skipped (slog.Debug):
+// the endpoint never fails and never blocks beyond modelsPerProviderTimeout.
+// Order is deterministic (by provider Name(), which RangeProviders guarantees),
+// so the caller's first-occurrence dedupe is stable.
+func liveModelEntries(ctx context.Context, router Router, now int64) []compatModel {
+	if router == nil {
+		return nil
+	}
+
+	// Snapshot the ModelLister providers in Name() order.
+	var listers []Provider
+	router.RangeProviders(func(p Provider) {
+		if _, ok := p.(ModelLister); ok {
+			listers = append(listers, p)
+		}
+	})
+	if len(listers) == 0 {
+		return nil
+	}
+
+	// Probe concurrently; per-provider results indexed to preserve order.
+	results := make([][]compatModel, len(listers))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i, p := range listers {
+		wg.Add(1)
+		go func(i int, p Provider) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, modelsPerProviderTimeout)
+			defer cancel()
+			ids, err := p.(ModelLister).ListModels(pctx)
+			if err != nil {
+				slog.Debug("compat: /v1/models: provider enumeration skipped",
+					"provider", p.Name(), "err", err)
+				return
+			}
+			entries := make([]compatModel, 0, len(ids))
+			frontier := isFrontierProvider(p)
+			for _, id := range ids {
+				if id == "" {
+					continue
+				}
+				entries = append(entries, modelEntryFor(p, id, frontier, now))
+			}
+			mu.Lock()
+			results[i] = entries
+			mu.Unlock()
+		}(i, p)
+	}
+	wg.Wait()
+
+	var out []compatModel
+	for _, entries := range results {
+		out = append(out, entries...)
+	}
+	return out
+}
+
+// isFrontierProvider reports whether p is an Anthropic/Claude frontier provider,
+// so its live model ids are emitted BARE (owned_by "anthropic", preserving
+// existing client naming) rather than composite.
+//
+// The set is the explicit canonical name list ONLY — deliberately NOT a
+// !IsLocal structural fallthrough. Bare claude ids are admitted by
+// resolveLiveCatalog's claude-* branch, which requires a frontier provider
+// (frontierProviderName, same name set). A non-local, non-claude ModelLister
+// (none exists today — OpenAICompatProvider is IsLocal=true — but a future one
+// could) whose ids were emitted bare would have NO admission path (not a
+// composite prefix, not a claude- id, not ProviderForModel), producing an
+// advertise-then-reject. Restricting to the names that have a real bare
+// admission path keeps emit ⇔ admit; everything else emits composite, which
+// always admits via the ProviderForName prefix guard.
+func isFrontierProvider(p Provider) bool {
+	switch p.Name() {
+	case "claude-oauth", "anthropic", "claude-code":
+		return true
+	}
+	return false
+}
+
+// isEmbeddingModelID reports whether a model id names an embedding model, so the
+// entry is tagged (description "embedding") instead of presented as a chat model.
+func isEmbeddingModelID(id string) bool {
+	l := strings.ToLower(id)
+	return strings.Contains(l, "text-embedding") || strings.Contains(l, "embed")
+}
+
+// modelEntryFor builds the compatModel for a live-enumerated id. Frontier
+// providers emit bare claude ids (owned_by "anthropic"); OpenAI-compat / local
+// providers emit composite "<provider>/<model>" ids (owned_by "cogos:<provider>")
+// with a tier derived from the provider name/capabilities. Embedding ids are
+// tagged rather than dropped.
+//
+// Bare emission is additionally guarded on the "claude-" prefix: resolveLiveCatalog
+// only admits bare frontier ids that start with "claude-", so an id from a frontier
+// provider that lacks the prefix (Anthropic's /v1/models returns only claude-* ids
+// today, so this is defensive) falls back to composite emission — which always
+// admits via the ProviderForName prefix guard — rather than becoming an
+// advertise-then-reject bare id.
+func modelEntryFor(p Provider, id string, frontier bool, now int64) compatModel {
+	desc := ""
+	if isEmbeddingModelID(id) {
+		desc = "embedding"
+	}
+	if frontier && strings.HasPrefix(id, "claude-") {
+		return mkCompatModel(id, "anthropic", "frontier-managed", desc, now)
+	}
+	name := p.Name()
+	composite := name + "/" + id
+	tier := "frontier-managed"
+	switch {
+	case strings.Contains(strings.ToLower(name), "eclipse"):
+		tier = "lan-local"
+	case p.Capabilities().IsLocal:
+		tier = "local-sovereign"
+	}
+	return mkCompatModel(composite, "cogos:"+name, tier, desc, now)
+}
+
+// eclipseModelServed reports whether some registered provider actually serves
+// the eclipse-26b model string. This is exactly the condition under which
+// IsKnownModel(router, "eclipse-26b") is true (via ProviderForModel), so it is
+// the correct emit-gate for the static eclipse-26b menu entry: emit ⇔ admit.
+// The broader name-based isEclipseConfigured is retained for callers that only
+// need to know an eclipse/lmstudio provider is present, but must NOT gate the
+// static id emission (that would advertise-then-reject).
+func eclipseModelServed(router Router) bool {
+	if router == nil {
+		return false
+	}
+	_, ok := router.ProviderForModel("eclipse-26b")
+	return ok
 }
 
 // isEclipseConfigured returns true when the router has a registered provider

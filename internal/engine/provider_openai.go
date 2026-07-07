@@ -243,6 +243,13 @@ func (p *OpenAICompatProvider) effectiveModel(req *CompletionRequest) string {
 	return p.model
 }
 
+// ListModels enumerates the concrete model IDs this OpenAI-compatible endpoint
+// currently serves (GET /v1/models). Satisfies the ModelLister interface used
+// by the /v1/models composition handler.
+func (p *OpenAICompatProvider) ListModels(ctx context.Context) ([]string, error) {
+	return p.listModels(ctx)
+}
+
 // listModels fetches the model list from /v1/models.
 func (p *OpenAICompatProvider) listModels(ctx context.Context) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/v1/models", nil)

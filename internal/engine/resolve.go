@@ -31,6 +31,7 @@ package engine
 
 import (
 	"log/slog"
+	"strings"
 )
 
 // ModelResolution is the output of ResolveModelRequest.
@@ -73,6 +74,81 @@ var intentAliases = map[string]ModelResolution{
 	// via this alias default.
 	"ollama":       {PreferProvider: "lmstudio-darkstar", InjectKernelTools: true},
 	"kernel-agent": {PreferProvider: "lmstudio-darkstar", InjectKernelTools: true},
+}
+
+// resolveLiveCatalog resolves the two id families that the live GET /v1/models
+// endpoint advertises beyond the static alias table, so an advertised id never
+// gets a boundary 400 (the admission-parity invariant). It is the single source
+// of truth shared by ResolveModelRequest and IsKnownModel.
+//
+//   - Composite "<provider>/<model>": split on the FIRST "/". When the prefix is
+//     a REGISTERED provider name, resolve to {PreferProvider: prefix,
+//     ModelOverride: suffix}. When the prefix is not a registered provider (e.g.
+//     an "openrouter/x/y"-style id), report no match so the caller falls through
+//     to the existing logic — this guard prevents mis-splitting such ids.
+//   - Live claude ids: when a frontier provider is registered (see
+//     frontierProviderName — the same predicate isFrontierConfigured emits on)
+//     AND the id has the "claude-" prefix, resolve to that provider with
+//     ModelOverride=model. This makes newly-shipped Anthropic ids (not in
+//     intentAliases) both admissible and routable — matching the "claude-oauth
+//     is model-agnostic" design intent — and keeps emit/admit in lockstep so a
+//     bare claude id like claude-haiku-4-5-20251001 is never advertised-then-
+//     rejected.
+//
+// Returns (resolution, true) on a match; (zero, false) otherwise. A nil router
+// yields no match (the caller handles the nil-router path).
+func resolveLiveCatalog(router Router, model string) (ModelResolution, bool) {
+	if router == nil || model == "" {
+		return ModelResolution{}, false
+	}
+
+	// Composite "<provider>/<model>": only when the prefix is a registered
+	// provider name; otherwise fall through so multi-segment ids aren't
+	// mis-split.
+	if i := strings.Index(model, "/"); i > 0 && i < len(model)-1 {
+		prefix, suffix := model[:i], model[i+1:]
+		if name, ok := router.ProviderForName(prefix); ok {
+			return ModelResolution{PreferProvider: name, ModelOverride: suffix}, true
+		}
+	}
+
+	// Live claude ids → the registered frontier provider (claude-oauth first).
+	if strings.HasPrefix(model, "claude-") {
+		if name, ok := frontierProviderName(router); ok {
+			return ModelResolution{PreferProvider: name, ModelOverride: model}, true
+		}
+	}
+
+	return ModelResolution{}, false
+}
+
+// frontierProviderName returns the registered frontier provider to route
+// managed-Claude ids to. It MUST admit under exactly the same conditions that
+// serve_compat.go's isFrontierConfigured emits the bare claude ids, or the
+// endpoint advertises a claude id that IsKnownModel rejects (advertise-then-
+// reject; the admission-parity invariant). isFrontierConfigured matches by
+// provider name {claude-oauth, anthropic, claude-code} OR by a provider serving
+// claude-sonnet-4-6 / claude-opus-4-7 under any name — so this helper checks the
+// same predicates and returns a routable provider name for each.
+//
+// Preference order mirrors the model-agnostic frontier failover: the direct-API
+// providers (claude-oauth, then anthropic) first, then the claude-code CLI, then
+// whatever provider serves the representative sonnet/opus model strings.
+func frontierProviderName(router Router) (string, bool) {
+	if router == nil {
+		return "", false
+	}
+	for _, name := range []string{"claude-oauth", "anthropic", "claude-code"} {
+		if n, ok := router.ProviderForName(name); ok {
+			return n, true
+		}
+	}
+	for _, model := range []string{"claude-sonnet-4-6", "claude-opus-4-7"} {
+		if n, ok := router.ProviderForModel(model); ok {
+			return n, true
+		}
+	}
+	return "", false
 }
 
 // ResolveModelRequest maps a model string to a ModelResolution using the
@@ -135,6 +211,14 @@ func ResolveModelRequest(router Router, model string, requestID string) ModelRes
 	if name, ok := router.ProviderForName(model); ok {
 		return ModelResolution{PreferProvider: name}
 	}
+
+	// Live-catalog parity: composite "<provider>/<model>" and newly-shipped
+	// claude-* ids advertised by GET /v1/models must both admit (IsKnownModel)
+	// and route. Checked before the generic ProviderForModel fallback so a
+	// composite id resolves to its named provider with the suffix as override.
+	if res, ok := resolveLiveCatalog(router, model); ok {
+		return res
+	}
 	// Model-ID pass-through: set ModelOverride and, if a provider serves this
 	// model, also set PreferProvider.
 	res := ModelResolution{ModelOverride: model}
@@ -179,6 +263,13 @@ func IsKnownModel(router Router, model string) bool {
 		return true
 	}
 	if _, ok := router.ProviderForModel(model); ok {
+		return true
+	}
+	// Live-catalog parity: composite "<provider>/<model>" ids and newly-shipped
+	// claude-* ids advertised at GET /v1/models are admissible even when they are
+	// not in the static alias table nor served by a ProviderForModel match. Same
+	// helper ResolveModelRequest uses, so admission and routing never diverge.
+	if _, ok := resolveLiveCatalog(router, model); ok {
 		return true
 	}
 	return false

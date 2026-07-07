@@ -34,6 +34,7 @@ type stubRouter struct {
 	byName  map[string]string // name → name
 	byModel map[string]string // model → provider name
 	local   []string          // providers with IsLocal=true, in order
+	provs   []Provider        // providers visited by RangeProviders (opt-in)
 }
 
 func newStubRouter() *stubRouter {
@@ -69,6 +70,15 @@ func (r *stubRouter) FirstLocalProvider() (string, bool) {
 		return r.local[0], true
 	}
 	return "", false
+}
+
+// RangeProviders visits the stub's registered providers. The stub tracks only
+// provider names/models, not Provider values, so it visits nothing by default;
+// tests that need live enumeration wire providers via provs (see below).
+func (r *stubRouter) RangeProviders(fn func(p Provider)) {
+	for _, p := range r.provs {
+		fn(p)
+	}
 }
 
 // Unused Router interface methods — satisfy the interface without panicking.
@@ -472,47 +482,65 @@ func TestModelsMenu_Eclipse26B_AbsentWhenNotConfigured(t *testing.T) {
 	}
 }
 
-func TestModelsMenu_Eclipse26B_PresentWhenEclipseRegistered(t *testing.T) {
+func TestModelsMenu_Eclipse26B_PresentWhenModelServed(t *testing.T) {
 	t.Parallel()
 
+	// A provider that actually SERVES the eclipse-26b model string. This is the
+	// only condition under which IsKnownModel(router,"eclipse-26b") is true, so it
+	// is the only condition under which the static eclipse-26b id may be emitted
+	// (emit ⇔ admit — the admission-parity invariant). A provider merely NAMED
+	// "eclipse"/"lmstudio" that serves some other model must NOT surface it (see
+	// TestModelsMenu_Eclipse26B_AbsentWhenNameOnly).
 	eclipseStub := NewStubProvider("eclipse", "eclipse response")
+	eclipseStub.model = "eclipse-26b"
 	router := NewSimpleRouter(RoutingConfig{Default: "eclipse"})
 	router.RegisterProvider(eclipseStub)
 
 	srv := newTestServerWithRouter(t, router)
 	resp := fetchModels(t, srv)
-	body, _ := json.Marshal(resp)
 
-	if !bytes.Contains(body, []byte("eclipse-26b")) {
-		t.Errorf("eclipse-26b should appear when eclipse provider is registered; body: %s", body)
-	}
-	// Verify tier.
+	var found bool
 	for _, m := range resp.Data {
 		if m.ID == "eclipse-26b" {
+			found = true
 			if m.Tier != "lan-local" {
 				t.Errorf("eclipse-26b tier = %q; want lan-local", m.Tier)
 			}
 			if m.OwnedBy != "cogos" {
 				t.Errorf("eclipse-26b owned_by = %q; want cogos", m.OwnedBy)
 			}
-			return
 		}
 	}
-	t.Error("eclipse-26b model entry not found in response Data")
+	if !found {
+		t.Errorf("eclipse-26b model entry not found in response Data: %+v", resp.Data)
+	}
+
+	// Admission parity: the advertised id must satisfy IsKnownModel.
+	if !IsKnownModel(router, "eclipse-26b") {
+		t.Error("eclipse-26b advertised but IsKnownModel returned false (advertise-then-reject)")
+	}
 }
 
-func TestModelsMenu_Eclipse26B_PresentWhenLMStudioRegistered(t *testing.T) {
+func TestModelsMenu_Eclipse26B_AbsentWhenNameOnly(t *testing.T) {
 	t.Parallel()
 
+	// Provider named "lmstudio"/"eclipse" but serving a DIFFERENT model — the
+	// pre-existing name-detection would have emitted eclipse-26b here, but the
+	// kernel boundary would then 400 a client selecting it (IsKnownModel false).
+	// Emit-gate is now ProviderForModel("eclipse-26b"), so it must NOT appear.
 	lmsStub := NewStubProvider("lmstudio", "lms response")
+	lmsStub.model = "ornith-1.0-35b"
 	router := NewSimpleRouter(RoutingConfig{Default: "lmstudio"})
 	router.RegisterProvider(lmsStub)
 
 	srv := newTestServerWithRouter(t, router)
 	body, _ := json.Marshal(fetchModels(t, srv))
 
-	if !bytes.Contains(body, []byte("eclipse-26b")) {
-		t.Errorf("eclipse-26b should appear when lmstudio provider is registered; body: %s", body)
+	if bytes.Contains(body, []byte("eclipse-26b")) {
+		t.Errorf("eclipse-26b must NOT be advertised when no provider serves it (IsKnownModel would 400 it); body: %s", body)
+	}
+	if IsKnownModel(router, "eclipse-26b") {
+		t.Error("IsKnownModel(eclipse-26b) should be false when no provider serves that model")
 	}
 }
 
@@ -659,6 +687,123 @@ func TestResolveModelRequest_26B_FallsThrough(t *testing.T) {
 	res := ResolveModelRequest(nil, "26b", "req-26b")
 	if res.PreferProvider != "" {
 		t.Errorf("26b: PreferProvider = %q; want empty (fall-through)", res.PreferProvider)
+	}
+}
+
+// ── Live-catalog parity: composite ids + newly-shipped claude ids ────────────
+//
+// These exercise resolveLiveCatalog through both ResolveModelRequest (routing)
+// and IsKnownModel (admission) so the two never diverge — the admission-parity
+// invariant that keeps GET /v1/models from advertising an id the boundary 400s.
+
+func TestResolveLiveCatalog_CompositeID_ResolvesAndAdmits(t *testing.T) {
+	t.Parallel()
+
+	router := NewSimpleRouter(RoutingConfig{})
+	router.RegisterProvider(NewStubProvider("lmstudio-eclipse", "r"))
+
+	const id = "lmstudio-eclipse/ornith-1.0-35b"
+	res := ResolveModelRequest(router, id, "t")
+	if res.PreferProvider != "lmstudio-eclipse" {
+		t.Errorf("composite PreferProvider = %q; want lmstudio-eclipse", res.PreferProvider)
+	}
+	if res.ModelOverride != "ornith-1.0-35b" {
+		t.Errorf("composite ModelOverride = %q; want ornith-1.0-35b", res.ModelOverride)
+	}
+	if !IsKnownModel(router, id) {
+		t.Errorf("composite id %q must be admissible", id)
+	}
+}
+
+func TestResolveLiveCatalog_CompositeID_UnregisteredPrefixFallsThrough(t *testing.T) {
+	t.Parallel()
+
+	// "openrouter" is NOT a registered provider, so an "openrouter/x/y"-style id
+	// must NOT be mis-split: it falls through to the generic model-id path
+	// (ModelOverride = whole string, no PreferProvider) and IsKnownModel is false.
+	router := NewSimpleRouter(RoutingConfig{})
+	router.RegisterProvider(NewStubProvider("lmstudio-darkstar", "r"))
+
+	const id = "openrouter/anthropic/claude-3"
+	res := ResolveModelRequest(router, id, "t")
+	if res.PreferProvider != "" {
+		t.Errorf("unregistered-prefix PreferProvider = %q; want empty (fall-through)", res.PreferProvider)
+	}
+	if res.ModelOverride != id {
+		t.Errorf("unregistered-prefix ModelOverride = %q; want whole id %q", res.ModelOverride, id)
+	}
+	if IsKnownModel(router, id) {
+		t.Errorf("unregistered-prefix id %q must NOT admit", id)
+	}
+}
+
+func TestResolveLiveCatalog_NewClaudeID_RoutesToOAuthAndAdmits(t *testing.T) {
+	t.Parallel()
+
+	router := NewSimpleRouter(RoutingConfig{})
+	router.RegisterProvider(NewStubProvider("claude-oauth", "r"))
+
+	// A newly-shipped claude id not present in intentAliases.
+	const id = "claude-opus-4-9-20260101"
+	res := ResolveModelRequest(router, id, "t")
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("new claude id PreferProvider = %q; want claude-oauth", res.PreferProvider)
+	}
+	if res.ModelOverride != id {
+		t.Errorf("new claude id ModelOverride = %q; want %q", res.ModelOverride, id)
+	}
+	if !IsKnownModel(router, id) {
+		t.Errorf("new claude id %q must be admissible", id)
+	}
+}
+
+func TestResolveLiveCatalog_NewClaudeID_NoFrontierProviderRejects(t *testing.T) {
+	t.Parallel()
+
+	// No frontier provider registered → a bare claude id is NOT admissible and
+	// does not resolve to a frontier provider.
+	router := NewSimpleRouter(RoutingConfig{})
+	router.RegisterProvider(NewStubProvider("lmstudio-darkstar", "r"))
+
+	const id = "claude-opus-4-9-20260101"
+	if IsKnownModel(router, id) {
+		t.Errorf("claude id %q must NOT admit without a frontier provider", id)
+	}
+	res := ResolveModelRequest(router, id, "t")
+	if res.PreferProvider != "" {
+		t.Errorf("no-frontier claude id PreferProvider = %q; want empty", res.PreferProvider)
+	}
+}
+
+func TestFrontierProviderName_MatchesEmitGate(t *testing.T) {
+	t.Parallel()
+
+	// claude-code alone must yield a routable frontier provider (Finding-1: the
+	// admit gate must match isFrontierConfigured's emit gate, which includes the
+	// claude-code name).
+	rCC := NewSimpleRouter(RoutingConfig{})
+	rCC.RegisterProvider(NewStubProvider("claude-code", "r"))
+	if name, ok := frontierProviderName(rCC); !ok || name != "claude-code" {
+		t.Errorf("frontierProviderName(claude-code) = (%q,%v); want (claude-code,true)", name, ok)
+	}
+
+	// A provider serving claude-sonnet-4-6 under a non-canonical name also
+	// qualifies (matches isFrontierConfigured's ProviderForModel branch).
+	rModel := NewSimpleRouter(RoutingConfig{})
+	sp := NewStubProvider("my-anthropic", "r")
+	sp.model = "claude-sonnet-4-6"
+	rModel.RegisterProvider(sp)
+	if name, ok := frontierProviderName(rModel); !ok || name != "my-anthropic" {
+		t.Errorf("frontierProviderName(serves sonnet) = (%q,%v); want (my-anthropic,true)", name, ok)
+	}
+
+	// Preference: claude-oauth wins when several are registered.
+	rPref := NewSimpleRouter(RoutingConfig{})
+	rPref.RegisterProvider(NewStubProvider("claude-code", "r"))
+	rPref.RegisterProvider(NewStubProvider("anthropic", "r"))
+	rPref.RegisterProvider(NewStubProvider("claude-oauth", "r"))
+	if name, ok := frontierProviderName(rPref); !ok || name != "claude-oauth" {
+		t.Errorf("frontierProviderName preference = (%q,%v); want (claude-oauth,true)", name, ok)
 	}
 }
 

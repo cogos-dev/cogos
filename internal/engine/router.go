@@ -168,6 +168,21 @@ func (r *SimpleRouter) FirstLocalProvider() (string, bool) {
 	return "", false
 }
 
+// RangeProviders calls fn for each registered provider. Providers are visited
+// in Name() order. A snapshot of the provider slice is taken under the read
+// lock and the lock is released before fn runs, so fn may perform network I/O
+// (e.g. a live GET /v1/models) without holding r.mu — and must not call back
+// into the router (no re-entrancy).
+func (r *SimpleRouter) RangeProviders(fn func(p Provider)) {
+	r.mu.RLock()
+	providers := make([]Provider, len(r.providers))
+	copy(providers, r.providers)
+	r.mu.RUnlock()
+	for _, p := range providers {
+		fn(p)
+	}
+}
+
 // Route selects the best available provider for the request.
 func (r *SimpleRouter) Route(ctx context.Context, req *CompletionRequest) (Provider, *RoutingDecision, error) {
 	start := time.Now()

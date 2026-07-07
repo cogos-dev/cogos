@@ -222,10 +222,22 @@ func (s *claudeCodeCredentialSource) Resolve() (OAuthCredential, error) {
 	return OAuthCredential{}, fmt.Errorf("claude-oauth: no credential found in keychain, env, or %s", s.credPath)
 }
 
+// keychainExecTimeout bounds the `security find-generic-password` subprocess so
+// a hung/locked/prompting keychain cannot block a credential Resolve() past this
+// budget. Resolve() is called (transitively) from the /v1/models ListModels
+// probe and from Available(); neither could kill the keychain exec before,
+// because the CredentialSource.Resolve() contract carries no context. Bounding
+// it here keeps the exec self-contained and hardens both callers without
+// widening the shared interface. A timeout is treated as "no keychain credential"
+// and falls through to the env-var / file sources.
+const keychainExecTimeout = 2 * time.Second
+
 // readKeychain reads the "Claude Code-credentials" keychain entry on macOS.
 // Source: _read_claude_code_credentials_from_keychain.
 func (s *claudeCodeCredentialSource) readKeychain() (OAuthCredential, bool) {
-	out, err := exec.Command("security", "find-generic-password",
+	ctx, cancel := context.WithTimeout(context.Background(), keychainExecTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "security", "find-generic-password",
 		"-s", "Claude Code-credentials",
 		"-w").Output()
 	if err != nil {
@@ -659,6 +671,84 @@ func (p *ClaudeOAuthProvider) probeAvailable(ctx context.Context) bool {
 	}
 
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+// ListModels enumerates the Anthropic model IDs the subscription can serve by
+// performing the authenticated GET /v1/models behind the credential lifecycle,
+// mirroring Available()'s auth + reactive-refresh-on-401 pattern but parsing the
+// response body ({"data":[{"id":...}]}) instead of discarding it. Satisfies the
+// ModelLister interface used by the /v1/models composition handler.
+//
+// The credential lifecycle stays READ-ONLY here (like Available): the kernel is
+// a keychain mirror and never POSTs a refresh; ReactiveRefreshAndRetry delegates
+// any refresh to the owner. Bounded by the same short probe timeout so one slow
+// upstream cannot stall the /v1/models composition beyond a few seconds.
+func (p *ClaudeOAuthProvider) ListModels(ctx context.Context) ([]string, error) {
+	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	token, err := p.lc.FreshToken(listCtx)
+	if err != nil {
+		return nil, fmt.Errorf("claude-oauth: ListModels: credential: %w", err)
+	}
+
+	ids, status, err := p.fetchModelIDs(listCtx, token)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusUnauthorized {
+		// Reactive refresh once (read-only: delegates to the credential owner),
+		// then retry — mirrors Available()'s 401 handling.
+		token, err = p.lc.ReactiveRefreshAndRetry(listCtx)
+		if err != nil {
+			return nil, fmt.Errorf("claude-oauth: ListModels: reactive refresh: %w", err)
+		}
+		ids, status, err = p.fetchModelIDs(listCtx, token)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("claude-oauth: ListModels: /v1/models status %d", status)
+	}
+	return ids, nil
+}
+
+// fetchModelIDs performs a single authenticated GET /v1/models and parses the
+// Anthropic model-list body ({"data":[{"id":...}]}). It returns the parsed IDs
+// (only when the status is 2xx), the HTTP status code (so the caller can drive
+// the reactive-refresh-on-401 retry), and any transport/decode error.
+func (p *ClaudeOAuthProvider) fetchModelIDs(ctx context.Context, token string) ([]string, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/v1/models", nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	p.setOAuthHeaders(req, token, false)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("claude-oauth: ListModels: /v1/models: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, resp.StatusCode, nil
+	}
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("claude-oauth: ListModels: decode: %w", err)
+	}
+	ids := make([]string, 0, len(body.Data))
+	for _, m := range body.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, resp.StatusCode, nil
 }
 
 // Capabilities returns what this provider supports.

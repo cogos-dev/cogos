@@ -49,6 +49,13 @@ type Provider interface {
 	Ping(ctx context.Context) (time.Duration, error)
 }
 
+// ModelLister is implemented by providers that can enumerate the concrete model
+// IDs they currently serve upstream. handleModels type-asserts this; providers
+// that don't implement it contribute only their configured Model().
+type ModelLister interface {
+	ListModels(ctx context.Context) ([]string, error)
+}
+
 // CancelSafeCompleter is implemented by providers whose Complete() cannot
 // reliably propagate ctx-cancellation to the server (#432). Such providers
 // expose CompleteCancelSafe, which routes the request through their
@@ -390,6 +397,10 @@ type Router interface {
 	// to pin requests to an on-device provider. Returns ("", false) when no
 	// local provider is registered.
 	FirstLocalProvider() (string, bool)
+
+	// RangeProviders calls fn for each registered provider under a read lock.
+	// Order is by Name(). fn must not call back into the router (no re-entrancy).
+	RangeProviders(fn func(p Provider))
 
 	// Stats returns routing statistics.
 	Stats() RouterStats

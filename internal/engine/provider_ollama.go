@@ -204,6 +204,13 @@ func (p *OllamaProvider) Ping(ctx context.Context) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
+// ListModels enumerates the locally-available Ollama models (GET /api/tags).
+// Satisfies the ModelLister interface used by the /v1/models composition
+// handler.
+func (p *OllamaProvider) ListModels(ctx context.Context) ([]string, error) {
+	return p.listModels(ctx)
+}
+
 // listModels queries GET /api/tags and returns the names of all locally
 // available Ollama models. Empty names are filtered out. This is the shared
 // implementation used by Available() and any future listing callers, extracted
