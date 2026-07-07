@@ -827,6 +827,12 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 	// management, mirroring mlx-supervised. See docs/inference/vllm.md and
 	// the ollama-to-vllm-migration-plan cogdoc.
 	case "openai-compat", "openai", "lmstudio", "vllm", "llamacpp":
+		// Opt-in: if this backend declares options.model_state.manage:true,
+		// register a companion lms-model-state reconciler in the global
+		// reconcile registry so the autonomic ticker can keep the declared
+		// model loaded at the declared context. The dispatch provider itself is
+		// unchanged — this is an orthogonal, OFF-BY-DEFAULT concern.
+		maybeRegisterModelStateReconciler(name, pc)
 		return NewOpenAICompatProvider(name, pc), nil
 	case "claude-code":
 		if procMgr == nil {
@@ -886,6 +892,49 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 	default:
 		return nil, fmt.Errorf("unknown provider type %q", t)
 	}
+}
+
+// maybeRegisterModelStateReconciler registers a companion lms-model-state
+// reconciler for an OpenAI-compatible backend IFF it opts in via
+// options.model_state.manage:true. This is the OPT-IN, OFF-BY-DEFAULT guardrail:
+// absent the block (or with manage:false) nothing is registered and the kernel
+// reconciles no model state on this backend.
+//
+// The token is pulled from the same api_key_env the dispatch provider uses.
+// UpsertProvider allows safe re-registration across BuildRouter calls.
+func maybeRegisterModelStateReconciler(name string, pc ProviderConfig) {
+	ms := parseModelStateOptions(pc.Options)
+	if !ms.Manage {
+		return
+	}
+	// liveState comes from LM Studio's native /api/v0/models, served only by LM
+	// Studio backends. vllm/llamacpp share the "openai" dispatch case but have no
+	// /api/v0 endpoint, so a model_state block copied onto one would register a
+	// reconciler that can only ever probe-fail. Restrict to LM-Studio-capable
+	// types (a generic "openai" that is really vllm would still degrade to
+	// Suspended, but excluding the explicit vllm/llamacpp types avoids the footgun).
+	switch pc.Type {
+	case "lmstudio", "openai", "openai-compat":
+		// may serve /api/v0/models
+	default:
+		slog.Debug("router: lms-model-state not applicable for provider type; skipping",
+			"name", name, "type", pc.Type)
+		return
+	}
+	token := ""
+	if pc.APIKeyEnv != "" {
+		token = os.Getenv(pc.APIKeyEnv)
+	}
+	// Workspace root is injected later via LoadConfig (reconcile daemon path);
+	// pass "" here and let the provider resolve the actuator best-effort.
+	msp, err := newLMSModelStateProvider(name, pc, token, "")
+	if err != nil {
+		slog.Warn("router: lms-model-state reconciler construction failed", "name", name, "err", err)
+		return
+	}
+	reconcile.UpsertProvider(lmsModelStateType+"/"+name, msp)
+	slog.Info("router: registered lms-model-state reconciler in reconcile registry",
+		"name", name, "model", ms.Model, "context_length", ms.ContextLength)
 }
 
 // probeLocalBackend probes LM Studio (:1234) then Ollama (:11434) with a
