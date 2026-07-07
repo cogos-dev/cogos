@@ -265,8 +265,11 @@ func (p *LMSModelStateProvider) probeModels(ctx context.Context) ([]lmsModelRow,
 	if err != nil {
 		return nil, fmt.Errorf("lms-model-state %q: build request: %w", p.name, err)
 	}
-	if p.token != "" {
-		req.Header.Set("Authorization", "Bearer "+p.token)
+	p.mu.RLock()
+	token := p.token // mutated by SetToken — read under the lock
+	p.mu.RUnlock()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	client := &http.Client{Timeout: lmsFetchTimeout}
@@ -442,8 +445,11 @@ func (p *LMSModelStateProvider) invokeActuator(ctx context.Context, op, model st
 		return err
 	}
 
-	// Token via ENV, never argv.
-	cmd.Env = append(os.Environ(), lmsActuatorTokenEnv+"="+p.token)
+	// Token via ENV, never argv. Read under RLock (SetToken mutates it).
+	p.mu.RLock()
+	token := p.token
+	p.mu.RUnlock()
+	cmd.Env = append(os.Environ(), lmsActuatorTokenEnv+"="+token)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -484,16 +490,19 @@ func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model 
 	}
 
 	// SDK actuator (remote, or local without the CLI). Requires the script.
-	if p.actuatorScript == "" {
+	p.mu.RLock()
+	actuatorScript := p.actuatorScript // mutated by LoadConfig — read under the lock
+	p.mu.RUnlock()
+	if actuatorScript == "" {
 		return nil, false, fmt.Errorf("lms-model-state %q: SDK actuator script not resolved", p.name)
 	}
-	if _, statErr := os.Stat(p.actuatorScript); statErr != nil {
+	if _, statErr := os.Stat(actuatorScript); statErr != nil {
 		return nil, false, fmt.Errorf("lms-model-state %q: SDK actuator not installed at %s (run: cd %s && npm install)",
-			p.name, p.actuatorScript, filepath.Dir(p.actuatorScript))
+			p.name, actuatorScript, filepath.Dir(actuatorScript))
 	}
 
 	args := []string{
-		p.actuatorScript, op,
+		actuatorScript, op,
 		"--host", p.host,
 		"--port", fmt.Sprintf("%d", p.port),
 		"--model", model,
@@ -592,6 +601,7 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 	probed := p.lastProbed
 	lastErr := p.lastErr
 	target := p.target
+	actuatorScript := p.actuatorScript // mutated by LoadConfig — read under the lock
 	p.mu.RUnlock()
 
 	// Opt-in gate: not managing ⇒ Suspended.
@@ -606,14 +616,14 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 
 	// Actuator presence check (stat is fast, O(1)). A missing actuator means we
 	// could probe but never remediate — surface as Suspended with a fix hint.
-	if p.actuatorScript == "" {
+	if actuatorScript == "" {
 		return p.suspended("SDK actuator script path unresolved")
 	}
-	if _, err := os.Stat(p.actuatorScript); err != nil {
+	if _, err := os.Stat(actuatorScript); err != nil {
 		// A local backend with the lms CLI available can still remediate.
 		if !(p.local && p.lmsCLI != "" && statOK(p.lmsCLI)) {
 			return p.suspended(fmt.Sprintf("SDK actuator not installed at %s (cd %s && npm install)",
-				p.actuatorScript, filepath.Dir(p.actuatorScript)))
+				actuatorScript, filepath.Dir(actuatorScript)))
 		}
 	}
 

@@ -19,10 +19,46 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
+
+// TestLMSModelStateProviderConcurrentFieldAccess exercises the mutable provider
+// fields (token via SetToken, actuatorScript via LoadConfig) concurrently with
+// the readers (FetchLive→probeModels reads token; Health reads actuatorScript),
+// so `go test -race` flags any unguarded access. The provider is the shared,
+// globally-registered singleton the framework's ConfigureProvider/Tokenable path
+// writes while the autonomic ticker + ReconcileDaemon read.
+func TestLMSModelStateProviderConcurrentFieldAccess(t *testing.T) {
+	p := makeLMSProvider(t, "http://127.0.0.1:1", "target", 262144) // unreachable is fine; the race is on the field access
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	spin := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					fn()
+				}
+			}
+		}()
+	}
+	root := t.TempDir()
+	spin(func() { p.SetToken("t") })                               // writes token
+	spin(func() { _, _ = p.LoadConfig(root) })                     // writes actuatorScript
+	spin(func() { _, _ = p.FetchLive(context.Background(), nil) }) // reads token (probeModels)
+	spin(func() { _ = p.Health() })                                // reads actuatorScript
+	time.Sleep(40 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
