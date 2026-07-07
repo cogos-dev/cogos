@@ -33,9 +33,19 @@ func hasHTTPAuthToken(cfg *Config) bool {
 // warnIfUnauthenticatedNonLoopback logs a loud warning at boot when
 // cfg.BindAddr is resolved to a non-loopback address and no HTTP auth token
 // is configured. It never blocks startup — refuse-to-start is a later
-// decision (L5-HTTP-AUTHZ).
+// decision (L5-HTTP-AUTHZ). Logs via slog.Default(); see
+// warnIfUnauthenticatedNonLoopbackTo for a variant that takes an explicit
+// logger (used by tests to avoid mutating global slog state).
 func warnIfUnauthenticatedNonLoopback(cfg *Config) {
-	if cfg == nil {
+	warnIfUnauthenticatedNonLoopbackTo(slog.Default(), cfg)
+}
+
+// warnIfUnauthenticatedNonLoopbackTo is the logger-injectable core of
+// warnIfUnauthenticatedNonLoopback. Split out so tests can assert on the
+// emitted warning without racing on the process-global slog default (see
+// serve_config_gate_test.go).
+func warnIfUnauthenticatedNonLoopbackTo(logger *slog.Logger, cfg *Config) {
+	if cfg == nil || logger == nil {
 		return
 	}
 	bindAddr := cfg.BindAddr
@@ -48,7 +58,7 @@ func warnIfUnauthenticatedNonLoopback(cfg *Config) {
 	if hasHTTPAuthToken(cfg) {
 		return
 	}
-	slog.Warn("SECURITY: kernel HTTP API is binding to a non-loopback address with no auth token configured — "+
+	logger.Warn("SECURITY: kernel HTTP API is binding to a non-loopback address with no auth token configured — "+
 		"the entire HTTP surface (including config mutation, skill exec, and service control when enabled) "+
 		"is reachable by anything that can reach this address/port; loopback-bind is currently the kernel's "+
 		"only access-control boundary",

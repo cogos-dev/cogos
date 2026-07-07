@@ -143,23 +143,21 @@ func TestConfigMutation_GateEnabled(t *testing.T) {
 
 // ─── Boot bind-address warning ──────────────────────────────────────────────
 
-// captureSlog redirects the default slog logger to a buffer for the duration
-// of fn, then restores it.
-func captureSlog(t *testing.T, fn func()) string {
-	t.Helper()
+// captureSlogTo builds a logger writing to a fresh buffer, calls fn with it,
+// and returns everything logged. Unlike mutating slog.SetDefault, this never
+// touches process-global state, so it's safe under t.Parallel() alongside
+// any other test in the package that might also log.
+func captureSlogTo(fn func(*slog.Logger)) string {
 	var buf bytes.Buffer
-	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	fn()
+	fn(slog.New(slog.NewTextHandler(&buf, nil)))
 	return buf.String()
 }
 
 func TestWarnIfUnauthenticatedNonLoopback_WarnsOnNonLoopback(t *testing.T) {
 	t.Parallel()
 	cfg := &Config{BindAddr: "0.0.0.0", Port: 6931}
-	out := captureSlog(t, func() {
-		warnIfUnauthenticatedNonLoopback(cfg)
+	out := captureSlogTo(func(l *slog.Logger) {
+		warnIfUnauthenticatedNonLoopbackTo(l, cfg)
 	})
 	if !strings.Contains(out, "SECURITY") {
 		t.Errorf("expected a SECURITY warning for non-loopback bind, got: %q", out)
@@ -177,8 +175,8 @@ func TestWarnIfUnauthenticatedNonLoopback_SilentOnLoopback(t *testing.T) {
 		t.Run("addr="+addr, func(t *testing.T) {
 			t.Parallel()
 			cfg := &Config{BindAddr: addr, Port: 6931}
-			out := captureSlog(t, func() {
-				warnIfUnauthenticatedNonLoopback(cfg)
+			out := captureSlogTo(func(l *slog.Logger) {
+				warnIfUnauthenticatedNonLoopbackTo(l, cfg)
 			})
 			if strings.Contains(out, "SECURITY") {
 				t.Errorf("expected no warning for loopback bind_addr=%q, got: %q", addr, out)
@@ -190,8 +188,8 @@ func TestWarnIfUnauthenticatedNonLoopback_SilentOnLoopback(t *testing.T) {
 func TestWarnIfUnauthenticatedNonLoopback_LANAddress(t *testing.T) {
 	t.Parallel()
 	cfg := &Config{BindAddr: "192.168.10.191", Port: 6931}
-	out := captureSlog(t, func() {
-		warnIfUnauthenticatedNonLoopback(cfg)
+	out := captureSlogTo(func(l *slog.Logger) {
+		warnIfUnauthenticatedNonLoopbackTo(l, cfg)
 	})
 	if !strings.Contains(out, "SECURITY") {
 		t.Errorf("expected a SECURITY warning for LAN bind, got: %q", out)
