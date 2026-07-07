@@ -25,7 +25,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/filelock"
 )
+
+// metaLockTimeout bounds how long UpsertSession/DeleteSession wait to acquire
+// the cross-process lock on _meta.json before giving up. Generous relative to
+// the write itself (a few JSON marshals + one rename) but short enough that a
+// wedged peer doesn't hang the caller indefinitely.
+const metaLockTimeout = 5 * time.Second
 
 // Index holds all indexed turns in memory plus a reference to the projection
 // directory for persistence.
@@ -58,6 +66,15 @@ type Index struct {
 	lastMetaMtime time.Time
 	lastMetaSize  int64
 	lastMetaHash  string
+}
+
+// metaDelta describes the change a single writeMetaFileLocked call must apply
+// to _meta.json, as opposed to a full re-assertion of this process's in-memory
+// idx.sessions snapshot (which could be stale relative to a peer process's
+// more recent write — see writeMetaFileLocked).
+type metaDelta struct {
+	upserts map[string]SessionMeta
+	deletes []string
 }
 
 // NewIndex creates an Index backed by projDir. projDir is created if absent.
@@ -163,6 +180,23 @@ func (idx *Index) LoadIfChanged() (bool, error) {
 }
 
 // UpsertSession writes session meta + turns to memory and to disk.
+//
+// The on-disk _meta.json is a shared file: the daemon's own reconcile/ticker
+// cycle and a separately-invoked "cog reconcile conversations" CLI process
+// can both call UpsertSession/DeleteSession against the same projDir
+// (issue #449). Without coordination the two read-modify-write cycles
+// interleave and the second writer's plain marshal-of-idx.sessions silently
+// drops whatever the first writer added, because each process's in-memory
+// idx.sessions only reflects its own view as of its last Load.
+//
+// To close that window, the on-disk write is guarded by a cross-process
+// filelock (metaLockPath) and, while holding it, writeMetaFileLocked re-reads
+// the current _meta.json from disk and applies only *this call's* delta
+// (metaDelta) on top of it — never a full re-assertion of this process's
+// entire in-memory idx.sessions snapshot, which could itself be stale
+// relative to a peer's more recent write and would silently resurrect
+// whatever the peer already removed. See writeMetaFileLocked for why a
+// snapshot-merge (rather than a delta-merge) is unsound.
 func (idx *Index) UpsertSession(meta SessionMeta, turns []Turn) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -174,8 +208,10 @@ func (idx *Index) UpsertSession(meta SessionMeta, turns []Turn) error {
 	if err := idx.writeTurnsFile(meta.SessionID, turns); err != nil {
 		return fmt.Errorf("conversations/index: write turns %s: %w", meta.SessionID, err)
 	}
-	// Persist meta index (marshals idx.sessions; must hold the lock).
-	return idx.writeMetaFileLocked()
+	// Persist meta index under the cross-process lock. Only this call's own
+	// upsert is applied as a delta on top of the current on-disk state — see
+	// writeMetaFileLocked.
+	return idx.writeMetaFileLocked(metaDelta{upserts: map[string]SessionMeta{meta.SessionID: meta}})
 }
 
 // DeleteSession removes a session from memory and disk.
@@ -190,7 +226,7 @@ func (idx *Index) DeleteSession(sessionID string) error {
 	if err := os.Remove(turnsPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("conversations/index: remove turns file: %w", err)
 	}
-	return idx.writeMetaFileLocked()
+	return idx.writeMetaFileLocked(metaDelta{deletes: []string{sessionID}})
 }
 
 // GetMeta returns the SessionMeta for a session, or false if not indexed.
@@ -382,6 +418,14 @@ func (idx *Index) metaPath() string {
 	return filepath.Join(idx.projDir, "_meta.json")
 }
 
+// metaLockPath is the advisory cross-process lock file guarding the
+// read-modify-write cycle on _meta.json. A sibling file, not metaPath itself,
+// so the lock's own lifecycle (create/lock/unlock) never touches the JSON
+// content file that Load/LoadIfChanged read.
+func (idx *Index) metaLockPath() string {
+	return filepath.Join(idx.projDir, "_meta.json.lock")
+}
+
 // sha256Hex returns the hex-encoded SHA-256 of b.
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
@@ -400,16 +444,76 @@ func (idx *Index) turnsPath(sessionID string) string {
 	return filepath.Join(idx.projDir, turnsFilename(sessionID))
 }
 
-// writeMetaFileLocked persists the session meta index. Callers must hold
-// idx.mu (write lock) because it marshals idx.sessions.
-func (idx *Index) writeMetaFileLocked() error {
-	b, err := json.MarshalIndent(idx.sessions, "", "  ")
+// writeMetaFileLocked persists delta (this call's own upserts/deletes) into
+// _meta.json. Callers must hold idx.mu (write lock).
+//
+// The write is atomic (tmp + rename, same pattern as
+// BusSessionManager.saveRegistry in internal/engine/bus_session.go) — a plain
+// truncate-before-write left _meta.json empty (and every subsequent Load
+// silently falling back to an empty index) if the process was killed
+// mid-write.
+//
+// It also takes the cross-process filelock (pkg/filelock) around the full
+// read-modify-write cycle: re-read whatever is currently on disk, apply only
+// delta on top of it, then atomically write the result. This is what closes
+// issue #449 — a CLI reconcile and the daemon's own reconcile cycle can each
+// read-modify-write _meta.json independently; taking the lock serializes the
+// two cycles, and applying a per-call delta (rather than a full marshal of
+// this process's in-memory idx.sessions) means a writer never re-asserts a
+// stale snapshot that could silently resurrect a session a peer has since
+// deleted, or drop one a peer has since added. A snapshot-merge was tried
+// first and found unsound by TestCrossProcessDeleteSurvivesConcurrentUpsert:
+// re-adding every key from idx.sessions on top of the freshly-read on-disk
+// map reintroduces this process's own stale copy of a session a peer already
+// deleted, because idx.sessions only reflects this process's last Load, not
+// the peer's more recent delete.
+func (idx *Index) writeMetaFileLocked(delta metaDelta) error {
+	lock, err := filelock.Acquire(idx.metaLockPath(), metaLockTimeout)
+	if err != nil {
+		return fmt.Errorf("conversations/index: acquire meta lock: %w", err)
+	}
+	defer lock.Release()
+
+	merged := make(map[string]SessionMeta)
+	if data, readErr := os.ReadFile(idx.metaPath()); readErr == nil {
+		var onDisk map[string]SessionMeta
+		if jsonErr := json.Unmarshal(data, &onDisk); jsonErr == nil {
+			for k, v := range onDisk {
+				merged[k] = v
+			}
+		}
+		// A corrupt/unparseable on-disk file is treated as empty rather than
+		// aborting the write — delta is still applied and this call becomes
+		// the one restoring a valid file.
+	} else if !os.IsNotExist(readErr) {
+		return fmt.Errorf("conversations/index: read meta for merge: %w", readErr)
+	}
+
+	for k, v := range delta.upserts {
+		merged[k] = v
+	}
+	for _, k := range delta.deletes {
+		delete(merged, k)
+	}
+
+	b, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(idx.metaPath(), b, 0o644); err != nil {
+	tmp := idx.metaPath() + fmt.Sprintf(".tmp.%d", time.Now().UnixNano())
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
+	if err := os.Rename(tmp, idx.metaPath()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	// Adopt the merged-and-written view as this process's in-memory sessions
+	// too, so a peer's concurrent addition/removal becomes visible here
+	// without waiting for the next Load/LoadIfChanged.
+	idx.sessions = merged
+
 	// Record our own write — hash of the exact bytes we wrote, plus the
 	// post-write stat — so the next LoadIfChanged recognises the file as
 	// unchanged-by-others and skips the full reload. Called under idx.mu (the
