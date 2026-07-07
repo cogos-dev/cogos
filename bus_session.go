@@ -221,6 +221,20 @@ func (m *busSessionManager) loadRegistry() []busRegistryEntry {
 }
 
 // saveRegistry writes the bus registry to disk.
+//
+// The write is atomic (tmp + rename): a plain truncate-before-write left
+// registry.json empty if the process was killed mid-write, and loadRegistry
+// swallows the resulting parse error and returns an empty registry — so the
+// next save from any process would discard every registered bus, not just the
+// one being added. Mirrors the daemon-side BusSessionManager.saveRegistry
+// (internal/engine/bus_session.go).
+//
+// NOTE: this closes the truncation→total-loss failure mode but does NOT add a
+// cross-process advisory lock. Full serialization of this root-CLI writer
+// against the daemon's writer of the same registry.json requires both sides to
+// take a shared filelock; that coordination is deferred to the L1 disposition
+// of the root bus-CLI (whether this cross-process scenario survives at all
+// depends on relocate-vs-delete). Tracked separately; see PR body.
 func (m *busSessionManager) saveRegistry(entries []busRegistryEntry) error {
 	if err := os.MkdirAll(m.busesDir(), 0755); err != nil {
 		return err
@@ -229,7 +243,15 @@ func (m *busSessionManager) saveRegistry(entries []busRegistryEntry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.registryPath(), data, 0644)
+	tmp := m.registryPath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, m.registryPath()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // appendBusEvent appends a new CogBlock to a bus's event chain.
