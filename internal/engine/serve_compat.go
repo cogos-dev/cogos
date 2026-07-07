@@ -272,6 +272,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // when fresh and recomposed under the cache lock (single-flight) when
 // cold/stale. The caller's ctx bounds the live provider probes; each probe is
 // additionally capped at modelsPerProviderTimeout.
+//
+// If the caller's ctx is cancelled/expired while composing, the live per-provider
+// probes (whose contexts descend from it) return early and otherwise-healthy
+// providers are skipped, yielding an incomplete list. That partial list is served
+// to this caller but is NOT written to the shared cache: a caller going away says
+// nothing about provider health, and caching it would serve the degraded menu to
+// every unrelated caller until the TTL expires. Same guard the Available() TTL
+// cache applies (#441).
 func composeModelsList(ctx context.Context, router Router) []compatModel {
 	entry := modelsCacheFor(router)
 	entry.mu.Lock()
@@ -280,6 +288,12 @@ func composeModelsList(ctx context.Context, router Router) []compatModel {
 		return entry.data
 	}
 	data := buildModelsList(ctx, router)
+	if ctx.Err() != nil {
+		// Caller cancelled/timed out mid-compose — do not poison the shared cache
+		// with a list that may be missing healthy providers. Leave the entry cold
+		// so the next caller rebuilds cleanly.
+		return data
+	}
 	entry.data = data
 	entry.fetchedAt = time.Now()
 	return data

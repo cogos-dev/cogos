@@ -41,6 +41,12 @@ func newListerStub(name string, isLocal bool, ids ...string) *listerStub {
 
 func (l *listerStub) ListModels(ctx context.Context) ([]string, error) {
 	l.calls++
+	// Respect caller cancellation like a real ctx-aware HTTP probe would, so a
+	// cancelled/expired caller context makes this stub fail (skipped by
+	// liveModelEntries) rather than returning ids unconditionally.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if l.listErr != nil {
 		return nil, l.listErr
 	}
@@ -374,4 +380,49 @@ func modelIDKeys(m map[string]modelsResponseModel) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// compatModelIDs indexes a composed list by id for presence checks.
+func compatModelIDs(ms []compatModel) map[string]bool {
+	out := make(map[string]bool, len(ms))
+	for _, m := range ms {
+		out[m.ID] = true
+	}
+	return out
+}
+
+// TestComposeModelsList_CancelledCallerDoesNotPoisonCache pins the #441-class
+// guard: a caller that cancels mid-compose cancels the in-flight per-provider
+// probes (their ctx descends from the caller's), so a healthy provider is skipped
+// and the composed list comes back incomplete. That incomplete list must NOT be
+// written to the shared 45s TTL cache — the next caller with a healthy context
+// must still receive the full menu. Without the guard, the first (cancelled) call
+// would cache the degraded list and the second call would serve it for up to 45s.
+func TestComposeModelsList_CancelledCallerDoesNotPoisonCache(t *testing.T) {
+	// No t.Parallel: reasons about the per-router package cache entry. The entry
+	// is keyed by this router alone, so it does not race other tests.
+	lister := newListerStub("lmstudio-darkstar", true, "gemma-4-26b", "qwen-3-14b")
+	frontier := newListerStub("claude-oauth", false, "claude-opus-4-8")
+
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+	router.RegisterProvider(lister)
+	router.RegisterProvider(frontier)
+
+	// First call under an already-cancelled caller context: the live probes see
+	// ctx.Err() and are skipped, so the healthy lister's composite ids are absent.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	first := compatModelIDs(composeModelsList(cancelled, router))
+	if first["lmstudio-darkstar/gemma-4-26b"] {
+		t.Fatalf("precondition failed: cancelled-caller probe should have been skipped; got %v", first)
+	}
+
+	// Second call under a healthy context: because the cancelled build was NOT
+	// cached, this must rebuild cleanly and surface the healthy lister's models.
+	second := compatModelIDs(composeModelsList(context.Background(), router))
+	for _, want := range []string{"lmstudio-darkstar/gemma-4-26b", "lmstudio-darkstar/qwen-3-14b"} {
+		if !second[want] {
+			t.Errorf("cache poisoned by cancelled caller: %q missing after healthy rebuild; got %v", want, second)
+		}
+	}
 }
