@@ -357,6 +357,135 @@ func TestReplayDeterminism(t *testing.T) {
 	}
 }
 
+// TestHashString_UsesRealSHA256 pins hashString to the real crypto/sha256 algorithm
+// with a known test vector, so a regression back to the old placeholder
+// (`return []byte(s)`, i.e. string identity) fails this test even though such a
+// regression would still produce a deterministic, discriminating "hash" and would
+// therefore NOT be caught by TestVerifyReplayDeterminism or
+// TestVerifyReplayDeterminism_DetectsDivergence above (both only check relative
+// determinism/discrimination, not the actual algorithm).
+func TestHashString_UsesRealSHA256(t *testing.T) {
+	// echo -n "cogos-replay-hash-fixture" | shasum -a 256
+	const input = "cogos-replay-hash-fixture"
+	const wantHex = "8ac0b24e3327e98ef4bd1945585ff5426d43969239fd62c6687de8f6708010b3"
+
+	got := fmt.Sprintf("%x", hashString(input))
+
+	if len(got) != 64 {
+		t.Fatalf("hashString(%q) produced a %d-char hex string, want 64 (32 bytes, sha256 digest size) -- got %q; a placeholder byte-identity implementation would produce len(input) bytes instead", input, len(got), got)
+	}
+
+	if got != wantHex {
+		t.Errorf("hashString(%q) = %s, want %s (known sha256 digest) -- if this fails after reverting to `return []byte(s)`, that confirms the placeholder no longer matches a real hash", input, got, wantHex)
+	}
+
+	// A placeholder byte-identity "hash" fails the length check above already, but
+	// also assert directly that the output is not simply the input bytes.
+	if string(hashString(input)) == input {
+		t.Error("hashString returned its input verbatim -- placeholder regression (crypto/sha256 was expected)")
+	}
+}
+
+// TestVerifyReplayDeterminism exercises VerifyReplayDeterminism end-to-end against a
+// real ledger fixture (a session directory with a few events.jsonl entries), replayed
+// twice, and asserts the two DAG-build+sort+hash runs agree on identical on-disk state.
+func TestVerifyReplayDeterminism(t *testing.T) {
+	repo := setupTestRepo(t)
+	ledgerDir := filepath.Join(repo, ".cog", "ledger")
+
+	sessionID := "test-session-verify-determ"
+	events := []*Event{
+		{ID: "evt1", Type: "test", Timestamp: "2026-01-16T10:00:00Z", SessionID: sessionID, Seq: 1},
+		{ID: "evt2", Type: "test", Timestamp: "2026-01-16T10:00:01Z", SessionID: sessionID, Seq: 2},
+		{ID: "evt3", Type: "test", Timestamp: "2026-01-16T10:00:02Z", SessionID: sessionID, Seq: 3},
+	}
+	writeSessionEvents(t, ledgerDir, sessionID, events)
+
+	if err := VerifyReplayDeterminism(repo, []string{sessionID}); err != nil {
+		t.Errorf("VerifyReplayDeterminism failed on a stable fixture replayed twice: %v", err)
+	}
+}
+
+// TestVerifyReplayDeterminism_DetectsDivergence proves the wired-up hash actually
+// discriminates content: two fixtures whose event sequences genuinely differ must
+// produce different ComputeReplayHash outputs. Before the sha256 fix, hashString
+// returned its input verbatim, so this still "worked" only by accident (%x of the raw
+// bytes still differed) -- the real defect was that identical divergent inputs (e.g.
+// events differing only by non-string-formatted fields the canonical string doesn't
+// capture) could not be trusted as a genuine hash. This test locks in that changing the
+// event sequence changes the hash under the real crypto/sha256 implementation.
+func TestVerifyReplayDeterminism_DetectsDivergence(t *testing.T) {
+	repoA := setupTestRepo(t)
+	sessionA := "test-session-divergent-a"
+	writeSessionEvents(t, filepath.Join(repoA, ".cog", "ledger"), sessionA, []*Event{
+		{ID: "evt1", Type: "test", Timestamp: "2026-01-16T10:00:00Z", SessionID: sessionA, Seq: 1},
+		{ID: "evt2", Type: "test", Timestamp: "2026-01-16T10:00:01Z", SessionID: sessionA, Seq: 2},
+	})
+
+	repoB := setupTestRepo(t)
+	sessionB := "test-session-divergent-b"
+	writeSessionEvents(t, filepath.Join(repoB, ".cog", "ledger"), sessionB, []*Event{
+		{ID: "evt1", Type: "test", Timestamp: "2026-01-16T10:00:00Z", SessionID: sessionB, Seq: 1},
+		{ID: "evt2", Type: "other", Timestamp: "2026-01-16T10:00:01Z", SessionID: sessionB, Seq: 2},
+	})
+
+	dagA, err := BuildEventDAG(repoA, []string{sessionA})
+	if err != nil {
+		t.Fatalf("BuildEventDAG (A) failed: %v", err)
+	}
+	sortedA, err := TopologicalSort(dagA)
+	if err != nil {
+		t.Fatalf("TopologicalSort (A) failed: %v", err)
+	}
+
+	dagB, err := BuildEventDAG(repoB, []string{sessionB})
+	if err != nil {
+		t.Fatalf("BuildEventDAG (B) failed: %v", err)
+	}
+	sortedB, err := TopologicalSort(dagB)
+	if err != nil {
+		t.Fatalf("TopologicalSort (B) failed: %v", err)
+	}
+
+	hashA := ComputeReplayHash(sortedA)
+	hashB := ComputeReplayHash(sortedB)
+
+	if hashA == hashB {
+		t.Errorf("expected divergent event sequences to produce different hashes, both got %s", hashA)
+	}
+}
+
+// writeSessionEvents writes a slice of events to a session's events.jsonl ledger file,
+// creating the session directory if needed. Shared by the replay-determinism tests.
+func writeSessionEvents(t *testing.T, ledgerDir, sessionID string, events []*Event) {
+	t.Helper()
+
+	sessionDir := filepath.Join(ledgerDir, sessionID)
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		t.Fatalf("failed to create session dir: %v", err)
+	}
+
+	eventsFile := filepath.Join(sessionDir, "events.jsonl")
+	f, err := os.Create(eventsFile)
+	if err != nil {
+		t.Fatalf("failed to create events file: %v", err)
+	}
+	defer f.Close()
+
+	for _, event := range events {
+		data, err := event.MarshalJSON()
+		if err != nil {
+			t.Fatalf("failed to marshal event %s: %v", event.ID, err)
+		}
+		if _, err := f.Write(data); err != nil {
+			t.Fatalf("failed to write event %s: %v", event.ID, err)
+		}
+		if _, err := f.Write([]byte("\n")); err != nil {
+			t.Fatalf("failed to write newline: %v", err)
+		}
+	}
+}
+
 // TestConflictResolution tests the resolution workflow
 func TestConflictResolution(t *testing.T) {
 	conflict := Conflict{

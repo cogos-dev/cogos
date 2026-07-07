@@ -6,6 +6,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -383,7 +384,15 @@ func ReplayMerged(workspaceRoot, sessionID string, mergeEvent *MergeEvent) error
 
 // === DETERMINISM VERIFICATION ===
 
-// ComputeReplayHash computes a deterministic hash of the replay sequence
+// ComputeReplayHash computes a deterministic hash of the replay sequence.
+//
+// Note: the canonical representation below covers ID, Type, branch, and branchSeq
+// only -- it does not encode Timestamp, ParentID, or Data. Two sequences that differ
+// solely in one of those fields will hash identically. This is existing behavior,
+// unchanged by the sha256 fix; flagged here rather than changed because widening the
+// canonical form is a design decision (what should determinism-verification actually
+// cover?) out of scope for the hashString fix. Revisit if VerifyReplayDeterminism is
+// ever wired into a live path.
 func ComputeReplayHash(events []*Event) string {
 	// Build canonical representation
 	var parts []string
@@ -398,10 +407,10 @@ func ComputeReplayHash(events []*Event) string {
 	return hash
 }
 
-// hashString computes SHA256 hash of a string
+// hashString computes the SHA-256 hash of a string
 func hashString(s string) []byte {
-	// This is a placeholder - in real implementation, use crypto/sha256
-	return []byte(s) // Simplified for now
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
 }
 
 // VerifyReplayDeterminism verifies that two replays produce the same sequence
