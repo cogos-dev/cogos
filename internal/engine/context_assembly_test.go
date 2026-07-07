@@ -307,15 +307,17 @@ func TestFormatForProviderStabilityOrder(t *testing.T) {
 
 	sys, msgs := pkg.FormatForProvider()
 
-	// System prompt should contain nucleus first, then client system, then docs.
+	// System prompt should contain nucleus first, then client system — and ONLY
+	// those (the session-stable half of Zone 1). Post ADR-066/071 amendment the
+	// volatile foveal docs no longer live in the system prompt.
 	if !contains(sys, "I am Cog.") {
 		t.Error("system prompt missing nucleus")
 	}
 	if !contains(sys, "You are helpful.") {
 		t.Error("system prompt missing client system")
 	}
-	if !contains(sys, "Doc A") {
-		t.Error("system prompt missing CogDoc")
+	if contains(sys, "Doc A") {
+		t.Error("system prompt must NOT contain the foveal doc content (moved to trailing user message)")
 	}
 
 	// Messages should be: conversation history + current message.
@@ -325,8 +327,14 @@ func TestFormatForProviderStabilityOrder(t *testing.T) {
 	if msgs[0].Content != "hello" {
 		t.Errorf("msgs[0] = %q; want 'hello'", msgs[0].Content)
 	}
-	if msgs[2].Content != "what is an eigenform?" {
-		t.Errorf("msgs[2] = %q; want 'what is an eigenform?'", msgs[2].Content)
+	// The final user message carries the user's own text PLUS the trailing foveal
+	// block (doc content). The user text must lead; the doc content must follow.
+	last := msgs[2].Content
+	if !strings.HasPrefix(last, "what is an eigenform?") {
+		t.Errorf("final message must start with the user text; got %q", last)
+	}
+	if !contains(last, "Doc A") {
+		t.Error("final user message missing trailing foveal doc content")
 	}
 }
 
@@ -362,21 +370,33 @@ func TestFormatForProviderManifestOutput(t *testing.T) {
 		CurrentMessage: &ProviderMessage{Role: "user", Content: "hi"},
 	}
 
-	sys, _ := pkg.FormatForProvider()
-	if !contains(sys, "# Workspace Context (1 relevant CogDocs)") {
-		t.Errorf("system prompt missing manifest heading: %q", sys)
+	sys, msgs := pkg.FormatForProvider()
+	// Manifest now lives in the trailing user message, NOT the system prompt.
+	if contains(sys, "# Workspace Context") {
+		t.Errorf("manifest must not be in the system prompt: %q", sys)
 	}
-	if !contains(sys, "Use cog_read_cogdoc to access full content when needed") {
-		t.Error("system prompt missing retrieval hint")
+	if len(msgs) != 1 {
+		t.Fatalf("msgs len = %d; want 1 (the current message with folded manifest)", len(msgs))
 	}
-	if !contains(sys, "cog://mem/semantic/architecture/spec.cog.md — foveated context architecture overview [salience: 0.87]") {
-		t.Error("system prompt missing manifest entry")
+	rendered := msgs[0].Content
+	if !contains(rendered, "# Workspace Context (1 relevant CogDocs)") {
+		t.Errorf("trailing message missing manifest heading: %q", rendered)
 	}
-	if !contains(sys, "## Schema Notes") {
-		t.Error("system prompt missing schema notes")
+	if !contains(rendered, "Use cog_read_cogdoc to access full content when needed") {
+		t.Error("trailing message missing retrieval hint")
 	}
-	if !contains(sys, "missing: tags, type") {
-		t.Error("system prompt missing schema issue details")
+	// Salience float has been STRIPPED for byte-stability — URI + summary remain.
+	if !contains(rendered, "cog://mem/semantic/architecture/spec.cog.md — foveated context architecture overview") {
+		t.Error("trailing message missing manifest entry")
+	}
+	if contains(rendered, "[salience:") {
+		t.Error("manifest must not render the live salience float (byte-stability)")
+	}
+	if !contains(rendered, "## Schema Notes") {
+		t.Error("trailing message missing schema notes")
+	}
+	if !contains(rendered, "missing: tags, type") {
+		t.Error("trailing message missing schema issue details")
 	}
 }
 

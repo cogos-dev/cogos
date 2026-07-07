@@ -240,10 +240,15 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		assembleScopeOpts = append(assembleScopeOpts, WithMemoryScope(bound.MemoryNamespace))
 	}
 
+	// Foveation / light-cone key: stable per-conversation, never the per-request
+	// UUID and never Process.SessionID(). Mirrors handleChat. The Anthropic
+	// metadata.user_id is the "user" field equivalent. See foveation_session_key.go.
+	foveationKey := foveationSessionKey(r.Header.Get(foveationKeyHeader), anthropicReq.Metadata.UserID, clientMsgs)
+
 	if useFullEmbodiment {
 		assembleOpts := []AssembleOption{
 			WithContext(r.Context()),
-			WithConversationID(creq.Metadata.RequestID),
+			WithConversationID(foveationKey),
 			WithManifestMode(true),
 		}
 		assembleOpts = append(assembleOpts, assembleScopeOpts...)

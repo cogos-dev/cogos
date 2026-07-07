@@ -25,20 +25,69 @@ type lightConeEntry struct {
 	updatedAt time.Time
 }
 
+// Default TTL / sweep cadence for light-cone eviction. A cone that has not been
+// touched (Get/Set) within lightConeDefaultTTL is considered stale and evicted by
+// the background sweeper. These bound memory even when the join key is coarse or a
+// session ends without an explicit Delete — closing the unbounded-growth leak that
+// the per-request-UUID key created (one orphaned entry per request, never reused,
+// never pruned).
+const (
+	lightConeDefaultTTL = 30 * time.Minute
+	lightConeSweepEvery = 5 * time.Minute
+)
+
 // LightConeManager provides thread-safe per-conversation light cone storage.
 type LightConeManager struct {
 	mu    sync.RWMutex
 	cones map[string]*lightConeEntry
 	trm   *MambaTRM // reference for computing norms
+
+	ttl  time.Duration
+	stop chan struct{} // closed by Close() to end the background sweeper
+	once sync.Once     // guards Close() so stop is closed at most once
 }
 
-// NewLightConeManager creates a new manager. The trm parameter is used
-// for computing light cone norms (can be nil if norms are not needed).
+// NewLightConeManager creates a new manager with the default TTL and starts a
+// background sweeper that evicts stale cones. The trm parameter is used for
+// computing light cone norms (can be nil if norms are not needed).
 func NewLightConeManager(trm *MambaTRM) *LightConeManager {
-	return &LightConeManager{
+	return NewLightConeManagerWithTTL(trm, lightConeDefaultTTL)
+}
+
+// NewLightConeManagerWithTTL is NewLightConeManager with an explicit TTL. A
+// non-positive ttl disables the background sweeper (Prune can still be called
+// manually) — useful for deterministic tests.
+func NewLightConeManagerWithTTL(trm *MambaTRM, ttl time.Duration) *LightConeManager {
+	m := &LightConeManager{
 		cones: make(map[string]*lightConeEntry),
 		trm:   trm,
+		ttl:   ttl,
+		stop:  make(chan struct{}),
 	}
+	if ttl > 0 {
+		go m.sweepLoop()
+	}
+	return m
+}
+
+// sweepLoop evicts cones idle longer than the TTL, until Close() is called.
+func (m *LightConeManager) sweepLoop() {
+	ticker := time.NewTicker(lightConeSweepEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stop:
+			return
+		case now := <-ticker.C:
+			m.Prune(now.Add(-m.ttl))
+		}
+	}
+}
+
+// Close stops the background sweeper. Safe to call multiple times; safe on a
+// manager constructed with a non-positive TTL (no sweeper was started).
+func (m *LightConeManager) Close() {
+	m.once.Do(func() { close(m.stop) })
 }
 
 // Get returns the light cone for a conversation, or nil if none exists.
