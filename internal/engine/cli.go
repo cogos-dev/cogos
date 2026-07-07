@@ -55,6 +55,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "  version     Print build version and exit\n")
 	fmt.Fprintf(w, "  node        Manage node configuration\n")
 	fmt.Fprintf(w, "  reconcile   Run reconciliation loop diagnostics\n")
+	fmt.Fprintf(w, "  coherence   Check workspace coherence (graded git-distance score)\n")
+	fmt.Fprintf(w, "  rates       Print the kernel clock-constant rate-ratio table\n")
 	fmt.Fprintf(w, "  reindex     Rebuild the FTS5 constellation index from scratch\n")
 	fmt.Fprintf(w, "  spine       Show the decision manifold (gravity/inertia field over ADRs/RFCs)\n")
 	fmt.Fprintf(w, "  mcp         MCP server sub-commands (serve, ...)\n")
@@ -140,6 +142,12 @@ func Main() {
 			return
 		case "reconcile":
 			runReconcileCmd(args[1:], *workspace)
+			return
+		case "coherence":
+			runCoherenceCmd(args[1:], *workspace)
+			return
+		case "rates":
+			runRatesCmd(args[1:], *workspace)
 			return
 		case "spine":
 			runSpineCmd(args[1:], *workspace)

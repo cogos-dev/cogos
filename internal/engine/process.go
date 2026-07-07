@@ -28,8 +28,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/myrgic/cogos/trace"
 	"github.com/google/uuid"
+	"github.com/myrgic/cogos/trace"
 )
 
 // TraceEmitter is the bus-publish hook for cycle-trace events. The main
@@ -189,6 +189,14 @@ type Process struct {
 	// the process is constructed without a bus (e.g. benchmarks, some tests);
 	// handleTailerBlock degrades gracefully in that case.
 	sessionActivityPublisher SessionActivityPublisher
+
+	// cadence records OBSERVED behavioral-cadence events (First Instruments
+	// Module E, M11/M12/M13): dormant-consolidation completions, heartbeat
+	// events past the StateActive gate, and active-window-expiry
+	// observations. Side-effect-free append-only telemetry (§0) — see
+	// cadence_events.go. Always initialized (never nil) so recording never
+	// requires a nil check at the tap sites.
+	cadence *cadenceRecorder
 }
 
 // SessionActivityPublisher is the bus-append signature used by
@@ -243,6 +251,7 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		hookRegistry:        loadStateHookRegistry(workspaceRootFromCfg(cfg)),
 		broker:              broker,
 		blobStore:           blobStore,
+		cadence:             newCadenceRecorder(),
 	}
 }
 
@@ -777,6 +786,17 @@ func (p *Process) emitHeartbeat() {
 		return
 	}
 
+	// First Instruments M12 tap (FROZEN tap point, blind-review-3 F9): record
+	// PAST the StateActive gate above, not at the run-loop invocation site
+	// (the ticker case that calls emitHeartbeat). Tapping at the invocation
+	// would record an event for every tick even inside a StateActive
+	// interval where the body below never runs, making the H6
+	// StateActive-exclusion a no-op for M12 (the event would already be
+	// recorded before the gate). Tapping here means M12 only records
+	// heartbeats that actually did real work — consistent with the K12-gated
+	// consolidation (M11) sharing this same suppression.
+	p.cadence.recordHeartbeat(time.Now().UTC(), p.State())
+
 	// Probe sibling services.
 	if p.nodeManifest != nil {
 		p.nodeHealth.Probe(p.nodeManifest, p.cfg.Port)
@@ -885,10 +905,22 @@ func (p *Process) emitHeartbeat() {
 	count, err := action.Run()
 	if err != nil {
 		slog.Warn("process: memory consolidation failed", "err", err)
+		// First Instruments Finding B: a persistent Run() error means the
+		// gate above returns without updating p.lastConsolidation, so
+		// attempts re-fire every heartbeat and the ATTEMPT cadence collapses
+		// to H. Deliberately do NOT record a cadence event here — tapping
+		// attempts/gate-passes instead of the success point below would
+		// forge the "cadence tracks H alone" KC-3-LAW kill signature from an
+		// environment fault. A run where Run() errors persist collects no
+		// valid M11 cadence and is INSTRUMENT-BROKEN, never a law-kill.
 		return
 	}
 
 	p.lastConsolidation = now
+	// First Instruments M11 tap (FROZEN at the SUCCESS point, blind-review-4
+	// Finding B): recorded co-located with p.lastConsolidation = now, i.e.
+	// only on a COMPLETED action.Run(), never on a gate-pass or attempt.
+	p.cadence.recordConsolidation(now, "heartbeat_gated", p.State())
 	slog.Info("process: memory consolidated", "sessions", count)
 }
 

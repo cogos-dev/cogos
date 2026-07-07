@@ -57,6 +57,12 @@ type bootConfig struct {
 	// the daemon iterates this list instead of the global registry.
 	// Set via WithIsolatedRegistry. nil = use global registry (default).
 	providers []reconcile.Reconcilable
+
+	// withoutLocalHarness, when true, skips starting the LocalHarnessController
+	// goroutine. Set via WithoutLocalHarness. Measurement boots that need to
+	// isolate the ReconcileDaemon's cadence from an uncontrolled background
+	// ticker should set this (First Instruments A4).
+	withoutLocalHarness bool
 }
 
 func applyBootOptions(opts []BootOption) bootConfig {
@@ -81,6 +87,37 @@ func applyBootOptions(opts []BootOption) bootConfig {
 func WithIsolatedRegistry(providers ...reconcile.Reconcilable) BootOption {
 	return func(c *bootConfig) {
 		c.providers = providers
+	}
+}
+
+// WithPollInterval returns a BootOption that overrides the ReconcileDaemon's
+// tick interval. d <= 0 leaves the daemon default (30 s, applied by
+// ReconcileDaemonConfig.withDefaults) in effect.
+//
+// This wires the previously-dead bootConfig.pollInterval field into
+// ReconcileDaemonConfig.PollInterval (First Instruments A1). Measurement
+// harnesses use this to defeat the natural tick (set very high, e.g. 1h, so
+// Trigger() is the sole cycle driver) or to force fast natural cadence in a
+// unit test.
+func WithPollInterval(d time.Duration) BootOption {
+	return func(c *bootConfig) {
+		c.pollInterval = d
+	}
+}
+
+// WithoutLocalHarness returns a BootOption that skips starting the
+// LocalHarnessController goroutine (its own ticker, independent of the
+// ReconcileDaemon) during Boot.
+//
+// engine.Boot unconditionally starts LocalHarnessController whenever
+// server.mcpServer is non-nil, which is true for every testkernel boot (the
+// MCP server is always constructed). That ticker is an uncontrolled
+// background noise source not accounted for by any prior cost model
+// (First Instruments A4). Measurement boots that want to isolate the
+// ReconcileDaemon's cadence should set this option.
+func WithoutLocalHarness() BootOption {
+	return func(c *bootConfig) {
+		c.withoutLocalHarness = true
 	}
 }
 
@@ -123,6 +160,15 @@ func (k *Kernel) WorkspaceRoot() string {
 // The daemon is already running when Boot returns.
 func (k *Kernel) ReconcileDaemon() *ReconcileDaemon {
 	return k.reconcileDaemon
+}
+
+// Process returns the kernel's continuous Process, exposing read-only
+// observation surfaces (e.g. State()) to integration tests and measurement
+// harnesses (First Instruments A7). No mutation surface is exposed here —
+// callers get the same *Process the kernel itself runs, but this accessor
+// is intended for read-only accessors such as State().
+func (k *Kernel) Process() *Process {
+	return k.process
 }
 
 // BEPEngine returns the running BEPEngine handle, or nil when
@@ -241,8 +287,11 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// Derived context the kernel owns; caller's ctx cancellation also stops it.
 	kernelCtx, cancel := context.WithCancel(ctx)
 
-	// Wire LocalHarnessController if an MCP server is present.
-	if server.mcpServer != nil {
+	// Wire LocalHarnessController if an MCP server is present, unless the
+	// caller opted out via WithoutLocalHarness (First Instruments A4 — this
+	// controller runs its own ticker, independent of the ReconcileDaemon, and
+	// measurement boots that need to isolate reconcile cadence skip it).
+	if server.mcpServer != nil && !bootCfg.withoutLocalHarness {
 		ctrl, err := NewLocalHarnessController(cfg, nucleus, process, server.mcpServer)
 		if err != nil {
 			slog.Warn("local harness disabled", "err", err)
@@ -257,11 +306,16 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// ADR-092 §2 step 4: Reconcile loop start.
 	// When WithIsolatedRegistry was passed (testkernel path), bootCfg.providers
 	// is non-nil and the daemon bypasses the global registry.
+	// bootCfg.pollInterval (set via WithPollInterval) is forwarded to
+	// ReconcileDaemonConfig.PollInterval; zero leaves the daemon's own default
+	// (30s, applied by withDefaults()) in effect (First Instruments A1).
 	reconcileDaemon := NewReconcileDaemon(ReconcileDaemonConfig{
 		WorkspaceRoot: cfg.WorkspaceRoot,
 		Providers:     bootCfg.providers,
+		PollInterval:  bootCfg.pollInterval,
 	})
 	reconcileDaemon.Start(kernelCtx)
+	server.SetReconcileDaemon(reconcileDaemon)
 
 	// Wire ProjectionWatcher as an early-trigger source.
 	for _, kind := range AllProjectionKinds {
