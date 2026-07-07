@@ -467,6 +467,32 @@ func (idx *Index) turnsPath(sessionID string) string {
 // map reintroduces this process's own stale copy of a session a peer already
 // deleted, because idx.sessions only reflects this process's last Load, not
 // the peer's more recent delete.
+//
+// Deliberately does NOT unconditionally adopt the disk-merged map (which may
+// contain a peer process's session keys) into idx.sessions, and does NOT
+// unconditionally update lastMeta{Mtime,Size,Hash} to describe the merged
+// file's on-disk stats. An earlier version of this fix did both
+// unconditionally, and cog-review (PR #458) correctly flagged the resulting
+// metadata/turns split-brain: idx.sessions would gain a peer's session key
+// while idx.turns — populated only by this process's own Load/UpsertSession —
+// never got that session's turns, and because lastMetaHash was set to match
+// the bytes just written, the next LoadIfChanged saw "no external change" and
+// skipped the full reload that would otherwise have backfilled idx.turns.
+// cog_list_conversations would then list a session that
+// cog_get_turn/cog_search could never actually serve.
+//
+// The fix: after computing merged, compare it against idx.sessions as the
+// caller already left it (delta pre-applied by UpsertSession/DeleteSession
+// before calling here). If they're equal, no peer wrote anything this
+// process doesn't already fully know about (turns included) — the common
+// sole-writer case — so it's safe to keep the LoadIfChanged fast-path
+// bookkeeping (lastMeta{Mtime,Size,Hash}) in sync with what was just written,
+// same as before this fix. If they differ, a peer's content is present in
+// merged that idx.sessions doesn't have turns for; leave idx.sessions and the
+// lastMeta bookkeeping untouched by this call, so the next LoadIfChanged
+// detects the file changed out from under its recorded baseline and performs
+// a full reload — sessions map AND turns map together — keeping the two maps
+// consistent with each other at the cost of that one reload.
 func (idx *Index) writeMetaFileLocked(delta metaDelta) error {
 	lock, err := filelock.Acquire(idx.metaLockPath(), metaLockTimeout)
 	if err != nil {
@@ -509,21 +535,47 @@ func (idx *Index) writeMetaFileLocked(delta metaDelta) error {
 		return err
 	}
 
-	// Adopt the merged-and-written view as this process's in-memory sessions
-	// too, so a peer's concurrent addition/removal becomes visible here
-	// without waiting for the next Load/LoadIfChanged.
-	idx.sessions = merged
-
-	// Record our own write — hash of the exact bytes we wrote, plus the
-	// post-write stat — so the next LoadIfChanged recognises the file as
-	// unchanged-by-others and skips the full reload. Called under idx.mu (the
-	// "Locked" suffix), so these fields are mutated under the write lock.
-	idx.lastMetaHash = sha256Hex(b)
-	if fi, statErr := os.Stat(idx.metaPath()); statErr == nil {
-		idx.lastMetaMtime = fi.ModTime()
-		idx.lastMetaSize = fi.Size()
+	// Only adopt merged (and the fast-path bookkeeping) when it exactly
+	// matches idx.sessions as the caller left it — i.e. no peer content is
+	// present that this process's idx.turns doesn't already cover. See the
+	// func comment above for why an unconditional adopt reintroduces the
+	// sessions/turns split-brain cog-review flagged on PR #458.
+	if sessionMapsEqual(merged, idx.sessions) {
+		idx.lastMetaHash = sha256Hex(b)
+		if fi, statErr := os.Stat(idx.metaPath()); statErr == nil {
+			idx.lastMetaMtime = fi.ModTime()
+			idx.lastMetaSize = fi.Size()
+		}
 	}
+	// else: leave idx.sessions/lastMeta* exactly as they were. idx.sessions
+	// still holds this call's own delta (applied by the caller), which is
+	// consistent with idx.turns; the on-disk file now also carries the
+	// peer's content, which the next LoadIfChanged's content-hash check will
+	// notice (it no longer matches lastMetaHash) and reload properly.
 	return nil
+}
+
+// sessionMapsEqual reports whether a and b contain exactly the same set of
+// session IDs mapped to byte-for-byte-equal SessionMeta values, using each
+// value's JSON encoding for the comparison (SessionMeta has no slice/map
+// fields, so this is equivalent to a field-by-field equality check but
+// avoids having to keep a manual comparator in sync with the struct).
+func sessionMapsEqual(a, b map[string]SessionMeta) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		aj, aerr := json.Marshal(av)
+		bj, berr := json.Marshal(bv)
+		if aerr != nil || berr != nil || string(aj) != string(bj) {
+			return false
+		}
+	}
+	return true
 }
 
 func (idx *Index) writeTurnsFile(sessionID string, turns []Turn) error {
