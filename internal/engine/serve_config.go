@@ -4,6 +4,12 @@
 //	PATCH /v1/config             — RFC 7396 merge-patch (validated, atomic, backed up)
 //	POST  /v1/config/rollback    — restore from a .bak-<timestamp> file
 //
+// All three routes are gated by Config.EnableConfigMutation (default false),
+// parity with EnableSkillExec (serve_skills.go) / EnableServiceControl
+// (serve_services.go): any local process on the same host could otherwise
+// read or rewrite kernel.yaml over loopback. Set enable_config_mutation:
+// true in kernel.yaml to opt in.
+//
 // All handlers return JSON on success and on structured-error paths.
 package engine
 
@@ -20,11 +26,31 @@ func (s *Server) registerConfigRoutes(mux *http.ServeMux) {
 	s.route(mux, "POST /v1/config/rollback", s.handleConfigRollback)
 }
 
+// requireConfigMutation checks the gate and writes a 403 if disabled.
+// Returns true if the handler should continue, false if it has already
+// written an error response. Mirrors requireServiceControl in
+// serve_services.go.
+func (s *Server) requireConfigMutation(w http.ResponseWriter) bool {
+	if s.cfg == nil || !s.cfg.EnableConfigMutation {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":  "disabled",
+			"detail": "config access via HTTP is disabled; set enable_config_mutation: true in kernel.yaml",
+		})
+		return false
+	}
+	return true
+}
+
 // handleConfigGet returns the effective kernel config. Query params:
 //
 //	include_raw_yaml=1   — also return raw kernel.yaml bytes
 //	include_defaults=1   — also return hardcoded defaults
 func (s *Server) handleConfigGet(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConfigMutation(w) {
+		return
+	}
 	q := r.URL.Query()
 	includeRaw := truthyQuery(q.Get("include_raw_yaml"))
 	includeDefaults := truthyQuery(q.Get("include_defaults"))
@@ -54,6 +80,9 @@ type configPatchRequest struct {
 }
 
 func (s *Server) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConfigMutation(w) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MB is vast for a scalar config
@@ -95,6 +124,9 @@ func (s *Server) handleConfigPatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfigRollback(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConfigMutation(w) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	var body rollbackConfigInput
 	if r.ContentLength > 0 {
