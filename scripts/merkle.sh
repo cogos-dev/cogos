@@ -1,4 +1,7 @@
 #!/bin/sh
+# no-pipefail: sourced library (not executed standalone) — 'set -e'/'pipefail'
+# here would mutate the *calling* shell's option state for every session that
+# sources this file, which is a correctness hazard, not a style choice.
 # .cog/lib/merkle.sh - Merkle proof utilities
 #
 # Leverages git's internal Merkle tree structure for efficient verification.

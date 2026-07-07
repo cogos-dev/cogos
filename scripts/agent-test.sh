@@ -1,5 +1,6 @@
 #!/bin/sh
 # Test agent lifecycle
+set -eu
 . .cog/cog
 
 echo "=== Testing Agent Lifecycle ==="
