@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/myrgic/cogos/pkg/filelock"
 	"github.com/myrgic/cogos/pkg/substrate/cogfield"
 )
 
@@ -178,8 +179,31 @@ func (m *BusSessionManager) RegisterBus(busID, sessionID, origin string) error {
 	return m.registerBusLocked(busID, sessionID, origin)
 }
 
+// registryLockTimeout bounds how long a registry writer waits for the
+// cross-process advisory lock before failing the operation.
+const registryLockTimeout = 5 * time.Second
+
+// acquireRegistryLock takes the cross-process advisory lock guarding the
+// load-modify-save cycle on registry.json. The root-package CLI writer
+// (busSessionManager, reachable from `cog bus send`/`cog infer`) takes the
+// SAME lock, so a running daemon and concurrent CLI invocations serialize
+// instead of last-writer-wins silently dropping each other's entries.
+// Lock ordering: m.mu is always taken before this filelock.
+func (m *BusSessionManager) acquireRegistryLock() (*filelock.FileLock, error) {
+	if err := os.MkdirAll(m.BusesDir(), 0755); err != nil {
+		return nil, err
+	}
+	return filelock.Acquire(m.RegistryPath()+".lock", registryLockTimeout)
+}
+
 // registerBusLocked is the locked-variant helper. Caller must hold m.mu.
 func (m *BusSessionManager) registerBusLocked(busID, sessionID, origin string) error {
+	lock, err := m.acquireRegistryLock()
+	if err != nil {
+		return fmt.Errorf("acquire registry lock: %w", err)
+	}
+	defer lock.Release()
+
 	registry := m.loadRegistry()
 
 	for i, entry := range registry {
@@ -420,6 +444,15 @@ func (m *BusSessionManager) LatestEventHash(busID string) (hash string, seq int6
 // updateRegistrySeqLocked updates the last event seq/timestamp in the registry.
 // Caller must hold m.mu.
 func (m *BusSessionManager) updateRegistrySeqLocked(busID string, seq int, ts string) {
+	lock, err := m.acquireRegistryLock()
+	if err != nil {
+		// Best-effort metadata update: skipping is safer than an unserialized
+		// read-modify-write that can drop a concurrent writer's entry.
+		slog.Warn("bus: skipping registry seq update (lock unavailable)", "err", err, "bus_id", busID)
+		return
+	}
+	defer lock.Release()
+
 	registry := m.loadRegistry()
 	for i, entry := range registry {
 		if entry.BusID == busID {

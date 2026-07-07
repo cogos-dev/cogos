@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/filelock"
 )
 
 // ADR-084 dataref migration policy (Phase 1: schema-additive).
@@ -177,8 +179,31 @@ func (m *busSessionManager) createMCPBus(sessionID, origin string) (string, erro
 	return busID, nil
 }
 
+// registryLockTimeout bounds how long a registry writer waits for the
+// cross-process advisory lock before failing the operation.
+const registryLockTimeout = 5 * time.Second
+
+// acquireRegistryLock takes the cross-process advisory lock guarding the
+// load-modify-save cycle on registry.json. The daemon's
+// internal/engine.BusSessionManager takes the SAME lock (registry.json.lock),
+// so concurrent `cog bus`/`cog infer` invocations and a running daemon
+// serialize instead of last-writer-wins silently dropping each other's
+// registry entries.
+func (m *busSessionManager) acquireRegistryLock() (*filelock.FileLock, error) {
+	if err := os.MkdirAll(m.busesDir(), 0755); err != nil {
+		return nil, err
+	}
+	return filelock.Acquire(m.registryPath()+".lock", registryLockTimeout)
+}
+
 // registerBus adds or updates a bus entry in the registry.
 func (m *busSessionManager) registerBus(busID, sessionID, origin string) error {
+	lock, err := m.acquireRegistryLock()
+	if err != nil {
+		return fmt.Errorf("acquire registry lock: %w", err)
+	}
+	defer lock.Release()
+
 	registry := m.loadRegistry()
 
 	// Check if bus already exists
@@ -229,12 +254,10 @@ func (m *busSessionManager) loadRegistry() []busRegistryEntry {
 // one being added. Mirrors the daemon-side BusSessionManager.saveRegistry
 // (internal/engine/bus_session.go).
 //
-// NOTE: this closes the truncation→total-loss failure mode but does NOT add a
-// cross-process advisory lock. Full serialization of this root-CLI writer
-// against the daemon's writer of the same registry.json requires both sides to
-// take a shared filelock; that coordination is deferred to the L1 disposition
-// of the root bus-CLI (whether this cross-process scenario survives at all
-// depends on relocate-vs-delete). Tracked separately; see PR body.
+// Cross-process serialization: every load-modify-save cycle on the registry
+// (registerBus, updateRegistrySeq) holds the shared advisory lock from
+// acquireRegistryLock; the daemon-side writer holds the same lock. Callers of
+// saveRegistry must hold that lock.
 func (m *busSessionManager) saveRegistry(entries []busRegistryEntry) error {
 	if err := os.MkdirAll(m.busesDir(), 0755); err != nil {
 		return err
@@ -432,6 +455,15 @@ func (m *busSessionManager) getLastEvent(busID string) (int, string) {
 
 // updateRegistrySeq updates the last event seq/timestamp in the registry.
 func (m *busSessionManager) updateRegistrySeq(busID string, seq int, ts string) {
+	lock, err := m.acquireRegistryLock()
+	if err != nil {
+		// Best-effort metadata update: skipping is safer than an unserialized
+		// read-modify-write that can drop a concurrent writer's entry.
+		log.Printf("[bus] skipping registry seq update (lock unavailable): %v", err)
+		return
+	}
+	defer lock.Release()
+
 	registry := m.loadRegistry()
 	for i, entry := range registry {
 		if entry.BusID == busID {
