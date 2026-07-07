@@ -453,9 +453,6 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-// writePinBaseline writes a baseline pin to .cog/state/eval-baselines.json.
-// The file is a JSON map[string]string: experiment_id → run_id.
-// Implements cog_pin_baseline's storage logic (design memo Q1 / Q10).
 // pinBaselineLockPath returns the advisory cross-process lock file guarding
 // the read-modify-write cycle on eval-baselines.json.
 func pinBaselineLockPath(root string) string {
