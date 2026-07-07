@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -113,18 +114,63 @@ type ReconcileDaemon struct {
 	// health self-reports per-provider reconcile anomalies (slow cycles,
 	// persistent degraded health) as WARNs and a queryable snapshot.
 	health *convergenceTracker
+
+	// cycleSerials is a monotonic per-provider completion counter, bumped at
+	// the END of each provider's runOneCycle (regardless of success/failure —
+	// a cycle "completed" whether or not the provider errored). This is
+	// telemetry, not kernel state (First Instruments §0/A3): it exists solely
+	// so test harnesses can observe "has cycle N happened" without depending
+	// on a fake provider's own internal counters (the prior test-local
+	// waitForCycle pattern, which only worked because the fake tracked its own
+	// fetchCount — a production provider under test has no such hook).
+	cycleSerialsMu sync.Mutex
+	cycleSerials   map[string]*atomic.Int64
 }
 
 // NewReconcileDaemon creates a ReconcileDaemon with the given config.
 // Call Start(ctx) to begin the loop.
 func NewReconcileDaemon(cfg ReconcileDaemonConfig) *ReconcileDaemon {
 	return &ReconcileDaemon{
-		cfg:       cfg.withDefaults(),
-		state:     ReconcileDaemonStarting,
-		triggered: make(map[string]struct{}),
-		triggerCh: make(chan struct{}, 1),
-		health:    newConvergenceTracker(cfg.Convergence),
+		cfg:          cfg.withDefaults(),
+		state:        ReconcileDaemonStarting,
+		triggered:    make(map[string]struct{}),
+		triggerCh:    make(chan struct{}, 1),
+		health:       newConvergenceTracker(cfg.Convergence),
+		cycleSerials: make(map[string]*atomic.Int64),
 	}
+}
+
+// LastCycleSerial returns the current monotonic cycle-completion counter for
+// providerType and true if at least one cycle has completed for it. Returns
+// (0, false) if no cycle for that provider type has completed yet.
+//
+// The counter is bumped once at the end of every runOneCycle call for that
+// provider type (First Instruments A3) — a real completion signal, not a
+// poll of provider-owned test state. Use testkernel.WaitForCycle to block
+// until a target serial is reached.
+func (d *ReconcileDaemon) LastCycleSerial(providerType string) (int, bool) {
+	d.cycleSerialsMu.Lock()
+	counter, ok := d.cycleSerials[providerType]
+	d.cycleSerialsMu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	return int(counter.Load()), true
+}
+
+// bumpCycleSerial increments the monotonic completion counter for
+// providerType, creating it on first use. Called once at the end of every
+// runOneCycle, after the provider's cycle (success or error) has fully
+// completed.
+func (d *ReconcileDaemon) bumpCycleSerial(providerType string) {
+	d.cycleSerialsMu.Lock()
+	counter, ok := d.cycleSerials[providerType]
+	if !ok {
+		counter = &atomic.Int64{}
+		d.cycleSerials[providerType] = counter
+	}
+	d.cycleSerialsMu.Unlock()
+	counter.Add(1)
 }
 
 // ProviderConvergence returns the current per-provider reconcile anomaly
@@ -402,6 +448,14 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 			)
 		}
 	}()
+
+	// Bump the monotonic cycle-completion counter at the END of this cycle,
+	// regardless of outcome (success, error, or recovered panic above — this
+	// defer runs after the panic-recover defer settles retErr, since defers
+	// execute LIFO and this one is registered second). Telemetry, not kernel
+	// state (First Instruments A3/§0): a test-observable "cycle N happened"
+	// signal, no effect on control flow.
+	defer d.bumpCycleSerial(providerType)
 
 	tracer := otel.Tracer("cogos.reconcile-daemon")
 	spanCtx, span := tracer.Start(ctx, "reconcile.daemon.cycle")

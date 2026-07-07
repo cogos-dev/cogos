@@ -8,6 +8,47 @@
 // protocol, enabling binary-assembly tests. CallTool is the Phase-3b follow-up.
 // Phase 4 will add goroutine-leak detection.
 //
+// # Background goroutines started by a testkernel.Boot (First Instruments A5)
+//
+// engine.Boot starts every one of these unconditionally except where noted.
+// Any measurement harness computing cadence/timing off a testkernel.Boot must
+// account for ALL of them as potential noise/contention sources, not just the
+// ReconcileDaemon:
+//
+//   - ReconcileDaemon.run — the periodic reconcile loop (this package's main
+//     subject; PollInterval-controlled via WithPollInterval, First
+//     Instruments A1).
+//   - Process.Run — the process's own consolidation/heartbeat select-loop
+//     (consolidationTicker + heartbeatTicker), driving emitHeartbeat and the
+//     K12-gated consolidation Module E taps. Cadence controlled via
+//     WithConsolidationInterval / WithHeartbeatInterval (First Instruments A2).
+//   - LocalHarnessController — its own ticker (interval = cfg.HeartbeatInterval
+//     seconds, default 1 minute), started whenever server.mcpServer is
+//     non-nil (true for every testkernel boot). An uncontrolled background
+//     source not accounted for by any prior cost model; skip it with
+//     WithoutLocalHarness (First Instruments A4).
+//   - ProjectionWatcher, one per AllProjectionKinds — fsnotify-based watchers
+//     over .cog/mem/semantic/lineage/nodes that call
+//     reconcileDaemon.Trigger(providerType) on change. In a fresh
+//     makeMinimalWorkspace() boot the watched directory does not exist, so
+//     these typically fail to start (logged at Debug) and are inert.
+//   - Decision-lineage ProjectionWatcher(s), one per DecisionCorpusDirs —
+//     same watch-then-Trigger shape as above, over the ADR/RFC decision
+//     corpus dirs; also typically inert in a minimal test workspace.
+//   - MemWatcher (mem-currency / FTS watcher) — only started when a
+//     ConstellationIndexer has been wired (pkgFTSRepairIndexer != nil); nil
+//     in standard testkernel boots, so this is normally NOT started.
+//   - The inference router's background availability maintainer (probes
+//     configured providers off the request hot path); started by
+//     BuildRouter regardless of BootOption.
+//   - OTel telemetry (initTelemetry) — no-op (no goroutine of consequence)
+//     when no OTLP collector is configured, which is the default test
+//     environment.
+//
+// See engine.Boot's own doc comment for the authoritative, code-level list;
+// this summary exists so a measurement-harness author does not have to
+// re-derive it from scratch.
+//
 // Typical usage:
 //
 //	func TestFoo(t *testing.T) {
@@ -61,6 +102,20 @@ type config struct {
 	// pollInterval overrides the reconcile daemon tick. 0 = use daemon default.
 	pollInterval time.Duration
 
+	// consolidationIntervalSec, when > 0, overrides engine.Config.ConsolidationInterval
+	// (seconds) before Boot. 0 = leave LoadConfig's resolved value in place.
+	consolidationIntervalSec int
+	consolidationIntervalSet bool
+
+	// heartbeatIntervalSec, when > 0, overrides engine.Config.HeartbeatInterval
+	// (seconds) before Boot. 0 = leave LoadConfig's resolved value in place.
+	heartbeatIntervalSec int
+	heartbeatIntervalSet bool
+
+	// withoutLocalHarness, when true, forwards engine.WithoutLocalHarness so
+	// the LocalHarnessController goroutine is not started for this boot.
+	withoutLocalHarness bool
+
 	// providers, when non-nil, is forwarded to engine.WithIsolatedRegistry so
 	// the daemon bypasses the global registry. nil = use global registry.
 	providers []reconcile.Reconcilable
@@ -85,6 +140,52 @@ func WithIsolatedRegistry(providers ...reconcile.Reconcilable) Option {
 	return func(c *config) { c.providers = providers }
 }
 
+// WithPollInterval overrides the ReconcileDaemon's tick interval for this
+// kernel. d <= 0 leaves the daemon default (30s) in effect.
+//
+// Forwards to engine.WithPollInterval (First Instruments A1). Measurement
+// harnesses use a very high value (e.g. 1h) to defeat the natural tick so
+// Trigger() is the sole cycle driver, or a very low value to force fast
+// natural cadence in a unit test.
+func WithPollInterval(d time.Duration) Option {
+	return func(c *config) { c.pollInterval = d }
+}
+
+// WithConsolidationInterval overrides the consolidation cadence (seconds) for
+// this kernel's Process before Boot. sec must be >= 0; 0 means "use the
+// engine default" (LoadConfig already resolves ConsolidationInterval to 3600
+// before Boot sees it, so 0 here is a no-op override rather than a literal
+// zero interval, which would panic time.NewTicker). A value of 1 (or any
+// second-scale value) is legal — this is what lets First Instruments realize
+// its second-scale cell lattice (First Instruments A2/A6).
+func WithConsolidationInterval(sec int) Option {
+	return func(c *config) {
+		c.consolidationIntervalSec = sec
+		c.consolidationIntervalSet = true
+	}
+}
+
+// WithHeartbeatInterval overrides the heartbeat cadence (seconds) for this
+// kernel's Process before Boot. sec must be >= 0; 0 means "use the engine
+// default" (60), same reasoning as WithConsolidationInterval (First
+// Instruments A2).
+func WithHeartbeatInterval(sec int) Option {
+	return func(c *config) {
+		c.heartbeatIntervalSec = sec
+		c.heartbeatIntervalSet = true
+	}
+}
+
+// WithoutLocalHarness skips starting the kernel's LocalHarnessController
+// goroutine for this boot. Forwards to engine.WithoutLocalHarness (First
+// Instruments A4) — see that option's doc comment for why this matters to
+// cadence measurement: engine.Boot unconditionally starts the controller
+// whenever an MCP server is present, which is true for every testkernel
+// boot, making it an uncontrolled background noise source unless skipped.
+func WithoutLocalHarness() Option {
+	return func(c *config) { c.withoutLocalHarness = true }
+}
+
 // Kernel is an opaque handle to an in-process kernel instance started by Boot.
 // Call Stop when the test finishes; the idiomatic pattern is t.Cleanup.
 type Kernel struct {
@@ -107,6 +208,41 @@ func (k *Kernel) WorkspaceRoot() string {
 // Trigger and inspect State without going through the HTTP surface.
 func (k *Kernel) ReconcileDaemon() *engine.ReconcileDaemon {
 	return k.kernel.ReconcileDaemon()
+}
+
+// State returns the current lifecycle state of this kernel's Process
+// (StateActive / StateReceptive / StateDormant). Read-only (First
+// Instruments A7) — used by measurement harnesses to assert a dormant
+// measurement boot is non-Active (H6), since emitHeartbeat early-returns on
+// StateActive, suppressing both the M12 heartbeat tap and the K12-gated
+// consolidation.
+func (k *Kernel) State() engine.ProcessState {
+	return k.kernel.Process().State()
+}
+
+// LastCycleSerial returns the current monotonic cycle-completion counter for
+// providerType (First Instruments A3). See engine.ReconcileDaemon.LastCycleSerial.
+func (k *Kernel) LastCycleSerial(providerType string) (int, bool) {
+	return k.kernel.ReconcileDaemon().LastCycleSerial(providerType)
+}
+
+// WaitForCycle blocks until providerType's cycle-completion counter reaches
+// at least minSerial, or ctx is done. Polls LastCycleSerial rather than any
+// provider-owned test state, so it works against a real production provider
+// under test, not just a fake that tracks its own counters (First
+// Instruments A3).
+func WaitForCycle(ctx context.Context, k *Kernel, providerType string, minSerial int) error {
+	const pollInterval = 5 * time.Millisecond
+	for {
+		if serial, ok := k.LastCycleSerial(providerType); ok && serial >= minSerial {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("testkernel.WaitForCycle: provider %q did not reach serial %d: %w", providerType, minSerial, ctx.Err())
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // Stop cancels the kernel's context and waits for all goroutines to exit.
@@ -266,11 +402,29 @@ func Boot(ctx context.Context, t *testing.T, opts ...Option) (*Kernel, error) {
 	if engineCfg.BindAddr == "" {
 		engineCfg.BindAddr = "127.0.0.1"
 	}
+	// First Instruments A2: override the process's cadence config in seconds
+	// before Boot, so second-scale cell-lattice values take effect. 0 means
+	// "use the default" (LoadConfig already resolved ConsolidationInterval to
+	// 3600 and HeartbeatInterval to 60 before we get here, so a literal 0
+	// override would disable the ticker entirely, not select a default —
+	// only apply the override when a positive value was explicitly set).
+	if cfg.consolidationIntervalSet && cfg.consolidationIntervalSec > 0 {
+		engineCfg.ConsolidationInterval = cfg.consolidationIntervalSec
+	}
+	if cfg.heartbeatIntervalSet && cfg.heartbeatIntervalSec > 0 {
+		engineCfg.HeartbeatInterval = cfg.heartbeatIntervalSec
+	}
 
 	// Build engine BootOptions from testkernel config.
 	var bootOpts []engine.BootOption
 	if cfg.providers != nil {
 		bootOpts = append(bootOpts, engine.WithIsolatedRegistry(cfg.providers...))
+	}
+	if cfg.pollInterval > 0 {
+		bootOpts = append(bootOpts, engine.WithPollInterval(cfg.pollInterval))
+	}
+	if cfg.withoutLocalHarness {
+		bootOpts = append(bootOpts, engine.WithoutLocalHarness())
 	}
 
 	k, err := engine.Boot(ctx, engineCfg, bootOpts...)
