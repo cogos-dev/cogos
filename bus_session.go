@@ -631,7 +631,19 @@ func (m *busSessionManager) resetBus(busID string) error {
 }
 
 // archiveBus does the locked portion of resetBus: archive + registry update.
+//
+// Lock ordering per the file's contract: the cross-process registry filelock
+// is acquired BEFORE m.mu (cold path — full registryLockTimeout), so the
+// registry read-modify-write below cannot race a peer process's
+// registerBus/updateRegistrySeq, and no goroutine ever waits on the filelock
+// while holding m.mu.
 func (m *busSessionManager) archiveBus(busID string) (string, error) {
+	rlock, err := m.acquireRegistryLock()
+	if err != nil {
+		return "", fmt.Errorf("acquire registry lock: %w", err)
+	}
+	defer rlock.Release()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

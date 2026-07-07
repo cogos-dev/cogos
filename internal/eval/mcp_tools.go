@@ -360,12 +360,16 @@ func dispatchTriggersLockPath(root string) string {
 // ComputePlan calls readAndClearDispatchTriggers() to consume and atomically
 // remove entries so they fire exactly once.
 //
-// Reachable from an MCP tool handler (cog_run_experiment) racing the
-// daemon's own eval ComputePlan cycle calling readAndClearDispatchTriggers
-// concurrently — the same read-modify-write race issue #449 was filed for on
-// the conversations index's _meta.json. Fixed the same way: an atomic
-// tmp+rename write, plus a cross-process filelock held across the full
-// read-modify-write cycle so a concurrent writer/clearer can't interleave.
+// Concurrency the lock actually guards (corrected, review round on ee61416):
+// in the SHIPPED cmd/cogos binary the reconcile provider for "eval" is a
+// no-op stub (internal/providers/daemon/daemon.go) — the real EvalProvider is
+// wired only to the MCP tool handlers plus a one-time boot LoadConfig, so the
+// daemon's reconcile loop does NOT touch this file today. The live races are
+// (a) two concurrent MCP tool invocations (multiple sessions) hitting the
+// same trigger file, and (b) any future wiring that registers the real
+// provider for reconcile (the root-package parallel tree already does).
+// Same read-modify-write class as issue #449, same fix: atomic tmp+rename
+// write plus a cross-process filelock across the full cycle.
 func writeDispatchTrigger(root, experimentID string, force bool) error {
 	stateDir := filepath.Join(root, ".cog", "state")
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
@@ -464,13 +468,15 @@ func pinBaselineLockPath(root string) string {
 // Implements cog_pin_baseline's storage logic (design memo Q1 / Q10).
 //
 // This was originally left unlocked/non-atomic on the (incorrect) claim
-// that no concurrent reader/writer exists — cog-review's re-review round on
-// this PR corrected that: internal/eval/provider_impl.go's LoadConfig reads
-// eval-baselines.json on every reconcile cycle (both the daemon's own loop
-// and `cogos reconcile eval`), and two concurrent cog_pin_baseline MCP calls
-// race each other with no serialization at all. Same bug class, same fix:
-// atomic tmp+rename write plus a cross-process filelock spanning the full
-// read-modify-write cycle.
+// that no concurrent reader/writer exists. Corrected justification (review
+// round on ee61416): in the SHIPPED cmd/cogos binary the "eval" reconcile
+// provider is a no-op stub, so the daemon reconcile loop does NOT read this
+// file each cycle — the real EvalProvider's LoadConfig runs once at boot and
+// via MCP handlers only. The live race is two concurrent cog_pin_baseline
+// MCP calls interleaving with each other (and with any future real-provider
+// reconcile wiring, which the root-package parallel tree already has). Same
+// bug class, same fix: atomic tmp+rename write plus a cross-process filelock
+// spanning the full read-modify-write cycle.
 func writePinBaseline(root, experimentID, runID string) error {
 	stateDir := filepath.Join(root, ".cog", "state")
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
