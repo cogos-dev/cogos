@@ -474,3 +474,45 @@ func TestCrossProcessDeleteUpsertSameSessionNoSplitBrain(t *testing.T) {
 		}
 	}
 }
+
+// TestTurnsLockPathDoesNotCollideWithMetaLockPath guards against the
+// self-deadlock cog-review flagged (unverified, low-likelihood) on PR #458's
+// fourth review pass: a session literally named "_meta" would make
+// turnsPath("_meta") resolve to the same path as metaPath() ("_meta.json"),
+// so a naive turnsLockPath == turnsPath+".lock" would collide with
+// metaLockPath's "_meta.json.lock" — and since UpsertSession/DeleteSession
+// hold the turnsLockPath lock across the whole call, including the nested
+// writeMetaFileLocked call that acquires metaLockPath, that collision would
+// make UpsertSession("_meta", ...) self-deadlock against its own second lock
+// acquisition until metaLockTimeout elapses.
+func TestTurnsLockPathDoesNotCollideWithMetaLockPath(t *testing.T) {
+	t.Parallel()
+
+	idx, err := NewIndex(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	if got, meta := idx.turnsLockPath("_meta"), idx.metaLockPath(); got == meta {
+		t.Fatalf("turnsLockPath(%q) == metaLockPath() == %q — collision would self-deadlock UpsertSession/DeleteSession for this sessionID", "_meta", meta)
+	}
+
+	// End-to-end: UpsertSession/DeleteSession for a session literally named
+	// "_meta" must complete promptly, not hang until metaLockTimeout.
+	now := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- idx.UpsertSession(
+			SessionMeta{SessionID: "_meta", TurnCount: 1, FirstTurnAt: now, LastTurnAt: now},
+			[]Turn{{UUID: "_meta", SessionID: "_meta", TurnIndex: 0, Role: "user", Timestamp: now, Text: "hi"}},
+		)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("UpsertSession(\"_meta\", ...): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("UpsertSession(\"_meta\", ...) did not return within 2s — likely self-deadlocked on a turnsLockPath/metaLockPath collision")
+	}
+}

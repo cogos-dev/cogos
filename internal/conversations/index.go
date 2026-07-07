@@ -630,8 +630,21 @@ func sessionMapsEqual(a, b map[string]SessionMeta) bool {
 // session's turns file. Keyed per-session (not a single shared lock across
 // all sessions) so two different sessions' writers never contend on the same
 // lock — only two writers of the *same* sessionID, which is the actual race.
+//
+// Deliberately NOT simply turnsPath(sessionID)+".lock": turnsPath("_meta")
+// resolves to the same path as metaPath() ("_meta.json"), since turnsFilename
+// just appends ".json" to the (slash-escaped) sessionID with no reserved-name
+// exclusion. A session literally named "_meta" would otherwise make
+// turnsLockPath collide with metaLockPath, and UpsertSession/DeleteSession —
+// which hold the turnsLockPath lock for the whole call, including the nested
+// writeMetaFileLocked call that acquires metaLockPath — would self-deadlock
+// against its own second acquisition until metaLockTimeout elapses. The
+// distinct ".sessions.lock" suffix (rather than plain ".lock", which would
+// reproduce exactly metaLockPath's "_meta.json.lock" for sessionID=="_meta")
+// guarantees turns-lock paths never collide with metaLockPath regardless of
+// sessionID content.
 func (idx *Index) turnsLockPath(sessionID string) string {
-	return idx.turnsPath(sessionID) + ".lock"
+	return idx.turnsPath(sessionID) + ".sessions.lock"
 }
 
 // writeTurnsFileLocked persists the full turns list for sessionID. Callers
