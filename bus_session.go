@@ -117,10 +117,15 @@ func (m *busSessionManager) eventsPath(busID string) string {
 
 // createChatBus creates a new bus for a chat conversation.
 // The bus ID is derived from the session ID: bus_chat_{sessionID}.
+//
+// Deliberately does NOT hold m.mu: everything here is either idempotent
+// filesystem setup or registerBus, which takes the cross-process registry
+// filelock internally — and per the lock-ordering contract the filelock is
+// never acquired while holding m.mu (a contended peer must not stall
+// unrelated bus operations). Concurrent calls for the same session are safe:
+// MkdirAll/Create-if-absent are idempotent, and registerBus is serialized by
+// the filelock with update-in-place semantics for an existing busID.
 func (m *busSessionManager) createChatBus(sessionID, origin string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	busID := fmt.Sprintf("bus_chat_%s", sessionID)
 
 	// Create bus directory
@@ -149,10 +154,10 @@ func (m *busSessionManager) createChatBus(sessionID, origin string) (string, err
 
 // createMCPBus creates a new bus for an MCP HTTP session.
 // The bus ID is derived from the session ID: bus_mcp_{sessionID}.
+//
+// No m.mu — same reasoning as createChatBus: idempotent filesystem setup plus
+// filelock-guarded registerBus; the filelock is never acquired under m.mu.
 func (m *busSessionManager) createMCPBus(sessionID, origin string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	busID := fmt.Sprintf("bus_mcp_%s", sessionID)
 
 	// Create bus directory
