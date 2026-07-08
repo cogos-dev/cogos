@@ -22,6 +22,11 @@ type SiteProvider struct {
 	mu         sync.Mutex
 	root       string
 	strategies map[string]DeployStrategy
+
+	// buildHashFn builds an app and returns the content hash of its dist tree.
+	// Injectable so tests can drive ComputePlan's drift logic without running a
+	// real build; when nil, ComputePlan falls back to (*SiteProvider).buildAndHash.
+	buildHashFn func(ctx context.Context, appDir, name string) (string, error)
 }
 
 func defaultStrategies() map[string]DeployStrategy {
@@ -131,8 +136,9 @@ func (s *SiteProvider) FetchLive(ctx context.Context, config any) (any, error) {
 // ─── ComputePlan ────────────────────────────────────────────────────────────────
 
 // ComputePlan diffs declared SiteCRDs against live deployment state.
-// Drift detection in v0.0.1: absent live → create; ResolvedFromTarget=false → create;
-// ArtifactSHA empty → update; otherwise → skip. Full SHA comparison is planned for v0.1.
+// Drift detection: ResolvedFromTarget=false → create; otherwise build the app
+// and hash its content, comparing against the hash recorded at the live target
+// (.artifact-sha). Empty live hash or a mismatch → update; equal → skip.
 func (s *SiteProvider) ComputePlan(config any, live any, state *ReconcileState) (*ReconcilePlan, error) {
 	crds, ok := config.([]SiteCRD)
 	if !ok {
@@ -146,6 +152,11 @@ func (s *SiteProvider) ComputePlan(config any, live any, state *ReconcileState) 
 	s.mu.Lock()
 	root := s.root
 	s.mu.Unlock()
+
+	buildHash := s.buildHashFn
+	if buildHash == nil {
+		buildHash = s.buildAndHash
+	}
 
 	plan := &ReconcilePlan{
 		ResourceType: "site",
@@ -186,8 +197,32 @@ func (s *SiteProvider) ComputePlan(config any, live any, state *ReconcileState) 
 			continue
 		}
 
-		// Artifact SHA empty signals a deployed-but-unknown state — treat as update
-		if liveState.ArtifactSHA == "" {
+		// Drift detection: build the artifact and hash its content, then compare
+		// against the hash recorded at the live target (.artifact-sha). A build
+		// or hash failure is surfaced as an update (safer to attempt a deploy
+		// than to silently skip a possibly-stale target).
+		//
+		// NOTE: this builds the app to hash it, duplicating the build ApplyPlan
+		// performs when the update is applied. Acceptable for now — plan and
+		// apply run the same build.sh, so the extra build is cheap and keeps the
+		// diff honest (an empty stub check could never detect content changes).
+		localSHA, buildErr := buildHash(context.Background(), appDir, name)
+		if buildErr != nil {
+			plan.Warnings = append(plan.Warnings,
+				fmt.Sprintf("%s: drift build failed, assuming update: %v", name, buildErr))
+			plan.Actions = append(plan.Actions, ReconcileAction{
+				Action:       ActionUpdate,
+				ResourceType: "site",
+				Name:         name,
+				Details:      details,
+			})
+			plan.Summary.Updates++
+			continue
+		}
+		details["artifact_sha"] = localSHA
+
+		if liveState.ArtifactSHA == "" || liveState.ArtifactSHA != localSHA {
+			// No recorded content hash at the target, or the content changed.
 			plan.Actions = append(plan.Actions, ReconcileAction{
 				Action:       ActionUpdate,
 				ResourceType: "site",

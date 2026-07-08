@@ -51,6 +51,18 @@ func makeCNAMEJSON(domain string) []byte {
 	return b
 }
 
+// makeContentsJSON returns JSON bytes simulating a gh api .../contents/<file>
+// response with base64-encoded content (used for the .artifact-sha manifest).
+func makeContentsJSON(name, content string) []byte {
+	encoded := base64.StdEncoding.EncodeToString([]byte(content + "\n"))
+	b, _ := json.Marshal(map[string]any{
+		"name":     name,
+		"content":  encoded,
+		"encoding": "base64",
+	})
+	return b
+}
+
 // notFoundErr returns a fake 404 error matching FetchLive's detection heuristic.
 func notFoundErr(path string) error {
 	return fmt.Errorf("gh api %s: exit status 1: 404 Not Found", path)
@@ -97,6 +109,9 @@ func TestGHPagesStrategy_FetchLive_SuccessPath(t *testing.T) {
 		if strings.Contains(path, "contents/CNAME") {
 			return makeCNAMEJSON("myrgic.com"), nil
 		}
+		if strings.Contains(path, "contents/.artifact-sha") {
+			return makeContentsJSON(".artifact-sha", "cafef00d"), nil
+		}
 		return nil, fmt.Errorf("unexpected path: %s", path)
 	})
 
@@ -108,8 +123,12 @@ func TestGHPagesStrategy_FetchLive_SuccessPath(t *testing.T) {
 	if !state.ResolvedFromTarget {
 		t.Error("ResolvedFromTarget: want true")
 	}
-	if state.ArtifactSHA != "abc123def456" {
-		t.Errorf("ArtifactSHA: got %q, want abc123def456", state.ArtifactSHA)
+	// ArtifactSHA is the deploy-embedded content hash, not the git commit SHA.
+	if state.ArtifactSHA != "cafef00d" {
+		t.Errorf("ArtifactSHA: got %q, want cafef00d", state.ArtifactSHA)
+	}
+	if state.Metadata["commit_sha"] != "abc123def456" {
+		t.Errorf("Metadata[commit_sha]: got %v, want abc123def456", state.Metadata["commit_sha"])
 	}
 	if state.CNAMEContent != "myrgic.com" {
 		t.Errorf("CNAMEContent: got %q, want myrgic.com", state.CNAMEContent)
@@ -117,6 +136,35 @@ func TestGHPagesStrategy_FetchLive_SuccessPath(t *testing.T) {
 	repo, ok := state.Metadata["repo"]
 	if !ok || repo != "myrgic/myrgic.github.io" {
 		t.Errorf("Metadata[repo]: got %v, want myrgic/myrgic.github.io", repo)
+	}
+}
+
+func TestGHPagesStrategy_FetchLive_MissingArtifactSHA_NotAnError(t *testing.T) {
+	app := ghCRD("no-sha", "nosha.example.com", "myrgic/no-sha")
+
+	withRunner(t, func(ctx context.Context, path string) ([]byte, error) {
+		if strings.Contains(path, "git/refs/heads/main") {
+			return makeRefJSON("abc999"), nil
+		}
+		if strings.Contains(path, "contents/CNAME") {
+			return makeCNAMEJSON("nosha.example.com"), nil
+		}
+		if strings.Contains(path, "contents/.artifact-sha") {
+			return nil, notFoundErr(path) // manifest absent (pre-.artifact-sha deploy)
+		}
+		return nil, fmt.Errorf("unexpected path: %s", path)
+	})
+
+	g := ghPages()
+	state, err := g.FetchLive(context.Background(), app)
+	if err != nil {
+		t.Fatalf("FetchLive: .artifact-sha 404 should not error, got: %v", err)
+	}
+	if !state.ResolvedFromTarget {
+		t.Error("ResolvedFromTarget: want true (repo exists; .artifact-sha is optional)")
+	}
+	if state.ArtifactSHA != "" {
+		t.Errorf("ArtifactSHA: want empty when .artifact-sha absent, got %q", state.ArtifactSHA)
 	}
 }
 
@@ -150,6 +198,9 @@ func TestGHPagesStrategy_FetchLive_MissingCNAME_NotAnError(t *testing.T) {
 		if strings.Contains(path, "contents/CNAME") {
 			return nil, notFoundErr(path) // CNAME not present
 		}
+		if strings.Contains(path, "contents/.artifact-sha") {
+			return makeContentsJSON(".artifact-sha", "beadfeed"), nil
+		}
 		return nil, fmt.Errorf("unexpected path: %s", path)
 	})
 
@@ -161,8 +212,11 @@ func TestGHPagesStrategy_FetchLive_MissingCNAME_NotAnError(t *testing.T) {
 	if !state.ResolvedFromTarget {
 		t.Error("ResolvedFromTarget: want true (repo exists; CNAME is optional)")
 	}
-	if state.ArtifactSHA != "deadbeef1234" {
-		t.Errorf("ArtifactSHA: got %q, want deadbeef1234", state.ArtifactSHA)
+	if state.ArtifactSHA != "beadfeed" {
+		t.Errorf("ArtifactSHA: got %q, want beadfeed", state.ArtifactSHA)
+	}
+	if state.Metadata["commit_sha"] != "deadbeef1234" {
+		t.Errorf("Metadata[commit_sha]: got %v, want deadbeef1234", state.Metadata["commit_sha"])
 	}
 	if state.CNAMEContent != "" {
 		t.Errorf("CNAMEContent: want empty when CNAME absent, got %q", state.CNAMEContent)

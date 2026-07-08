@@ -15,7 +15,10 @@ package site
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +35,57 @@ import (
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 	"gopkg.in/yaml.v3"
 )
+
+// artifactSHAFile is the deploy-embedded manifest recording the content hash of
+// the artifact a target was built from. FetchLive reads it back to compare live
+// against a freshly-built artifact; Deploy writes it before staging.
+const artifactSHAFile = ".artifact-sha"
+
+// artifactHash computes a deterministic sha256 over every file in distDir,
+// hashing the sorted sequence of (relative-path, file-bytes) so the result is
+// independent of filesystem walk order. Directories and symlinks are ignored;
+// only regular file contents contribute. Returns lowercase hex.
+//
+// Each entry is length-prefixed (path length, path, content length, content) so
+// that no two distinct trees can collide by concatenation ambiguity.
+func artifactHash(distDir string) (string, error) {
+	var rels []string
+	err := filepath.Walk(distDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(distDir, path)
+		if err != nil {
+			return err
+		}
+		rels = append(rels, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("artifactHash: walk %s: %w", distDir, err)
+	}
+	sort.Strings(rels)
+
+	h := sha256.New()
+	var lenBuf [8]byte
+	for _, rel := range rels {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(rel)))
+		h.Write(lenBuf[:])
+		h.Write([]byte(rel))
+
+		data, err := os.ReadFile(filepath.Join(distDir, filepath.FromSlash(rel)))
+		if err != nil {
+			return "", fmt.Errorf("artifactHash: read %s: %w", rel, err)
+		}
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(data)))
+		h.Write(lenBuf[:])
+		h.Write(data)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 func init() {
 	sp := newSiteProvider()
@@ -75,12 +130,16 @@ type siteSpec struct {
 	RedirectTo *string    `yaml:"redirect_to,omitempty" json:"redirect_to,omitempty"`
 }
 
-type sourceSpec struct{ Path string `yaml:"path" json:"path"` }
+type sourceSpec struct {
+	Path string `yaml:"path" json:"path"`
+}
 type buildSpec struct {
 	Command string `yaml:"command" json:"command"`
 	Dist    string `yaml:"dist"    json:"dist"`
 }
-type httpsSpec struct{ Required bool `yaml:"required" json:"required"` }
+type httpsSpec struct {
+	Required bool `yaml:"required" json:"required"`
+}
 type deploySpec struct {
 	Strategy string         `yaml:"strategy" json:"strategy"`
 	Target   map[string]any `yaml:"target"   json:"target"`
@@ -125,10 +184,17 @@ type siteProvider struct {
 	mu         sync.Mutex
 	root       string
 	strategies map[string]deployStrategy
+
+	// buildHashFn builds an app and returns the content hash of its dist tree.
+	// Injectable so tests can drive ComputePlan's drift logic without running a
+	// real build; defaults to (*siteProvider).buildAndHash.
+	buildHashFn func(ctx context.Context, appDir, name string) (string, error)
 }
 
 func newSiteProvider() *siteProvider {
-	return &siteProvider{strategies: map[string]deployStrategy{}}
+	sp := &siteProvider{strategies: map[string]deployStrategy{}}
+	sp.buildHashFn = sp.buildAndHash
+	return sp
 }
 
 func (s *siteProvider) RegisterStrategy(name string, strat deployStrategy) {
@@ -241,7 +307,32 @@ func (s *siteProvider) ComputePlan(config any, live any, state *reconcile.State)
 			continue
 		}
 
-		if liveState.ArtifactSHA == "" {
+		// Drift detection: build the artifact and hash its content, then compare
+		// against the hash recorded at the live target (.artifact-sha). A build
+		// or hash failure is surfaced as an update (safer to attempt a deploy
+		// than to silently skip a possibly-stale target).
+		//
+		// NOTE: this builds the app to hash it, duplicating the build ApplyPlan
+		// performs when the update is applied. Acceptable for now — plan and
+		// apply run the same build.sh, so the extra build is cheap and keeps the
+		// diff honest (an empty stub check could never detect content changes).
+		localSHA, buildErr := s.buildHashFn(context.Background(), appDir, name)
+		if buildErr != nil {
+			plan.Warnings = append(plan.Warnings,
+				fmt.Sprintf("%s: drift build failed, assuming update: %v", name, buildErr))
+			plan.Actions = append(plan.Actions, reconcile.Action{
+				Action:       reconcile.ActionUpdate,
+				ResourceType: "site",
+				Name:         name,
+				Details:      details,
+			})
+			plan.Summary.Updates++
+			continue
+		}
+		details["artifact_sha"] = localSHA
+
+		if liveState.ArtifactSHA == "" || liveState.ArtifactSHA != localSHA {
+			// No recorded content hash at the target, or the content changed.
 			plan.Actions = append(plan.Actions, reconcile.Action{
 				Action:       reconcile.ActionUpdate,
 				ResourceType: "site",
@@ -423,6 +514,18 @@ func siteBuild(ctx context.Context, appDir, name string) error {
 	return nil
 }
 
+// buildAndHash runs the app's build (the same build.sh path ApplyPlan uses) and
+// returns the content hash of the produced dist directory. The build writes to
+// appDir/dist in place — build.sh hard-codes that path and relies on the app's
+// location for its ../../packages copies, so there is no separate temp build dir
+// to redirect to or clean up; the dist tree is the artifact ApplyPlan deploys.
+func (s *siteProvider) buildAndHash(ctx context.Context, appDir, name string) (string, error) {
+	if err := siteBuild(ctx, appDir, name); err != nil {
+		return "", err
+	}
+	return artifactHash(filepath.Join(appDir, "dist"))
+}
+
 // ─── GHPagesStrategy ─────────────────────────────────────────────────────────
 
 type ghPagesStrategy struct{ mu sync.Mutex }
@@ -457,6 +560,10 @@ func (g *ghPagesStrategy) FetchLive(ctx context.Context, app siteCRD) (liveSiteS
 	}
 	state := liveSiteState{ResolvedFromTarget: true, Metadata: make(map[string]any)}
 
+	// The main ref establishes whether the target is deployed at all. Its commit
+	// SHA is not content-comparable (it changes on every force-push regardless of
+	// artifact content), so it is recorded only as metadata; ArtifactSHA comes
+	// from the deploy-embedded .artifact-sha manifest below.
 	refData, err := ghAPI(ctx, fmt.Sprintf("/repos/%s/git/refs/heads/main", repo))
 	if err != nil {
 		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "Not Found") {
@@ -466,12 +573,14 @@ func (g *ghPagesStrategy) FetchLive(ctx context.Context, app siteCRD) (liveSiteS
 		return liveSiteState{}, fmt.Errorf("FetchLive: fetch main ref: %w", err)
 	}
 	var refResp struct {
-		Object struct{ SHA string `json:"sha"` } `json:"object"`
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
 	}
 	if err := json.Unmarshal(refData, &refResp); err != nil {
 		return liveSiteState{}, fmt.Errorf("FetchLive: parse ref response: %w", err)
 	}
-	state.ArtifactSHA = refResp.Object.SHA
+	state.Metadata["commit_sha"] = refResp.Object.SHA
 
 	cnameData, err := ghAPI(ctx, fmt.Sprintf("/repos/%s/contents/CNAME", repo))
 	if err == nil {
@@ -486,6 +595,24 @@ func (g *ghPagesStrategy) FetchLive(ctx context.Context, app siteCRD) (liveSiteS
 			}
 		}
 	}
+
+	// Fetch the deploy-embedded artifact content hash (optional — 404 is normal
+	// for a target deployed before .artifact-sha was introduced; an empty
+	// ArtifactSHA then forces an update on the next reconcile).
+	shaData, err := ghAPI(ctx, fmt.Sprintf("/repos/%s/contents/%s", repo, artifactSHAFile))
+	if err == nil {
+		var shaResp struct {
+			Content  string `json:"content"`
+			Encoding string `json:"encoding"`
+		}
+		if err := json.Unmarshal(shaData, &shaResp); err == nil && shaResp.Encoding == "base64" {
+			decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(shaResp.Content, "\n", ""))
+			if err == nil {
+				state.ArtifactSHA = strings.TrimSpace(string(decoded))
+			}
+		}
+	}
+
 	state.Metadata["repo"] = repo
 	return state, nil
 }
@@ -512,6 +639,17 @@ func (g *ghPagesStrategy) Deploy(ctx context.Context, app siteCRD, artifactDir s
 	}
 	if err := copyDir(artifactDir, tmpDir); err != nil {
 		return fmt.Errorf("Deploy: copy artifact: %w", err)
+	}
+	// Record the content hash of the artifact this deploy ships, so a later
+	// FetchLive can detect drift. Hash the source artifactDir (before CNAME and
+	// .artifact-sha are added to the deploy tree) so it matches the hash Diff
+	// computes over a freshly-built dist.
+	sha, err := artifactHash(artifactDir)
+	if err != nil {
+		return fmt.Errorf("Deploy: hash artifact: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, artifactSHAFile), []byte(sha), 0644); err != nil {
+		return fmt.Errorf("Deploy: write %s: %w", artifactSHAFile, err)
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, "CNAME"), []byte(app.Spec.Domain), 0644); err != nil {
 		return fmt.Errorf("Deploy: write CNAME: %w", err)
