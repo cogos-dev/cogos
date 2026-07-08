@@ -4,14 +4,69 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 
 	"gopkg.in/yaml.v3"
 )
+
+// artifactSHAFile is the deploy-embedded manifest recording the content hash of
+// the artifact a target was built from. FetchLive reads it back to compare live
+// against a freshly-built artifact; Deploy writes it before staging.
+const artifactSHAFile = ".artifact-sha"
+
+// artifactHash computes a deterministic sha256 over every file in distDir,
+// hashing the sorted sequence of (relative-path, file-bytes) so the result is
+// independent of filesystem walk order. Directories and symlinks are ignored;
+// only regular file contents contribute. Returns lowercase hex.
+//
+// Each entry is length-prefixed (path length, path, content length, content) so
+// that no two distinct trees can collide by concatenation ambiguity.
+func artifactHash(distDir string) (string, error) {
+	var rels []string
+	err := filepath.Walk(distDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(distDir, path)
+		if err != nil {
+			return err
+		}
+		rels = append(rels, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("artifactHash: walk %s: %w", distDir, err)
+	}
+	sort.Strings(rels)
+
+	h := sha256.New()
+	var lenBuf [8]byte
+	for _, rel := range rels {
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(rel)))
+		h.Write(lenBuf[:])
+		h.Write([]byte(rel))
+
+		data, err := os.ReadFile(filepath.Join(distDir, filepath.FromSlash(rel)))
+		if err != nil {
+			return "", fmt.Errorf("artifactHash: read %s: %w", rel, err)
+		}
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(data)))
+		h.Write(lenBuf[:])
+		h.Write(data)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 // siteLoadCRDs walks <root>/apps/*/site.yaml and returns parsed SiteCRDs.
 // Parse errors are hard failures; validation errors are logged as warnings
@@ -60,4 +115,16 @@ func siteBuild(ctx context.Context, appDir, name string) error {
 	}
 	log.Printf("[site] build %s: %s", name, out)
 	return nil
+}
+
+// buildAndHash runs the app's build (the same build.sh path ApplyPlan uses) and
+// returns the content hash of the produced dist directory. The build writes to
+// appDir/dist in place — build.sh hard-codes that path and relies on the app's
+// location for its ../../packages copies, so there is no separate temp build dir
+// to redirect to or clean up; the dist tree is the artifact ApplyPlan deploys.
+func (s *SiteProvider) buildAndHash(ctx context.Context, appDir, name string) (string, error) {
+	if err := siteBuild(ctx, appDir, name); err != nil {
+		return "", err
+	}
+	return artifactHash(filepath.Join(appDir, "dist"))
 }

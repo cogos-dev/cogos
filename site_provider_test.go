@@ -202,8 +202,8 @@ func TestSiteProvider_LoadConfig_InvalidValidation(t *testing.T) {
 func TestSiteProvider_LoadConfig_MixedValidAndInvalid(t *testing.T) {
 	root := t.TempDir()
 	buildAppsDir(t, root, map[string]string{
-		"good-app":  validSiteYAML("good-app", "good.example.com"),
-		"bad-app":   invalidSiteYAML("bad-app"),
+		"good-app": validSiteYAML("good-app", "good.example.com"),
+		"bad-app":  invalidSiteYAML("bad-app"),
 	})
 
 	sp := &SiteProvider{strategies: defaultStrategies()}
@@ -310,10 +310,17 @@ func TestSiteProvider_FetchLive_StrategyError(t *testing.T) {
 
 // ─── ComputePlan tests ───────────────────────────────────────────────────────────
 
+// stubBuildHash returns a fixed hash for every app, letting ComputePlan drift
+// tests exercise the compare logic without running a real build.
+func stubBuildHash(sha string) func(context.Context, string, string) (string, error) {
+	return func(context.Context, string, string) (string, error) { return sha, nil }
+}
+
 func TestSiteProvider_ComputePlan_AllSynced(t *testing.T) {
 	mock := &mockDeployStrategy{}
 	sp := newProviderWithMock(mock)
 	sp.root = "/fake/root"
+	sp.buildHashFn = stubBuildHash("deadbeef") // local build matches live → skip
 
 	crds := []SiteCRD{makeCRD("app-a", "a.example.com")}
 	liveMap := map[string]LiveSiteState{
@@ -335,10 +342,37 @@ func TestSiteProvider_ComputePlan_AllSynced(t *testing.T) {
 	}
 }
 
+func TestSiteProvider_ComputePlan_ContentDrift_IsUpdate(t *testing.T) {
+	mock := &mockDeployStrategy{}
+	sp := newProviderWithMock(mock)
+	sp.root = "/fake/root"
+	sp.buildHashFn = stubBuildHash("newsha") // local build differs from live → update
+
+	crds := []SiteCRD{makeCRD("app-a", "a.example.com")}
+	liveMap := map[string]LiveSiteState{
+		"app-a": {ArtifactSHA: "oldsha", ResolvedFromTarget: true},
+	}
+
+	plan, err := sp.ComputePlan(crds, liveMap, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if len(plan.Actions) != 1 {
+		t.Fatalf("ComputePlan: got %d actions, want 1", len(plan.Actions))
+	}
+	if plan.Actions[0].Action != ActionUpdate {
+		t.Errorf("ComputePlan: got action %q, want Update on content drift", plan.Actions[0].Action)
+	}
+	if plan.Summary.Updates != 1 {
+		t.Errorf("ComputePlan: Summary.Updates = %d, want 1", plan.Summary.Updates)
+	}
+}
+
 func TestSiteProvider_ComputePlan_EmptyArtifactSHA_IsUpdate(t *testing.T) {
 	mock := &mockDeployStrategy{}
 	sp := newProviderWithMock(mock)
 	sp.root = "/fake/root"
+	sp.buildHashFn = stubBuildHash("anysha") // live has no recorded hash → update regardless
 
 	crds := []SiteCRD{makeCRD("app-a", "a.example.com")}
 	liveMap := map[string]LiveSiteState{
@@ -438,6 +472,14 @@ func TestSiteProvider_ComputePlan_SummaryCounts(t *testing.T) {
 	mock := &mockDeployStrategy{}
 	sp := newProviderWithMock(mock)
 	sp.root = "/fake/root"
+	// app-skip's freshly-built hash matches its live hash → skip; app-update has
+	// no live hash → update; app-create is not deployed → create.
+	sp.buildHashFn = func(_ context.Context, _, name string) (string, error) {
+		if name == "app-skip" {
+			return "sha1", nil
+		}
+		return "other", nil
+	}
 
 	crds := []SiteCRD{
 		makeCRD("app-skip", "skip.example.com"),

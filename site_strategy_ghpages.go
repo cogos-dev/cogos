@@ -79,8 +79,9 @@ func ghAPI(ctx context.Context, path string) ([]byte, error) {
 
 // FetchLive retrieves the current deployed state from the GitHub Pages target repo.
 // It queries:
-//   - /repos/<repo>/git/refs/heads/main → ArtifactSHA (current HEAD)
+//   - /repos/<repo>/git/refs/heads/main → existence + Metadata["commit_sha"]
 //   - /repos/<repo>/contents/CNAME → CNAMEContent (optional; 404 = empty)
+//   - /repos/<repo>/contents/.artifact-sha → ArtifactSHA (optional; 404 = empty)
 func (g *GHPagesStrategy) FetchLive(ctx context.Context, app SiteCRD) (LiveSiteState, error) {
 	repo, err := g.resolveRepo(app)
 	if err != nil {
@@ -92,7 +93,10 @@ func (g *GHPagesStrategy) FetchLive(ctx context.Context, app SiteCRD) (LiveSiteS
 		Metadata:           make(map[string]any),
 	}
 
-	// Query main branch SHA
+	// Query main branch ref. This establishes whether the target is deployed at
+	// all. The commit SHA is not content-comparable (it changes on every
+	// force-push regardless of artifact content), so it is recorded only as
+	// metadata; ArtifactSHA comes from the deploy-embedded .artifact-sha manifest.
 	refData, err := ghAPIRunner(ctx, fmt.Sprintf("/repos/%s/git/refs/heads/main", repo))
 	if err != nil {
 		// If the repo doesn't exist yet or has no main branch, treat as not deployed
@@ -111,7 +115,7 @@ func (g *GHPagesStrategy) FetchLive(ctx context.Context, app SiteCRD) (LiveSiteS
 	if err := json.Unmarshal(refData, &refResp); err != nil {
 		return LiveSiteState{}, fmt.Errorf("FetchLive: parse ref response: %w", err)
 	}
-	state.ArtifactSHA = refResp.Object.SHA
+	state.Metadata["commit_sha"] = refResp.Object.SHA
 
 	// Query CNAME (optional — 404 is normal)
 	cnameData, err := ghAPIRunner(ctx, fmt.Sprintf("/repos/%s/contents/CNAME", repo))
@@ -129,6 +133,25 @@ func (g *GHPagesStrategy) FetchLive(ctx context.Context, app SiteCRD) (LiveSiteS
 		}
 	}
 	// CNAME fetch errors are silently ignored — it's optional
+
+	// Query the deploy-embedded artifact content hash (optional — 404 is normal
+	// for a target deployed before .artifact-sha was introduced; an empty
+	// ArtifactSHA then forces an update on the next reconcile).
+	shaData, err := ghAPIRunner(ctx, fmt.Sprintf("/repos/%s/contents/%s", repo, artifactSHAFile))
+	if err == nil {
+		var shaResp struct {
+			Content  string `json:"content"`
+			Encoding string `json:"encoding"`
+		}
+		if err := json.Unmarshal(shaData, &shaResp); err == nil && shaResp.Encoding == "base64" {
+			decoded, err := base64.StdEncoding.DecodeString(
+				strings.ReplaceAll(shaResp.Content, "\n", ""))
+			if err == nil {
+				state.ArtifactSHA = strings.TrimSpace(string(decoded))
+			}
+		}
+	}
+	// .artifact-sha fetch errors are silently ignored — it's optional
 
 	state.Metadata["repo"] = repo
 	return state, nil
@@ -168,6 +191,18 @@ func (g *GHPagesStrategy) Deploy(ctx context.Context, app SiteCRD, artifactDir s
 	// Copy artifact contents into temp dir
 	if err := copyDir(artifactDir, tmpDir); err != nil {
 		return fmt.Errorf("Deploy: copy artifact: %w", err)
+	}
+
+	// Record the content hash of the artifact this deploy ships, so a later
+	// FetchLive can detect drift. Hash the source artifactDir (before CNAME and
+	// .artifact-sha are added to the deploy tree) so it matches the hash
+	// ComputePlan computes over a freshly-built dist.
+	sha, err := artifactHash(artifactDir)
+	if err != nil {
+		return fmt.Errorf("Deploy: hash artifact: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, artifactSHAFile), []byte(sha), 0644); err != nil {
+		return fmt.Errorf("Deploy: write %s: %w", artifactSHAFile, err)
 	}
 
 	// Write CNAME file (domain without trailing newline)
