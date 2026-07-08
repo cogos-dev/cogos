@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/filelock"
 )
 
 // ADR-084 dataref migration policy (Phase 1: schema-additive).
@@ -115,10 +117,15 @@ func (m *busSessionManager) eventsPath(busID string) string {
 
 // createChatBus creates a new bus for a chat conversation.
 // The bus ID is derived from the session ID: bus_chat_{sessionID}.
+//
+// Deliberately does NOT hold m.mu: everything here is either idempotent
+// filesystem setup or registerBus, which takes the cross-process registry
+// filelock internally — and per the lock-ordering contract the filelock is
+// never acquired while holding m.mu (a contended peer must not stall
+// unrelated bus operations). Concurrent calls for the same session are safe:
+// MkdirAll/Create-if-absent are idempotent, and registerBus is serialized by
+// the filelock with update-in-place semantics for an existing busID.
 func (m *busSessionManager) createChatBus(sessionID, origin string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	busID := fmt.Sprintf("bus_chat_%s", sessionID)
 
 	// Create bus directory
@@ -147,10 +154,10 @@ func (m *busSessionManager) createChatBus(sessionID, origin string) (string, err
 
 // createMCPBus creates a new bus for an MCP HTTP session.
 // The bus ID is derived from the session ID: bus_mcp_{sessionID}.
+//
+// No m.mu — same reasoning as createChatBus: idempotent filesystem setup plus
+// filelock-guarded registerBus; the filelock is never acquired under m.mu.
 func (m *busSessionManager) createMCPBus(sessionID, origin string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	busID := fmt.Sprintf("bus_mcp_%s", sessionID)
 
 	// Create bus directory
@@ -177,8 +184,37 @@ func (m *busSessionManager) createMCPBus(sessionID, origin string) (string, erro
 	return busID, nil
 }
 
+// registryLockTimeout bounds how long a registry writer waits for the
+// cross-process advisory lock before failing the operation (registration:
+// correctness-critical, cold path).
+const registryLockTimeout = 5 * time.Second
+
+// registrySeqLockTimeout bounds the best-effort seq-metadata update on the
+// append hot path — short, because a skipped update self-heals on the next
+// append and a long wait would delay the append caller.
+const registrySeqLockTimeout = 500 * time.Millisecond
+
+// acquireRegistryLock takes the cross-process advisory lock guarding the
+// load-modify-save cycle on registry.json. The daemon's
+// internal/engine.BusSessionManager takes the SAME lock (registry.json.lock),
+// so concurrent `cog bus`/`cog infer` invocations and a running daemon
+// serialize instead of last-writer-wins silently dropping each other's
+// registry entries.
+func (m *busSessionManager) acquireRegistryLock() (*filelock.FileLock, error) {
+	if err := os.MkdirAll(m.busesDir(), 0755); err != nil {
+		return nil, err
+	}
+	return filelock.Acquire(m.registryPath()+".lock", registryLockTimeout)
+}
+
 // registerBus adds or updates a bus entry in the registry.
 func (m *busSessionManager) registerBus(busID, sessionID, origin string) error {
+	lock, err := m.acquireRegistryLock()
+	if err != nil {
+		return fmt.Errorf("acquire registry lock: %w", err)
+	}
+	defer lock.Release()
+
 	registry := m.loadRegistry()
 
 	// Check if bus already exists
@@ -221,6 +257,18 @@ func (m *busSessionManager) loadRegistry() []busRegistryEntry {
 }
 
 // saveRegistry writes the bus registry to disk.
+//
+// The write is atomic (tmp + rename): a plain truncate-before-write left
+// registry.json empty if the process was killed mid-write, and loadRegistry
+// swallows the resulting parse error and returns an empty registry — so the
+// next save from any process would discard every registered bus, not just the
+// one being added. Mirrors the daemon-side BusSessionManager.saveRegistry
+// (internal/engine/bus_session.go).
+//
+// Cross-process serialization: every load-modify-save cycle on the registry
+// (registerBus, updateRegistrySeq) holds the shared advisory lock from
+// acquireRegistryLock; the daemon-side writer holds the same lock. Callers of
+// saveRegistry must hold that lock.
 func (m *busSessionManager) saveRegistry(entries []busRegistryEntry) error {
 	if err := os.MkdirAll(m.busesDir(), 0755); err != nil {
 		return err
@@ -229,7 +277,15 @@ func (m *busSessionManager) saveRegistry(entries []busRegistryEntry) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.registryPath(), data, 0644)
+	tmp := m.registryPath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, m.registryPath()); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // appendBusEvent appends a new CogBlock to a bus's event chain.
@@ -287,15 +343,16 @@ func (m *busSessionManager) appendBusEvent(busID, eventType, from string, payloa
 	}
 	f.Close()
 
-	// Update registry
-	m.updateRegistrySeq(busID, newSeq, evt.Ts)
-
 	// Snapshot handlers while locked, then release BEFORE dispatching.
 	// This prevents deadlocks when handlers call appendBusEvent (e.g. tool
 	// router posting tool.result in response to tool.invoke).
 	handlers := make([]busEventHandler, len(m.eventHandlers))
 	copy(handlers, m.eventHandlers)
 	m.mu.Unlock()
+
+	// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
+	// cross-process filelock, and must never stall unrelated bus operations.
+	m.updateRegistrySeq(busID, newSeq, evt.Ts)
 
 	// Dispatch handlers outside the lock — safe because each handler
 	// that needs to write back to the bus will re-acquire the lock via
@@ -365,11 +422,12 @@ func (m *busSessionManager) appendBusEventRef(busID, eventType, from, digest, me
 	}
 	f.Close()
 
-	m.updateRegistrySeq(busID, newSeq, evt.Ts)
-
 	handlers := make([]busEventHandler, len(m.eventHandlers))
 	copy(handlers, m.eventHandlers)
 	m.mu.Unlock()
+
+	// Outside m.mu — see updateRegistrySeq's lock-ordering contract.
+	m.updateRegistrySeq(busID, newSeq, evt.Ts)
 
 	for _, h := range handlers {
 		h.handler(busID, &evt)
@@ -409,10 +467,32 @@ func (m *busSessionManager) getLastEvent(busID string) (int, string) {
 }
 
 // updateRegistrySeq updates the last event seq/timestamp in the registry.
+// Caller must NOT hold m.mu — this blocks (briefly) on the cross-process
+// registry filelock, and holding the in-process mutex across that wait would
+// let one contended peer stall every unrelated bus operation in this process.
+//
+// Best-effort + monotonic: seq metadata self-heals on the next append, so on
+// lock contention we skip (short registrySeqLockTimeout) rather than wait,
+// and the IfNewer guard makes an out-of-order update a harmless no-op instead
+// of a seq regression.
 func (m *busSessionManager) updateRegistrySeq(busID string, seq int, ts string) {
+	if err := os.MkdirAll(m.busesDir(), 0755); err != nil {
+		log.Printf("[bus] skipping registry seq update: %v", err)
+		return
+	}
+	lock, err := filelock.Acquire(m.registryPath()+".lock", registrySeqLockTimeout)
+	if err != nil {
+		log.Printf("[bus] skipping registry seq update (lock contended): %v", err)
+		return
+	}
+	defer lock.Release()
+
 	registry := m.loadRegistry()
 	for i, entry := range registry {
 		if entry.BusID == busID {
+			if entry.LastEventSeq >= seq {
+				return // stale out-of-order update; newer one already landed
+			}
 			registry[i].LastEventSeq = seq
 			registry[i].LastEventAt = ts
 			registry[i].EventCount = seq
@@ -551,7 +631,19 @@ func (m *busSessionManager) resetBus(busID string) error {
 }
 
 // archiveBus does the locked portion of resetBus: archive + registry update.
+//
+// Lock ordering per the file's contract: the cross-process registry filelock
+// is acquired BEFORE m.mu (cold path — full registryLockTimeout), so the
+// registry read-modify-write below cannot race a peer process's
+// registerBus/updateRegistrySeq, and no goroutine ever waits on the filelock
+// while holding m.mu.
 func (m *busSessionManager) archiveBus(busID string) (string, error) {
+	rlock, err := m.acquireRegistryLock()
+	if err != nil {
+		return "", fmt.Errorf("acquire registry lock: %w", err)
+	}
+	defer rlock.Release()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

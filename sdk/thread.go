@@ -201,6 +201,24 @@ func (p *threadProjector) setThread(uri *ParsedURI, content []byte) error {
 }
 
 // patchThread updates thread metadata.
+//
+// Multi-writer audit (v1.0 alignment, ledger L10): patchThread's
+// load-then-write of threadMetaPath (via fs.WriteJSON, already atomic —
+// tmp+rename in sdk/internal/fs) is a read-modify-write over a shared file,
+// the same shape that required the filelock+delta fix in
+// internal/conversations/index.go for issue #449. It is NOT given the same
+// cross-process lock here because, as of this audit, sdk.Kernel (the only
+// type that constructs a threadProjector, see cogos.go's RegisterProjector
+// call) has zero callers outside the sdk package itself — neither
+// cmd/cogos/internal/engine (the daemon) nor any root-tree CLI command
+// constructs an sdk.Kernel or resolves a cog:thread/* URI through it. The
+// only repo-wide sdk import outside sdk/ itself is inference.go's
+// sdk.ParseURI, unrelated to thread mutation. So no CLI+daemon (or any
+// two-process) interleaving on threadMetaPath currently exists to race on. If
+// sdk.Kernel is ever wired into a live entrypoint (daemon or CLI) that can run
+// concurrently with another writer of the same node's thread files, apply the
+// same filelock-plus-delta pattern used in internal/conversations/index.go
+// before that happens.
 func (p *threadProjector) patchThread(uri *ParsedURI, content []byte) error {
 	threadID := uri.Path
 	if threadID == "" || threadID == "current" {
