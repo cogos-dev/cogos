@@ -251,8 +251,8 @@ func TestResolveModelRequest_Foreground(t *testing.T) {
 	if res.PreferProvider != "claude-oauth" {
 		t.Errorf("foreground: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
-	if res.ModelOverride != "claude-sonnet-4-6" {
-		t.Errorf("foreground: ModelOverride = %q; want claude-sonnet-4-6", res.ModelOverride)
+	if res.ModelOverride != "claude-sonnet-5" {
+		t.Errorf("foreground: ModelOverride = %q; want claude-sonnet-5", res.ModelOverride)
 	}
 	if res.InjectKernelTools {
 		t.Error("foreground: InjectKernelTools should be false")
@@ -265,8 +265,8 @@ func TestResolveModelRequest_Deliberation(t *testing.T) {
 	if res.PreferProvider != "claude-oauth" {
 		t.Errorf("deliberation: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
-	if res.ModelOverride != "claude-opus-4-7" {
-		t.Errorf("deliberation: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
+	if res.ModelOverride != "claude-opus-4-8" {
+		t.Errorf("deliberation: ModelOverride = %q; want claude-opus-4-8", res.ModelOverride)
 	}
 }
 
@@ -298,8 +298,8 @@ func TestResolveModelRequest_OpusShortAlias(t *testing.T) {
 	if res.PreferProvider != "claude-oauth" {
 		t.Errorf("opus: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
-	if res.ModelOverride != "claude-opus-4-7" {
-		t.Errorf("opus: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
+	if res.ModelOverride != "claude-opus-4-8" {
+		t.Errorf("opus: ModelOverride = %q; want claude-opus-4-8", res.ModelOverride)
 	}
 }
 
@@ -332,8 +332,8 @@ func TestGateway_ForegroundRoutes_ToClaudeCode(t *testing.T) {
 		t.Error("foreground: claude-oauth stub not called")
 	}
 	// ModelOverride should be forwarded to the provider.
-	if ccStub.lastRequest != nil && ccStub.lastRequest.ModelOverride != "claude-sonnet-4-6" {
-		t.Errorf("foreground: ModelOverride = %q; want claude-sonnet-4-6",
+	if ccStub.lastRequest != nil && ccStub.lastRequest.ModelOverride != "claude-sonnet-5" {
+		t.Errorf("foreground: ModelOverride = %q; want claude-sonnet-5",
 			ccStub.lastRequest.ModelOverride)
 	}
 }
@@ -358,8 +358,8 @@ func TestGateway_DeliberationRoutes_ToClaudeCode(t *testing.T) {
 	if ccStub.lastRequest == nil {
 		t.Error("deliberation: claude-oauth stub not called")
 	}
-	if ccStub.lastRequest != nil && ccStub.lastRequest.ModelOverride != "claude-opus-4-7" {
-		t.Errorf("deliberation: ModelOverride = %q; want claude-opus-4-7",
+	if ccStub.lastRequest != nil && ccStub.lastRequest.ModelOverride != "claude-opus-4-8" {
+		t.Errorf("deliberation: ModelOverride = %q; want claude-opus-4-8",
 			ccStub.lastRequest.ModelOverride)
 	}
 }
@@ -855,3 +855,31 @@ func TestIsEclipseConfigured_ModelMatch(t *testing.T) {
 var _ http.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 })
+
+// TestResolve_Claude5Generation covers the 2026-07 alias refresh: the current-
+// generation short aliases (sonnet/opus/fable) and every raw Claude-5-era id a
+// dispatch caller may pin. Dispatch resolves with a nil router, so any id
+// missing from intentAliases silently falls to the local default (the #430
+// wrong-model trap) — these entries are what keep that from happening.
+func TestResolve_Claude5Generation(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"sonnet":                    "claude-sonnet-5",
+		"opus":                      "claude-opus-4-8",
+		"fable":                     "claude-fable-5",
+		"haiku":                     "claude-haiku-4-5-20251001",
+		"claude-sonnet-5":           "claude-sonnet-5",
+		"claude-opus-4-8":           "claude-opus-4-8",
+		"claude-fable-5":            "claude-fable-5",
+		"claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001",
+	}
+	for model, want := range cases {
+		res := ResolveModelRequest(nil, model, "req-c5")
+		if res.PreferProvider != "claude-oauth" {
+			t.Errorf("%s: PreferProvider = %q; want claude-oauth", model, res.PreferProvider)
+		}
+		if res.ModelOverride != want {
+			t.Errorf("%s: ModelOverride = %q; want %q", model, res.ModelOverride, want)
+		}
+	}
+}

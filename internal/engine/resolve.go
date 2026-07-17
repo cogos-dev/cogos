@@ -49,19 +49,21 @@ var intentAliases = map[string]ModelResolution{
 	// OAuth bearer, direct /v1/messages, no CLI subprocess). claude-code stays
 	// registered as the router fallback and as claude-oauth's internal 429
 	// fallback, so nothing is stranded if the OAuth path is unavailable.
-	"foreground":   {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
-	"deliberation": {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
+	"foreground":   {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-5"},
+	"deliberation": {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-8"},
 	// Raw model IDs that should route to claude-oauth.
 	"claude-sonnet-4-6": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
 	"claude-opus-4-7":   {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
-	// Short convenience aliases — per-model selection (haiku / sonnet / opus).
-	// claude-oauth is model-agnostic (effectiveModel honours ModelOverride), so a
-	// single provider serves the whole family; any other raw claude-* id falls
-	// through to default routing (claude-oauth) with ModelOverride preserved.
+	// Short convenience aliases — per-model selection (haiku / sonnet / opus /
+	// fable). claude-oauth is model-agnostic (effectiveModel honours
+	// ModelOverride), so a single provider serves the whole family. Aliases track
+	// the CURRENT generation; older generations stay reachable via their raw ids
+	// above.
 	"claude": {PreferProvider: "claude-oauth"},
 	"haiku":  {PreferProvider: "claude-oauth", ModelOverride: "claude-haiku-4-5-20251001"},
-	"sonnet": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
-	"opus":   {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
+	"sonnet": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-5"},
+	"opus":   {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-8"},
+	"fable":  {PreferProvider: "claude-oauth", ModelOverride: "claude-fable-5"},
 	// Other provider aliases.
 	"codex": {PreferProvider: "codex"},
 	// Local/kernel aliases — injectKernelTools tells the gateway to wire tools.
@@ -74,6 +76,29 @@ var intentAliases = map[string]ModelResolution{
 	// via this alias default.
 	"ollama":       {PreferProvider: "lmstudio-darkstar", InjectKernelTools: true},
 	"kernel-agent": {PreferProvider: "lmstudio-darkstar", InjectKernelTools: true},
+}
+
+// dispatchFrontierAliases maps raw current-generation Anthropic model ids to
+// claude-oauth for the NIL-ROUTER (dispatch) path only. The dispatch harness
+// resolves models with no live router ("no live probe, no I/O"), so
+// resolveLiveCatalog's dynamic claude-prefix rule never runs there — without
+// these entries a dispatch caller pinning a raw 5-generation id silently falls
+// through to the local default and is served a different model than requested
+// (the #430 wrong-model trap; observed live 2026-07-17: Model=claude-fable-5 →
+// served ornith-1.0-35b).
+//
+// Deliberately NOT merged into intentAliases: on the gateway path (live
+// router) raw claude ids must keep resolving DYNAMICALLY via resolveLiveCatalog
+// → frontierProviderName, so installs whose frontier tier is claude-code-only
+// or a non-canonically-named provider route to the provider they actually have
+// (see TestHandleModels_HaikuAdmitsUnderClaudeCodeOnly). A static claude-oauth
+// pin here would shadow that. Also deliberately NOT consulted by IsKnownModel:
+// gateway admission must stay in lockstep with what the live catalog emits.
+var dispatchFrontierAliases = map[string]ModelResolution{
+	"claude-sonnet-5":           {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-5"},
+	"claude-opus-4-8":           {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-8"},
+	"claude-fable-5":            {PreferProvider: "claude-oauth", ModelOverride: "claude-fable-5"},
+	"claude-haiku-4-5-20251001": {PreferProvider: "claude-oauth", ModelOverride: "claude-haiku-4-5-20251001"},
 }
 
 // resolveLiveCatalog resolves the two id families that the live GET /v1/models
@@ -206,6 +231,14 @@ func ResolveModelRequest(router Router, model string, requestID string) ModelRes
 
 	// Router-based fallback: live provider name / model match.
 	if router == nil {
+		// Dispatch path (no live router): raw current-generation claude ids
+		// resolve via the static dispatch table so an explicitly-pinned model
+		// is never silently swapped for the local default (#430). Gateway
+		// callers never reach this branch — their raw claude ids resolve
+		// dynamically below via resolveLiveCatalog.
+		if res, ok := dispatchFrontierAliases[model]; ok {
+			return res
+		}
 		return ModelResolution{}
 	}
 	if name, ok := router.ProviderForName(model); ok {

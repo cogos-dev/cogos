@@ -742,3 +742,35 @@ func TestAnthropicName(t *testing.T) {
 		t.Errorf("Name() = %q; want my-anthropic", p.Name())
 	}
 }
+
+// TestBuildAnthropicRequest_TemperatureDeprecation: models that reject the
+// temperature/top_p parameters (Opus 4.7+ and the Claude 5 family) must have
+// them stripped at the wire builder — the agent harness sets a default
+// temperature on every dispatch, and forwarding it 400s the whole request
+// ("`temperature` is deprecated for this model", verified live 2026-07-17).
+// Older models keep the caller's values.
+func TestBuildAnthropicRequest_TemperatureDeprecation(t *testing.T) {
+	t.Parallel()
+	temp, topp := 0.7, 0.9
+	req := &CompletionRequest{Temperature: &temp, TopP: &topp,
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}}}
+
+	for _, model := range []string{
+		"claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-5",
+		"claude-fable-5", "claude-sonnet-5-20260501",
+	} {
+		ar := buildAnthropicRequest(model, req, false, 1024)
+		if ar.Temperature != nil || ar.TopP != nil {
+			t.Errorf("%s: temperature/top_p not stripped (temp=%v topp=%v)",
+				model, ar.Temperature, ar.TopP)
+		}
+	}
+	for _, model := range []string{
+		"claude-sonnet-4-6", "claude-haiku-4-5-20251001",
+	} {
+		ar := buildAnthropicRequest(model, req, false, 1024)
+		if ar.Temperature == nil || *ar.Temperature != temp {
+			t.Errorf("%s: temperature wrongly stripped", model)
+		}
+	}
+}
