@@ -249,6 +249,36 @@ type anthropicSSEUsage struct {
 
 // ── Request builder ───────────────────────────────────────────────────────────
 
+// temperatureDeprecatedPrefixes lists Anthropic model-id prefixes that REJECT
+// the temperature/top_p sampling parameters with a 400 ("`temperature` is
+// deprecated for this model") instead of ignoring them. Prefix-matched so dated
+// release variants (e.g. claude-sonnet-5-20260501) are covered. Verified live
+// 2026-07-17: claude-opus-4-7 rejects; claude-sonnet-4-6 and
+// claude-haiku-4-5-20251001 still accept. The Claude 5 family follows the
+// opus-4-7+ behavior.
+var temperatureDeprecatedPrefixes = []string{
+	"claude-opus-4-7",
+	"claude-opus-4-8",
+	"claude-sonnet-5",
+	"claude-haiku-5",
+	"claude-opus-5",
+	"claude-fable-5",
+	"claude-mythos-5",
+}
+
+// modelDeprecatesTemperature reports whether the given Anthropic model id
+// rejects client-set temperature/top_p. The harness sets a default temperature
+// on every dispatch (local models want it), so the wire builder must strip it
+// for these models or every dispatch to them 400s on arrival.
+func modelDeprecatesTemperature(model string) bool {
+	for _, p := range temperatureDeprecatedPrefixes {
+		if strings.HasPrefix(model, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildAnthropicRequest converts a CompletionRequest to the Anthropic wire format.
 // Context items are prepended to the system prompt as labelled sections so the
 // model sees full workspace attentional field content.
@@ -261,6 +291,10 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 		Temperature:   req.Temperature,
 		TopP:          req.TopP,
 		StopSequences: req.Stop,
+	}
+	if modelDeprecatesTemperature(model) {
+		ar.Temperature = nil
+		ar.TopP = nil
 	}
 
 	// Map conversation messages to the Anthropic wire format.
