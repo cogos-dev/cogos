@@ -365,6 +365,21 @@ func (s *Server) SetAgentController(ctrl AgentController) {
 	}
 }
 
+// Process returns the server's kernel Process handle. Exported so
+// WireProviderRuntime hooks (set from internal/providers/all, which cannot
+// reach unexported Server fields) can wire provider-side event emission
+// (e.g. marginbridge.Provider.SetEventSink) without internal/engine importing
+// the provider package directly, per ADR-085 leaf-package discipline.
+func (s *Server) Process() *Process { return s.process }
+
+// BusSessions returns the server's bus/session manager. See Process() for
+// why this accessor exists.
+func (s *Server) BusSessions() *BusSessionManager { return s.busSessions }
+
+// BusBroker returns the server's SSE bus broker. See Process() for why this
+// accessor exists.
+func (s *Server) BusBroker() *BusEventBroker { return s.busBroker }
+
 // SetReconcileDaemon wires the kernel's ReconcileDaemon into the server so
 // GET /v1/reconcile/coherence (First Instruments Module B, M1-B) can read
 // LastCoherence(). Called from Boot() after the daemon is constructed. Nil

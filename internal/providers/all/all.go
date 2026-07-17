@@ -51,7 +51,8 @@ import (
 	"github.com/myrgic/cogos/internal/eval"
 	"github.com/myrgic/cogos/internal/providers/component"
 	"github.com/myrgic/cogos/internal/providers/daemon"
-	_ "github.com/myrgic/cogos/internal/providers/site" // registers "site" with pkg/reconcile
+	"github.com/myrgic/cogos/internal/providers/marginbridge" // registers "margin-bridge" with pkg/reconcile
+	_ "github.com/myrgic/cogos/internal/providers/site"       // registers "site" with pkg/reconcile
 	"github.com/myrgic/cogos/internal/workspace"
 	subidentity "github.com/myrgic/cogos/pkg/substrate/identity"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
@@ -195,6 +196,61 @@ func Register(evalProvider *eval.EvalProvider, harnessRegistry *subidentity.Harn
 			s.SetHarnessBackend(harnessRegistry)
 		}
 	}
+
+	// Wire margin-bridge's kernel-native event delivery (ledger + SSE bus).
+	// The provider itself stays decoupled from internal/engine (ADR-085 leaf
+	// package discipline); this closure is the one place that bridges the
+	// two, using accessor methods on *engine.Server since WireProviderRuntime
+	// runs after NewServer, when Process/BusSessions/BusBroker all exist.
+	engine.WireProviderRuntime = func(s *engine.Server) {
+		p, err := reconcile.GetProvider("margin-bridge")
+		if err != nil {
+			return
+		}
+		mb, ok := p.(*marginbridge.Provider)
+		if !ok {
+			return
+		}
+		mb.SetEventSink(&kernelEventSink{server: s})
+	}
+}
+
+// kernelEventSink adapts *engine.Server's Process/BusSessionManager/
+// BusEventBroker handles to marginbridge.EventSink.
+type kernelEventSink struct {
+	server *engine.Server
+}
+
+// EmitLedgerEvent appends a hash-chained ledger event via the kernel
+// Process, visible to cog_read_events/cog_tail_events. Not gated by the
+// cog_emit_event MCP tool's closed allowedEventTypes map — that allowlist
+// only applies to the MCP-exposed tool, not this internal engine call.
+func (k *kernelEventSink) EmitLedgerEvent(eventType string, data map[string]interface{}) error {
+	proc := k.server.Process()
+	if proc == nil {
+		return fmt.Errorf("margin-bridge: no kernel process available")
+	}
+	return proc.EmitEvent(eventType, data, "margin-bridge")
+}
+
+// EmitBusEvent appends to the named bus and publishes it to live SSE
+// subscribers. AppendEvent alone does not reach SSE subscribers — the HTTP
+// bus-send handler calls busBroker.Publish itself after AppendEvent
+// (internal/engine/serve_bus.go), so this adapter must do the same for any
+// consumer attached over SSE (Mod3, dashboard) to see the event.
+func (k *kernelEventSink) EmitBusEvent(busID, eventType, from string, payload map[string]interface{}) error {
+	mgr := k.server.BusSessions()
+	if mgr == nil {
+		return fmt.Errorf("margin-bridge: no bus session manager available")
+	}
+	evt, err := mgr.AppendEvent(busID, eventType, from, payload)
+	if err != nil {
+		return err
+	}
+	if broker := k.server.BusBroker(); broker != nil {
+		broker.Publish(busID, evt)
+	}
+	return nil
 }
 
 // RegisterConversations chains the conversations layer onto the already-set

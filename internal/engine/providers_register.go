@@ -49,6 +49,17 @@ var RegisterMCPExtensions func(srv *MCPServer)
 // (naked-by-default: safe, correct, no functional change for existing callers).
 var WireHarnessBackend func(s *Server)
 
+// WireProviderRuntime is called once during Boot after NewServer (and after
+// WireHarnessBackend), so provider packages that need post-boot kernel
+// handles — the running *Process for ledger events, the *BusSessionManager /
+// *BusEventBroker for the SSE bus — can be wired without internal/engine
+// importing them directly. Set by internal/providers/all.Register, which
+// looks the provider up via pkg/substrate/reconcile.GetProvider and calls its
+// exported setter (e.g. marginbridge.Provider.SetEventSink) with an adapter
+// built from Server.Process()/BusSessions()/BusBroker(). Nil means no
+// provider needs post-boot runtime wiring (e.g. in tests).
+var WireProviderRuntime func(s *Server)
+
 // RegisterHTTPExtensions is called once during NewServer after the built-in
 // routes are registered. Extensions receive the *Server and *http.ServeMux so
 // they can call s.route() to register additional HTTP endpoints (e.g. the
