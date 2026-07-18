@@ -348,9 +348,9 @@ func writeDiscordServerYAML(root string, cfg *DiscordServerConfig) error {
 	buf.WriteString("# creates/updates/deletes for managed resources.\n")
 	buf.WriteString("#\n")
 	buf.WriteString("# Usage:\n")
-	buf.WriteString("#   cog plan discord      # see what would change\n")
-	buf.WriteString("#   cog apply discord     # apply changes\n")
-	buf.WriteString("#   cog snapshot discord  # re-crawl and regenerate this file\n")
+	buf.WriteString("#   cogos reconcile discord --dry-run   # see what would change\n")
+	buf.WriteString("#   cogos reconcile discord             # apply changes\n")
+	buf.WriteString("#   cogos reconcile discord --snapshot  # re-crawl and regenerate this file\n")
 	buf.WriteString("\n")
 	buf.Write(yamlData)
 
