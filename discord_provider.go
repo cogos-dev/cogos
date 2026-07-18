@@ -8,7 +8,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // DiscordLiveState bundles the live Discord data fetched from the API.
@@ -170,6 +176,192 @@ func (d *DiscordProvider) Health() ResourceStatus {
 		}
 	}
 	return NewResourceStatus(SyncStatusUnknown, HealthHealthy)
+}
+
+// ─── Config Export (ConfigExporter interface) ───────────────────────────────
+
+// ExportConfig implements reconcile.ConfigExporter. It reads the live Discord
+// server state (roles + channels) and regenerates the declarative
+// .cog/config/discord/server.yaml — the "snapshot" operation (live → spec)
+// that establishes the declared-state baseline.
+//
+// The bot token is resolved from config the same way SetupDiscordProvider does
+// (flag/env/auth.yaml) unless one is already set via SetToken.
+func (d *DiscordProvider) ExportConfig(root string) error {
+	// Resolve token if not already set so the CLI can call this uniformly.
+	if d.Token == "" {
+		token, err := resolveToken(root, "")
+		if err != nil {
+			return fmt.Errorf("discord: resolve token for snapshot: %w", err)
+		}
+		d.Token = token
+	}
+
+	// Load the existing config to learn the guild ID/name to crawl.
+	cfg, _, err := loadDiscordServerConfig(root)
+	if err != nil {
+		return fmt.Errorf("discord: load config for snapshot: %w", err)
+	}
+	if cfg.Guild.ID == "" {
+		return fmt.Errorf("discord: snapshot requires guild.id in %s", filepath.Join(".cog", "config", "discord", "server.yaml"))
+	}
+
+	live, err := d.FetchLive(context.Background(), cfg)
+	if err != nil {
+		return fmt.Errorf("discord: fetch live state for snapshot: %w", err)
+	}
+	liveState, ok := live.(*DiscordLiveState)
+	if !ok {
+		return fmt.Errorf("discord: unexpected live state type %T", live)
+	}
+
+	guildName := cfg.Guild.Name
+	guildDesc := cfg.Guild.Description
+	newCfg := buildDiscordConfigFromLive(liveState, cfg.Guild.ID, guildName, guildDesc)
+
+	if err := writeDiscordServerYAML(root, newCfg); err != nil {
+		return fmt.Errorf("discord: write snapshot: %w", err)
+	}
+	return nil
+}
+
+// buildDiscordConfigFromLive maps live Discord state (flat channel list + roles)
+// into a declarative *DiscordServerConfig, reconstructing the category→channel
+// nesting from each channel's parent_id and type (type 4 = category). Secrets
+// are never part of this shape, so nothing is redacted. Ordering is
+// deterministic: roles by descending position, categories/channels by ascending
+// position.
+func buildDiscordConfigFromLive(live *DiscordLiveState, guildID, guildName, guildDesc string) *DiscordServerConfig {
+	// role ID → name for permission-overwrite target resolution.
+	roleIDToName := map[string]string{}
+	for _, r := range live.Roles {
+		roleIDToName[r.ID] = r.Name
+	}
+
+	// ── Roles ── (skip @everyone and discord-managed roles)
+	var roles []RoleConfig
+	for _, r := range live.Roles {
+		if r.ID == guildID || r.Managed {
+			continue
+		}
+		roles = append(roles, RoleConfig{
+			Name:        r.Name,
+			Color:       intColorToHex(r.Color),
+			Permissions: permBitsToNames(r.Permissions),
+			Hoist:       r.Hoist,
+			Mentionable: r.Mentionable,
+			Position:    r.Position,
+			ManagedBy:   "cog",
+		})
+	}
+	sort.SliceStable(roles, func(i, j int) bool {
+		return roles[i].Position > roles[j].Position
+	})
+
+	// ── Categories ── (channel type 4)
+	catByID := map[string]*CategoryConfig{}
+	var categories []*CategoryConfig
+	for _, ch := range live.Channels {
+		if ch.Type != 4 {
+			continue
+		}
+		cat := &CategoryConfig{
+			Name:                 ch.Name,
+			Position:             ch.Position,
+			ManagedBy:            "cog",
+			PermissionOverwrites: convertPermOverwrites(ch.PermissionOverwrites, roleIDToName),
+		}
+		catByID[ch.ID] = cat
+		categories = append(categories, cat)
+	}
+
+	// ── Channels ── nested under their parent category.
+	for _, ch := range live.Channels {
+		if ch.Type == 4 {
+			continue
+		}
+		if ch.ParentID == nil {
+			continue // uncategorized channels are not part of the managed tree
+		}
+		cat, ok := catByID[*ch.ParentID]
+		if !ok {
+			continue
+		}
+		chType := channelTypeToString[ch.Type]
+		if chType == "" {
+			chType = fmt.Sprintf("%d", ch.Type)
+		}
+		cat.Channels = append(cat.Channels, ChannelConfig{
+			Name:                 ch.Name,
+			Type:                 chType,
+			Topic:                ch.Topic,
+			Position:             ch.Position,
+			Slowmode:             ch.RateLimitPerUser,
+			NSFW:                 ch.NSFW,
+			ManagedBy:            "cog",
+			PermissionOverwrites: convertPermOverwrites(ch.PermissionOverwrites, roleIDToName),
+		})
+	}
+
+	sort.SliceStable(categories, func(i, j int) bool {
+		return categories[i].Position < categories[j].Position
+	})
+	for _, cat := range categories {
+		sort.SliceStable(cat.Channels, func(i, j int) bool {
+			return cat.Channels[i].Position < cat.Channels[j].Position
+		})
+	}
+
+	catVals := make([]CategoryConfig, len(categories))
+	for i, cat := range categories {
+		catVals[i] = *cat
+	}
+
+	return &DiscordServerConfig{
+		Version: "1.0",
+		Guild: GuildConfig{
+			ID:          guildID,
+			Name:        guildName,
+			Description: guildDesc,
+			ManagedBy:   "cog",
+			Roles:       roles,
+			Categories:  catVals,
+		},
+	}
+}
+
+// writeDiscordServerYAML marshals cfg to YAML, prepends the standard header
+// comment block, and writes .cog/config/discord/server.yaml (0644).
+func writeDiscordServerYAML(root string, cfg *DiscordServerConfig) error {
+	yamlData, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	var buf strings.Builder
+	buf.WriteString("# Discord Server Configuration (Declarative)\n")
+	buf.WriteString("# Generated by: cog snapshot discord\n")
+	buf.WriteString(fmt.Sprintf("# Generated at: %s\n", time.Now().UTC().Format(time.RFC3339)))
+	buf.WriteString("#\n")
+	buf.WriteString("# This file was auto-generated from the live Discord server state.\n")
+	buf.WriteString("# The reconciler diffs this against the live server and applies\n")
+	buf.WriteString("# creates/updates/deletes for managed resources.\n")
+	buf.WriteString("#\n")
+	buf.WriteString("# Usage:\n")
+	buf.WriteString("#   cog plan discord      # see what would change\n")
+	buf.WriteString("#   cog apply discord     # apply changes\n")
+	buf.WriteString("#   cog snapshot discord  # re-crawl and regenerate this file\n")
+	buf.WriteString("\n")
+	buf.Write(yamlData)
+
+	outPath := filepath.Join(root, ".cog", "config", "discord", "server.yaml")
+	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+	if err := os.WriteFile(outPath, []byte(buf.String()), 0644); err != nil {
+		return fmt.Errorf("write server.yaml: %w", err)
+	}
+	return nil
 }
 
 // --- Conversion helpers between Discord-specific and generic types ---
