@@ -53,6 +53,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -100,6 +101,23 @@ func NewIdentityGrantRegistry() *IdentityGrantRegistry {
 	}
 }
 
+// maxLiveGrantSurfaces bounds the number of distinct surfaces the registry
+// will track at once. `surface` is an unauthenticated, caller-supplied
+// string with no allowlist (cog-review finding, PR #471 second pass,
+// serve_identity_grants.go:118 as of commit 7918055): without a cap, any
+// loopback caller could grow bySurface/byGrantID without bound simply by
+// varying the surface name on every mint call, eventually exhausting kernel
+// memory. This is a coarse safety net appropriate to chunk 1's loopback-only
+// threat model — a real allowlist/auth story is chunk 4's job, not a
+// retrofit here.
+const maxLiveGrantSurfaces = 256
+
+// ErrGrantStoreAtCapacity is returned (wrapped) by MintOrReuse when a mint
+// for a not-yet-tracked surface would exceed maxLiveGrantSurfaces, so the
+// HTTP handler can map it to a distinct status/error code (429) rather than
+// a generic 400.
+var ErrGrantStoreAtCapacity = errors.New("grant store at capacity")
+
 // MintOrReuse returns the live, unexpired grant for surface if one exists
 // AND its scope matches the requested scope exactly (as a set); otherwise
 // mints a fresh one with the given scope and TTL, replacing whatever grant
@@ -115,6 +133,20 @@ func NewIdentityGrantRegistry() *IdentityGrantRegistry {
 // teeth #5) still reuses the existing token unchanged; a different-scope
 // re-mint mints fresh rather than lying about what scope the returned token
 // actually carries.
+//
+// Bounding: a mint for a surface NOT already tracked first evicts any
+// expired entries (reclaiming space before growing), then rejects with an
+// error if the store is still at maxLiveGrantSurfaces — this caps unbounded
+// growth from an unauthenticated caller varying the surface string (cog-
+// review finding, PR #471 second pass). A re-mint of an ALREADY-tracked
+// surface (scope change) never counts against the cap, since it doesn't grow
+// the number of distinct surfaces.
+//
+// byGrantID leak fix: when a re-mint supersedes an existing grant for the
+// same surface, the superseded grant's byGrantID entry is deleted before the
+// new one is inserted — otherwise byGrantID would grow by one permanently
+// unreachable entry per scope-changing re-mint (cog-review finding, PR #471
+// second pass, serve_identity_grants.go:147 as of commit 7918055).
 func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl time.Duration) (*IdentityGrant, error) {
 	if surface == "" {
 		return nil, fmt.Errorf("surface is required")
@@ -124,8 +156,16 @@ func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if existing, ok := r.bySurface[surface]; ok && !existing.expired(now) && scopeSetEqual(existing.Scope, scope) {
+	existing, tracked := r.bySurface[surface]
+	if tracked && !existing.expired(now) && scopeSetEqual(existing.Scope, scope) {
 		return existing, nil
+	}
+
+	if !tracked {
+		r.evictExpiredLocked(now)
+		if len(r.bySurface) >= maxLiveGrantSurfaces {
+			return nil, fmt.Errorf("%w: grant store at capacity (%d live surfaces); cannot mint a grant for a new surface", ErrGrantStoreAtCapacity, maxLiveGrantSurfaces)
+		}
 	}
 
 	token, err := mintGrantToken()
@@ -143,9 +183,29 @@ func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl 
 		IssuedAt:  now,
 		ExpiresAt: now.Add(ttl),
 	}
+	if tracked {
+		// Supersede: remove the old grant's byGrantID entry so the index
+		// doesn't leak an unreachable entry on every scope-changing re-mint.
+		delete(r.byGrantID, existing.GrantID)
+	}
 	r.bySurface[surface] = grant
 	r.byGrantID[grant.GrantID] = grant
 	return grant, nil
+}
+
+// evictExpiredLocked removes every expired grant from both bySurface and
+// byGrantID. Caller must hold r.mu for writing. This is the store's only
+// reclamation path for chunk 1 (no ledger, no revoke/rotate yet) — it runs
+// opportunistically before a new-surface mint would otherwise grow the
+// store, so a churn of short-TTL grants across many surface names doesn't
+// accumulate permanently between restarts.
+func (r *IdentityGrantRegistry) evictExpiredLocked(now time.Time) {
+	for surface, g := range r.bySurface {
+		if g.expired(now) {
+			delete(r.bySurface, surface)
+			delete(r.byGrantID, g.GrantID)
+		}
+	}
 }
 
 // Verify checks a presented token for a named surface against the live
@@ -326,6 +386,10 @@ func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request)
 	}
 	grant, err := s.identityGrants.MintOrReuse(req.Surface, req.Scope, ttl)
 	if err != nil {
+		if errors.Is(err, ErrGrantStoreAtCapacity) {
+			writeJSONError(w, http.StatusTooManyRequests, "capacity_exceeded", err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}

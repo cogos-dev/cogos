@@ -7,10 +7,13 @@ package engine
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func newIdentityGrantServer(t *testing.T) (*Server, *httptest.Server) {
@@ -203,6 +206,100 @@ func TestIdentityGrantList_NeverIncludesToken(t *testing.T) {
 	if bytes.Contains(bytes.ToLower(raw), []byte(`"token"`)) {
 		t.Fatalf("grant listing must never include a token field; got %s", raw)
 	}
+}
+
+// TestIdentityGrantMint_ByGrantIDDoesNotLeakOnRescope guards the second
+// cog-review-confirmed defect on PR #471 (serve_identity_grants.go:147 as of
+// commit 7918055): a scope-changing re-mint for the same surface must not
+// leave the superseded grant's byGrantID entry behind. Alternates the
+// requested scope for one surface across several mints and asserts
+// byGrantID never grows past one live entry.
+func TestIdentityGrantMint_ByGrantIDDoesNotLeakOnRescope(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+
+	scopes := [][]string{{"a"}, {"b"}, {"a"}, {"b"}, {"a"}}
+	var lastGrantID string
+	for i, scope := range scopes {
+		g, err := reg.MintOrReuse("scope-flapper", scope, 0)
+		if err != nil {
+			t.Fatalf("mint %d: %v", i, err)
+		}
+		lastGrantID = g.GrantID
+	}
+
+	if got := len(reg.bySurface); got != 1 {
+		t.Fatalf("expected exactly one live surface entry, got %d", got)
+	}
+	if got := len(reg.byGrantID); got != 1 {
+		t.Fatalf("expected byGrantID to hold exactly the one live grant after %d scope-alternating re-mints, got %d entries (leak)", len(scopes), got)
+	}
+	if _, ok := reg.byGrantID[lastGrantID]; !ok {
+		t.Fatalf("expected byGrantID to contain the current live grant_id %q", lastGrantID)
+	}
+}
+
+// TestIdentityGrantMint_BoundedGrowthAcrossManySurfaces guards the first
+// cog-review-confirmed defect on PR #471 (serve_identity_grants.go:118 as of
+// commit 7918055): an unauthenticated caller varying the surface string on
+// every mint must not grow the store without bound. Mints well past
+// maxLiveGrantSurfaces distinct, never-expiring surface names and asserts
+// the registry rejects new surfaces once at capacity rather than growing
+// forever.
+func TestIdentityGrantMint_BoundedGrowthAcrossManySurfaces(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+
+	var lastErr error
+	minted := 0
+	for i := 0; i < maxLiveGrantSurfaces+50; i++ {
+		surface := fmt.Sprintf("surface-%d", i)
+		_, err := reg.MintOrReuse(surface, []string{"x"}, 24*time.Hour)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		minted++
+	}
+
+	if minted > maxLiveGrantSurfaces {
+		t.Fatalf("expected at most %d live surfaces to ever be mintable, got %d minted successfully", maxLiveGrantSurfaces, minted)
+	}
+	if len(reg.bySurface) > maxLiveGrantSurfaces {
+		t.Fatalf("expected bySurface to stay bounded at %d, got %d entries", maxLiveGrantSurfaces, len(reg.bySurface))
+	}
+	if lastErr == nil {
+		t.Fatalf("expected minting past capacity to eventually fail, but all %d mints succeeded", maxLiveGrantSurfaces+50)
+	}
+	if !errors.Is(lastErr, ErrGrantStoreAtCapacity) {
+		t.Fatalf("expected the over-capacity error to wrap ErrGrantStoreAtCapacity, got: %v", lastErr)
+	}
+}
+
+// TestIdentityGrantMint_CapacityErrorMapsTo429 checks the HTTP-layer mapping
+// for the capacity error (429, not the generic 400 every other MintOrReuse
+// error uses) so a caller/monitoring surface can distinguish "malformed
+// request" from "store full."
+func TestIdentityGrantMint_CapacityErrorMapsTo429(t *testing.T) {
+	s := &Server{identityGrants: NewIdentityGrantRegistry()}
+	mux := http.NewServeMux()
+	s.registerIdentityGrantRoutes(mux)
+	front := httptest.NewServer(mux)
+	defer front.Close()
+
+	var lastResp *http.Response
+	for i := 0; i < maxLiveGrantSurfaces+5; i++ {
+		lastResp = identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+			"surface": fmt.Sprintf("http-surface-%d", i),
+			"scope":   []string{"x"},
+		})
+		if lastResp.StatusCode == http.StatusTooManyRequests {
+			break
+		}
+		lastResp.Body.Close()
+	}
+	if lastResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected a 429 once the grant store hit capacity, last status was %d", lastResp.StatusCode)
+	}
+	lastResp.Body.Close()
 }
 
 func TestIdentityGrantCurrent_ZeroPasteBootstrap(t *testing.T) {
