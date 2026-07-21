@@ -91,6 +91,58 @@ func TestIdentityGrantMint_IdempotentPerSurface(t *testing.T) {
 	}
 }
 
+// TestIdentityGrantMint_ReuseWithDifferentScope guards the defect confirmed
+// by cog-review on PR #471: MintOrReuse must not echo back a stale, live
+// grant's scope when the *current* request asks for a different scope than
+// what's already live. A same-scope re-mint (simulating a restart) still
+// reuses the token unchanged (TestIdentityGrantMint_IdempotentPerSurface);
+// a different-scope re-mint must mint fresh and return exactly the newly
+// requested scope, never the old one.
+func TestIdentityGrantMint_ReuseWithDifferentScope(t *testing.T) {
+	_, front := newIdentityGrantServer(t)
+
+	first := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "scope-test",
+		"scope":   []string{"chat:post", "chat:admin"},
+	})
+	var firstOut identityGrantMintResponse
+	identityDecodeBody(t, first, &firstOut)
+	if len(firstOut.Scope) != 2 {
+		t.Fatalf("expected initial mint to carry both requested scopes, got %v", firstOut.Scope)
+	}
+
+	// Re-mint the SAME surface with a NARROWER scope. The response must
+	// reflect the newly requested scope, not the previously-stored broader
+	// one — regardless of idempotency, which only applies to a same-scope
+	// restart.
+	second := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "scope-test",
+		"scope":   []string{"chat:post"},
+	})
+	var secondOut identityGrantMintResponse
+	identityDecodeBody(t, second, &secondOut)
+	if len(secondOut.Scope) != 1 || secondOut.Scope[0] != "chat:post" {
+		t.Fatalf("expected re-mint with a different scope to echo exactly the newly requested scope %v, got %v",
+			[]string{"chat:post"}, secondOut.Scope)
+	}
+	if secondOut.Token == firstOut.Token {
+		t.Fatalf("expected a different-scope re-mint to issue a fresh token, got the same one back")
+	}
+
+	// The old, broader token must no longer verify — it was superseded, not
+	// left live alongside the new one (one live grant per surface, chunk 1's
+	// stated invariant).
+	oldVerify := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "scope-test",
+		"token":   firstOut.Token,
+	})
+	var oldOut identityVerifyResponse
+	identityDecodeBody(t, oldVerify, &oldOut)
+	if oldOut.Valid {
+		t.Fatalf("expected the superseded broader-scope token to no longer verify")
+	}
+}
+
 func TestIdentityVerify_ValidAndInvalidTokens(t *testing.T) {
 	_, front := newIdentityGrantServer(t)
 

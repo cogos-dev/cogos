@@ -100,11 +100,21 @@ func NewIdentityGrantRegistry() *IdentityGrantRegistry {
 	}
 }
 
-// MintOrReuse returns the live, unexpired grant for surface if one exists;
-// otherwise mints a fresh one with the given scope and TTL. This is the
-// idempotency the design's chunk-1 verify teeth #5 requires: a chat-server.py
-// restart must not invalidate whatever the operator (or a bootstrapped page)
-// already holds.
+// MintOrReuse returns the live, unexpired grant for surface if one exists
+// AND its scope matches the requested scope exactly (as a set); otherwise
+// mints a fresh one with the given scope and TTL, replacing whatever grant
+// (if any) previously lived at that surface key.
+//
+// The scope check matters: reusing a live grant regardless of what scope the
+// *current* request asked for would silently echo back a stale, possibly
+// broader-or-narrower scope than requested — contradicting this file's own
+// "the response never echoes back a broader scope than the caller requested"
+// invariant (handleIdentityGrantMint's doc comment, design §4 chunk-1
+// verify-tooth #1) the moment a caller re-mints with a *different* scope
+// than what's already live. A same-scope re-mint (the restart case, verify
+// teeth #5) still reuses the existing token unchanged; a different-scope
+// re-mint mints fresh rather than lying about what scope the returned token
+// actually carries.
 func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl time.Duration) (*IdentityGrant, error) {
 	if surface == "" {
 		return nil, fmt.Errorf("surface is required")
@@ -114,7 +124,7 @@ func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if existing, ok := r.bySurface[surface]; ok && !existing.expired(now) {
+	if existing, ok := r.bySurface[surface]; ok && !existing.expired(now) && scopeSetEqual(existing.Scope, scope) {
 		return existing, nil
 	}
 
@@ -187,6 +197,29 @@ func (r *IdentityGrantRegistry) Snapshot() []*IdentityGrant {
 		out = append(out, g)
 	}
 	return out
+}
+
+// scopeSetEqual compares two scope lists as sets (order-independent,
+// duplicate-insensitive) — a re-mint request listing the same capabilities
+// in a different order is still a "same scope" reuse, not a re-scope.
+func scopeSetEqual(a, b []string) bool {
+	setA := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		setA[s] = struct{}{}
+	}
+	setB := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		setB[s] = struct{}{}
+	}
+	if len(setA) != len(setB) {
+		return false
+	}
+	for s := range setA {
+		if _, ok := setB[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func mintGrantToken() (string, error) {
