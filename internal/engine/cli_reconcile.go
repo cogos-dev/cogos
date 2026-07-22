@@ -2,11 +2,15 @@
 //
 // Usage:
 //
-//	cogos reconcile <type> [--dry-run] [--json] [--resource <name>]
+//	cogos reconcile <type> [--dry-run] [--json] [--resource <name>] [--snapshot]
 //
 // Runs the plan (and optionally apply) cycle for a single registered
 // provider type. The provider must already be registered with pkg/reconcile
 // (via an init() import in cmd/cogos/providers_wire.go).
+//
+// --snapshot inverts the direction (live → spec): it regenerates the
+// declared config from live state via reconcile.ConfigExporter, if the
+// provider implements it, and returns before the normal plan/apply cycle.
 //
 // Workspace root is resolved from the --workspace global flag or via git-root
 // detection on the cwd. The command exits 0 on success (synced or dry-run),
@@ -21,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -34,6 +39,7 @@ func runReconcileCmd(args []string, defaultWorkspace string) {
 	workspace := fs.String("workspace", defaultWorkspace, "Workspace root path (auto-detected from cwd if empty)")
 	dryRun := fs.Bool("dry-run", false, "Plan only; do not apply changes")
 	jsonOut := fs.Bool("json", false, "Output plan as JSON")
+	snapshot := fs.Bool("snapshot", false, "Snapshot live state into the declared config (live → spec); requires ConfigExporter support")
 	_ = fs.String("resource", "", "Reserved: reconcile only this named resource (not yet implemented)")
 
 	fs.Usage = func() {
@@ -86,6 +92,34 @@ func runReconcileCmd(args []string, defaultWorkspace string) {
 	}
 
 	ctx := context.Background()
+
+	// Snapshot (live → spec): if requested, regenerate the declared config
+	// from live state and return before the normal spec → live cycle. This is
+	// the inverse of reconcile and must not also run plan/apply. Requires the
+	// provider to implement reconcile.ConfigExporter.
+	if *snapshot {
+		exporter, ok := provider.(reconcile.ConfigExporter)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "error: provider %q does not support snapshot (no ConfigExporter)\n", providerType)
+			os.Exit(1)
+		}
+		// Acquire the same state lock used by the reconcile cycle since we are
+		// mutating provider-owned config files.
+		snapLock, lockErr := reconcile.AcquireStateLock(root, providerType)
+		if lockErr != nil {
+			fmt.Fprintf(os.Stderr, "error: acquire state lock for %s: %v\n", providerType, lockErr)
+			os.Exit(1)
+		}
+		defer snapLock.Release()
+
+		if err := exporter.ExportConfig(root); err != nil {
+			fmt.Fprintf(os.Stderr, "error: snapshot %s: %v\n", providerType, err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "%s\nsnapshot written\n",
+			filepath.Join(root, ".cog", "config", providerType))
+		return
+	}
 
 	// Load config.
 	config, err := provider.LoadConfig(root)
