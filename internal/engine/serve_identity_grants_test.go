@@ -1,5 +1,6 @@
-// serve_identity_grants_test.go — end-to-end tests for board task 60 chunk 1
-// (kernel-issued identity grants). Follows the newChannelServer pattern in
+// serve_identity_grants_test.go — end-to-end tests for board task 60
+// chunk 1 (kernel-issued identity grants, in-memory) and chunk 2
+// (ledger-backed grants + revoke). Follows the newChannelServer pattern in
 // serve_sessions_channel_test.go: a Server wired with just the fields the
 // handlers need, fronted by httptest.NewServer.
 package engine
@@ -12,6 +13,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -334,4 +337,283 @@ func TestIdentityGrantCurrent_ZeroPasteBootstrap(t *testing.T) {
 		t.Fatalf("expected GET current to return the live grant's token unchanged, got %q vs %q",
 			hitOut.Token, mintedOut.Token)
 	}
+}
+
+// ─── chunk 2: ledger-backed grants + revoke ──────────────────────────────────
+
+// TestIdentityGrantMint_LedgerRestartTooth is THE tooth chunk 1 could not
+// pass and chunk 2 must (design's "CHUNK 1 VERIFICATION NOTES" / chunk 2
+// verify-teeth): mint a grant against a ledger-backed registry, simulate a
+// kernel restart by discarding the in-memory registry and reconstructing a
+// fresh one from the same workspace's ledger, and confirm the pre-restart
+// token still verifies — via the ledger-derived integrity hash, not memory
+// that didn't survive.
+func TestIdentityGrantMint_LedgerRestartTooth(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+
+	before := NewIdentityGrantRegistryWithLedger(workspaceRoot)
+	grant, err := before.MintOrReuse("constellation-chat", []string{"chat:post", "chat:read"}, 0)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	token := grant.Token
+	if token == "" {
+		t.Fatalf("expected a non-empty token from a fresh mint")
+	}
+
+	// Simulate a kernel restart: throw away `before` entirely and rebuild
+	// from the ledger alone, exactly what NewServer does on boot.
+	after, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	g, ok := after.Verify("constellation-chat", token)
+	if !ok {
+		t.Fatalf("expected the pre-restart token to still verify after ledger rebuild")
+	}
+	if len(g.Scope) != 2 {
+		t.Fatalf("expected rebuilt grant to carry the original scope, got %v", g.Scope)
+	}
+
+	// Garbage token must still fail post-rebuild (rebuild doesn't
+	// accidentally make verification permissive).
+	if _, ok := after.Verify("constellation-chat", "garbage"); ok {
+		t.Fatalf("expected a garbage token to fail verification after rebuild")
+	}
+
+	// The rebuilt grant must NOT carry the raw token in memory (design §3.2
+	// — the ledger never stores it, so a fresh boot can't reconstruct it).
+	if g.Token != "" {
+		t.Fatalf("expected the rebuilt grant to have no cached raw token, got %q", g.Token)
+	}
+
+	// GET-current-style zero-paste bootstrap must honestly 404 post-rebuild
+	// rather than hand back an empty string as if it were a real token.
+	if _, ok := after.Current("constellation-chat"); ok {
+		t.Fatalf("expected Current to report unavailable for a ledger-rebuilt grant with no cached raw token")
+	}
+}
+
+// TestIdentityGrantRevoke_FailsVerifyImmediately covers design §3.4/§4
+// chunk-2 verify-teeth: revoking a grant makes it fail verification right
+// away, with no kernel restart or TTL wait involved.
+func TestIdentityGrantRevoke_FailsVerifyImmediately(t *testing.T) {
+	_, front := newLedgerBackedIdentityGrantServer(t, t.TempDir())
+
+	mint := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+	var minted identityGrantMintResponse
+	identityDecodeBody(t, mint, &minted)
+
+	revokeResp, err := http.Post(front.URL+"/v1/identity/grants/"+minted.GrantID+"/revoke", "application/json", nil)
+	if err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if revokeResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on revoke, got %d", revokeResp.StatusCode)
+	}
+	revokeResp.Body.Close()
+
+	verify := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "constellation-chat",
+		"token":   minted.Token,
+	})
+	var verifyOut identityVerifyResponse
+	identityDecodeBody(t, verify, &verifyOut)
+	if verifyOut.Valid {
+		t.Fatalf("expected a revoked grant's token to fail verification immediately")
+	}
+
+	// Revoking an already-revoked (now-gone) grant_id 404s rather than
+	// silently succeeding twice.
+	again, err := http.Post(front.URL+"/v1/identity/grants/"+minted.GrantID+"/revoke", "application/json", nil)
+	if err != nil {
+		t.Fatalf("second revoke: %v", err)
+	}
+	if again.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 revoking an already-revoked grant, got %d", again.StatusCode)
+	}
+	again.Body.Close()
+}
+
+// TestIdentityGrantRevoke_ScopeIsolation is design §4 chunk-3's forward-
+// looking verify-tooth, applicable already at chunk 2: revoking one
+// surface's grant must not disturb a second, independently-scoped surface's
+// live grant.
+func TestIdentityGrantRevoke_ScopeIsolation(t *testing.T) {
+	_, front := newLedgerBackedIdentityGrantServer(t, t.TempDir())
+
+	chatMint := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+	var chatOut identityGrantMintResponse
+	identityDecodeBody(t, chatMint, &chatOut)
+
+	signalMint := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "signal-dashboard",
+		"scope":   []string{"signal:post"},
+	})
+	var signalOut identityGrantMintResponse
+	identityDecodeBody(t, signalMint, &signalOut)
+
+	revokeResp, err := http.Post(front.URL+"/v1/identity/grants/"+chatOut.GrantID+"/revoke", "application/json", nil)
+	if err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	revokeResp.Body.Close()
+
+	signalVerify := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "signal-dashboard",
+		"token":   signalOut.Token,
+	})
+	var signalVerifyOut identityVerifyResponse
+	identityDecodeBody(t, signalVerify, &signalVerifyOut)
+	if !signalVerifyOut.Valid {
+		t.Fatalf("expected revoking constellation-chat's grant to leave signal-dashboard's grant untouched")
+	}
+}
+
+// TestIdentityGrantMint_CapacityFreedByRevokeNotJustRestart guards the
+// "capacity-fill + restart" lockout note filed against chunk 1: previously
+// the only way past a full grant store was a kernel restart that wiped
+// EVERY live grant (destructive). Chunk 2's revoke frees exactly one
+// surface's slot without disturbing any other live grant, and — since the
+// store is now ledger-backed — a restart no longer silently resets the cap
+// either (covered by the restart tooth above); this test exercises the
+// non-destructive remedy directly.
+func TestIdentityGrantMint_CapacityFreedByRevokeNotJustRestart(t *testing.T) {
+	reg := NewIdentityGrantRegistryWithLedger(t.TempDir())
+	t.Cleanup(resetLedgerCacheForTest)
+
+	var firstGrantID string
+	for i := 0; i < maxLiveGrantSurfaces; i++ {
+		g, err := reg.MintOrReuse(fmt.Sprintf("cap-surface-%d", i), []string{"x"}, 24*time.Hour)
+		if err != nil {
+			t.Fatalf("mint %d: %v", i, err)
+		}
+		if i == 0 {
+			firstGrantID = g.GrantID
+		}
+	}
+
+	// Store is now exactly at capacity — one more distinct surface must fail.
+	if _, err := reg.MintOrReuse("cap-surface-overflow", []string{"x"}, 24*time.Hour); !errors.Is(err, ErrGrantStoreAtCapacity) {
+		t.Fatalf("expected capacity error before any revoke, got %v", err)
+	}
+
+	// Revoke frees exactly one slot.
+	if _, ok := reg.Revoke(firstGrantID); !ok {
+		t.Fatalf("expected revoke of a live grant to succeed")
+	}
+
+	if _, err := reg.MintOrReuse("cap-surface-overflow", []string{"x"}, 24*time.Hour); err != nil {
+		t.Fatalf("expected minting a new surface to succeed after revoke freed a slot, got: %v", err)
+	}
+
+	// Every OTHER previously-minted surface (besides the revoked one) must
+	// still verify — revoke must not have disturbed them.
+	if _, ok := reg.bySurface["cap-surface-1"]; !ok {
+		t.Fatalf("expected an unrelated surface's grant to survive another surface's revoke")
+	}
+}
+
+// TestIdentityGrantMint_ReMintAfterLedgerRebuildIssuesFresh documents the
+// honest limitation named in this file's header: a same-scope re-mint for a
+// surface whose grant was reconstructed from the ledger (kernel restart)
+// cannot reuse the old raw token (never persisted) and must mint fresh,
+// while correctly retiring the old grant_id so byGrantID doesn't leak
+// across a restart-then-remint sequence.
+func TestIdentityGrantMint_ReMintAfterLedgerRebuildIssuesFresh(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+
+	before := NewIdentityGrantRegistryWithLedger(workspaceRoot)
+	original, err := before.MintOrReuse("constellation-chat", []string{"chat:post"}, 0)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	after, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	reminted, err := after.MintOrReuse("constellation-chat", []string{"chat:post"}, 0)
+	if err != nil {
+		t.Fatalf("re-mint after rebuild: %v", err)
+	}
+	if reminted.Token == "" {
+		t.Fatalf("expected a fresh, non-empty token from the post-rebuild re-mint")
+	}
+	if reminted.GrantID == original.GrantID {
+		t.Fatalf("expected a fresh grant_id, not reuse of the pre-restart grant_id")
+	}
+
+	// The pre-restart token must no longer verify — it was superseded, not
+	// left live alongside the new one.
+	if _, ok := after.Verify("constellation-chat", original.Token); ok {
+		t.Fatalf("expected the pre-restart token to fail verification once superseded by a post-rebuild re-mint")
+	}
+	// The new token verifies fine.
+	if _, ok := after.Verify("constellation-chat", reminted.Token); !ok {
+		t.Fatalf("expected the freshly re-minted token to verify")
+	}
+	// byGrantID must not leak the superseded grant_id.
+	if _, ok := after.byGrantID[original.GrantID]; ok {
+		t.Fatalf("expected the superseded pre-restart grant_id to be gone from byGrantID after re-mint")
+	}
+}
+
+// TestIdentityGrantLedger_NeverStoresRawToken guards the ADR-091 /
+// design-§3.2 invariant directly against the ledger file on disk: no ledger
+// line for any identity.grant.* event may contain the raw token value.
+func TestIdentityGrantLedger_NeverStoresRawToken(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+
+	reg := NewIdentityGrantRegistryWithLedger(workspaceRoot)
+	grant, err := reg.MintOrReuse("constellation-chat", []string{"chat:post"}, 0)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if _, ok := reg.Revoke(grant.GrantID); !ok {
+		t.Fatalf("expected revoke to succeed")
+	}
+
+	raw, err := os.ReadFile(filepath.Join(workspaceRoot, ".cog", "ledger", "identity-grants", "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read ledger file: %v", err)
+	}
+	if bytes.Contains(raw, []byte(grant.Token)) {
+		t.Fatalf("ledger file must never contain the raw token value; found it in: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(grant.IntegrityHash)) {
+		t.Fatalf("expected the ledger to record the grant's integrity hash; got: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte("identity.grant.issued")) || !bytes.Contains(raw, []byte("identity.grant.revoked")) {
+		t.Fatalf("expected both issued and revoked events in the ledger; got: %s", raw)
+	}
+}
+
+// newLedgerBackedIdentityGrantServer mirrors newIdentityGrantServer but
+// wires a ledger-backed registry rooted at workspaceRoot, for chunk-2 tests
+// that need real ledger writes (revoke, capacity+revoke interaction).
+func newLedgerBackedIdentityGrantServer(t *testing.T, workspaceRoot string) (*Server, *httptest.Server) {
+	t.Helper()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+	s := &Server{identityGrants: NewIdentityGrantRegistryWithLedger(workspaceRoot)}
+	mux := http.NewServeMux()
+	s.registerIdentityGrantRoutes(mux)
+	front := httptest.NewServer(mux)
+	t.Cleanup(func() { front.Close() })
+	return s, front
 }
