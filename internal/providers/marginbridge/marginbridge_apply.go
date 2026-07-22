@@ -23,13 +23,25 @@ import (
 // non-skip) action, applies echo suppression for watch-file settlements
 // authored by the operator's own login, and emits a wake (ledger + bus)
 // for everything else.
+//
+// It also resets and repopulates the per-cycle failedApplyAddrs stash: any
+// action whose apply fails (e.g. a transient sink.EmitLedgerEvent error) has
+// its resource address recorded there for the BuildState call that follows
+// in the same reconcile cycle to consult, so that address's state entry
+// carries forward its prior sha instead of being persisted at the new live
+// sha (which would mark the failed wake "seen" and never retry it).
 func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]reconcile.Result, error) {
+	p.resetApplyFailures()
 	var results []reconcile.Result
 	for _, action := range plan.Actions {
 		if action.Action == reconcile.ActionSkip {
 			continue
 		}
-		results = append(results, p.applyAction(ctx, action))
+		result := p.applyAction(ctx, action)
+		if result.Status == reconcile.ApplyFailed {
+			p.markApplyFailed(action.Name)
+		}
+		results = append(results, result)
 	}
 	return results, nil
 }
@@ -75,7 +87,11 @@ func (p *Provider) applyAction(ctx context.Context, action reconcile.Action) rec
 	}
 
 	text := p.buildWakeText(ctx, gh, repo, kind, path, sha, action.Details)
-	sid := fmt.Sprintf("%d", time.Now().UnixMilli())
+	// The millisecond timestamp alone can collide if two actions in the same
+	// ApplyPlan call resolve within the same millisecond (reachable with a
+	// fast/mocked ghClient); the per-process monotonic counter component
+	// guarantees a distinct id regardless.
+	sid := fmt.Sprintf("%d-%d", time.Now().UnixMilli(), p.nextApplySeq())
 
 	payload := map[string]interface{}{
 		"kind":     "signal",
@@ -148,9 +164,12 @@ func (p *Provider) buildWakeText(ctx context.Context, gh ghClient, repo, kind, p
 
 // BuildState mirrors the live snapshot into reconcile.State — plus, for any
 // scope that failed to fetch this cycle, the previously-tracked resources
-// carried forward from existing (see the merge below) — along with the
-// self-throttle bookkeeping (last_polled_at / snapshot_json) in
-// state.Metadata consumed by FetchLive's throttledSnapshot.
+// carried forward from existing (see the merge below), and, per-address, the
+// prior resource carried forward (old sha) in place of the new live one for
+// any address whose ApplyPlan action failed this cycle (failedApplyAddrs,
+// set by ApplyPlan above) — along with the self-throttle bookkeeping
+// (last_polled_at / snapshot_json) in state.Metadata consumed by FetchLive's
+// throttledSnapshot.
 func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
 	cfg, ok := config.(*Config)
 	if !ok || cfg == nil {
@@ -171,11 +190,28 @@ func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (
 		state.Lineage = Type + "-" + time.Now().UTC().Format("20060102T150405Z")
 	}
 
+	// failedApply holds the resource addresses whose apply action failed
+	// this cycle (e.g. sink.EmitLedgerEvent transiently erroring). existingIdx
+	// looks up each such address's prior resource so the loops below can
+	// persist the OLD sha instead of the new live one: a failed wake must
+	// stay out-of-sync with live so the next cycle's ComputePlan re-detects
+	// the change and retries it, rather than marking it "seen" and dropping
+	// it silently (PR #468 round-3 cog-review).
+	failedApply := p.applyFailedAddresses()
+	existingIdx := reconcile.ResourceIndex(existing) // nil-safe: reading a nil map is legal in Go
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	for dir, entries := range snap.InboxEntries {
 		for _, e := range entries {
+			addr := "inbox:" + e.Path
+			if failedApply[addr] {
+				if prev, ok := existingIdx[addr]; ok {
+					state.Resources = append(state.Resources, *prev)
+					continue
+				}
+			}
 			state.Resources = append(state.Resources, reconcile.Resource{
-				Address:       "inbox:" + e.Path,
+				Address:       addr,
 				Type:          Type,
 				Mode:          reconcile.ModeManaged,
 				ExternalID:    e.SHA,
@@ -190,8 +226,15 @@ func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (
 		}
 	}
 	for path, sha := range snap.WatchFiles {
+		addr := "watch:" + path
+		if failedApply[addr] {
+			if prev, ok := existingIdx[addr]; ok {
+				state.Resources = append(state.Resources, *prev)
+				continue
+			}
+		}
 		state.Resources = append(state.Resources, reconcile.Resource{
-			Address:       "watch:" + path,
+			Address:       addr,
 			Type:          Type,
 			Mode:          reconcile.ModeManaged,
 			ExternalID:    sha,

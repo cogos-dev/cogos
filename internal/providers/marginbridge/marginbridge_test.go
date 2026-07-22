@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -130,9 +131,21 @@ type emittedEvent struct {
 
 type mockSink struct {
 	events []emittedEvent
+
+	// failLedgerForPath makes EmitLedgerEvent return an error for a payload
+	// whose "path" field matches, instead of recording the event — used to
+	// simulate a transient sink.EmitLedgerEvent failure (e.g. ledger write/
+	// lock contention) for one specific action while others in the same
+	// ApplyPlan call still succeed.
+	failLedgerForPath map[string]error
 }
 
 func (s *mockSink) EmitLedgerEvent(eventType string, data map[string]interface{}) error {
+	if path, _ := data["path"].(string); path != "" {
+		if err, ok := s.failLedgerForPath[path]; ok {
+			return err
+		}
+	}
 	s.events = append(s.events, emittedEvent{kind: "ledger", evtType: eventType, data: data})
 	return nil
 }
@@ -945,6 +958,204 @@ func TestPartialFetchFailure_WatchFileCarriesForwardAndWakesOnLaterChange(t *tes
 	}
 	if baseline, _ := action.Details["baseline"].(bool); baseline {
 		t.Errorf("cycle 3: the ledger's real change was silently re-baselined instead of waking — the defect this test guards against")
+	}
+}
+
+// ─── Apply failure: carry-forward old sha, retry next cycle ───────────────
+//
+// Regression coverage for the PR #468 round-3 cog-review CHANGES_REQUESTED
+// finding: ApplyPlan's wake-emission failures were not fed back into
+// BuildState, which unconditionally rebuilt state.Resources from the live
+// FetchLive snapshot — persisting the FAILED action's resource at its new
+// live sha and marking it "seen". The next cycle's ComputePlan then saw
+// state sha == live sha and emitted ActionSkip: the failed wake was
+// permanently lost with no retry.
+
+func TestApplyFailure_CarriesForwardOldShaAndRetriesNextCycle(t *testing.T) {
+	gh := newMockGH()
+	gh.setSelfLogin("chazmaniandinkle")
+	gh.setCommitAuthor("my/repo", "signals/inbox/a.json", "some-bot", false)
+	gh.setContent("my/repo", "signals/inbox/a.json", "sha-a2", `{"text":"a changed"}`)
+	gh.setCommitAuthor("my/repo", "signals/inbox/b.json", "some-bot", false)
+	gh.setContent("my/repo", "signals/inbox/b.json", "sha-b2", `{"text":"b changed"}`)
+
+	p := newTestProvider(gh)
+	sink := &mockSink{failLedgerForPath: map[string]error{
+		"signals/inbox/a.json": fmt.Errorf("ledger append: lock contention"),
+	}}
+	p.SetEventSink(sink)
+
+	existing := &reconcile.State{
+		Lineage: "margin-bridge-existing",
+		Resources: []reconcile.Resource{
+			{
+				Address: "inbox:signals/inbox/a.json", Type: Type, ExternalID: "sha-a1",
+				Attributes: map[string]any{"kind": "inbox", "dir": "signals/inbox", "path": "signals/inbox/a.json"},
+			},
+			{
+				Address: "inbox:signals/inbox/b.json", Type: Type, ExternalID: "sha-b1",
+				Attributes: map[string]any{"kind": "inbox", "dir": "signals/inbox", "path": "signals/inbox/b.json"},
+			},
+		},
+	}
+
+	snap := newLiveSnapshot()
+	snap.FetchedAt = time.Now().UTC()
+	snap.InboxEntries["signals/inbox"] = []liveEntry{
+		{Path: "signals/inbox/a.json", Name: "a.json", SHA: "sha-a2"},
+		{Path: "signals/inbox/b.json", Name: "b.json", SHA: "sha-b2"},
+	}
+
+	cfg := &Config{Enabled: true, Repo: "my/repo", WatchDirs: []string{"signals/inbox"}}
+
+	// Cycle 1: both a.json and b.json changed on GitHub. sink.EmitLedgerEvent
+	// is rigged to fail for a.json only.
+	plan1, err := p.ComputePlan(cfg, snap, existing)
+	if err != nil {
+		t.Fatalf("ComputePlan (cycle 1): %v", err)
+	}
+	if plan1.Summary.Creates != 2 {
+		t.Fatalf("cycle 1: expected 2 creates (both addresses changed); got %+v", plan1.Summary)
+	}
+
+	results1, err := p.ApplyPlan(context.Background(), plan1)
+	if err != nil {
+		t.Fatalf("ApplyPlan (cycle 1): %v", err)
+	}
+	var aResult, bResult *reconcile.Result
+	for i := range results1 {
+		switch results1[i].Name {
+		case "inbox:signals/inbox/a.json":
+			aResult = &results1[i]
+		case "inbox:signals/inbox/b.json":
+			bResult = &results1[i]
+		}
+	}
+	if aResult == nil || aResult.Status != reconcile.ApplyFailed {
+		t.Fatalf("cycle 1: expected a.json's action to fail apply (rigged sink error); got %+v", aResult)
+	}
+	if bResult == nil || bResult.Status != reconcile.ApplySucceeded {
+		t.Fatalf("cycle 1: expected b.json's action to succeed; got %+v", bResult)
+	}
+
+	// BuildState runs unconditionally after ApplyPlan regardless of apply
+	// failures (matching internal/engine/reconcile_daemon.go's runOneCycle).
+	state1, err := p.BuildState(cfg, snap, existing)
+	if err != nil {
+		t.Fatalf("BuildState (cycle 1): %v", err)
+	}
+	idx1 := reconcile.ResourceIndex(state1)
+	if r, ok := idx1["inbox:signals/inbox/a.json"]; !ok || r.ExternalID != "sha-a1" {
+		t.Fatalf("cycle 1: expected a.json's resource to persist at its OLD sha (sha-a1) after the failed apply — the defect this test guards against; got %+v (ok=%v)", r, ok)
+	}
+	if r, ok := idx1["inbox:signals/inbox/b.json"]; !ok || r.ExternalID != "sha-b2" {
+		t.Fatalf("cycle 1: expected b.json's resource to advance to its NEW sha (sha-b2); got %+v (ok=%v)", r, ok)
+	}
+
+	// Cycle 2: live is unchanged from cycle 1 (a.json is still at sha-a2 on
+	// GitHub — nothing new happened), but state now records a.json's OLD sha
+	// (sha-a1, carried forward from the failed apply). ComputePlan must
+	// re-detect that drift and replan a wake — this is the retry.
+	plan2, err := p.ComputePlan(cfg, snap, state1)
+	if err != nil {
+		t.Fatalf("ComputePlan (cycle 2): %v", err)
+	}
+	var aAction2 *reconcile.Action
+	for i := range plan2.Actions {
+		switch plan2.Actions[i].Name {
+		case "inbox:signals/inbox/a.json":
+			aAction2 = &plan2.Actions[i]
+		case "inbox:signals/inbox/b.json":
+			if plan2.Actions[i].Action != reconcile.ActionSkip {
+				t.Errorf("cycle 2: expected b.json (already at its live sha) to skip; got %v", plan2.Actions[i].Action)
+			}
+		}
+	}
+	if aAction2 == nil || aAction2.Action != reconcile.ActionCreate {
+		t.Fatalf("cycle 2: expected a.json's failed wake to be replanned as ActionCreate (retry) — the defect this test guards against (pre-fix: ActionSkip, retried forever); got %+v", aAction2)
+	}
+
+	// Sink recovers: no more injected failures.
+	sink.failLedgerForPath = nil
+	results2, err := p.ApplyPlan(context.Background(), plan2)
+	if err != nil {
+		t.Fatalf("ApplyPlan (cycle 2): %v", err)
+	}
+	if len(results2) != 1 || results2[0].Status != reconcile.ApplySucceeded {
+		t.Fatalf("cycle 2: expected a.json's retried apply to succeed once the sink recovers; got %+v", results2)
+	}
+
+	state2, err := p.BuildState(cfg, snap, state1)
+	if err != nil {
+		t.Fatalf("BuildState (cycle 2): %v", err)
+	}
+	if r, ok := reconcile.ResourceIndex(state2)["inbox:signals/inbox/a.json"]; !ok || r.ExternalID != "sha-a2" {
+		t.Fatalf("cycle 2: expected a.json's resource to finally advance to sha-a2 after the retried apply succeeded; got %+v (ok=%v)", r, ok)
+	}
+}
+
+// ─── Apply event id: monotonic tiebreaker ──────────────────────────────────
+//
+// Advisory coverage from the same PR #468 round-3 cog-review: applyAction
+// derived the event id from time.Now().UnixMilli() alone, so two actions
+// resolved within the same ApplyPlan call could collide if they landed in
+// the same millisecond. The per-process monotonic counter component
+// guarantees distinct, strictly-increasing ids regardless of wall-clock
+// granularity.
+
+func TestApplyAction_EventIDsAreUniqueEvenWithinSameMillisecond(t *testing.T) {
+	gh := newMockGH()
+	names := []string{"a.json", "b.json", "c.json"}
+	for _, f := range names {
+		gh.setCommitAuthor("my/repo", "signals/inbox/"+f, "some-bot", false)
+		gh.setContent("my/repo", "signals/inbox/"+f, "sha-"+f, `{"text":"x"}`)
+	}
+
+	p := newTestProvider(gh)
+	sink := &mockSink{}
+	p.SetEventSink(sink)
+
+	var actions []reconcile.Action
+	for _, f := range names {
+		actions = append(actions, reconcile.Action{
+			Action: reconcile.ActionCreate, Name: "inbox:signals/inbox/" + f, Details: map[string]any{
+				"repo": "my/repo", "path": "signals/inbox/" + f, "kind": "inbox", "sha": "sha-" + f, "name": f,
+			},
+		})
+	}
+	if _, err := p.ApplyPlan(context.Background(), &reconcile.Plan{Actions: actions}); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	seen := map[string]bool{}
+	var lastSeq uint64
+	first := true
+	for _, ev := range sink.events {
+		if ev.kind != "ledger" {
+			continue
+		}
+		id, _ := ev.data["id"].(string)
+		if id == "" {
+			t.Fatalf("expected a non-empty event id")
+		}
+		if seen[id] {
+			t.Fatalf("duplicate event id %q across actions in the same ApplyPlan call", id)
+		}
+		seen[id] = true
+
+		parts := strings.SplitN(id, "-", 2)
+		if len(parts) != 2 {
+			t.Fatalf("expected id shaped millis-seq; got %q", id)
+		}
+		seq, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			t.Fatalf("expected a numeric monotonic-counter suffix; got %q: %v", parts[1], err)
+		}
+		if !first && seq != lastSeq+1 {
+			t.Errorf("expected the monotonic counter to increment by 1 per action; got %d after %d", seq, lastSeq)
+		}
+		lastSeq = seq
+		first = false
 	}
 }
 

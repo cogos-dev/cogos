@@ -201,6 +201,26 @@ type Provider struct {
 	// zero-I/O status report — updated at the end of every FetchLive call.
 	lastSnapshot  *liveSnapshot
 	lastFetchTime time.Time
+
+	// applySeq is a per-process monotonic counter mixed into applyAction's
+	// emitted event id alongside time.Now().UnixMilli(), so two actions
+	// resolved within the same millisecond (only reachable with a fast/mocked
+	// ghClient in practice) still get distinct ids (PR #468 round-3
+	// cog-review unverified_notes).
+	applySeq uint64
+
+	// failedApplyAddrs records the resource addresses (reconcile.Resource.
+	// Address / reconcile.Action.Name, e.g. "inbox:signals/inbox/a.json")
+	// whose ApplyPlan action failed (ApplyFailed) during the most recent
+	// ApplyPlan call. Cleared at the start of every ApplyPlan and consumed
+	// once by the BuildState call that follows in the same reconcile cycle
+	// (LoadConfig -> FetchLive -> ComputePlan -> ApplyPlan -> BuildState ->
+	// WriteState, internal/engine/reconcile_daemon.go's runOneCycle) so a
+	// wake whose ledger/bus emission failed keeps its OLD sha in state
+	// instead of being marked "seen" at the new live sha and never retried.
+	// The apply-side analogue of FailedDirs/FailedFiles' fetch-side
+	// carry-forward (PR #468 round-3 cog-review).
+	failedApplyAddrs map[string]bool
 }
 
 // NewProvider constructs an unwired Provider. Call SetEventSink once the
@@ -240,6 +260,47 @@ func (p *Provider) eventSink() EventSink {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.sink
+}
+
+// nextApplySeq returns the next value of the per-process monotonic counter
+// mixed into applyAction's emitted event id.
+func (p *Provider) nextApplySeq() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.applySeq++
+	return p.applySeq
+}
+
+// resetApplyFailures clears the per-cycle apply-failure stash. Called once
+// at the start of every ApplyPlan.
+func (p *Provider) resetApplyFailures() {
+	p.mu.Lock()
+	p.failedApplyAddrs = make(map[string]bool)
+	p.mu.Unlock()
+}
+
+// markApplyFailed records that the action at the given resource address
+// failed to apply this cycle, for the BuildState call that follows to
+// consult.
+func (p *Provider) markApplyFailed(address string) {
+	p.mu.Lock()
+	if p.failedApplyAddrs == nil {
+		p.failedApplyAddrs = make(map[string]bool)
+	}
+	p.failedApplyAddrs[address] = true
+	p.mu.Unlock()
+}
+
+// applyFailedAddresses returns a snapshot copy of the current per-cycle
+// apply-failure stash.
+func (p *Provider) applyFailedAddresses() map[string]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]bool, len(p.failedApplyAddrs))
+	for k, v := range p.failedApplyAddrs {
+		out[k] = v
+	}
+	return out
 }
 
 // Type returns the resource type identifier.
