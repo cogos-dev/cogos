@@ -7,11 +7,21 @@
 //   - Each quarantine record is a JSON line with the original record plus a
 //     _quarantine provenance block.
 //
-// Quarantine is append-only. The observatory never reads quarantine files back
-// into the index — they are a forensic/diagnostic surface only.
+// Quarantine is append-only but idempotent: a record whose dedup key (the
+// original record's refs.stable_id, or a content hash when absent) is already
+// present in the source's quarantine file is skipped. Reconcile cycles re-read
+// an unchanged ingest source repeatedly — without this guard a quarantine-only
+// source (every record rejected, e.g. claude-ai-web composer drafts) grows its
+// quarantine.jsonl without bound, one full re-append per cycle.
+//
+// The observatory never reads quarantine files back into the index — they are a
+// forensic/diagnostic surface only.
 package conversations
 
 import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -77,25 +87,58 @@ type quarantineRecord struct {
 }
 
 // QuarantineWriter writes quarantined records to the per-source quarantine
-// directory. Thread-safe via an internal mutex.
+// directory. Thread-safe via an internal mutex. Writes are idempotent per
+// dedup key (see quarantineDedupKey): repeated quarantining of the same record
+// across reconcile cycles is a no-op.
 type QuarantineWriter struct {
 	mu         sync.Mutex
 	quarantine string // <workspace>/.cog/observatory/quarantine
+
+	// seen maps sanitized source name → set of dedup keys already quarantined
+	// for that source. Lazily populated from the on-disk quarantine.jsonl the
+	// first time a source is written, so idempotency spans process restarts and
+	// dedups against any pre-existing backlog.
+	seen map[string]map[string]struct{}
 }
 
 // NewQuarantineWriter creates a writer backed by quarantineDir.
 // quarantineDir is typically <workspace>/.cog/observatory/quarantine.
 func NewQuarantineWriter(quarantineDir string) *QuarantineWriter {
-	return &QuarantineWriter{quarantine: quarantineDir}
+	return &QuarantineWriter{
+		quarantine: quarantineDir,
+		seen:       make(map[string]map[string]struct{}),
+	}
 }
 
 // WriteRecord appends one quarantined record to
-// <quarantineDir>/<source>/quarantine.jsonl.
-// The file is created and the directory is mkdir'd if absent.
-// Returns an error only for I/O failures; callers may log and continue.
+// <quarantineDir>/<source>/quarantine.jsonl, unless a record with the same
+// dedup key has already been quarantined for this source (in which case it is
+// a no-op and returns nil). The file is created and the directory is mkdir'd
+// if absent. Returns an error only for I/O failures; callers may log and
+// continue.
 func (q *QuarantineWriter) WriteRecord(source string, original json.RawMessage, prov QuarantineProvenance) error {
-	prov.QuarantinedAt = time.Now().UTC().Format(time.RFC3339)
+	key := quarantineDedupKey(original)
 
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	safeSource := sanitizeSourceName(source)
+	dir := filepath.Join(q.quarantine, safeSource)
+	path := filepath.Join(dir, "quarantine.jsonl")
+
+	// Lazily load the set of dedup keys already on disk for this source so
+	// idempotency holds across process restarts and against a pre-existing
+	// backlog.
+	seen, ok := q.seen[safeSource]
+	if !ok {
+		seen = loadQuarantineKeys(path)
+		q.seen[safeSource] = seen
+	}
+	if _, dup := seen[key]; dup {
+		return nil // already quarantined — idempotent no-op
+	}
+
+	prov.QuarantinedAt = time.Now().UTC().Format(time.RFC3339)
 	qr := quarantineRecord{
 		Original:   original,
 		Quarantine: prov,
@@ -106,15 +149,10 @@ func (q *QuarantineWriter) WriteRecord(source string, original json.RawMessage, 
 	}
 	line = append(line, '\n')
 
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	dir := filepath.Join(q.quarantine, sanitizeSourceName(source))
 	if mkdirErr := os.MkdirAll(dir, 0o755); mkdirErr != nil {
 		return fmt.Errorf("quarantine: mkdir %s: %w", dir, mkdirErr)
 	}
 
-	path := filepath.Join(dir, "quarantine.jsonl")
 	f, openErr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if openErr != nil {
 		return fmt.Errorf("quarantine: open %s: %w", path, openErr)
@@ -124,7 +162,65 @@ func (q *QuarantineWriter) WriteRecord(source string, original json.RawMessage, 
 	if _, writeErr := f.Write(line); writeErr != nil {
 		return fmt.Errorf("quarantine: write %s: %w", path, writeErr)
 	}
+
+	seen[key] = struct{}{}
 	return nil
+}
+
+// quarantineDedupKey derives the idempotency key for a raw ingest record. It
+// prefers refs.stable_id (the same stable identity the ingest parser dedups
+// turns by); when absent it falls back to a SHA-256 of the raw record bytes so
+// byte-identical records still dedup. The "s:"/"h:" prefix keeps a stable_id
+// from ever colliding with a content hash.
+func quarantineDedupKey(original json.RawMessage) string {
+	var probe struct {
+		Refs struct {
+			StableID any `json:"stable_id"`
+		} `json:"refs"`
+	}
+	if json.Unmarshal(original, &probe) == nil && probe.Refs.StableID != nil {
+		switch v := probe.Refs.StableID.(type) {
+		case string:
+			if v != "" {
+				return "s:" + v
+			}
+		case float64:
+			return "s:" + fmt.Sprintf("%.0f", v)
+		default:
+			if b, mErr := json.Marshal(v); mErr == nil {
+				return "s:" + string(b)
+			}
+		}
+	}
+	sum := sha256.Sum256(original)
+	return "h:" + hex.EncodeToString(sum[:16])
+}
+
+// loadQuarantineKeys reads an existing quarantine.jsonl and returns the set of
+// dedup keys it already contains. A missing or unreadable file yields an empty
+// set (fail-open: worst case is one redundant append, never a lost record).
+func loadQuarantineKeys(path string) map[string]struct{} {
+	keys := make(map[string]struct{})
+	f, err := os.Open(path)
+	if err != nil {
+		return keys
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, maxScannerTokenSize), maxScannerTokenSize)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var qr quarantineRecord
+		if json.Unmarshal(line, &qr) != nil || len(qr.Original) == 0 {
+			continue
+		}
+		keys[quarantineDedupKey(qr.Original)] = struct{}{}
+	}
+	return keys
 }
 
 // sanitizeSourceName replaces characters that are not safe in directory names.

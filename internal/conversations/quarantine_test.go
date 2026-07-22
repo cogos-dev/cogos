@@ -62,32 +62,85 @@ func TestQuarantineWriter_AppendsBetweenCalls(t *testing.T) {
 	qDir := t.TempDir()
 	qw := NewQuarantineWriter(qDir)
 
-	original := json.RawMessage(`{"schema":"cogos.observatory.conversations/v0.1","source":"src","session_id":"s1","role":"user","timestamp":"2026-06-10T00:00:00Z","text":"msg1"}`)
 	prov := QuarantineProvenance{Reason: QuarantineReasonUnmappedComponent, Component: "session.turn"}
 
+	// Three DISTINCT records (distinct stable_ids) must all append.
 	for i := 0; i < 3; i++ {
+		original := json.RawMessage(`{"schema":"cogos.observatory.conversations/v0.1","source":"src","session_id":"s1","role":"user","timestamp":"2026-06-10T00:00:00Z","text":"msg","refs":{"stable_id":"src:` + string(rune('a'+i)) + `"}}`) //nolint:lll
 		if err := qw.WriteRecord("src", original, prov); err != nil {
 			t.Fatalf("WriteRecord %d: %v", i, err)
 		}
 	}
 
-	path := filepath.Join(qDir, "src", "quarantine.jsonl")
+	if got := countLines(t, filepath.Join(qDir, "src", "quarantine.jsonl")); got != 3 {
+		t.Errorf("expected 3 lines, got %d", got)
+	}
+}
+
+// TestQuarantineWriter_IdempotentByStableID is the regression test for the
+// unbounded-growth bug: a quarantine-only source re-read every reconcile cycle
+// re-quarantined the same records forever. Re-quarantining a record with the
+// same stable_id must be a no-op.
+func TestQuarantineWriter_IdempotentByStableID(t *testing.T) {
+	qDir := t.TempDir()
+	prov := QuarantineProvenance{Reason: QuarantineReasonDraftRole, Component: "session.turn"}
+	original := json.RawMessage(`{"schema":"cogos.observatory.conversations/v0.1","source":"claude-ai-web","session_id":"c1","role":"user-draft","timestamp":"2026-06-14T19:52:32Z","text":"could you","refs":{"stable_id":"claude-ai-web:c1:6db3df9a4b641b8f"}}`) //nolint:lll
+	path := filepath.Join(qDir, "claude-ai-web", "quarantine.jsonl")
+
+	// Same record, many cycles, same writer.
+	qw := NewQuarantineWriter(qDir)
+	for i := 0; i < 50; i++ {
+		if err := qw.WriteRecord("claude-ai-web", original, prov); err != nil {
+			t.Fatalf("WriteRecord cycle %d: %v", i, err)
+		}
+	}
+	if got := countLines(t, path); got != 1 {
+		t.Fatalf("same-writer: expected 1 line, got %d", got)
+	}
+
+	// Idempotency must survive a process restart (fresh writer loads on-disk
+	// keys) — models the kernel being restarted between reconcile cycles.
+	qw2 := NewQuarantineWriter(qDir)
+	for i := 0; i < 50; i++ {
+		if err := qw2.WriteRecord("claude-ai-web", original, prov); err != nil {
+			t.Fatalf("fresh-writer WriteRecord cycle %d: %v", i, err)
+		}
+	}
+	if got := countLines(t, path); got != 1 {
+		t.Fatalf("fresh-writer: expected 1 line, got %d", got)
+	}
+
+	// A record without a stable_id dedups by content hash — byte-identical
+	// re-quarantines are still a no-op.
+	noStable := json.RawMessage(`{"schema":"cogos.observatory.conversations/v0.1","source":"nostable","session_id":"n1","role":"user","timestamp":"2026-06-10T00:00:00Z","text":"x"}`) //nolint:lll
+	qw3 := NewQuarantineWriter(qDir)
+	for i := 0; i < 5; i++ {
+		if err := qw3.WriteRecord("nostable", noStable, prov); err != nil {
+			t.Fatalf("nostable WriteRecord cycle %d: %v", i, err)
+		}
+	}
+	if got := countLines(t, filepath.Join(qDir, "nostable", "quarantine.jsonl")); got != 1 {
+		t.Fatalf("nostable content-hash dedup: expected 1 line, got %d", got)
+	}
+}
+
+// countLines counts non-empty lines in a JSONL file.
+func countLines(t *testing.T, path string) int {
+	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
-		t.Fatalf("open: %v", err)
+		t.Fatalf("open %s: %v", path, err)
 	}
 	defer f.Close()
-
 	count := 0
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, maxScannerTokenSize), maxScannerTokenSize)
 	for scanner.Scan() {
 		if strings.TrimSpace(scanner.Text()) != "" {
 			count++
 		}
 	}
-	if count != 3 {
-		t.Errorf("expected 3 lines, got %d", count)
-	}
+	return count
 }
 
 func TestQuarantineWriter_SourceNameSanitization(t *testing.T) {
