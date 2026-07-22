@@ -1,13 +1,16 @@
 package marginbridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -666,6 +669,282 @@ func TestBuildStateAndThrottledSnapshotRoundTrip(t *testing.T) {
 	}
 	if cached.WatchFiles["comments/ledger.json"] != "sha-ledger" {
 		t.Errorf("throttledSnapshot: cached snapshot missing watch file sha")
+	}
+}
+
+// ─── Partial/failed fetch: carry-forward, never silently drop ─────────────
+//
+// Regression coverage for the PR #468 cog-review CHANGES_REQUESTED finding:
+// a transient `gh api` error on one watched dir/file (FetchLive) combined
+// with BuildState rebuilding state.Resources solely from the current
+// snapshot (no merge against existing) permanently dropped that scope's
+// tracked history the moment any other change in the same cycle forced a
+// state write. The next successful fetch then treated every address under
+// the dropped scope as never-before-seen and silently re-baselined it —
+// swallowing a real signal with zero observability. These tests exercise
+// both affected afferent kinds (inbox dir, watch file).
+
+func TestBuildState_FailedScopesCarryForwardButLegitimateEmptyDoesNot(t *testing.T) {
+	p := newTestProvider(newMockGH())
+	existing := &reconcile.State{
+		Lineage: "margin-bridge-existing",
+		Resources: []reconcile.Resource{
+			{
+				Address: "inbox:signals/inbox/a.json", Type: Type, ExternalID: "sha-a",
+				Attributes: map[string]any{"kind": "inbox", "dir": "signals/inbox", "path": "signals/inbox/a.json"},
+			},
+			{
+				Address: "inbox:comments/inbox/old.json", Type: Type, ExternalID: "sha-old",
+				Attributes: map[string]any{"kind": "inbox", "dir": "comments/inbox", "path": "comments/inbox/old.json"},
+			},
+			{
+				Address: "watch:comments/ledger.json", Type: Type, ExternalID: "sha-ledger-1",
+				Attributes: map[string]any{"kind": "watch", "path": "comments/ledger.json"},
+			},
+		},
+	}
+
+	snap := newLiveSnapshot()
+	snap.FetchedAt = time.Now().UTC()
+	// signals/inbox's listing failed this cycle (transient gh error) —
+	// a.json must be carried forward.
+	snap.FailedDirs["signals/inbox"] = true
+	// comments/inbox fetched successfully and is now genuinely empty
+	// (old.json was claimed/removed by the consuming seat) — NOT a failed
+	// scope, so old.json must be dropped, not carried forward.
+	// comments/ledger.json's content-sha fetch failed this cycle — its
+	// resource must be carried forward.
+	snap.FailedFiles["comments/ledger.json"] = true
+
+	cfg := &Config{Enabled: true, Repo: "my/repo", WatchDirs: []string{"signals/inbox", "comments/inbox"}, WatchFiles: []string{"comments/ledger.json"}}
+	state, err := p.BuildState(cfg, snap, existing)
+	if err != nil {
+		t.Fatalf("BuildState: %v", err)
+	}
+
+	idx := reconcile.ResourceIndex(state)
+	if r, ok := idx["inbox:signals/inbox/a.json"]; !ok || r.ExternalID != "sha-a" {
+		t.Errorf("expected a.json's resource to be carried forward from the failed dir; got %+v (ok=%v)", r, ok)
+	}
+	if _, ok := idx["inbox:comments/inbox/old.json"]; ok {
+		t.Errorf("expected old.json's resource to be dropped: comments/inbox fetched successfully and is legitimately empty, not a failed scope")
+	}
+	if r, ok := idx["watch:comments/ledger.json"]; !ok || r.ExternalID != "sha-ledger-1" {
+		t.Errorf("expected the ledger's resource to be carried forward from the failed file fetch; got %+v (ok=%v)", r, ok)
+	}
+	if len(state.Resources) != 2 {
+		t.Errorf("expected exactly 2 resources (a.json + ledger carried forward, old.json dropped); got %d: %+v", len(state.Resources), state.Resources)
+	}
+}
+
+func TestFetchLive_TransientErrorRecordsFailedScopeAndLogs(t *testing.T) {
+	gh := newMockGH()
+	p := newTestProvider(gh)
+	root := t.TempDir()
+	writeConfig(t, root, "repo: my/repo\nwatch_dirs: [signals/inbox]\nwatch_files: [comments/ledger.json]\n")
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cfg := cfgAny.(*Config)
+
+	dirPath := "repos/my/repo/contents/signals/inbox"
+	filePath := "repos/my/repo/contents/comments/ledger.json"
+	gh.queueError(dirPath, fmt.Errorf("gh api %s: exit status 1: HTTP 500: rate limited", dirPath), 1)
+	gh.queueError(filePath, fmt.Errorf("gh api %s: exit status 1: HTTP 500: rate limited", filePath), 1)
+
+	oldOutput := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(oldOutput)
+
+	liveAny, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	snap, ok := liveAny.(*liveSnapshot)
+	if !ok {
+		t.Fatalf("FetchLive: expected *liveSnapshot; got %T", liveAny)
+	}
+	if !snap.FailedDirs["signals/inbox"] {
+		t.Errorf("expected signals/inbox to be recorded in FailedDirs after a transient gh error")
+	}
+	if !snap.FailedFiles["comments/ledger.json"] {
+		t.Errorf("expected comments/ledger.json to be recorded in FailedFiles after a transient gh error")
+	}
+	if _, ok := snap.InboxEntries["signals/inbox"]; ok {
+		t.Errorf("expected no InboxEntries for a dir whose listing failed")
+	}
+	if _, ok := snap.WatchFiles["comments/ledger.json"]; ok {
+		t.Errorf("expected no WatchFiles entry for a file whose fetch failed")
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "signals/inbox") {
+		t.Errorf("expected the dir fetch failure to be logged (never silent); got log output: %q", logged)
+	}
+	if !strings.Contains(logged, "comments/ledger.json") {
+		t.Errorf("expected the file fetch failure to be logged (never silent); got log output: %q", logged)
+	}
+}
+
+func TestPartialFetchFailure_InboxDirCarriesForwardAndWakesOnLaterChange(t *testing.T) {
+	gh := newMockGH()
+	gh.setDirListing("my/repo", "signals/inbox", []dirEntry{{name: "a.json", sha: "sha-a1"}})
+	p := newTestProvider(gh)
+	root := t.TempDir()
+	writeConfig(t, root, "repo: my/repo\nwatch_dirs: [signals/inbox]\n")
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cfg := cfgAny.(*Config)
+
+	// Cycle 1 (healthy): a.json baselines into state — first sight, no wake.
+	live1, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive (cycle 1): %v", err)
+	}
+	plan1, err := p.ComputePlan(cfg, live1, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan (cycle 1): %v", err)
+	}
+	if plan1.Summary.Updates != 1 {
+		t.Fatalf("cycle 1: expected 1 baseline update; got %+v", plan1.Summary)
+	}
+	state1, err := p.BuildState(cfg, live1, nil)
+	if err != nil {
+		t.Fatalf("BuildState (cycle 1): %v", err)
+	}
+	if r, ok := reconcile.ResourceIndex(state1)["inbox:signals/inbox/a.json"]; !ok || r.ExternalID != "sha-a1" {
+		t.Fatalf("cycle 1: expected a.json tracked at sha-a1; got %+v (ok=%v)", r, ok)
+	}
+
+	// Cycle 2: signals/inbox's listing transiently errors (rate limit,
+	// network blip). In the real daemon, some other change elsewhere in the
+	// same cycle would force BuildState/WriteState to run regardless
+	// (reconcile_daemon only skips the write when the whole plan has zero
+	// changes) — BuildState is exercised unconditionally here to match that.
+	dirPath := "repos/my/repo/contents/signals/inbox"
+	gh.queueError(dirPath, fmt.Errorf("gh api %s: exit status 1: HTTP 500: rate limited", dirPath), 1)
+	live2, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive (cycle 2): %v", err)
+	}
+	snap2 := live2.(*liveSnapshot)
+	if !snap2.FailedDirs["signals/inbox"] {
+		t.Fatalf("cycle 2: expected signals/inbox recorded as a failed dir")
+	}
+	state2, err := p.BuildState(cfg, live2, state1)
+	if err != nil {
+		t.Fatalf("BuildState (cycle 2): %v", err)
+	}
+	r2, ok := reconcile.ResourceIndex(state2)["inbox:signals/inbox/a.json"]
+	if !ok {
+		t.Fatalf("cycle 2: a.json's tracked resource was dropped after a transient fetch failure — the defect this test guards against")
+	}
+	if r2.ExternalID != "sha-a1" {
+		t.Errorf("cycle 2: expected a.json's carried-forward sha to be unchanged (sha-a1); got %s", r2.ExternalID)
+	}
+
+	// Cycle 3: fetch recovers. a.json's real content changed while we
+	// couldn't observe it — a genuine signal that arrived during the gap.
+	gh.setDirListing("my/repo", "signals/inbox", []dirEntry{{name: "a.json", sha: "sha-a2"}})
+	live3, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive (cycle 3): %v", err)
+	}
+	plan3, err := p.ComputePlan(cfg, live3, state2)
+	if err != nil {
+		t.Fatalf("ComputePlan (cycle 3): %v", err)
+	}
+	if plan3.Summary.Creates != 1 {
+		t.Fatalf("cycle 3: expected a.json's real content change to wake (ActionCreate) via the preserved cursor; got %+v", plan3.Summary)
+	}
+	action := plan3.Actions[0]
+	if action.Action != reconcile.ActionCreate {
+		t.Errorf("cycle 3: expected ActionCreate; got %v", action.Action)
+	}
+	if baseline, _ := action.Details["baseline"].(bool); baseline {
+		t.Errorf("cycle 3: a.json's real change was silently re-baselined instead of waking — the defect this test guards against")
+	}
+}
+
+func TestPartialFetchFailure_WatchFileCarriesForwardAndWakesOnLaterChange(t *testing.T) {
+	gh := newMockGH()
+	gh.setContent("my/repo", "comments/ledger.json", "sha-l1", `{"comments":[]}`)
+	p := newTestProvider(gh)
+	root := t.TempDir()
+	writeConfig(t, root, "repo: my/repo\nwatch_files: [comments/ledger.json]\n")
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cfg := cfgAny.(*Config)
+
+	// Cycle 1 (healthy): the ledger baselines into state.
+	live1, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive (cycle 1): %v", err)
+	}
+	plan1, err := p.ComputePlan(cfg, live1, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan (cycle 1): %v", err)
+	}
+	if plan1.Summary.Updates != 1 {
+		t.Fatalf("cycle 1: expected 1 baseline update; got %+v", plan1.Summary)
+	}
+	state1, err := p.BuildState(cfg, live1, nil)
+	if err != nil {
+		t.Fatalf("BuildState (cycle 1): %v", err)
+	}
+	if r, ok := reconcile.ResourceIndex(state1)["watch:comments/ledger.json"]; !ok || r.ExternalID != "sha-l1" {
+		t.Fatalf("cycle 1: expected ledger tracked at sha-l1; got %+v (ok=%v)", r, ok)
+	}
+
+	// Cycle 2: the ledger's content-sha fetch transiently errors.
+	filePath := "repos/my/repo/contents/comments/ledger.json"
+	gh.queueError(filePath, fmt.Errorf("gh api %s: exit status 1: HTTP 500: rate limited", filePath), 1)
+	live2, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive (cycle 2): %v", err)
+	}
+	snap2 := live2.(*liveSnapshot)
+	if !snap2.FailedFiles["comments/ledger.json"] {
+		t.Fatalf("cycle 2: expected comments/ledger.json recorded as a failed file")
+	}
+	state2, err := p.BuildState(cfg, live2, state1)
+	if err != nil {
+		t.Fatalf("BuildState (cycle 2): %v", err)
+	}
+	r2, ok := reconcile.ResourceIndex(state2)["watch:comments/ledger.json"]
+	if !ok {
+		t.Fatalf("cycle 2: ledger's tracked resource was dropped after a transient fetch failure — the defect this test guards against")
+	}
+	if r2.ExternalID != "sha-l1" {
+		t.Errorf("cycle 2: expected the carried-forward sha to be unchanged (sha-l1); got %s", r2.ExternalID)
+	}
+
+	// Cycle 3: fetch recovers. The ledger's real content (a settlement)
+	// changed while we couldn't observe it.
+	gh.setContent("my/repo", "comments/ledger.json", "sha-l2", `{"comments":[{"a":1}]}`)
+	live3, err := p.FetchLive(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("FetchLive (cycle 3): %v", err)
+	}
+	plan3, err := p.ComputePlan(cfg, live3, state2)
+	if err != nil {
+		t.Fatalf("ComputePlan (cycle 3): %v", err)
+	}
+	if plan3.Summary.Creates != 1 {
+		t.Fatalf("cycle 3: expected the ledger's real change to wake (ActionCreate) via the preserved cursor; got %+v", plan3.Summary)
+	}
+	action := plan3.Actions[0]
+	if action.Action != reconcile.ActionCreate {
+		t.Errorf("cycle 3: expected ActionCreate; got %v", action.Action)
+	}
+	if baseline, _ := action.Details["baseline"].(bool); baseline {
+		t.Errorf("cycle 3: the ledger's real change was silently re-baselined instead of waking — the defect this test guards against")
 	}
 }
 

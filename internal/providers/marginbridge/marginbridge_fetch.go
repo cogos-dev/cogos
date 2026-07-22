@@ -31,6 +31,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
@@ -73,7 +74,11 @@ func (p *Provider) FetchLive(ctx context.Context, config any) (any, error) {
 		if err != nil {
 			// Absent dir or transient gh error: skip this dir for this
 			// cycle, matching the prototype's `continue` on RuntimeError.
-			// Next cycle retries.
+			// Next cycle retries. Recorded in FailedDirs (never silent) so
+			// BuildState carries this dir's previously-tracked resources
+			// forward instead of dropping them.
+			snap.FailedDirs[dir] = true
+			log.Printf("[margin-bridge] warning: FetchLive listDir %s: %v", dir, err)
 			continue
 		}
 		if len(entries) > 0 {
@@ -86,7 +91,11 @@ func (p *Provider) FetchLive(ctx context.Context, config any) (any, error) {
 		if err != nil {
 			// Absent/transient: treated as "no observation" this cycle, not
 			// a change. ComputePlan skips watch files missing from the
-			// snapshot entirely.
+			// snapshot entirely. Recorded in FailedFiles (never silent) so
+			// BuildState carries this file's previously-tracked resource
+			// forward instead of dropping it.
+			snap.FailedFiles[wf] = true
+			log.Printf("[margin-bridge] warning: FetchLive fetchContentSHA %s: %v", wf, err)
 			continue
 		}
 		snap.WatchFiles[wf] = sha
@@ -162,6 +171,12 @@ func throttledSnapshot(st *reconcile.State, cfg *Config) *liveSnapshot {
 	}
 	if snap.WatchFiles == nil {
 		snap.WatchFiles = make(map[string]string)
+	}
+	if snap.FailedDirs == nil {
+		snap.FailedDirs = make(map[string]bool)
+	}
+	if snap.FailedFiles == nil {
+		snap.FailedFiles = make(map[string]bool)
 	}
 	return &snap
 }

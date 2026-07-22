@@ -110,13 +110,26 @@ type liveSnapshot struct {
 	// A path absent from this map means the file could not be fetched this
 	// cycle (e.g. 404 or transient gh error) and is treated as "no change".
 	WatchFiles map[string]string `json:"watch_files"`
-	FetchedAt  time.Time         `json:"fetched_at"`
+	// FailedDirs records watch dirs whose `gh api` directory listing errored
+	// this cycle (rate limit, network blip, transient GitHub fault) — as
+	// distinct from a dir that was fetched successfully and is simply empty.
+	// BuildState (marginbridge_apply.go) uses this to distinguish "not
+	// observed this cycle" from "observed as gone": a scope recorded here
+	// has its previously-tracked resources carried forward instead of
+	// dropped.
+	FailedDirs map[string]bool `json:"failed_dirs,omitempty"`
+	// FailedFiles is the watch-file analogue of FailedDirs: watch files
+	// whose content-sha fetch errored this cycle.
+	FailedFiles map[string]bool `json:"failed_files,omitempty"`
+	FetchedAt   time.Time       `json:"fetched_at"`
 }
 
 func newLiveSnapshot() *liveSnapshot {
 	return &liveSnapshot{
 		InboxEntries: make(map[string][]liveEntry),
 		WatchFiles:   make(map[string]string),
+		FailedDirs:   make(map[string]bool),
+		FailedFiles:  make(map[string]bool),
 	}
 }
 

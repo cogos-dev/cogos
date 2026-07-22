@@ -146,7 +146,9 @@ func (p *Provider) buildWakeText(ctx context.Context, gh ghClient, repo, kind, p
 	return extracted
 }
 
-// BuildState mirrors the live snapshot 1:1 into reconcile.State, plus the
+// BuildState mirrors the live snapshot into reconcile.State — plus, for any
+// scope that failed to fetch this cycle, the previously-tracked resources
+// carried forward from existing (see the merge below) — along with the
 // self-throttle bookkeeping (last_polled_at / snapshot_json) in
 // state.Metadata consumed by FetchLive's throttledSnapshot.
 func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
@@ -200,6 +202,33 @@ func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (
 				"path": path,
 			},
 		})
+	}
+
+	// Carry forward previously-tracked resources for any scope (watch dir or
+	// watch file) that failed to fetch this cycle (FailedDirs/FailedFiles,
+	// set by FetchLive in marginbridge_fetch.go) instead of dropping them.
+	// Without this, a transient `gh api` error on one watched dir/file —
+	// landing in the same cycle as any real change elsewhere that forces
+	// this state write — would silently erase that scope's tracked history:
+	// the next successful fetch would then treat every address under it,
+	// including a real change that arrived during the gap, as never-before-
+	// seen and re-baseline it with no wake (PR #468 review).
+	if existing != nil && (len(snap.FailedDirs) > 0 || len(snap.FailedFiles) > 0) {
+		for _, r := range existing.Resources {
+			kind, _ := r.Attributes["kind"].(string)
+			switch kind {
+			case "inbox":
+				dir, _ := r.Attributes["dir"].(string)
+				if snap.FailedDirs[dir] {
+					state.Resources = append(state.Resources, r)
+				}
+			case "watch":
+				path, _ := r.Attributes["path"].(string)
+				if snap.FailedFiles[path] {
+					state.Resources = append(state.Resources, r)
+				}
+			}
+		}
 	}
 
 	snapJSON, _ := marshalSnapshot(snap)
