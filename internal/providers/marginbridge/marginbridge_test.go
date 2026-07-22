@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,6 +22,12 @@ import (
 type mockGH struct {
 	responses map[string][]byte
 	calls     []string
+
+	// errQueue lets a test script N consecutive failures for a given path
+	// before falling through to any registered response (or the default
+	// 404) — used to exercise transient-failure-then-recovery paths like
+	// resolveSelfLogin's first `gh api user` attempt erroring.
+	errQueue map[string][]error
 }
 
 func newMockGH() *mockGH {
@@ -29,10 +36,26 @@ func newMockGH() *mockGH {
 
 func (m *mockGH) api(_ context.Context, path string) ([]byte, error) {
 	m.calls = append(m.calls, path)
+	if errs, ok := m.errQueue[path]; ok && len(errs) > 0 {
+		err := errs[0]
+		m.errQueue[path] = errs[1:]
+		return nil, err
+	}
 	if data, ok := m.responses[path]; ok {
 		return data, nil
 	}
 	return nil, fmt.Errorf("gh api %s: exit status 1: HTTP 404: Not Found", path)
+}
+
+// queueError makes the next n calls to path return err before falling
+// through to any registered response.
+func (m *mockGH) queueError(path string, err error, n int) {
+	if m.errQueue == nil {
+		m.errQueue = make(map[string][]error)
+	}
+	for i := 0; i < n; i++ {
+		m.errQueue[path] = append(m.errQueue[path], err)
+	}
 }
 
 func (m *mockGH) setJSON(path string, v any) {
@@ -73,9 +96,11 @@ type dirEntry struct {
 }
 
 // setCommitAuthor registers the commits?path=... response used by
-// commitAuthor.
+// commitAuthor. Keyed with the same repo/path encoding commitAuthor itself
+// applies (path is a query value, so it is fully query-escaped; repo is a
+// REST path component, so only its "/"-separated segments are escaped).
 func (m *mockGH) setCommitAuthor(repo, path, login string, verified bool) {
-	m.setJSON(fmt.Sprintf("repos/%s/commits?path=%s&per_page=1", repo, path), []map[string]any{
+	m.setJSON(fmt.Sprintf("repos/%s/commits?path=%s&per_page=1", encodeGHPath(repo), url.QueryEscape(path)), []map[string]any{
 		{
 			"author": map[string]any{"login": login},
 			"commit": map[string]any{
@@ -475,6 +500,76 @@ func TestApplyPlan_WatchFileFromUntrustedAuthorWakes(t *testing.T) {
 	}
 	if payload["tier"] != "untrusted" {
 		t.Errorf("expected tier=untrusted; got %v", payload["tier"])
+	}
+}
+
+func TestResolveSelfLogin_TransientErrorDoesNotPermanentlyCacheEmptyLogin(t *testing.T) {
+	gh := newMockGH()
+	// The first `gh api user` attempt fails transiently (rate limit,
+	// network blip, auth hiccup during startup); a later attempt succeeds
+	// and returns the real operator login.
+	gh.queueError("user", fmt.Errorf("gh api user: exit status 1: HTTP 500: rate limited"), 1)
+	gh.setSelfLogin("chazmaniandinkle")
+	gh.setCommitAuthor("my/repo", "comments/ledger.json", "chazmaniandinkle", true)
+
+	p := newTestProvider(gh)
+	sink := &mockSink{}
+	p.SetEventSink(sink)
+
+	watchAction := reconcile.Action{
+		Action: reconcile.ActionCreate, Name: "watch:comments/ledger.json", Details: map[string]any{
+			"repo": "my/repo", "path": "comments/ledger.json", "kind": "watch", "sha": "abcdef1234567",
+		},
+	}
+
+	// Evaluation 1: resolveSelfLogin's `gh api user` call errors. The
+	// erroring attempt must NOT be cached as resolved: tier stays
+	// "untrusted" for this evaluation (the operator-authored settlement
+	// wakes as if external, since self-login couldn't be confirmed), but
+	// selfLoginResolv must remain false so the NEXT call retries instead of
+	// being stuck untrusted for the rest of the process's lifetime.
+	results, err := p.ApplyPlan(context.Background(), &reconcile.Plan{Actions: []reconcile.Action{watchAction}})
+	if err != nil {
+		t.Fatalf("ApplyPlan (evaluation 1): %v", err)
+	}
+	if results[0].Status != reconcile.ApplySucceeded {
+		t.Fatalf("evaluation 1: expected succeeded; got %+v", results[0])
+	}
+	if len(sink.events) != 2 {
+		t.Fatalf("evaluation 1: expected a wake (tier untrusted while self-login is unresolved); got %d events", len(sink.events))
+	}
+	if got := sink.events[0].data["tier"]; got != "untrusted" {
+		t.Errorf("evaluation 1: expected tier=untrusted while self-login is unresolved; got %v", got)
+	}
+
+	p.mu.Lock()
+	resolved := p.selfLoginResolv
+	p.mu.Unlock()
+	if resolved {
+		t.Fatalf("resolveSelfLogin: an erroring attempt must not set selfLoginResolv=true (would permanently disable echo suppression)")
+	}
+
+	// Evaluation 2: a later call retries and `gh api user` now succeeds.
+	// selfLogin resolves to the operator's login and the echo-suppression
+	// branch fires for the same watch-file settlement.
+	sink.events = nil
+	results, err = p.ApplyPlan(context.Background(), &reconcile.Plan{Actions: []reconcile.Action{watchAction}})
+	if err != nil {
+		t.Fatalf("ApplyPlan (evaluation 2): %v", err)
+	}
+	if results[0].Status != reconcile.ApplySucceeded {
+		t.Fatalf("evaluation 2: expected succeeded; got %+v", results[0])
+	}
+	if len(sink.events) != 0 {
+		t.Errorf("evaluation 2: expected echo suppression once self-login resolves to the operator; got %d events: %+v", len(sink.events), sink.events)
+	}
+
+	p.mu.Lock()
+	resolved = p.selfLoginResolv
+	login := p.selfLogin
+	p.mu.Unlock()
+	if !resolved || login != "chazmaniandinkle" {
+		t.Errorf("resolveSelfLogin: expected resolved=true login=chazmaniandinkle after the successful retry; got resolved=%v login=%q", resolved, login)
 	}
 }
 

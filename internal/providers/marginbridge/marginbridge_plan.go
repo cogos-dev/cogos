@@ -51,7 +51,7 @@ import (
 // matches "first sight never wakes."
 func (p *Provider) ComputePlan(config any, live any, state *reconcile.State) (*reconcile.Plan, error) {
 	cfg, ok := config.(*Config)
-	if !ok {
+	if !ok || cfg == nil {
 		return nil, fmt.Errorf("margin-bridge: ComputePlan: unexpected config type %T", config)
 	}
 

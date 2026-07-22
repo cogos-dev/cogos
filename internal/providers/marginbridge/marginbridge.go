@@ -33,6 +33,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -354,9 +355,23 @@ func (execGHClient) api(ctx context.Context, path string) ([]byte, error) {
 	return out, nil
 }
 
+// encodeGHPath percent-encodes each "/"-separated segment of a GitHub API
+// path component (a "repo/owner" identifier, or a repository-relative file
+// path), preserving the literal "/" segment separators the REST route
+// itself is built on. Guards against a segment containing a reserved or
+// unsafe character (spaces, "?", "#", non-ASCII, etc.) corrupting the
+// request path.
+func encodeGHPath(s string) string {
+	segments := strings.Split(s, "/")
+	for i, seg := range segments {
+		segments[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segments, "/")
+}
+
 // fetchContentSHA fetches repos/{repo}/contents/{path} and returns its sha.
 func fetchContentSHA(ctx context.Context, gh ghClient, repo, path string) (string, error) {
-	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/contents/%s", repo, path))
+	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/contents/%s", encodeGHPath(repo), encodeGHPath(path)))
 	if err != nil {
 		return "", err
 	}
@@ -372,7 +387,7 @@ func fetchContentSHA(ctx context.Context, gh ghClient, repo, path string) (strin
 // fetchContentText decodes the base64 `content` field of a contents API
 // response into a string. Used for building the human-readable wake line.
 func fetchContentText(ctx context.Context, gh ghClient, repo, path string) (string, error) {
-	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/contents/%s", repo, path))
+	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/contents/%s", encodeGHPath(repo), encodeGHPath(path)))
 	if err != nil {
 		return "", err
 	}
@@ -398,7 +413,12 @@ func fetchContentText(ctx context.Context, gh ghClient, repo, path string) (stri
 // false) on any error — a signal whose provenance can't be resolved still
 // gets the wake, just tagged untrusted/unverified (never silently dropped).
 func commitAuthor(ctx context.Context, gh ghClient, repo, path string) (login string, verified bool) {
-	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/commits?path=%s&per_page=1", repo, path))
+	// path is a genuine query-string value here (not a REST path segment),
+	// so it needs full query-encoding (escapes "&", "=", "/", etc.) rather
+	// than the path-segment encoding used for the contents/{path} routes —
+	// otherwise a path containing "&" or "=" could inject extra query
+	// parameters into this request.
+	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/commits?path=%s&per_page=1", encodeGHPath(repo), url.QueryEscape(path)))
 	if err != nil {
 		return "unknown", false
 	}
@@ -440,14 +460,23 @@ func (p *Provider) resolveSelfLogin(ctx context.Context) string {
 	gh := p.gh
 	p.mu.Unlock()
 
+	data, err := gh.api(ctx, "user")
+	if err != nil {
+		// Transient failure (rate limit, network blip, auth hiccup during
+		// startup): do NOT cache this as a resolved empty self-login.
+		// Leave selfLoginResolv=false so the next call retries, instead of
+		// permanently pinning tier to "untrusted" (and disabling the
+		// operator echo-suppression branch in ApplyPlan) for the rest of
+		// the process's lifetime.
+		return ""
+	}
+
 	login := ""
-	if data, err := gh.api(ctx, "user"); err == nil {
-		var resp struct {
-			Login string `json:"login"`
-		}
-		if json.Unmarshal(data, &resp) == nil {
-			login = resp.Login
-		}
+	var resp struct {
+		Login string `json:"login"`
+	}
+	if json.Unmarshal(data, &resp) == nil {
+		login = resp.Login
 	}
 
 	p.mu.Lock()

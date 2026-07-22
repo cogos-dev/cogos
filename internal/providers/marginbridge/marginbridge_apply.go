@@ -151,7 +151,7 @@ func (p *Provider) buildWakeText(ctx context.Context, gh ghClient, repo, kind, p
 // state.Metadata consumed by FetchLive's throttledSnapshot.
 func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (*reconcile.State, error) {
 	cfg, ok := config.(*Config)
-	if !ok {
+	if !ok || cfg == nil {
 		return nil, fmt.Errorf("margin-bridge: BuildState: unexpected config type %T", config)
 	}
 	if !cfg.Enabled {

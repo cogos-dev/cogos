@@ -106,7 +106,7 @@ func (p *Provider) cacheSnapshot(snap *liveSnapshot) {
 // listDir fetches repos/{repo}/contents/{dir} and returns the file entries,
 // skipping subdirectories and housekeeping filenames.
 func listDir(ctx context.Context, gh ghClient, repo, dir string) ([]liveEntry, error) {
-	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/contents/%s", repo, dir))
+	data, err := gh.api(ctx, fmt.Sprintf("repos/%s/contents/%s", encodeGHPath(repo), encodeGHPath(dir)))
 	if err != nil {
 		return nil, err
 	}
