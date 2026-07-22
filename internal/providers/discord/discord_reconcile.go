@@ -1,4 +1,4 @@
-package main
+package discord
 
 import (
 	"encoding/json"
@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
 // ─── Config types (match .cog/config/discord/server.yaml) ───────────────────
@@ -1117,7 +1119,7 @@ func writeState(root string, state *DiscordState) error {
 }
 
 func generateLineage() string {
-	return GenerateLineage()
+	return reconcile.GenerateLineage()
 }
 
 // resourceAddress builds the hierarchical address for a resource.

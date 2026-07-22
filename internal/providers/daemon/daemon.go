@@ -25,9 +25,15 @@
 // internal/providers/component and is wired here via blank import.
 // The pin provider (internal/providers/pin) is fully extracted and registered
 // here directly — its Health() delegates to the extracted package.
+// The discord provider (Wave 4, ADR-121) is likewise fully extracted to
+// internal/providers/discord and registered here directly (globalDiscordProvider)
+// — its full LoadConfig/FetchLive/ComputePlan/ApplyPlan/BuildState/Health/
+// ExportConfig cycle runs for real, re-homed from _legacy/wave4-providers/.
 // The identity provider (Wave 6b) is registered here as a stub; the full
 // plan/apply wiring lives in the workspace-root identity_wiring.go.
-// The other eight are implemented as minimal structs below.
+// The other seven (agent, eval, identity, mcp-tools, openclaw-agents,
+// openclaw-cron, openclaw-gateway, service) are implemented as minimal
+// Health()-only structs below.
 //
 // cmd/cogos/providers_wire.go imports this package (triggering init()) and
 // wires both engine.RegisterProviders and engine.SetProvidersWorkspace so
@@ -43,6 +49,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/myrgic/cogos/internal/providers/discord"
 	"github.com/myrgic/cogos/internal/providers/pin"
 	"github.com/myrgic/cogos/internal/providers/selfupdate"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
@@ -82,12 +89,24 @@ func SetWorkspaceRoot(root string) {
 	// updater log path resolve correctly. The full plan/apply cycle runs in the
 	// daemon (unlike the Health()-only stubs above).
 	selfupdate.SetWorkspaceRoot(root)
+	// Teach the discord provider the workspace root so Health() can fall back
+	// to checking .cog/config/discord/config.hcl presence even before a token
+	// has been resolved (mirrors the pre-Wave-4 stub's check).
+	globalDiscordProvider.SetWorkspaceRoot(root)
 }
 
 // globalPinProvider is the singleton pinProvider registered in init().
 // Exposed so providers_wire.go can inject the workspace locator after the
 // engine's URIRegistry is initialised.
 var globalPinProvider = &pinProvider{stubMethods: stubMethods{name: "pin"}}
+
+// globalDiscordProvider is the singleton *discord.DiscordProvider registered
+// in init(). Wave 4 (ADR-121): replaces the former Health()-only discordProvider
+// stub with the real LoadConfig/FetchLive/ComputePlan/ApplyPlan/BuildState cycle
+// re-homed from _legacy/wave4-providers/. SetWorkspaceRoot (above) wires the
+// workspace root into it at boot so Health()'s config.hcl fallback check keeps
+// working exactly as the stub's did.
+var globalDiscordProvider = &discord.DiscordProvider{}
 
 // SetPinWorkspaceLocator wires a WorkspaceLocator into the pin provider so that
 // FetchLive can consult the global workspace registry. Called from
@@ -167,7 +186,7 @@ func (p *pinProvider) Health() reconcile.ResourceStatus {
 
 func init() {
 	reconcile.RegisterProvider("agent", &agentProvider{stubMethods: stubMethods{name: "agent"}})
-	reconcile.RegisterProvider("discord", &discordProvider{stubMethods: stubMethods{name: "discord"}})
+	reconcile.RegisterProvider("discord", globalDiscordProvider)
 	reconcile.RegisterProvider("eval", &evalProvider{stubMethods: stubMethods{name: "eval"}})
 	reconcile.RegisterProvider("identity", &identityProvider{stubMethods: stubMethods{name: "identity"}})
 	reconcile.RegisterProvider("mcp-tools", &mcpToolsProvider{stubMethods: stubMethods{name: "mcp-tools"}})
@@ -290,31 +309,13 @@ func (p *agentProvider) Health() reconcile.ResourceStatus {
 }
 
 // ─── discord ──────────────────────────────────────────────────────────────────
-
-type discordProvider struct{ stubMethods }
-
-func (p *discordProvider) Type() string { return "discord" }
-
-func (p *discordProvider) Health() reconcile.ResourceStatus {
-	// Token presence mirrors the workspace-root DiscordProvider.Health() check.
-	if os.Getenv("DISCORD_BOT_TOKEN") == "" {
-		// Check .cog/config/discord/config.hcl for token field.
-		root, bad := resolveRoot()
-		if bad != nil {
-			return *bad
-		}
-		hclPath := filepath.Join(root, ".cog", "config", "discord", "config.hcl")
-		if _, err := os.Stat(hclPath); err != nil {
-			return reconcile.ResourceStatus{
-				Sync:      reconcile.SyncStatusUnknown,
-				Health:    reconcile.HealthMissing,
-				Operation: reconcile.OperationIdle,
-				Message:   "no bot token configured",
-			}
-		}
-	}
-	return reconcile.NewResourceStatus(reconcile.SyncStatusUnknown, reconcile.HealthHealthy)
-}
+//
+// Wave 4 (ADR-121): the real *discord.DiscordProvider is registered directly
+// (see globalDiscordProvider above and its RegisterProvider("discord", ...)
+// call in init()). There is no daemon-local stub type here anymore — the
+// re-homed provider from _legacy/wave4-providers/ implements the full
+// LoadConfig/FetchLive/ComputePlan/ApplyPlan/BuildState/Health/ExportConfig
+// cycle itself.
 
 // ─── mcp-tools ────────────────────────────────────────────────────────────────
 
