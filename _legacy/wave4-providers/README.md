@@ -37,6 +37,11 @@ no daemon registration at all; `discord`'s `discordProvider` embeds
 `stubMethods` and implements only `Type()` + `Health()`). The files below are
 the real logic that stub is standing in for.
 
+> **Update:** `discord` was re-homed out of this directory (see "Re-homed"
+> below) by the PR that also carries PR #470's `ConfigExporter`/`--snapshot`
+> payload forward onto the ported provider. `rbac` remains here, unresolved,
+> per its own Wave 4 instruction (item 1) below.
+
 ## Preserved files
 
 | File | Lines | Why reserved for Wave 4 |
@@ -45,13 +50,21 @@ the real logic that stub is standing in for.
 | `rbac_provider_test.go` | 640 | Unit tests for `RBACProvider`: `LoadConfig`, `ComputePlan`, `ApplyPlan`+`FetchLive`, `Health`. |
 | `rbac_provider_e2e_test.go` | 379 | Hermetic end-to-end tests closing the deferred integration coverage from PR #285 (K8s-style RBAC binding CRDs): full `LoadConfig → FetchLive → ComputePlan → ApplyPlan → BuildState → Health` cycle against a tempdir workspace. |
 | `rbac_bindings_wiring.go` | 22 | The `init()` registration that wires `RBACProvider` into the global reconcile registry (`RegisterProvider("rbac-bindings", provider)`) with a stub bus-emit adapter. Real glue for the real provider — kept alongside it so the registration pattern isn't lost, distinct from the alias-shim family below. |
-| `discord_provider.go` | 335 | `DiscordProvider`, the Reconcilable adapter for Discord server infrastructure (channels, roles) — delegates to `discord_reconcile.go`. Root-only; nothing anywhere else implements this. |
-| `discord_provider_test.go` | 186 | Unit tests for `DiscordProvider`. |
-| `discord_reconcile.go` | 1980 | The reconcile logic `DiscordProvider` delegates to: config types matching `.cog/config/discord/server.yaml`, live-state fetch via the Discord API, diff/plan computation, and plan application (channel/role create-update-delete). |
-| `discord_hcl.go` | 587 | HCL config parsing/serialization for Discord server config (`.cog/config/discord/config.hcl`) — struct types and encode/decode via `hashicorp/hcl`. |
-| `discord_hcl_test.go` | 668 | Unit tests for the HCL config layer. |
 
-**Total: 5,611 lines across 9 files.**
+**Total: 1,855 lines across 4 files remaining (rbac only).**
+
+## Re-homed
+
+- **`discord_provider.go`, `discord_provider_test.go`, `discord_reconcile.go`,
+  `discord_hcl.go`, `discord_hcl_test.go`** — moved to
+  `internal/providers/discord/` (Wave 4 instruction item 2, below). The
+  daemon's `discordProvider` stub in `internal/providers/daemon/daemon.go` was
+  replaced with the real ported `*discord.DiscordProvider`, registered at the
+  same `RegisterProvider("discord", ...)` call site. The re-homed provider
+  also carries forward PR #470's `ExportConfig`/`cogos reconcile discord
+  --snapshot` payload, which had gone stale against this directory's
+  post-archival layout. See that PR for context; this directory's discord
+  entry supersedes it.
 
 ## Deliberately NOT preserved (correctly left deleted)
 
@@ -86,16 +99,18 @@ the real logic that stub is standing in for.
    target package (e.g. alongside `internal/providers/daemon`'s other
    `RegisterProvider` calls), replacing the stub bus-emit adapter with a real
    one if `AppendEvent`/modality-bus wiring has landed by then.
-2. Repackage `discord_provider.go` + `discord_reconcile.go` + `discord_hcl.go`
+2. ~~Repackage `discord_provider.go` + `discord_reconcile.go` + `discord_hcl.go`
    (+ both test files) into `internal/providers/daemon` (or a sibling
    `internal/providers/discord` package), replacing the `internal/providers/daemon/daemon.go`
    `discordProvider` stub's `Type()`/`Health()`-only implementation with the
    real `LoadConfig`/`FetchLive`/`ComputePlan`/`ApplyPlan`/`BuildState` cycle
-   this code provides.
-3. In both cases: drop the leading `_` directory nesting, restore normal
-   package declarations (no more `package main`), fix imports to current
-   module-relative paths, and re-run `go build ./...`, `go build -tags fts5
-   ./...`, `go vet ./...`, and the tests before merging.
+   this code provides.~~ **Done** — re-homed to `internal/providers/discord/`;
+   see "Re-homed" above.
+3. In both cases (rbac still pending, discord done): drop the leading `_`
+   directory nesting, restore normal package declarations (no more `package
+   main`), fix imports to current module-relative paths, and re-run `go build
+   ./...`, `go build -tags fts5 ./...`, `go vet ./...`, and the tests before
+   merging.
 4. If the operator instead accepts the loss explicitly for either provider,
    delete the corresponding files from this directory and drop their row
    from the table above in the same commit as that decision.
