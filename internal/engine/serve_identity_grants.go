@@ -230,6 +230,27 @@ const maxLiveGrantSurfaces = 256
 // a generic 400.
 var ErrGrantStoreAtCapacity = errors.New("grant store at capacity")
 
+// ErrGrantLedgerAppendFailed is returned (wrapped) by MintOrReuse and Revoke
+// when the write-ahead ledger append itself fails — a server-side durability
+// fault (disk full, fd exhaustion, transient I/O), NOT a caller mistake. The
+// HTTP handlers map it to 503 Service Unavailable so a caller/monitor sees a
+// retryable infra failure, never a 400 "invalid_request" (mint) or a 404
+// "already gone" (revoke) that misdescribes what happened (cog-review
+// findings, PR #472 second pass, serve_identity_grants.go:444/:850 as of
+// commit 280aa1a). Errors are wrapped with %w on both this sentinel and the
+// underlying append error, so errors.Is works against either.
+var ErrGrantLedgerAppendFailed = errors.New("identity-grants ledger append failed")
+
+// ErrGrantNotFound is returned by Revoke when grantID names no currently-
+// live grant (already revoked, expired-and-evicted, or never existed). It
+// exists so the HTTP handler can distinguish "genuinely gone" (404) from a
+// ledger-append failure (503) — previously both collapsed into the same
+// (nil, false), and a caller trying to kill a leaked credential could be
+// told it was already gone while the grant stayed fully live and verifying
+// (cog-review finding, PR #472 second pass, serve_identity_grants.go:444 as
+// of commit 280aa1a).
+var ErrGrantNotFound = errors.New("no live grant with that id")
+
 // MintOrReuse returns the live, unexpired grant for surface if one exists,
 // its scope matches the requested scope exactly (as a set), AND its raw
 // token is still cached in this process's memory; otherwise mints a fresh
@@ -344,11 +365,11 @@ func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl 
 		// failure could land the first durably and never the second (cog-
 		// review finding, PR #472; see the doc comment above).
 		if err := r.appendSupersessionEventLocked(existing, grant, now); err != nil {
-			return nil, fmt.Errorf("ledger supersede: %w", err)
+			return nil, fmt.Errorf("%w: ledger supersede: %w", ErrGrantLedgerAppendFailed, err)
 		}
 	} else {
 		if err := r.appendGrantEventLocked("identity.grant.issued", grant, now); err != nil {
-			return nil, fmt.Errorf("ledger issue: %w", err)
+			return nil, fmt.Errorf("%w: ledger issue: %w", ErrGrantLedgerAppendFailed, err)
 		}
 	}
 
@@ -426,24 +447,31 @@ func (r *IdentityGrantRegistry) Current(surface string) (*IdentityGrant, bool) {
 
 // Revoke removes the live grant identified by grantID, appending an
 // identity.grant.revoked ledger event before mutating the in-memory index
-// (write-ahead, same discipline as MintOrReuse). Returns (grant, true) on
-// success; (nil, false) if grantID names no currently-live grant (already
-// revoked, expired-and-evicted, or never existed) — the handler maps that to
-// 404, matching the existing not-found shape used elsewhere in this file.
-func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, bool) {
+// (write-ahead, same discipline as MintOrReuse). Returns (grant, nil) on
+// success. Returns (nil, ErrGrantNotFound) if grantID names no currently-
+// live grant (already revoked, expired-and-evicted, or never existed) — the
+// handler maps that to 404. Returns (nil, error wrapping
+// ErrGrantLedgerAppendFailed) when the write-ahead append itself fails: the
+// grant is then STILL LIVE and its token still verifies, and the caller must
+// be told so — collapsing this case into the not-found result (as an earlier
+// version did) made the revoke endpoint 404 as if the credential were
+// already dead while it kept working, the same error-masking class
+// MintOrReuse's supersession fix closed (cog-review finding, PR #472 second
+// pass, serve_identity_grants.go:444 as of commit 280aa1a).
+func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, error) {
 	if grantID == "" {
-		return nil, false
+		return nil, ErrGrantNotFound
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	g, ok := r.byGrantID[grantID]
 	if !ok {
-		return nil, false
+		return nil, ErrGrantNotFound
 	}
 	if err := r.appendGrantEventLocked("identity.grant.revoked", g, time.Now().UTC()); err != nil {
 		slog.Warn("identity_grants: ledger revoke append failed; grant remains live", "grant_id", grantID, "err", err)
-		return nil, false
+		return nil, fmt.Errorf("%w: ledger revoke: %w", ErrGrantLedgerAppendFailed, err)
 	}
 	delete(r.byGrantID, grantID)
 	// Only clear bySurface if this grant is still the CURRENT live one for
@@ -454,7 +482,7 @@ func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, bool) {
 	if current, ok := r.bySurface[g.Surface]; ok && current.GrantID == grantID {
 		delete(r.bySurface, g.Surface)
 	}
-	return g, true
+	return g, nil
 }
 
 // Snapshot returns every live grant for the operator-facing inventory (GET
@@ -847,6 +875,14 @@ func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request)
 			writeJSONError(w, http.StatusTooManyRequests, "capacity_exceeded", err.Error())
 			return
 		}
+		if errors.Is(err, ErrGrantLedgerAppendFailed) {
+			// Server-side durability fault (disk full, transient I/O), not a
+			// caller mistake: 503 so a caller/monitor sees a retryable infra
+			// failure, not a non-retryable 400 (cog-review finding, PR #472
+			// second pass, serve_identity_grants.go:850 as of commit 280aa1a).
+			writeJSONError(w, http.StatusServiceUnavailable, "ledger_unavailable", err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -949,15 +985,24 @@ type identityGrantRevokeResponse struct {
 // state") — a subsequent POST /v1/identity/verify for this grant's token
 // fails right away; the only latency is whatever cache TTL a calling surface
 // applies on its own side (design §3.4 note, not this endpoint's concern).
-// 404 when grantID names no currently-live grant.
+// 404 when grantID names no currently-live grant; 503 when the write-ahead
+// ledger append fails — in that case the grant is STILL LIVE and still
+// verifying, and telling the caller 404 ("already gone") would mask a failed
+// revoke of a possibly-leaked credential (cog-review finding, PR #472 second
+// pass, serve_identity_grants.go:444 as of commit 280aa1a).
 func (s *Server) handleIdentityGrantRevoke(w http.ResponseWriter, r *http.Request) {
 	grantID := r.PathValue("id")
 	if grantID == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "grant id is required")
 		return
 	}
-	grant, ok := s.identityGrants.Revoke(grantID)
-	if !ok {
+	grant, err := s.identityGrants.Revoke(grantID)
+	if err != nil {
+		if errors.Is(err, ErrGrantLedgerAppendFailed) {
+			writeJSONError(w, http.StatusServiceUnavailable, "ledger_unavailable",
+				"revoke NOT applied — grant "+grantID+" is still live: "+err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusNotFound, "not_found", "no live grant with id "+grantID)
 		return
 	}

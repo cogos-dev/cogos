@@ -508,8 +508,8 @@ func TestIdentityGrantMint_CapacityFreedByRevokeNotJustRestart(t *testing.T) {
 	}
 
 	// Revoke frees exactly one slot.
-	if _, ok := reg.Revoke(firstGrantID); !ok {
-		t.Fatalf("expected revoke of a live grant to succeed")
+	if _, err := reg.Revoke(firstGrantID); err != nil {
+		t.Fatalf("expected revoke of a live grant to succeed, got: %v", err)
 	}
 
 	if _, err := reg.MintOrReuse("cap-surface-overflow", []string{"x"}, 24*time.Hour); err != nil {
@@ -584,8 +584,8 @@ func TestIdentityGrantLedger_NeverStoresRawToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	if _, ok := reg.Revoke(grant.GrantID); !ok {
-		t.Fatalf("expected revoke to succeed")
+	if _, err := reg.Revoke(grant.GrantID); err != nil {
+		t.Fatalf("expected revoke to succeed, got: %v", err)
 	}
 
 	raw, err := os.ReadFile(filepath.Join(workspaceRoot, ".cog", "ledger", "identity-grants", "events.jsonl"))
@@ -740,6 +740,106 @@ func TestIdentityGrantMint_SupersedeAppendFailureLeavesOldGrantLive(t *testing.T
 	}
 	if _, ok := after.byGrantID[original.GrantID]; !ok {
 		t.Fatalf("expected the original grant_id to still be tracked after restart")
+	}
+}
+
+// TestIdentityGrantRevoke_AppendFailureReports503NotFakeNotFound guards the
+// cog-review finding on PR #472 second pass (serve_identity_grants.go:444 as
+// of commit 280aa1a): a ledger-append failure during revoke must NOT be
+// reported the same way as "grant not found." Previously Revoke returned the
+// identical (nil, false) for both, so the endpoint 404'd — reading as
+// "already revoked" — while the grant stayed fully live and its token kept
+// verifying: a caller trying to kill a leaked credential was told it was
+// dead when it wasn't. This test injects an append failure and proves:
+//  1. The HTTP revoke returns 503 (retryable infra fault), not 404.
+//  2. The grant is still live and its token still verifies (write-ahead
+//     honored — memory untouched on a failed append).
+//  3. Once the ledger recovers, the same revoke succeeds (200) and the
+//     token stops verifying — the failure was transient, not masked.
+func TestIdentityGrantRevoke_AppendFailureReports503NotFakeNotFound(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	s, front := newLedgerBackedIdentityGrantServer(t, workspaceRoot)
+
+	mint := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+	var minted identityGrantMintResponse
+	identityDecodeBody(t, mint, &minted)
+
+	// Break the ledger writer, simulating transient I/O failure.
+	injectedErr := errors.New("simulated append failure: disk full")
+	s.identityGrants.appendEvent = func(workspaceRoot, sessionID string, envelope *EventEnvelope) error {
+		return injectedErr
+	}
+
+	failResp, err := http.Post(front.URL+"/v1/identity/grants/"+minted.GrantID+"/revoke", "application/json", nil)
+	if err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if failResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when the revoke's ledger append fails (grant still live), got %d", failResp.StatusCode)
+	}
+	failResp.Body.Close()
+
+	// The grant must still be live: write-ahead means a failed append
+	// mutates nothing, and the caller was told so (503, not 404).
+	verify := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "constellation-chat",
+		"token":   minted.Token,
+	})
+	var verifyOut identityVerifyResponse
+	identityDecodeBody(t, verify, &verifyOut)
+	if !verifyOut.Valid {
+		t.Fatalf("expected the grant to still verify after a failed (503) revoke — nothing durable was written")
+	}
+
+	// Ledger recovers: the same revoke now succeeds and the token dies.
+	s.identityGrants.appendEvent = AppendEvent
+	okResp, err := http.Post(front.URL+"/v1/identity/grants/"+minted.GrantID+"/revoke", "application/json", nil)
+	if err != nil {
+		t.Fatalf("retry revoke: %v", err)
+	}
+	if okResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected the retried revoke to succeed once the ledger recovered, got %d", okResp.StatusCode)
+	}
+	okResp.Body.Close()
+
+	verifyAfter := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "constellation-chat",
+		"token":   minted.Token,
+	})
+	var verifyAfterOut identityVerifyResponse
+	identityDecodeBody(t, verifyAfter, &verifyAfterOut)
+	if verifyAfterOut.Valid {
+		t.Fatalf("expected the token to stop verifying after the successful retried revoke")
+	}
+}
+
+// TestIdentityGrantMint_LedgerAppendFailureMapsTo503 guards the second
+// cog-review finding on PR #472 second pass (serve_identity_grants.go:850 as
+// of commit 280aa1a): a ledger-append failure during mint is a server-side
+// durability fault and must map to 503 (retryable), not 400 "invalid_request"
+// (non-retryable client error).
+func TestIdentityGrantMint_LedgerAppendFailureMapsTo503(t *testing.T) {
+	s, front := newLedgerBackedIdentityGrantServer(t, t.TempDir())
+
+	injectedErr := errors.New("simulated append failure: disk full")
+	s.identityGrants.appendEvent = func(workspaceRoot, sessionID string, envelope *EventEnvelope) error {
+		return injectedErr
+	}
+
+	resp := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when the mint's ledger append fails, got %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(raw, []byte("ledger_unavailable")) {
+		t.Fatalf("expected the 503 body to carry the ledger_unavailable error code, got: %s", raw)
 	}
 }
 
