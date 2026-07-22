@@ -4,7 +4,7 @@ id: ADR-121
 layer: spec
 title: "ADR-121: Single-Binary Consolidation — Fold the CLI Into cogos, Delete the Legacy Root Package"
 created: 2026-07-13
-status: proposed
+status: accepted
 tags: [adr, consolidation, cli, single-binary, dead-code, go-layout, supersedes-track5]
 author: chaz
 refs:
@@ -148,3 +148,44 @@ stops defending a package nobody ships; and the go.work matrix shrinks to
 modules that earn their independence. The cost is a coordinated cutover and
 the Wave 4 decisions, which are deliberately separated so the mechanical
 work never waits on the judgment calls.
+
+## Execution note (root deletion landed ahead of the verb-porting waves)
+
+The single entrypoint is **`cmd/cogos` → `internal/engine.Main()`**. This is
+not new as of this deletion — every artifact-producing build target
+(Makefile's `cog` target and all OS/arch variants, `make install`, CI's
+`ci.yml` build/mcpserver/release jobs, the Dockerfiles, `scripts/setup-dev.sh`)
+already compiled exclusively from `./cmd/cogos`. The root `package main` was
+never in that build graph; its only Go consumers were its own 232 files, and
+the only place it compiled at all was `ci.yml`'s untagged `go build ./...`
+Windows cross-compile correctness check, which produced no shipped artifact.
+
+Given that, the root package's 232 `.go` files were removed in this pass as
+a **mechanical dead-source deletion**, verified by: `git rm` of every
+root-level `*.go` file in a throwaway worktree off `origin/main`, followed by
+`go clean -cache && go build ./...` and `go vet ./...` both exiting 0, with
+`cmd/cogos` still building and running `version` correctly. That proves no
+Go source anywhere consumes root — it does not, by itself, prove verb
+parity in the shipped CLI.
+
+**This does not complete Waves 1–2.** Root carried roughly 36 CLI verbs
+against the daemon's ~27 (largely disjoint); the thirteen load-bearing verbs
+enumerated in "The port surface" above (`memory`, `ref`, `verify`, `coord`,
+`events`, `constellation`, `skill list`, etc.) were **not** ported into
+`internal/cli` before this deletion, because that parity gap already existed
+on `origin/main` independent of whether root's source was present — the
+canonical build has delegated to `engine.Main()` all along. Deleting dead
+source neither creates nor closes that gap. Any wrapper script or skill still
+shelling out to a stale, disk-resident `cog` build (predating this ADR's
+Makefile switch to `cmd/cogos`) is unaffected by this deletion and unblocked
+by it either; it will keep resolving to whatever is on disk until its next
+rebuild.
+
+Waves 1–2 (port the thirteen verbs into `internal/cli`, cut wrappers/skills
+over, retire shadow-binary routing) and Wave 4 (root
+identity/rbac/discord/service providers, TAA tier pipeline, `tui`,
+`pkg/`→`internal` moves) remain open follow-up work, tracked as this ADR's
+continuation, if verb parity in the shipped `cogos`/`cog` binary is the
+operator's goal. This deletion should be read narrowly: dead legacy source is
+gone and the build graph is simpler; it is not a claim that every root verb
+survives somewhere reachable today.
