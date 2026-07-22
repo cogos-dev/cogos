@@ -271,6 +271,15 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		WireHarnessBackend(server)
 	}
 
+	// Wire post-boot provider runtime handles (kernel Process for ledger
+	// events, BusSessionManager/BusEventBroker for the SSE bus) into any
+	// registered Reconcilable that needs them. Set by
+	// internal/providers/all.Register; nil (e.g. in tests) is safe — the
+	// affected provider(s) degrade to no-emit rather than failing boot.
+	if WireProviderRuntime != nil {
+		WireProviderRuntime(server)
+	}
+
 	// Wire the constellation indexer so CogDocService.WriteAndSync /
 	// PatchAndSync perform an eager per-file FTS upsert, and so that the lazy
 	// drift-repair path in searchMemoryFTSDriftRepair can call IndexFile without
