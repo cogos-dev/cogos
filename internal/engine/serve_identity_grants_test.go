@@ -603,6 +603,146 @@ func TestIdentityGrantLedger_NeverStoresRawToken(t *testing.T) {
 	}
 }
 
+// TestIdentityGrantMint_SupersedeReplaysAtomically guards the replay side of
+// the cog-review fix on PR #472 (serve_identity_grants.go:302 as of commit
+// de5cbfe): a scope-changing re-mint of an already-tracked surface now
+// writes a single identity.grant.superseded event (not a separate revoked +
+// issued pair). This confirms that event alone, replayed through
+// RebuildIdentityGrantRegistryFromLedger, both retires the old grant_id AND
+// installs the new grant as live for the surface — one ledger line, two
+// coordinated effects.
+func TestIdentityGrantMint_SupersedeReplaysAtomically(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+
+	reg := NewIdentityGrantRegistryWithLedger(workspaceRoot)
+	original, err := reg.MintOrReuse("constellation-chat", []string{"chat:post"}, 0)
+	if err != nil {
+		t.Fatalf("initial mint: %v", err)
+	}
+	reminted, err := reg.MintOrReuse("constellation-chat", []string{"chat:admin"}, 0)
+	if err != nil {
+		t.Fatalf("scope-changing re-mint: %v", err)
+	}
+	if reminted.GrantID == original.GrantID {
+		t.Fatalf("expected a fresh grant_id for the scope-changing re-mint")
+	}
+
+	raw, err := os.ReadFile(filepath.Join(workspaceRoot, ".cog", "ledger", "identity-grants", "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read ledger file: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("identity.grant.superseded")) {
+		t.Fatalf("expected the supersession to write a single identity.grant.superseded event; ledger: %s", raw)
+	}
+	if bytes.Contains(raw, []byte("identity.grant.revoked")) {
+		t.Fatalf("expected NO identity.grant.revoked event from a supersession (that was the two-append shape this fix replaces); ledger: %s", raw)
+	}
+
+	after, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if _, ok := after.byGrantID[original.GrantID]; ok {
+		t.Fatalf("expected the superseded grant_id to be retired by replaying the single superseded event")
+	}
+	if g, ok := after.byGrantID[reminted.GrantID]; !ok || g.Surface != "constellation-chat" {
+		t.Fatalf("expected the new grant_id to be live for constellation-chat after replay")
+	}
+	if _, ok := after.Verify("constellation-chat", original.Token); ok {
+		t.Fatalf("expected the superseded token to fail verification after replay")
+	}
+	if _, ok := after.Verify("constellation-chat", reminted.Token); !ok {
+		t.Fatalf("expected the new token to verify after replay")
+	}
+}
+
+// TestIdentityGrantMint_SupersedeAppendFailureLeavesOldGrantLive is the
+// injected-failure test for the cog-review finding on PR #472
+// (serve_identity_grants.go:302 as of commit de5cbfe). The finding: the OLD
+// MintOrReuse wrote a supersession as two independent ledger appends
+// (revoke-old, then issue-new) and only rolled back the in-memory mutation
+// if the SECOND append failed — so a failure isolated to that second append
+// left a durable revoke-with-no-reissue on disk, and the surface's still-
+// valid old grant would silently vanish on the next restart (the exact
+// lockout class this chunk exists to close).
+//
+// This test forces the (now single, atomic-by-construction) supersession
+// append to fail via the registry's injectable appendEvent seam, and proves
+// the failure mode is fully closed:
+//  1. MintOrReuse returns an error.
+//  2. The in-memory index is untouched — the old grant is still exactly
+//     what it was, in both bySurface and byGrantID.
+//  3. The old grant still verifies immediately (no window of silent
+//     invalidation).
+//  4. Simulating a restart (rebuild from the ledger, which the failed
+//     append never touched) still finds the old grant live — the revoke-
+//     with-no-reissue state that used to be reachable here is now
+//     unreachable by construction, since there was only ever one append to
+//     fail, and it failed cleanly with zero side effects.
+func TestIdentityGrantMint_SupersedeAppendFailureLeavesOldGrantLive(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+
+	reg := NewIdentityGrantRegistryWithLedger(workspaceRoot)
+	original, err := reg.MintOrReuse("constellation-chat", []string{"chat:post"}, 0)
+	if err != nil {
+		t.Fatalf("initial mint: %v", err)
+	}
+
+	// Inject a failure simulating transient I/O trouble (disk full, fd
+	// exhaustion) on exactly the append the supersession path makes.
+	injectedErr := errors.New("simulated append failure: disk full")
+	reg.appendEvent = func(workspaceRoot, sessionID string, envelope *EventEnvelope) error {
+		return injectedErr
+	}
+
+	_, err = reg.MintOrReuse("constellation-chat", []string{"chat:admin"}, 0)
+	if err == nil {
+		t.Fatalf("expected the scope-changing re-mint to fail when the ledger append fails")
+	}
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected MintOrReuse's error to wrap the injected append failure, got: %v", err)
+	}
+
+	// In-memory state must be completely untouched by the failed attempt.
+	if got := reg.bySurface["constellation-chat"]; got == nil || got.GrantID != original.GrantID {
+		t.Fatalf("expected bySurface to still hold the original grant untouched, got %+v", got)
+	}
+	if got, ok := reg.byGrantID[original.GrantID]; !ok || got.GrantID != original.GrantID {
+		t.Fatalf("expected byGrantID to still hold the original grant_id untouched")
+	}
+	if got := len(reg.byGrantID); got != 1 {
+		t.Fatalf("expected exactly one live grant_id (no phantom new grant tracked despite the failed append), got %d", got)
+	}
+	if got := len(reg.bySurface); got != 1 {
+		t.Fatalf("expected exactly one live surface entry, got %d", got)
+	}
+
+	// The old token must still verify — no silent invalidation window.
+	if _, ok := reg.Verify("constellation-chat", original.Token); !ok {
+		t.Fatalf("expected the original grant to still verify immediately after a failed supersession append")
+	}
+
+	// Simulate a restart: rebuild from the ledger (untouched by the failed
+	// append) using a fresh registry with the real, non-failing writer. The
+	// original grant must still be the one and only live grant for this
+	// surface — the exact restart-lockout scenario the finding described is
+	// now unreachable.
+	after, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if _, ok := after.Verify("constellation-chat", original.Token); !ok {
+		t.Fatalf("expected the original grant to still verify after a simulated restart following a failed supersession append")
+	}
+	if _, ok := after.byGrantID[original.GrantID]; !ok {
+		t.Fatalf("expected the original grant_id to still be tracked after restart")
+	}
+}
+
 // newLedgerBackedIdentityGrantServer mirrors newIdentityGrantServer but
 // wires a ledger-backed registry rooted at workspaceRoot, for chunk-2 tests
 // that need real ledger writes (revoke, capacity+revoke interaction).

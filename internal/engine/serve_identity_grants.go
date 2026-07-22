@@ -68,15 +68,24 @@
 //	                                   §3.2 already names.
 //
 // Chunk 2 — ledger-backed grants (design §3.2, "CHUNK 2 VERIFICATION NOTES"):
-// every mint and revoke is a write-ahead ledger event
-// (identity.grant.issued / identity.grant.revoked) on the kernel's existing
-// hash-chained ledger (ledger.go's AppendEvent, same mechanism
+// every mint and revoke is a write-ahead ledger event on the kernel's
+// existing hash-chained ledger (ledger.go's AppendEvent, same mechanism
 // worktree_spawn.go's FilesystemLedgerWriter already uses for its own
 // dedicated session bucket) BEFORE the in-memory index is mutated — the
 // ledger is the source of truth, the in-memory IdentityGrantRegistry is a
-// derived, rebuildable cache. The ledger event carries {grant_id, surface,
-// scope, integrity_hash, issued_at/expires_at or revoked_at} — NEVER the raw
-// token value (ADR-091 §5; same verifyKeyIntegrity hash-not-value pattern
+// derived, rebuildable cache. A fresh mint for a not-yet-tracked surface
+// writes identity.grant.issued; an explicit revoke writes
+// identity.grant.revoked; a re-mint that SUPERSEDES an already-tracked
+// surface's grant (scope change, or a lost-raw-token reissue — see
+// MintOrReuse's doc comment) writes a single identity.grant.superseded event
+// carrying both the retired grant_id and the new grant's full record, rather
+// than two independent appends (cog-review finding, PR #472,
+// serve_identity_grants.go:302 as of commit de5cbfe — two independently-
+// fallible appends left a window where a durable revoke could land with no
+// corresponding reissue if the second append failed transiently). Every
+// event carries {grant_id, surface, scope, integrity_hash, issued_at/
+// expires_at or revoked_at/superseded_at} — NEVER the raw token value
+// (ADR-091 §5; same verifyKeyIntegrity hash-not-value pattern
 // identity_provider.go already established). On kernel boot,
 // RebuildIdentityGrantRegistryFromLedger replays every identity.grant.*
 // event in the dedicated "identity-grants" ledger session bucket to
@@ -164,12 +173,24 @@ func (g *IdentityGrant) expired(now time.Time) bool {
 // in-memory only, matching chunk 1's original behavior exactly (used by
 // existing unit tests that construct the registry directly and don't care
 // about ledger durability).
+//
+// appendEvent is the ledger-write seam every mutation calls through instead
+// of calling the package-level AppendEvent directly. It defaults to
+// AppendEvent itself (see the constructors below) and exists so a test can
+// substitute a failing writer to prove the write-ahead / atomic-supersession
+// invariants hold under a mid-sequence append failure (cog-review finding,
+// PR #472 — see TestIdentityGrantMint_SupersedeAppendFailureLeavesOldGrantLive).
 type IdentityGrantRegistry struct {
 	mu            sync.RWMutex
 	bySurface     map[string]*IdentityGrant
 	byGrantID     map[string]*IdentityGrant
 	workspaceRoot string
+	appendEvent   identityGrantAppendFunc
 }
+
+// identityGrantAppendFunc matches AppendEvent's signature. See
+// IdentityGrantRegistry.appendEvent's doc comment.
+type identityGrantAppendFunc func(workspaceRoot, sessionID string, envelope *EventEnvelope) error
 
 // NewIdentityGrantRegistry returns an empty, ledger-less registry (in-memory
 // only — chunk 1's original behavior, preserved for existing unit tests and
@@ -179,14 +200,16 @@ func NewIdentityGrantRegistry() *IdentityGrantRegistry {
 }
 
 // NewIdentityGrantRegistryWithLedger returns an empty registry that appends
-// identity.grant.issued/identity.grant.revoked events to the ledger under
-// workspaceRoot on every mint/revoke (chunk 2, design §3.2). Pass "" for the
-// same ledger-less behavior as NewIdentityGrantRegistry.
+// identity.grant.issued/identity.grant.revoked/identity.grant.superseded
+// events to the ledger under workspaceRoot on every mint/revoke (chunk 2,
+// design §3.2). Pass "" for the same ledger-less behavior as
+// NewIdentityGrantRegistry.
 func NewIdentityGrantRegistryWithLedger(workspaceRoot string) *IdentityGrantRegistry {
 	return &IdentityGrantRegistry{
 		bySurface:     make(map[string]*IdentityGrant),
 		byGrantID:     make(map[string]*IdentityGrant),
 		workspaceRoot: workspaceRoot,
+		appendEvent:   AppendEvent,
 	}
 }
 
@@ -248,16 +271,34 @@ var ErrGrantStoreAtCapacity = errors.New("grant store at capacity")
 // new one is inserted — otherwise byGrantID would grow by one permanently
 // unreachable entry per scope-changing re-mint (cog-review finding, PR #471
 // second pass, serve_identity_grants.go:147 as of commit 7918055). Chunk 2
-// extends this: the supersession is also recorded in the ledger as an
-// identity.grant.revoked event for the old grant_id BEFORE the new
-// identity.grant.issued event, so a future ledger replay reconstructs the
-// same single-live-grant-per-surface invariant instead of resurrecting both
-// the old and new grant_id into byGrantID.
+// extends this: the supersession is also recorded in the ledger, so a future
+// ledger replay reconstructs the same single-live-grant-per-surface invariant
+// instead of resurrecting both the old and new grant_id into byGrantID.
 //
 // Ledger-write-ahead (design §3.2 / ADR-091 §5): every ledger append below
 // happens BEFORE the corresponding in-memory mutation. If an append fails,
 // MintOrReuse returns the error without touching bySurface/byGrantID, so the
 // in-memory index never claims a grant the ledger doesn't also record.
+//
+// Atomicity of the supersession append (cog-review finding, PR #472,
+// serve_identity_grants.go:302 as of commit de5cbfe): an EARLIER version of
+// this method wrote the supersession as two independent, sequential ledger
+// appends — identity.grant.revoked for the old grant, then
+// identity.grant.issued for the new one — and only rolled back the in-memory
+// mutation (not the first, already-durable append) if the SECOND append
+// failed. A transient failure isolated to the second append (disk fills up
+// between the two writes, fd exhaustion, any I/O hiccup) left the ledger
+// durably recording the old grant as revoked while the in-memory index kept
+// serving it as live — the old token kept verifying right up until the next
+// restart, at which point RebuildIdentityGrantRegistryFromLedger replayed the
+// revoke with no corresponding reissue and the surface silently lost a still-
+// valid credential. That is the exact lockout class this chunk exists to
+// close. The fix is atomicity by construction: appendSupersessionEventLocked
+// below performs exactly ONE ledger append carrying both the retired
+// grant_id and the new grant's full record (identity.grant.superseded). One
+// append has exactly one failure mode — it either lands completely or not at
+// all — so there is no window in which the ledger can disagree with itself
+// about which grant is live for this surface.
 func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl time.Duration) (*IdentityGrant, error) {
 	if surface == "" {
 		return nil, fmt.Errorf("surface is required")
@@ -297,14 +338,18 @@ func (r *IdentityGrantRegistry) MintOrReuse(surface string, scope []string, ttl 
 	}
 
 	if tracked {
-		// Write-ahead: record the supersession in the ledger before mutating
-		// memory, so a replay never resurrects the superseded grant_id.
-		if err := r.appendGrantEventLocked("identity.grant.revoked", existing, now); err != nil {
-			return nil, fmt.Errorf("ledger revoke (supersede): %w", err)
+		// Write-ahead, atomic by construction: ONE ledger append carries both
+		// the retired grant_id and the new grant's full record, so there is
+		// no window between "old revoked" and "new issued" where a transient
+		// failure could land the first durably and never the second (cog-
+		// review finding, PR #472; see the doc comment above).
+		if err := r.appendSupersessionEventLocked(existing, grant, now); err != nil {
+			return nil, fmt.Errorf("ledger supersede: %w", err)
 		}
-	}
-	if err := r.appendGrantEventLocked("identity.grant.issued", grant, now); err != nil {
-		return nil, fmt.Errorf("ledger issue: %w", err)
+	} else {
+		if err := r.appendGrantEventLocked("identity.grant.issued", grant, now); err != nil {
+			return nil, fmt.Errorf("ledger issue: %w", err)
+		}
 	}
 
 	if tracked {
@@ -466,7 +511,50 @@ func (r *IdentityGrantRegistry) appendGrantEventLocked(eventType string, grant *
 		},
 		Metadata: EventMetadata{Source: "identity-grants"},
 	}
-	return AppendEvent(r.workspaceRoot, identityGrantsLedgerSession, env)
+	return r.appendEvent(r.workspaceRoot, identityGrantsLedgerSession, env)
+}
+
+// appendSupersessionEventLocked writes ONE identity.grant.superseded ledger
+// event carrying both supersededGrant's id (the grant being retired) and
+// grant's full record (the new live grant for the same surface) as a single
+// atomic-by-construction append. Caller must hold r.mu (for writing). No-op
+// (returns nil) when r.workspaceRoot == "", same ledger-less behavior as
+// appendGrantEventLocked.
+//
+// This is the fix for the cog-review finding on PR #472
+// (serve_identity_grants.go:302 as of commit de5cbfe): MintOrReuse's
+// supersession path used to make two independent appendGrantEventLocked
+// calls (revoke-old, then issue-new), each independently fallible, and only
+// rolled back the in-memory mutation if the SECOND one failed — leaving a
+// durable, un-reissued revoke on disk if only the first succeeded. Folding
+// both into one event removes that window entirely: AppendEvent either
+// writes this single line or it doesn't, so MintOrReuse's caller-visible
+// contract ("if the append fails, bySurface/byGrantID are untouched") now
+// actually holds for the supersession path too.
+func (r *IdentityGrantRegistry) appendSupersessionEventLocked(supersededGrant, grant *IdentityGrant, now time.Time) error {
+	if r.workspaceRoot == "" {
+		return nil
+	}
+	data := map[string]interface{}{
+		"superseded_grant_id": supersededGrant.GrantID,
+		"grant_id":            grant.GrantID,
+		"surface":             grant.Surface,
+		"scope":               grant.Scope,
+		"integrity_hash":      grant.IntegrityHash,
+		"issued_at":           grant.IssuedAt.Format(time.RFC3339),
+		"expires_at":          grant.ExpiresAt.Format(time.RFC3339),
+		"superseded_at":       now.Format(time.RFC3339),
+	}
+	env := &EventEnvelope{
+		HashedPayload: EventPayload{
+			Type:      "identity.grant.superseded",
+			Timestamp: now.Format(time.RFC3339),
+			SessionID: identityGrantsLedgerSession,
+			Data:      data,
+		},
+		Metadata: EventMetadata{Source: "identity-grants"},
+	}
+	return r.appendEvent(r.workspaceRoot, identityGrantsLedgerSession, env)
 }
 
 // sha256Hex (defined in process.go) is the integrity-hash primitive this
@@ -475,8 +563,9 @@ func (r *IdentityGrantRegistry) appendGrantEventLocked(eventType string, grant *
 // established for resolved key bytes).
 
 // RebuildIdentityGrantRegistryFromLedger reconstructs the live grant set by
-// replaying every identity.grant.issued/identity.grant.revoked event from
-// the "identity-grants" ledger session bucket, in file order (the ledger is
+// replaying every identity.grant.issued/identity.grant.revoked/identity.
+// grant.superseded event from the "identity-grants" ledger session bucket,
+// in file order (the ledger is
 // append-only, so file order is event order). This is what makes a
 // previously-issued grant still verify after a kernel restart — the design's
 // chunk-1-to-2 verify tooth — and is called once, from NewServer, in place
@@ -565,6 +654,32 @@ func applyIdentityGrantLedgerEvent(reg *IdentityGrantRegistry, env *EventEnvelop
 		if current, ok := reg.bySurface[surface]; ok && current.GrantID == grantID {
 			delete(reg.bySurface, surface)
 		}
+	case "identity.grant.superseded":
+		// One event, two effects: retire supersededGrantID (if any is named
+		// — defensively tolerant of an empty value rather than failing the
+		// whole replay) exactly like a revoke, AND install grant_id as the
+		// new live grant for surface exactly like an issue — atomically,
+		// since both effects come from replaying this single ledger line
+		// (see appendSupersessionEventLocked's doc comment).
+		supersededGrantID, _ := data["superseded_grant_id"].(string)
+		scope := stringSliceFromAny(data["scope"])
+		integrityHash, _ := data["integrity_hash"].(string)
+		issuedAt := parseRFC3339Lenient(data["issued_at"])
+		expiresAt := parseRFC3339Lenient(data["expires_at"])
+		grant := &IdentityGrant{
+			GrantID:       grantID,
+			Surface:       surface,
+			Scope:         scope,
+			Token:         "", // never persisted — see file header
+			IntegrityHash: integrityHash,
+			IssuedAt:      issuedAt,
+			ExpiresAt:     expiresAt,
+		}
+		if supersededGrantID != "" {
+			delete(reg.byGrantID, supersededGrantID)
+		}
+		reg.bySurface[surface] = grant
+		reg.byGrantID[grantID] = grant
 	}
 }
 
