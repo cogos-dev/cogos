@@ -102,9 +102,10 @@ type Server struct {
 	// protocol. See serve_sessions_channel.go for the full rationale.
 	channelSessionRegistry *ChannelSessionRegistry
 
-	// identityGrants is the in-memory store backing board-task-60 chunk 1
-	// (kernel-issued identity grants — see serve_identity_grants.go). Chunk
-	// 1 only; ledger-backed restart-safety is chunk 2.
+	// identityGrants is the in-memory, ledger-backed store for board-task-60
+	// kernel-issued identity grants (see serve_identity_grants.go). Chunk 1
+	// proved the mechanism in-memory only; chunk 2 made it ledger-backed
+	// (rebuilt from .cog/ledger/identity-grants/ on boot) and added revoke.
 	identityGrants *IdentityGrantRegistry
 
 	// mod3Client is the HTTP client used to forward channel-session calls
@@ -183,8 +184,18 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// ADR-082 Wave 2 kernel-owned channel-session identity.
 	s.channelSessionRegistry = NewChannelSessionRegistry()
 
-	// Board task 60 chunk 1: kernel-issued identity grants.
-	s.identityGrants = NewIdentityGrantRegistry()
+	// Board task 60 chunk 2: kernel-issued identity grants, rebuilt from the
+	// ledger on boot so a previously-issued grant still verifies after a
+	// kernel restart (design §3.2; the chunk-1-to-2 verify tooth). Falls
+	// back to an empty, still-ledger-backed registry on a read error (e.g.
+	// a corrupt ledger file) rather than failing to boot — losing the warm
+	// cache is recoverable (surfaces re-mint), refusing to start is not.
+	identityGrants, err := RebuildIdentityGrantRegistryFromLedger(cfg.WorkspaceRoot)
+	if err != nil {
+		slog.Warn("serve: identity grant ledger rebuild failed; starting with an empty grant store", "err", err)
+		identityGrants = NewIdentityGrantRegistryWithLedger(cfg.WorkspaceRoot)
+	}
+	s.identityGrants = identityGrants
 
 	mux := http.NewServeMux()
 	s.routeH(mux, "GET /", dashboard.Handler())
@@ -241,10 +252,10 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// above (incompatible session_id formats — see serve_sessions_channel.go).
 	s.registerChannelSessionRoutes(mux)
 
-	// Board task 60 chunk 1: kernel-issued identity grants — the
+	// Board task 60 chunk 1/2: kernel-issued identity grants — the
 	// constellation-chat surface's kernel-verified credential (design doc
-	// cog://mem/working/2026-07-21-kernel-identity-seat-design). In-memory
-	// only this chunk; see serve_identity_grants.go.
+	// cog://mem/working/2026-07-21-kernel-identity-seat-design). Ledger-
+	// backed + revocable as of chunk 2; see serve_identity_grants.go.
 	s.registerIdentityGrantRoutes(mux)
 
 	// Phase 1B: peer-awareness packet endpoint (READ side of the 4E
