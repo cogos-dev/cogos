@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	cogos reconcile <type> [--dry-run] [--json] [--resource <name>] [--snapshot]
+//	cogos reconcile <type> [--dry-run] [--json] [--resource <name>] [--snapshot] [--token <token>]
 //
 // Runs the plan (and optionally apply) cycle for a single registered
 // provider type. The provider must already be registered with pkg/reconcile
@@ -11,6 +11,12 @@
 // --snapshot inverts the direction (live → spec): it regenerates the
 // declared config from live state via reconcile.ConfigExporter, if the
 // provider implements it, and returns before the normal plan/apply cycle.
+//
+// --token supplies an auth token for providers implementing
+// reconcile.Tokenable (e.g. discord); falling back to {TYPE}_TOKEN /
+// {TYPE}_BOT_TOKEN / {TYPE}_API_TOKEN environment variables via
+// reconcile.ConfigureProvider, mirroring the doc comment on
+// reconcile.Tokenable itself.
 //
 // Workspace root is resolved from the --workspace global flag or via git-root
 // detection on the cwd. The command exits 0 on success (synced or dry-run),
@@ -40,6 +46,7 @@ func runReconcileCmd(args []string, defaultWorkspace string) {
 	dryRun := fs.Bool("dry-run", false, "Plan only; do not apply changes")
 	jsonOut := fs.Bool("json", false, "Output plan as JSON")
 	snapshot := fs.Bool("snapshot", false, "Snapshot live state into the declared config (live → spec); requires ConfigExporter support")
+	token := fs.String("token", "", "Auth token for Tokenable providers (falls back to {TYPE}_TOKEN-style env vars)")
 	_ = fs.String("resource", "", "Reserved: reconcile only this named resource (not yet implemented)")
 
 	fs.Usage = func() {
@@ -90,6 +97,13 @@ func runReconcileCmd(args []string, defaultWorkspace string) {
 			err, strings.Join(reconcile.ListProviders(), ", "))
 		os.Exit(1)
 	}
+
+	// Wire an auth token into the provider if it implements reconcile.Tokenable
+	// (flag takes precedence, then {TYPE}_TOKEN-style env vars). A no-op for
+	// providers that don't need one. Without this, Tokenable providers (e.g.
+	// discord) never receive a token through this CLI path at all — FetchLive/
+	// ApplyPlan would always see an empty token even with a valid env var set.
+	reconcile.ConfigureProvider(provider, providerType, *token)
 
 	ctx := context.Background()
 
