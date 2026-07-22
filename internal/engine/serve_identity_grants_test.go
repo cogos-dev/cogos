@@ -1,0 +1,337 @@
+// serve_identity_grants_test.go — end-to-end tests for board task 60 chunk 1
+// (kernel-issued identity grants). Follows the newChannelServer pattern in
+// serve_sessions_channel_test.go: a Server wired with just the fields the
+// handlers need, fronted by httptest.NewServer.
+package engine
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func newIdentityGrantServer(t *testing.T) (*Server, *httptest.Server) {
+	t.Helper()
+	s := &Server{identityGrants: NewIdentityGrantRegistry()}
+	mux := http.NewServeMux()
+	s.registerIdentityGrantRoutes(mux)
+	front := httptest.NewServer(mux)
+	t.Cleanup(func() { front.Close() })
+	return s, front
+}
+
+func identityPostJSON(t *testing.T, url string, body any) *http.Response {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp
+}
+
+func identityDecodeBody(t *testing.T, resp *http.Response, v any) {
+	t.Helper()
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(raw, v); err != nil {
+		t.Fatalf("decode body %s: %v", raw, err)
+	}
+}
+
+func TestIdentityGrantMint_ScopeNeverWidened(t *testing.T) {
+	_, front := newIdentityGrantServer(t)
+
+	resp := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var out identityGrantMintResponse
+	identityDecodeBody(t, resp, &out)
+	if out.Token == "" {
+		t.Fatalf("expected a non-empty token")
+	}
+	if len(out.Scope) != 1 || out.Scope[0] != "chat:post" {
+		t.Fatalf("expected scope to echo exactly what was requested, got %v", out.Scope)
+	}
+}
+
+func TestIdentityGrantMint_IdempotentPerSurface(t *testing.T) {
+	_, front := newIdentityGrantServer(t)
+
+	first := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post", "chat:read"},
+	})
+	var firstOut identityGrantMintResponse
+	identityDecodeBody(t, first, &firstOut)
+
+	// Simulate a restart: mint again for the same surface. Must return the
+	// SAME token, not invalidate whatever a client already holds (design
+	// §4 chunk-1 verify-teeth item 5).
+	second := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post", "chat:read"},
+	})
+	var secondOut identityGrantMintResponse
+	identityDecodeBody(t, second, &secondOut)
+
+	if firstOut.Token != secondOut.Token {
+		t.Fatalf("expected idempotent reuse of the live grant, got different tokens: %q vs %q",
+			firstOut.Token, secondOut.Token)
+	}
+	if firstOut.GrantID != secondOut.GrantID {
+		t.Fatalf("expected the same grant_id on reuse, got %q vs %q", firstOut.GrantID, secondOut.GrantID)
+	}
+}
+
+// TestIdentityGrantMint_ReuseWithDifferentScope guards the defect confirmed
+// by cog-review on PR #471: MintOrReuse must not echo back a stale, live
+// grant's scope when the *current* request asks for a different scope than
+// what's already live. A same-scope re-mint (simulating a restart) still
+// reuses the token unchanged (TestIdentityGrantMint_IdempotentPerSurface);
+// a different-scope re-mint must mint fresh and return exactly the newly
+// requested scope, never the old one.
+func TestIdentityGrantMint_ReuseWithDifferentScope(t *testing.T) {
+	_, front := newIdentityGrantServer(t)
+
+	first := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "scope-test",
+		"scope":   []string{"chat:post", "chat:admin"},
+	})
+	var firstOut identityGrantMintResponse
+	identityDecodeBody(t, first, &firstOut)
+	if len(firstOut.Scope) != 2 {
+		t.Fatalf("expected initial mint to carry both requested scopes, got %v", firstOut.Scope)
+	}
+
+	// Re-mint the SAME surface with a NARROWER scope. The response must
+	// reflect the newly requested scope, not the previously-stored broader
+	// one — regardless of idempotency, which only applies to a same-scope
+	// restart.
+	second := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "scope-test",
+		"scope":   []string{"chat:post"},
+	})
+	var secondOut identityGrantMintResponse
+	identityDecodeBody(t, second, &secondOut)
+	if len(secondOut.Scope) != 1 || secondOut.Scope[0] != "chat:post" {
+		t.Fatalf("expected re-mint with a different scope to echo exactly the newly requested scope %v, got %v",
+			[]string{"chat:post"}, secondOut.Scope)
+	}
+	if secondOut.Token == firstOut.Token {
+		t.Fatalf("expected a different-scope re-mint to issue a fresh token, got the same one back")
+	}
+
+	// The old, broader token must no longer verify — it was superseded, not
+	// left live alongside the new one (one live grant per surface, chunk 1's
+	// stated invariant).
+	oldVerify := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "scope-test",
+		"token":   firstOut.Token,
+	})
+	var oldOut identityVerifyResponse
+	identityDecodeBody(t, oldVerify, &oldOut)
+	if oldOut.Valid {
+		t.Fatalf("expected the superseded broader-scope token to no longer verify")
+	}
+}
+
+func TestIdentityVerify_ValidAndInvalidTokens(t *testing.T) {
+	_, front := newIdentityGrantServer(t)
+
+	mint := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+	var minted identityGrantMintResponse
+	identityDecodeBody(t, mint, &minted)
+
+	// Valid token verifies.
+	ok := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "constellation-chat",
+		"token":   minted.Token,
+	})
+	var okOut identityVerifyResponse
+	identityDecodeBody(t, ok, &okOut)
+	if !okOut.Valid {
+		t.Fatalf("expected valid=true for a freshly minted token")
+	}
+
+	// Garbage token is rejected.
+	bad := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "constellation-chat",
+		"token":   "garbage",
+	})
+	var badOut identityVerifyResponse
+	identityDecodeBody(t, bad, &badOut)
+	if badOut.Valid {
+		t.Fatalf("expected valid=false for a garbage token")
+	}
+
+	// Right token, wrong surface is rejected — scope isolation across surfaces.
+	wrongSurface := identityPostJSON(t, front.URL+"/v1/identity/verify", map[string]any{
+		"surface": "signal-dashboard",
+		"token":   minted.Token,
+	})
+	var wrongOut identityVerifyResponse
+	identityDecodeBody(t, wrongSurface, &wrongOut)
+	if wrongOut.Valid {
+		t.Fatalf("expected valid=false when a token is presented for a different surface")
+	}
+}
+
+func TestIdentityGrantList_NeverIncludesToken(t *testing.T) {
+	_, front := newIdentityGrantServer(t)
+	identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+
+	resp, err := http.Get(front.URL + "/v1/identity/grants")
+	if err != nil {
+		t.Fatalf("GET grants: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if bytes.Contains(bytes.ToLower(raw), []byte(`"token"`)) {
+		t.Fatalf("grant listing must never include a token field; got %s", raw)
+	}
+}
+
+// TestIdentityGrantMint_ByGrantIDDoesNotLeakOnRescope guards the second
+// cog-review-confirmed defect on PR #471 (serve_identity_grants.go:147 as of
+// commit 7918055): a scope-changing re-mint for the same surface must not
+// leave the superseded grant's byGrantID entry behind. Alternates the
+// requested scope for one surface across several mints and asserts
+// byGrantID never grows past one live entry.
+func TestIdentityGrantMint_ByGrantIDDoesNotLeakOnRescope(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+
+	scopes := [][]string{{"a"}, {"b"}, {"a"}, {"b"}, {"a"}}
+	var lastGrantID string
+	for i, scope := range scopes {
+		g, err := reg.MintOrReuse("scope-flapper", scope, 0)
+		if err != nil {
+			t.Fatalf("mint %d: %v", i, err)
+		}
+		lastGrantID = g.GrantID
+	}
+
+	if got := len(reg.bySurface); got != 1 {
+		t.Fatalf("expected exactly one live surface entry, got %d", got)
+	}
+	if got := len(reg.byGrantID); got != 1 {
+		t.Fatalf("expected byGrantID to hold exactly the one live grant after %d scope-alternating re-mints, got %d entries (leak)", len(scopes), got)
+	}
+	if _, ok := reg.byGrantID[lastGrantID]; !ok {
+		t.Fatalf("expected byGrantID to contain the current live grant_id %q", lastGrantID)
+	}
+}
+
+// TestIdentityGrantMint_BoundedGrowthAcrossManySurfaces guards the first
+// cog-review-confirmed defect on PR #471 (serve_identity_grants.go:118 as of
+// commit 7918055): an unauthenticated caller varying the surface string on
+// every mint must not grow the store without bound. Mints well past
+// maxLiveGrantSurfaces distinct, never-expiring surface names and asserts
+// the registry rejects new surfaces once at capacity rather than growing
+// forever.
+func TestIdentityGrantMint_BoundedGrowthAcrossManySurfaces(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+
+	var lastErr error
+	minted := 0
+	for i := 0; i < maxLiveGrantSurfaces+50; i++ {
+		surface := fmt.Sprintf("surface-%d", i)
+		_, err := reg.MintOrReuse(surface, []string{"x"}, 24*time.Hour)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		minted++
+	}
+
+	if minted > maxLiveGrantSurfaces {
+		t.Fatalf("expected at most %d live surfaces to ever be mintable, got %d minted successfully", maxLiveGrantSurfaces, minted)
+	}
+	if len(reg.bySurface) > maxLiveGrantSurfaces {
+		t.Fatalf("expected bySurface to stay bounded at %d, got %d entries", maxLiveGrantSurfaces, len(reg.bySurface))
+	}
+	if lastErr == nil {
+		t.Fatalf("expected minting past capacity to eventually fail, but all %d mints succeeded", maxLiveGrantSurfaces+50)
+	}
+	if !errors.Is(lastErr, ErrGrantStoreAtCapacity) {
+		t.Fatalf("expected the over-capacity error to wrap ErrGrantStoreAtCapacity, got: %v", lastErr)
+	}
+}
+
+// TestIdentityGrantMint_CapacityErrorMapsTo429 checks the HTTP-layer mapping
+// for the capacity error (429, not the generic 400 every other MintOrReuse
+// error uses) so a caller/monitoring surface can distinguish "malformed
+// request" from "store full."
+func TestIdentityGrantMint_CapacityErrorMapsTo429(t *testing.T) {
+	s := &Server{identityGrants: NewIdentityGrantRegistry()}
+	mux := http.NewServeMux()
+	s.registerIdentityGrantRoutes(mux)
+	front := httptest.NewServer(mux)
+	defer front.Close()
+
+	var lastResp *http.Response
+	for i := 0; i < maxLiveGrantSurfaces+5; i++ {
+		lastResp = identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+			"surface": fmt.Sprintf("http-surface-%d", i),
+			"scope":   []string{"x"},
+		})
+		if lastResp.StatusCode == http.StatusTooManyRequests {
+			break
+		}
+		lastResp.Body.Close()
+	}
+	if lastResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected a 429 once the grant store hit capacity, last status was %d", lastResp.StatusCode)
+	}
+	lastResp.Body.Close()
+}
+
+func TestIdentityGrantCurrent_ZeroPasteBootstrap(t *testing.T) {
+	_, front := newIdentityGrantServer(t)
+
+	// No grant minted yet -> 404, so a caller knows to mint or degrade.
+	miss, err := http.Get(front.URL + "/v1/identity/grants/current?surface=constellation-chat")
+	if err != nil {
+		t.Fatalf("GET current: %v", err)
+	}
+	if miss.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 before any grant exists, got %d", miss.StatusCode)
+	}
+	miss.Body.Close()
+
+	minted := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "constellation-chat",
+		"scope":   []string{"chat:post"},
+	})
+	var mintedOut identityGrantMintResponse
+	identityDecodeBody(t, minted, &mintedOut)
+
+	// Now the surface's own page can bootstrap with zero paste: GET current
+	// returns the SAME live token, no operator action involved.
+	hit, err := http.Get(front.URL + "/v1/identity/grants/current?surface=constellation-chat")
+	if err != nil {
+		t.Fatalf("GET current: %v", err)
+	}
+	var hitOut identityGrantMintResponse
+	identityDecodeBody(t, hit, &hitOut)
+	if hitOut.Token != mintedOut.Token {
+		t.Fatalf("expected GET current to return the live grant's token unchanged, got %q vs %q",
+			hitOut.Token, mintedOut.Token)
+	}
+}

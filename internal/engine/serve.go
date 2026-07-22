@@ -102,6 +102,11 @@ type Server struct {
 	// protocol. See serve_sessions_channel.go for the full rationale.
 	channelSessionRegistry *ChannelSessionRegistry
 
+	// identityGrants is the in-memory store backing board-task-60 chunk 1
+	// (kernel-issued identity grants — see serve_identity_grants.go). Chunk
+	// 1 only; ledger-backed restart-safety is chunk 2.
+	identityGrants *IdentityGrantRegistry
+
 	// mod3Client is the HTTP client used to forward channel-session calls
 	// to mod3. Nil in production (falls back to the package-level
 	// mod3HTTPClient); tests set this to an httptest-backed client.
@@ -178,6 +183,9 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// ADR-082 Wave 2 kernel-owned channel-session identity.
 	s.channelSessionRegistry = NewChannelSessionRegistry()
 
+	// Board task 60 chunk 1: kernel-issued identity grants.
+	s.identityGrants = NewIdentityGrantRegistry()
+
 	mux := http.NewServeMux()
 	s.routeH(mux, "GET /", dashboard.Handler())
 	s.routeH(mux, "GET /canvas", canvas.Handler())
@@ -232,6 +240,12 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// /v1/channel-sessions/* to coexist with the agent-session surface
 	// above (incompatible session_id formats — see serve_sessions_channel.go).
 	s.registerChannelSessionRoutes(mux)
+
+	// Board task 60 chunk 1: kernel-issued identity grants — the
+	// constellation-chat surface's kernel-verified credential (design doc
+	// cog://mem/working/2026-07-21-kernel-identity-seat-design). In-memory
+	// only this chunk; see serve_identity_grants.go.
+	s.registerIdentityGrantRoutes(mux)
 
 	// Phase 1B: peer-awareness packet endpoint (READ side of the 4E
 	// ambient-awareness loop; Phase 1A populates channel.<sid>.activity).
