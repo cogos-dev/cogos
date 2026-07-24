@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/myrgic/cogos/pkg/substrate/bep"
 	"github.com/myrgic/cogos/trace"
 )
 
@@ -1029,16 +1030,54 @@ func loadOrCreateNodeID(cfg *Config) string {
 		return uuid.NewString()
 	}
 	path := filepath.Join(runDir, "node_id")
+	// An already-persisted id is authoritative and never rewritten — it is
+	// referenced in the ledger, the manifest, and process attribution, so
+	// changing it would sever that history. Anchoring applies to MINTING only.
 	if data, err := os.ReadFile(path); err == nil {
 		if id := strings.TrimSpace(string(data)); id != "" {
 			return id
 		}
 	}
-	id := uuid.NewString()
+	// Mint. Prefer the kernel's own BEP device identity so process.NodeID and
+	// the peer identity it presents on the wire are the SAME value (RFC-036,
+	// "sealed device identity" — collapses two identity primitives into one).
+	// Reads the cert file directly, so it is independent of whether the BEP
+	// engine is enabled/running (cluster.enabled may be false at this point in
+	// boot). Falls back to a UUID when no cert exists (fresh node, BEP never
+	// initialized) — strictly preserving prior behavior.
+	id := bepAnchoredNodeID()
+	if id == "" {
+		id = uuid.NewString()
+	}
 	if err := os.WriteFile(path, []byte(id+"\n"), 0o644); err != nil {
 		return id
 	}
 	return id
+}
+
+// bepAnchoredNodeID returns the formatted BEP DeviceID derived from the node's
+// on-disk BEP certificate, or "" when no usable cert is present. Never panics;
+// any error (missing cert, unparseable, empty chain) yields "" for UUID
+// fallback.
+//
+// It reads the DEFAULT BEP cert dir (bep.ExpandCertDir("") == bep.CertDir() ==
+// ~/.cog/etc), which is exactly what NewBEPEngine resolves to when the cluster
+// config sets no CertDir override — so for every deployment that uses the
+// default (all of them today; the cert lives at ~/.cog/etc), the node id is
+// anchored to the SAME cert BEP presents on the wire. KNOWN BOUNDARY: a node
+// that overrides cluster.CertDir would need that resolved dir threaded through
+// NewProcess to stay consistent; until then such a node anchors to the default
+// dir or falls back to UUID. Tracked as a follow-up, not silently correct.
+func bepAnchoredNodeID() string {
+	cert, err := bep.LoadBEPCert(bep.ExpandCertDir(""))
+	if err != nil {
+		return ""
+	}
+	devID, err := bep.DeviceIDFromTLSCert(&cert)
+	if err != nil {
+		return ""
+	}
+	return bep.FormatDeviceID(devID)
 }
 
 func (p *Process) nucleusDigest() string {
