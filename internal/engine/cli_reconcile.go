@@ -90,6 +90,25 @@ func runReconcileCmd(args []string, defaultWorkspace string) {
 		}
 	}
 
+	// Register providers that are NOT self-registering via package init(), and
+	// inject the workspace root into the ones that need it. runServe does both
+	// (cli.go's RegisterProviders call + LoadConfig's SetProvidersWorkspace);
+	// this path did neither, so any provider registered inside the
+	// RegisterProviders hook rather than by a package init() was unreachable
+	// from the CLI entirely. ProjectionCompiler is the current instance:
+	// `cogos reconcile projection-compiler` could only ever report an unknown
+	// resource type, because nothing on this path had registered it.
+	//
+	// The 10 daemon providers are unaffected either way — they register in
+	// internal/providers/daemon's init(), which runs in any process that
+	// imports it. This restores parity for the rest.
+	if RegisterProviders != nil {
+		RegisterProviders()
+	}
+	if SetProvidersWorkspace != nil {
+		SetProvidersWorkspace(root)
+	}
+
 	// Retrieve the provider.
 	provider, err := reconcile.GetProvider(providerType)
 	if err != nil {

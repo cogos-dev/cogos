@@ -1,7 +1,9 @@
-// cli_reconcile_test.go — tests for the --snapshot flag-dispatch branch
-// added to "cogos reconcile <type>" (ConfigExporter type assertion, the
-// snapshot-specific state-lock acquisition, and the success output format).
-// Flagged by cog-review on PR #473 as having no automated coverage.
+// cli_reconcile_test.go — tests for "cogos reconcile <type>" branches flagged
+// by cog-review as having no automated coverage: the --snapshot flag-dispatch
+// branch (ConfigExporter type assertion, the snapshot-specific state-lock
+// acquisition, and the success output format; PR #473), and the
+// RegisterProviders/SetProvidersWorkspace hook invocation that makes
+// hook-only-registered providers reachable at all (PR #475).
 //
 // runReconcileCmd calls os.Exit on every error branch and prints directly to
 // os.Stdout/os.Stderr, so it cannot be exercised in-process without killing
@@ -53,6 +55,19 @@ type mockExportReconciler struct {
 
 func (m *mockExportReconciler) ExportConfig(root string) error { return nil }
 
+// mockHookOnlyReconciler simulates a provider that is registered exclusively
+// inside the RegisterProviders hook — never via a package init() — which is
+// exactly the class of provider runReconcileCmd left unreachable before the
+// fix for PR #475 (ProjectionCompiler being the real-world instance, per
+// internal/providers/all/all.go's RegisterProviders closure). Unlike
+// mockPlainReconciler, ComputePlan returns a non-nil empty Plan so the
+// --dry-run path can render and exit cleanly once the provider is found.
+type mockHookOnlyReconciler struct{ mockPlainReconciler }
+
+func (m *mockHookOnlyReconciler) ComputePlan(any, any, *reconcile.State) (*reconcile.Plan, error) {
+	return &reconcile.Plan{ResourceType: m.name}, nil
+}
+
 const (
 	reconcileSnapshotHelperEnv = "CLI_RECONCILE_SNAPSHOT_HELPER"
 	reconcileSnapshotCaseEnv   = "CLI_RECONCILE_SNAPSHOT_CASE"
@@ -78,6 +93,17 @@ func TestHelperProcessReconcileSnapshot(t *testing.T) {
 	case "success":
 		reconcile.RegisterProvider("mockexport", &mockExportReconciler{mockPlainReconciler{name: "mockexport"}})
 		runReconcileCmd([]string{"mockexport", "--snapshot"}, root)
+		os.Exit(0)
+	case "hookonly":
+		// Deliberately do NOT call reconcile.RegisterProvider directly here —
+		// the whole point is that this provider is reachable ONLY through the
+		// RegisterProviders hook, mirroring how cmd/cogos/providers_wire.go's
+		// init() wires ProjectionCompiler into engine.RegisterProviders rather
+		// than registering it via a package init().
+		RegisterProviders = func() {
+			reconcile.RegisterProvider("mockhookonly", &mockHookOnlyReconciler{mockPlainReconciler{name: "mockhookonly"}})
+		}
+		runReconcileCmd([]string{"mockhookonly", "--dry-run", "--json"}, root)
 		os.Exit(0)
 	}
 	// runReconcileCmd exits the process directly on every branch above except
@@ -148,6 +174,33 @@ func TestReconcileSnapshotLockBusy(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "acquire state lock for mockexport") {
 		t.Errorf("stderr = %q, want it to mention state lock acquisition failure", stderr)
+	}
+}
+
+// TestReconcileHookOnlyProviderReachable is the regression test flagged by
+// cog-review on PR #475: runReconcileCmd must call the RegisterProviders /
+// SetProvidersWorkspace hooks before looking up the provider, exactly as
+// runServe does (cli.go:271-274, 308-311). Before that fix, any provider
+// registered only inside the RegisterProviders closure — never via a package
+// init() — was permanently unreachable from "cogos reconcile <type>" and
+// GetProvider always returned "unknown resource type", regardless of what was
+// wired into the hook. ProjectionCompiler was the real-world instance of this
+// (internal/providers/all/all.go:171-174), reported as an "unknown resource
+// type" failure for `cogos reconcile projection-compiler`.
+//
+// This test reproduces that class with a mock: a provider registered
+// exclusively from inside RegisterProviders, never called directly. On the
+// pre-fix code (RegisterProviders/SetProvidersWorkspace not invoked in
+// runReconcileCmd) this fails with exit 1 and "unknown resource type" in
+// stderr; on the fixed code it succeeds with exit 0.
+func TestReconcileHookOnlyProviderReachable(t *testing.T) {
+	root := t.TempDir()
+	code, _, stderr := runReconcileSnapshotHelper(t, "hookonly", root)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr=%q)", code, stderr)
+	}
+	if strings.Contains(stderr, "unknown resource type") {
+		t.Errorf("stderr = %q, provider registered only via the RegisterProviders hook was not found — the hook was not invoked", stderr)
 	}
 }
 
