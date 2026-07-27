@@ -415,6 +415,38 @@ func (r *WorktreeReconciler) ComputePlan(config any, live any, _ *reconcile.Stat
 		plan.Actions = append(plan.Actions, action)
 	}
 
+	// Health: degraded if any alarm is actively firing this cycle; healthy
+	// otherwise. This MUST run here, in ComputePlan, rather than in ApplyPlan:
+	// ComputePlan runs unconditionally on every reconcile cycle, whereas
+	// ApplyPlan is skipped entirely by the daemon once the plan converges to
+	// all-Skip (reconcile_daemon.go: `if !plan.Summary.HasChanges() { ... return }`).
+	// An alarm that has already been acknowledged (ActionSkip, per the
+	// idempotency guard above) reclassifies here every cycle, so Health
+	// correctly returns to non-degraded on the very next ComputePlan call even
+	// though ApplyPlan never runs again for it. Before this fix, Health was
+	// only ever set inside ApplyPlan, so an acknowledged alarm left Health
+	// pinned Degraded forever, which kept the autonomic ticker's needsHeal true
+	// and re-ran a full heal cycle for this provider on every tick indefinitely.
+	anyAlarm := false
+	for _, a := range plan.Actions {
+		// Only an actively-firing alarm (ActionUpdate) degrades health. An
+		// already-acknowledged alarm becomes an ActionSkip that still carries
+		// its classification in Details; counting that here would pin
+		// HealthDegraded forever.
+		if a.Action == reconcile.ActionSkip {
+			continue
+		}
+		if cls, _ := a.Details["classification"].(string); isAlarmClassification(cls) {
+			anyAlarm = true
+			break
+		}
+	}
+	if anyAlarm {
+		r.setHealth(reconcile.SyncStatusOutOfSync, reconcile.HealthDegraded, "alarm classification present")
+	} else {
+		r.setHealth(reconcile.SyncStatusSynced, reconcile.HealthHealthy, "")
+	}
+
 	return plan, nil
 }
 
@@ -647,35 +679,22 @@ func (r *WorktreeReconciler) ApplyPlan(ctx context.Context, plan *reconcile.Plan
 		}
 	}
 
-	// Health: degraded if any alarm fired; otherwise healthy.
-	anyAlarm := false
+	// Health: apply errors are an ADDITIVE degradation signal on top of the
+	// classification-derived Health that ComputePlan just set (see the Health
+	// block at the end of ComputePlan for why that computation lives there
+	// now). ApplyPlan must never clear a ComputePlan-set Degraded state on its
+	// own — it only has authority to degrade further when the apply itself
+	// failed. If there were no apply errors, leave Health exactly as
+	// ComputePlan left it this cycle.
 	anyError := false
 	for _, res := range results {
 		if res.Status == reconcile.ApplyFailed {
 			anyError = true
+			break
 		}
 	}
-	for _, a := range plan.Actions {
-		// Only an actively-firing alarm (ActionUpdate) degrades health. An
-		// already-acknowledged alarm becomes an ActionSkip that still carries its
-		// classification in Details; counting that here pinned HealthDegraded
-		// forever, which kept the autonomic ticker's needsHeal true and re-ran a
-		// full heal cycle for this provider every tick (and continuously
-		// triggered the daemon-vs-ticker concurrent-apply race).
-		if a.Action == reconcile.ActionSkip {
-			continue
-		}
-		if cls, _ := a.Details["classification"].(string); isAlarmClassification(cls) {
-			anyAlarm = true
-		}
-	}
-	switch {
-	case anyError:
+	if anyError {
 		r.setHealth(reconcile.SyncStatusOutOfSync, reconcile.HealthDegraded, "apply errors")
-	case anyAlarm:
-		r.setHealth(reconcile.SyncStatusOutOfSync, reconcile.HealthDegraded, "alarm classification present")
-	default:
-		r.setHealth(reconcile.SyncStatusSynced, reconcile.HealthHealthy, "")
 	}
 
 	return results, nil

@@ -307,6 +307,103 @@ func TestWorktreeReconcilerAlarmIdempotent(t *testing.T) {
 	}
 }
 
+// TestWorktreeReconciler_HealthUnfreezesOnSkipOnlyCycle_NoApplyPlan is the
+// regression test for the anomaly-flood defect diagnosed 2026-07-27
+// (sibling path to PR #404): the daemon's runOneCycle (reconcile_daemon.go)
+// skips ApplyPlan entirely once plan.Summary.HasChanges() is false — i.e. once
+// every action in the plan is ActionSkip because the reconciler has already
+// converged. Before the fix, Health was set ONLY inside ApplyPlan, so an
+// alarm acknowledged on one cycle (ActionUpdate -> ApplyPlan runs -> Degraded)
+// stayed Degraded forever on every subsequent all-Skip cycle, because
+// ComputePlan alone never touched Health and ApplyPlan was never invoked
+// again for this provider. That pinned the autonomic ticker's needsHeal true
+// indefinitely (full heal cycle every tick, forever).
+//
+// Unlike TestWorktreeReconcilerAlarmIdempotent above (which calls ApplyPlan
+// unconditionally every cycle and therefore does not exercise the daemon's
+// HasChanges() short-circuit), this test mirrors the daemon's actual
+// runOneCycle behavior: ApplyPlan is invoked ONLY when the plan has changes.
+// It fails against the pre-fix code because pre-fix Health is never
+// recomputed on the all-Skip cycle.
+func TestWorktreeReconciler_HealthUnfreezesOnSkipOnlyCycle_NoApplyPlan(t *testing.T) {
+	repoRoot := "/test/cogos"
+	ledger := newFakeLedger(repoRoot)
+	git := newFakeGit(repoRoot)
+	git.addWorktree(LiveWorktree{
+		Path:   "/test/cogos/.claude/worktrees/constellation-live",
+		Branch: "constellation-live",
+	})
+
+	r := NewWorktreeReconciler(repoRoot, ledger, ledger, git)
+	ctx := context.Background()
+
+	// runOneCycle mirrors reconcile_daemon.go:674-687 — ApplyPlan runs ONLY
+	// when the plan has non-skip changes; an all-Skip (converged) plan returns
+	// early without ever calling ApplyPlan.
+	runOneCycle := func() *reconcile.Plan {
+		cfg, err := r.LoadConfig("/test/workspace")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		live, err := r.FetchLive(ctx, cfg)
+		if err != nil {
+			t.Fatalf("FetchLive: %v", err)
+		}
+		plan, err := r.ComputePlan(cfg, live, nil)
+		if err != nil {
+			t.Fatalf("ComputePlan: %v", err)
+		}
+		if !plan.Summary.HasChanges() {
+			// Converged: daemon does NOT call ApplyPlan.
+			return plan
+		}
+		if _, err := r.ApplyPlan(ctx, plan); err != nil {
+			t.Fatalf("ApplyPlan: %v", err)
+		}
+		return plan
+	}
+
+	// Cycle 1: alarm-unknown-binding fires for the first time (ActionUpdate),
+	// plan has changes, ApplyPlan runs and emits worktree.alarm -> Degraded.
+	p1 := runOneCycle()
+	if p1.Summary.Updates != 1 {
+		t.Fatalf("cycle 1: Updates=%d want 1 (alarm firing)", p1.Summary.Updates)
+	}
+	if h := r.Health(); h.Health != reconcile.HealthDegraded {
+		t.Fatalf("cycle 1: health=%v want Degraded (alarm actively firing)", h.Health)
+	}
+
+	// Cycle 2: the alarm is now in the ledger, so ComputePlan reclassifies the
+	// same worktree as ActionSkip ("alarm already emitted per ledger"). The
+	// plan converges to all-Skip, so runOneCycle's HasChanges() guard means
+	// ApplyPlan is NEVER called this cycle or any subsequent cycle for this
+	// worktree. Health must still return to non-degraded, because ComputePlan
+	// itself derives Health from the current (Skip) classification.
+	p2 := runOneCycle()
+	if p2.Summary.HasChanges() {
+		t.Fatalf("cycle 2: expected an all-Skip converged plan, got summary=%+v", p2.Summary)
+	}
+	if p2.Summary.Skipped != 1 {
+		t.Fatalf("cycle 2: Skipped=%d want 1", p2.Summary.Skipped)
+	}
+	if h := r.Health(); h.Health == reconcile.HealthDegraded || h.Sync == reconcile.SyncStatusOutOfSync {
+		t.Errorf("cycle 2 (all-Skip, ApplyPlan never ran): health=%v sync=%v want Healthy/Synced — "+
+			"Health must unfreeze via ComputePlan alone, not just via ApplyPlan", h.Health, h.Sync)
+	}
+
+	// Cycles 3-5: stays converged and stays healthy — the freeze does not
+	// recur once ComputePlan owns the classification-derived Health signal.
+	for i := 3; i <= 5; i++ {
+		p := runOneCycle()
+		if p.Summary.HasChanges() {
+			t.Fatalf("cycle %d: expected all-Skip converged plan, got summary=%+v", i, p.Summary)
+		}
+		if h := r.Health(); h.Health == reconcile.HealthDegraded {
+			t.Errorf("cycle %d: health=%v want Healthy (must not re-freeze)", i, h.Health)
+		}
+	}
+}
+
 // TestNewWorktreeReconciler_DefaultsNilAdapters covers C3: adapters passed nil
 // (the production registration path) are defaulted at construction, so LoadConfig
 // never writes these fields at runtime and concurrent daemon/ticker LoadConfig
