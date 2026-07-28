@@ -13,6 +13,52 @@ make build
 
 Requirements: Go 1.25+, macOS or Linux.
 
+### Running a dev kernel alongside a production node
+
+If this machine already runs a cogos daemon, read this before `make install`.
+
+`make install` writes to `$(PREFIX)/bin/cogos`, and `PREFIX` defaults to
+`~/.cog` — the same path a production daemon is usually executing. Installing
+there replaces the running kernel's binary in place. `make install` refuses to
+do this when it detects a live process executing the target, so the safe paths
+are:
+
+```sh
+make dev                              # build ./cog + print isolation instructions
+make install PREFIX=$HOME/.cog-dev    # install beside production, not over it
+make install ALLOW_RUNNING_INSTALL=1  # deliberate in-place upgrade (you restart the daemon)
+```
+
+Run the dev kernel with **both** a separate port and a separate workspace root:
+
+```sh
+./cog serve --workspace /tmp/cog-dev --port 6932
+```
+
+Never point a dev kernel at a production workspace. The two instances would
+contend on the same state directory and lock files — see #482 for what that
+failure looks like in practice.
+
+**Self-update will reclaim the path.** If the node has
+`.cog/config/self-update.yaml` with `enabled: true` and `auto_apply: true`, the
+SelfUpdate provider polls GitHub releases and swaps the binary automatically. An
+installed dev build has a lifetime bounded by the next check tick. Pin it first:
+
+```yaml
+pin: v0.16.22   # freeze on an exact tag while developing
+```
+
+**Version strings.** `VERSION` is derived from `git describe --tags --always
+--dirty`, so a local build reports something like `v0.16.22-3-gabc1234-dirty` —
+honest about ancestry, distance from the tag, and uncommitted changes. It sorts
+*after* the tag it descends from, so a dev build is never mistaken for a
+downgrade. Override with `make build VERSION=...` when you need an exact value.
+
+**Bounds.** A dev instance on a scratch workspace has no production corpus, so
+it cannot reproduce corpus-shaped behaviour (large reconcile cycles, lock
+contention under load). "Works on my dev kernel" is weak evidence for anything
+that scales with corpus size.
+
 ## Running tests
 
 ```sh

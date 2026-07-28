@@ -8,13 +8,22 @@
 #   make all      - Build for all platforms (cog-{os}-{arch})
 #   make test     - Run tests
 #   make clean    - Remove build artifacts
-#   make install  - Install to ~/.cog/bin/cogos
+#   make dev      - Build a dev binary + print isolation instructions
+#   make install  - Install to $(PREFIX)/bin/cogos (PREFIX defaults to ~/.cog)
 #   make push     - Build + push to OCI layout (triggers kernel auto-reload)
 #   make image    - Build production OCI image
 #   make e2e      - Run e2e test in a container
 #   make e2e-local - Run e2e test locally
 
-VERSION := 0.16.6
+# VERSION is derived from git so a local build never claims to be a release it
+# is not. `git describe --tags --always --dirty` yields e.g.
+# v0.16.22-2-g127b651-dirty: descended from v0.16.22, two commits past it, with
+# uncommitted changes. That string sorts AFTER the tag it descends from, so a
+# dev build is never mistaken for a downgrade by self-update's comparator.
+# Overridable (?=) so the release workflow and packagers can pin an exact value.
+# Falls back to the honest "dev" (matching internal/engine/cli.go's default)
+# when git is unavailable, e.g. a source tarball with no .git.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=$(BUILD_TIME) -X github.com/myrgic/cogos/internal/engine.Version=$(VERSION)
 BUILD_TAGS := fts5
@@ -33,7 +42,7 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64 windows-amd64 windows-arm64
 
-.PHONY: all build clean test test-coverage test-integration bench install push image run e2e e2e-local $(PLATFORMS) $(BINARY)
+.PHONY: all build clean test test-coverage test-integration bench install check-not-running dev push image run e2e e2e-local $(PLATFORMS) $(BINARY)
 
 # Default: build for current platform
 build: $(BINARY)
@@ -69,11 +78,17 @@ windows-amd64:
 windows-arm64:
 	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build -ldflags="$(LDFLAGS)" -o $(BINARY)-windows-arm64.exe ./cmd/cogos/
 
-INSTALL_DIR := $(HOME)/.cog/bin
+# PREFIX is the install root. Override it to install a dev build somewhere that
+# is not the production kernel's path:
+#   make install PREFIX=$$HOME/.cog-dev
+PREFIX ?= $(HOME)/.cog
+INSTALL_DIR := $(PREFIX)/bin
 INSTALL_TARGET := $(INSTALL_DIR)/cogos
 
-# Install to ~/.cog/bin/cogos (atomic: build, verify, checksum, move)
-install: build
+# Install to $(PREFIX)/bin/cogos (atomic: build, verify, checksum, move).
+# Refuses to overwrite a binary that a running process is executing — see
+# check-not-running.
+install: build check-not-running
 	@echo "=== Installing to $(INSTALL_TARGET) ==="
 	@./$(BINARY) version > /dev/null 2>&1 || (echo "ERROR: built binary fails version check" && exit 1)
 	@mkdir -p "$(INSTALL_DIR)"
@@ -87,6 +102,55 @@ install: build
 	@NEW_SHA=$$(shasum -a 256 "$(INSTALL_TARGET)" | cut -d' ' -f1); \
 		echo "  Installed cogos $(VERSION) ($(GOOS)/$(GOARCH))"; \
 		echo "  SHA-256: $$NEW_SHA"
+
+# Refuse to clobber a binary that a live process is executing. This is the guard
+# that turns "use a different PREFIX" from a convention into a safety property:
+# on a machine running a production node, `make install` would otherwise replace
+# the running kernel's binary in place.
+#
+# Set ALLOW_RUNNING_INSTALL=1 to override (e.g. a deliberate in-place upgrade
+# where you intend to restart the daemon afterwards).
+check-not-running:
+	@if [ "$(ALLOW_RUNNING_INSTALL)" = "1" ]; then \
+		echo "  ALLOW_RUNNING_INSTALL=1 — skipping running-daemon check"; \
+		exit 0; \
+	fi; \
+	target="$(INSTALL_TARGET)"; \
+	if [ ! -e "$$target" ]; then exit 0; fi; \
+	pids=$$(pgrep -f 'cogos serve' 2>/dev/null || true); \
+	for pid in $$pids; do \
+		exe=$$(ps -o comm= -p "$$pid" 2>/dev/null || true); \
+		if [ "$$exe" = "$$target" ]; then \
+			echo ""; \
+			echo "REFUSING TO INSTALL: $$target is being executed by PID $$pid."; \
+			echo ""; \
+			echo "Installing over a running kernel's binary replaces production in place."; \
+			echo "Options:"; \
+			echo "  make install PREFIX=\$$HOME/.cog-dev   # install beside it, not over it"; \
+			echo "  make dev                              # build + isolation instructions"; \
+			echo "  make install ALLOW_RUNNING_INSTALL=1  # override, if you mean it"; \
+			echo ""; \
+			exit 1; \
+		fi; \
+	done; \
+	exit 0
+
+# Build a local dev binary and print how to run it without colliding with a
+# production node. Does not install anything.
+dev: build
+	@echo ""
+	@echo "=== Dev build ready: ./$(BINARY) (version $(VERSION)) ==="
+	@echo ""
+	@echo "Run it isolated from any production node — separate port AND workspace:"
+	@echo "  ./$(BINARY) serve --workspace /tmp/cog-dev --port 6932"
+	@echo ""
+	@echo "Never point a dev kernel at a production workspace: the two would"
+	@echo "contend on the same state dir and lock files (see #482)."
+	@echo ""
+	@echo "If this node has self-update enabled with auto_apply, pin it first or"
+	@echo "a release will silently replace an installed dev binary mid-session:"
+	@echo "  pin: $(shell git describe --tags --abbrev=0 2>/dev/null || echo vX.Y.Z)   # in .cog/config/self-update.yaml"
+	@echo ""
 
 # Push to OCI layout — running kernel auto-reloads
 push: build
