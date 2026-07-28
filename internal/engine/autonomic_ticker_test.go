@@ -854,7 +854,7 @@ func TestHealDegradedProviders_CallsReconcileOnUnhealthy(t *testing.T) {
 
 	withSelfHealableProviders(t, []*selfHealableProvider{degraded}, func() {
 		ctx := context.Background()
-		healDegradedProviders(ctx)
+		healDegradedProviders(ctx, "")
 
 		if degraded.fetchLiveCalls != 1 {
 			t.Errorf("FetchLive calls: got %d; want 1", degraded.fetchLiveCalls)
@@ -879,7 +879,7 @@ func TestHealDegradedProviders_SkipsHealthyProviders(t *testing.T) {
 
 	withSelfHealableProviders(t, []*selfHealableProvider{healthy}, func() {
 		ctx := context.Background()
-		healDegradedProviders(ctx)
+		healDegradedProviders(ctx, "")
 
 		if healthy.fetchLiveCalls != 0 {
 			t.Errorf("FetchLive should not be called for healthy provider: got %d calls", healthy.fetchLiveCalls)
@@ -908,7 +908,7 @@ func TestHealDegradedProviders_SkipsWhenNoPlanChanges(t *testing.T) {
 
 	withSelfHealableProviders(t, []*selfHealableProvider{degraded}, func() {
 		ctx := context.Background()
-		healDegradedProviders(ctx)
+		healDegradedProviders(ctx, "")
 
 		if degraded.fetchLiveCalls != 1 {
 			t.Errorf("FetchLive calls: got %d; want 1", degraded.fetchLiveCalls)

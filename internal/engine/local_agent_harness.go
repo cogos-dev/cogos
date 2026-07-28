@@ -579,7 +579,7 @@ func (c *LocalHarnessController) autonomicTick(ctx context.Context) {
 	// repaired autonomically without waking the LLM. If self-heal succeeds,
 	// the next snapshot will be green and no escalation fires.
 	if !snap.AllGreen() {
-		healDegradedProviders(ctx)
+		healDegradedProviders(ctx, c.cfg.WorkspaceRoot)
 	}
 
 	// 3. Consume the triggerPending flag atomically.
