@@ -3,12 +3,21 @@
 // A self-sustaining feedback loop kept the conversations provider permanently
 // Degraded on a live node:
 //
-//	reconcile daemon (30s poll, 31-244s cycle) overlaps itself
-//	→ autonomic self-heal calls ApplyPlan on the SAME provider
+//	the reconcile daemon holds the reconcile state lock for a whole
+//	Load→Apply→Write cycle (reconcile_daemon.go, AcquireStateLock)
+//	→ autonomic self-heal calls ApplyPlan on the SAME provider WITHOUT
+//	  taking that lock (autonomic_ticker.go — no AcquireStateLock at all)
 //	→ both contend on .cog/state/conversations/_meta.json.lock
-//	→ the loser gets filelock.ErrLockTimeout
+//	→ the loser gets filelock.ErrLockTimeout (usually the daemon: observed
+//	  2018 daemon action-failures against 1 self-heal ApplyPlan failure)
 //	→ the timeout lands in p.lastErrors → Health() == Degraded
 //	→ Degraded satisfies needsHeal → self-heal fires again → repeat forever
+//
+// Note the asymmetry: self-heal is the UNLOCKED actor, so it wins the race
+// almost every time and the daemon is the victim. The daemon does not overlap
+// itself — its run loop is a single goroutine with MaxConcurrent=1 and a
+// coalescing ticker, so a slow cycle drops intervening ticks rather than
+// stacking. Contention is daemon-vs-self-heal, not daemon-vs-daemon.
 //
 // The invariant these tests pin: losing a race for an on-disk index lock is
 // BACKPRESSURE, not corruption. It must not set Health=Degraded and must not
