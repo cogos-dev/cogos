@@ -20,8 +20,11 @@
 # v0.16.22-2-g127b651-dirty: descended from v0.16.22, two commits past it, with
 # uncommitted changes. That string sorts AFTER the tag it descends from, so a
 # dev build is never mistaken for a downgrade by self-update's comparator.
-# Overridable (?=) so the release workflow and packagers can pin an exact value.
-# Falls back to the honest "dev" (matching internal/engine/cli.go's default)
+# Overridable (?=) so packagers and any caller that builds through make can pin
+# an exact value. Note the release workflow does NOT go through make — it calls
+# `go build` with its own ldflags (release.yml:95) — so releases are unaffected
+# by this default either way.
+# Falls back to the honest "dev" (matching internal/engine/cli.go:32's default)
 # when git is unavailable, e.g. a source tarball with no .git.
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -118,8 +121,11 @@ install: build check-not-running
 #           never matches; do not rely on it here.
 #   macOS — no /proc; `lsof -p PID` reports the text (executable) mapping, and
 #           BSD `ps -o comm=` also happens to give a full path.
-# Anything that does not resolve to an absolute path is discarded rather than
-# compared, so an unrecognised platform fails open with no false positives.
+# Anything that does not resolve to an absolute path is treated as UNKNOWN, and
+# an unknown `cogos serve` process is refused rather than assumed harmless: a
+# process owned by another user (a service account) is not readable via
+# /proc/PID/exe or lsof, and guessing wrong overwrites a live production binary.
+# Fail loud, with ALLOW_RUNNING_INSTALL=1 as the documented escape.
 # Both sides are realpath-normalised so a symlinked PREFIX still matches.
 check-not-running:
 	@if [ "$(ALLOW_RUNNING_INSTALL)" = "1" ]; then \
@@ -142,7 +148,24 @@ check-not-running:
 			exe=$$(ps -o comm= -p "$$pid" 2>/dev/null || true); \
 		fi; \
 		case "$$exe" in /*) ;; *) exe="";; esac; \
-		if [ -n "$$exe" ] && [ "$$exe" = "$$rtarget" ]; then \
+		if [ -z "$$exe" ]; then \
+			echo ""; \
+			echo "REFUSING TO INSTALL: cannot determine the executable of PID $$pid,"; \
+			echo "which is running 'cogos serve'. It may be this target."; \
+			echo ""; \
+			echo "This usually means the process belongs to another user (a service"; \
+			echo "account), so /proc/PID/exe and lsof are not readable from here."; \
+			echo "Refusing rather than guessing: a wrong guess overwrites a live"; \
+			echo "production binary."; \
+			echo ""; \
+			echo "Options:"; \
+			echo "  make install PREFIX=\$$HOME/.cog-dev   # install beside it, not over it"; \
+			echo "  sudo make install                     # if you can read the process"; \
+			echo "  make install ALLOW_RUNNING_INSTALL=1  # override, if you mean it"; \
+			echo ""; \
+			exit 1; \
+		fi; \
+		if [ "$$exe" = "$$rtarget" ]; then \
 			echo ""; \
 			echo "REFUSING TO INSTALL: $$target is being executed by PID $$pid."; \
 			echo ""; \
