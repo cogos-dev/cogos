@@ -340,11 +340,7 @@ func snapshotFingerprint(snap KernelHealthSnapshot) string {
 // corrected autonomically without waking the LLM. Errors are logged but never
 // propagate — a failed apply leaves Health() degraded, which will trigger the
 // LLM escalation predicate on the same tick if needed.
-// workspaceRoot is the root used to load each provider's prior reconcile state
-// before planning. An empty root disables state loading (plans are computed
-// from scratch), which is the pre-#433 behaviour and is what tests that don't
-// care about state continuity pass.
-func healDegradedProviders(ctx context.Context, workspaceRoot string) {
+func healDegradedProviders(ctx context.Context) {
 	healBackoffMu.Lock()
 	healTickCount++
 	currentTick := healTickCount
@@ -410,26 +406,8 @@ func healDegradedProviders(ctx context.Context, workspaceRoot string) {
 			continue
 		}
 
-		// Load prior reconcile state so the plan is computed against what the
-		// last cycle actually wrote, exactly as the reconcile daemon does
-		// (reconcile_daemon.go LoadState → ComputePlan). Passing nil here made
-		// every self-heal a from-scratch replan of the entire corpus — on the
-		// conversations provider that was ~2374 actions per cycle, every cycle,
-		// forever (#433). A missing state file maps to (nil, nil), which
-		// degrades to exactly the previous behaviour.
-		var state *reconcile.State
-		if workspaceRoot != "" {
-			s, stateErr := reconcile.LoadState(workspaceRoot, name)
-			if stateErr != nil {
-				slog.Warn("autonomic: self-heal: LoadState failed; planning against empty state",
-					"provider", name, "err", stateErr)
-			} else {
-				state = s
-			}
-		}
-
 		// Compute plan.
-		plan, err := p.ComputePlan(cfg, live, state)
+		plan, err := p.ComputePlan(cfg, live, nil)
 		if err != nil {
 			slog.Warn("autonomic: self-heal: ComputePlan failed", "provider", name, "err", err)
 			healRecordFailure(name, currentTick, "ComputePlan", err)
