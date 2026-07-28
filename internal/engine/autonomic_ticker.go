@@ -87,10 +87,10 @@ type KernelHealthSnapshot struct {
 	// AnomaliesTotal is the cumulative count since process start, carried for
 	// post-hoc audit alongside the per-tick delta above.
 	AnomaliesTotal int64 `json:"anomalies_total"`
-	// HostVitals carries RFC-037 S0 host gauges (disk/mem/load/uptime),
+	// HostVitals carries RFC-040 S0 host gauges (disk/mem/load/uptime),
 	// sampled in this same tick — no new loop, no new daemon (see
 	// host_vitals.go). Gauges are OBSERVATIONS, not health: nothing in this
-	// block feeds AllGreen() or any escalation decision (RFC-037 N5).
+	// block feeds AllGreen() or any escalation decision (RFC-040 N5).
 	// Threshold crossings, if ever wanted, route through the existing
 	// anomaly machinery, exactly as the abandoned-inference count above
 	// does — this field itself carries only the raw current reading.
@@ -196,7 +196,7 @@ func buildKernelHealthSnapshotWith(ctx context.Context, readAbandoned func() (to
 		Providers: make(map[string]reconcile.ResourceStatus),
 	}
 
-	// RFC-037 S0: sample host gauges in this same tick. sampleHostVitals is
+	// RFC-040 S0: sample host gauges in this same tick. sampleHostVitals is
 	// best-effort per gauge (see host_vitals.go) and never blocks or panics,
 	// so this cannot turn a cheap tick into a slow one nor fail the snapshot.
 	snap.HostVitals = sampleHostVitals()

@@ -1,6 +1,6 @@
 //go:build linux
 
-// host_vitals_linux.go — RFC-037 S0 gauge samplers for Linux.
+// host_vitals_linux.go — RFC-040 S0 gauge samplers for Linux.
 //
 // All three readings are pure syscall/procfs, no subprocess spawn, no cgo:
 // cheap enough to run on every autonomic tick.

@@ -1,12 +1,12 @@
 //go:build !linux && !darwin
 
-// host_vitals_other.go — RFC-037 S0 gauge samplers for every platform other
+// host_vitals_other.go — RFC-040 S0 gauge samplers for every platform other
 // than Linux and macOS (Windows, BSD, ...).
 //
 // No gauge has a non-cgo, non-subprocess implementation wired up for these
 // platforms yet. All three samplers report "unsupported" so HostVitals ships
 // with every optional field omitted rather than fabricated — the soft-degrade
-// contract RFC-037 N5 requires, applied at the platform granularity instead
+// contract RFC-040 N5 requires, applied at the platform granularity instead
 // of the single-reading granularity.
 package engine
 

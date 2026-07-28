@@ -1,11 +1,11 @@
 //go:build darwin
 
-// host_vitals_darwin.go — RFC-037 S0 gauge samplers for macOS.
+// host_vitals_darwin.go — RFC-040 S0 gauge samplers for macOS.
 //
 // disk_free_bytes is a plain Statfs syscall, same as Linux. mem_free_bytes
 // and load1 are NOT implemented here: both would need APIs this codebase
 // has no path to without adding cgo (see per-function comments below), and
-// this is a minimal-seam PR — no new build-mode dependency. Per RFC-037's
+// this is a minimal-seam PR — no new build-mode dependency. Per RFC-040's
 // soft-degrade contract, both samplers return an error so the corresponding
 // HostVitals field is simply omitted on this platform, never fabricated.
 package engine
