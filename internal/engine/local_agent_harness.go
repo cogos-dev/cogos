@@ -1077,7 +1077,15 @@ func (c *LocalHarnessController) buildAmbientBlock(ctx context.Context) string {
 	b.WriteString("=== ambient state of self ===\n")
 	b.WriteString(c.buildObservation(""))
 
-	snap := buildKernelHealthSnapshot(ctx)
+	// Use the non-consuming peek form: this is a concurrent, informational
+	// caller relative to the autonomic ticker's own buildKernelHealthSnapshot
+	// call (local_agent_harness.go's autonomicTick, above). Using the
+	// consuming form here would swap-and-reset the #432 abandoned-inference
+	// watermark out from under the ticker, silently suppressing
+	// escalateAbandonedInference on its next tick. See
+	// buildKernelHealthSnapshotPeek and abandonedInferencePeek for the full
+	// rationale.
+	snap := buildKernelHealthSnapshotPeek(ctx)
 	fmt.Fprintf(&b, "health_counts: healthy=%d degraded=%d missing=%d suspended=%d anomalies=%d\n",
 		snap.Counts.Healthy, snap.Counts.Degraded, snap.Counts.Missing, snap.Counts.Suspended, snap.Anomalies)
 	if !snap.AllGreen() && len(snap.Providers) > 0 {
@@ -1668,6 +1676,17 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		},
 	})
 
+	// start begins the batch timer BEFORE the ambient-state block (below) is
+	// built. buildAmbientBlock -> buildKernelHealthSnapshotPeek ->
+	// probeAllProviders performs a real, sequential per-provider Health()
+	// probe (context_blocks_health.go: up to healthProbeTimeout==200ms per
+	// provider, so worst case N_providers x 200ms of wall time) — confirmed
+	// non-trivial I/O, not free work. Starting the timer first ensures
+	// TotalDurationSec reflects the batch's true wall-clock cost for
+	// Ambient=true callers instead of undercounting by the ambient-probe
+	// latency.
+	start := time.Now()
+
 	// req.Ambient (opt-in, default false — existing callers unaffected): build
 	// the ambient-state-of-self block once per batch, not once per fan-out
 	// slot. Health-snapshot probing is real work (probeAllProviders) and the
@@ -1679,7 +1698,6 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		ambientBlock = c.buildAmbientBlock(ctx)
 	}
 
-	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < req.N; i++ {
 		wg.Add(1)
@@ -1731,15 +1749,6 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		systemPrompt = c.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
 	}
 
-	// Ambient-state injection (cogdoc 16), opt-in via req.Ambient. Prepended
-	// ahead of the resolved system prompt — the same AdditionalContext +
-	// "\n\n" + SystemPrompt pattern the PreInference hook uses on the main
-	// chat/external-CLI path (harness/harness.go RunInference). That path is
-	// wired to the chat harness only; this is the same sandwich applied at
-	// the seam LocalHarnessController.DispatchToHarness never had one.
-	if ambientBlock != "" {
-		systemPrompt = ambientBlock + "\n\n" + systemPrompt
-	}
 	counting := &countingProvider{Provider: provider}
 
 	// ADR-066 §models-always-swappable: temperature and max_tokens must be
@@ -1754,9 +1763,20 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	}
 
 	// ADR-066 §KV-Cache-Branching: RequestID must be content-stable so that
-	// identical fan-out slots share a KV-cache prefix. Hash (systemPrompt +
-	// task + sorted tool names); append idx only for per-slot log uniqueness —
-	// the prefix up to the dash is cache-relevant and identical across slots.
+	// identical fan-out slots share a KV-cache prefix, AND so that a retried
+	// identical dispatch dedupes against the in-flight registry (#432 retry
+	// discipline, inference_inflight.go beginInflightInference). Hash the
+	// BASE systemPrompt (pre-ambient) + task + sorted tool names; append idx
+	// only for per-slot log uniqueness — the prefix up to the dash is
+	// cache-relevant and identical across slots.
+	//
+	// Deliberately hashed BEFORE the ambient-state block (below) is prepended:
+	// buildAmbientBlock embeds a live time=<RFC3339> line and fluctuating
+	// health data, so two otherwise-identical retries of the same task would
+	// hash differently if ambient content were included, producing distinct
+	// RequestIDs and silently defeating the dedup guard for every
+	// req.Ambient=true caller. The ambient block affects what the provider
+	// sees, not the request's identity.
 	//
 	// registry.Definitions() returns the registry's own backing slice by
 	// reference (tool_loop.go KernelToolRegistry.Definitions), and registry
@@ -1783,6 +1803,21 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		h.Write([]byte(n))
 	}
 	contentKey := hex.EncodeToString(h.Sum(nil))[:16]
+
+	// Ambient-state injection (cogdoc 16), opt-in via req.Ambient. Prepended
+	// ahead of the resolved system prompt — the same AdditionalContext +
+	// "\n\n" + SystemPrompt pattern the PreInference hook uses on the main
+	// chat/external-CLI path (harness/harness.go RunInference). That path is
+	// wired to the chat harness only; this is the same sandwich applied at
+	// the seam LocalHarnessController.DispatchToHarness never had one.
+	//
+	// Applied AFTER contentKey is computed (above) — see the comment there:
+	// the ambient block is live/call-varying content that must reach the
+	// provider without becoming part of the request's content-stable
+	// identity.
+	if ambientBlock != "" {
+		systemPrompt = ambientBlock + "\n\n" + systemPrompt
+	}
 
 	compReq := &CompletionRequest{
 		SystemPrompt: systemPrompt,
