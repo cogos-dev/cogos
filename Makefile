@@ -110,6 +110,17 @@ install: build check-not-running
 #
 # Set ALLOW_RUNNING_INSTALL=1 to override (e.g. a deliberate in-place upgrade
 # where you intend to restart the daemon afterwards).
+#
+# Resolving a PID's executable is platform-specific, and getting this wrong
+# makes the guard a silent no-op rather than a loud failure:
+#   Linux — /proc/PID/exe is the authoritative symlink. NOTE: `ps -o comm=`
+#           returns only the BASENAME on procps, so comparing it to a full path
+#           never matches; do not rely on it here.
+#   macOS — no /proc; `lsof -p PID` reports the text (executable) mapping, and
+#           BSD `ps -o comm=` also happens to give a full path.
+# Anything that does not resolve to an absolute path is discarded rather than
+# compared, so an unrecognised platform fails open with no false positives.
+# Both sides are realpath-normalised so a symlinked PREFIX still matches.
 check-not-running:
 	@if [ "$(ALLOW_RUNNING_INSTALL)" = "1" ]; then \
 		echo "  ALLOW_RUNNING_INSTALL=1 — skipping running-daemon check"; \
@@ -117,10 +128,21 @@ check-not-running:
 	fi; \
 	target="$(INSTALL_TARGET)"; \
 	if [ ! -e "$$target" ]; then exit 0; fi; \
+	rtarget=$$(cd "$$(dirname "$$target")" 2>/dev/null && pwd -P)/$$(basename "$$target"); \
 	pids=$$(pgrep -f 'cogos serve' 2>/dev/null || true); \
 	for pid in $$pids; do \
-		exe=$$(ps -o comm= -p "$$pid" 2>/dev/null || true); \
-		if [ "$$exe" = "$$target" ]; then \
+		exe=""; \
+		if [ -r "/proc/$$pid/exe" ]; then \
+			exe=$$(readlink -f "/proc/$$pid/exe" 2>/dev/null || true); \
+		fi; \
+		if [ -z "$$exe" ] && command -v lsof >/dev/null 2>&1; then \
+			exe=$$(lsof -p "$$pid" -Ffn 2>/dev/null | awk '/^ftxt$$/{t=1;next} /^n/{if(t){print substr($$0,2);exit}} {t=0}'); \
+		fi; \
+		if [ -z "$$exe" ]; then \
+			exe=$$(ps -o comm= -p "$$pid" 2>/dev/null || true); \
+		fi; \
+		case "$$exe" in /*) ;; *) exe="";; esac; \
+		if [ -n "$$exe" ] && [ "$$exe" = "$$rtarget" ]; then \
 			echo ""; \
 			echo "REFUSING TO INSTALL: $$target is being executed by PID $$pid."; \
 			echo ""; \
