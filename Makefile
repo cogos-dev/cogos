@@ -135,6 +135,16 @@ check-not-running:
 	target="$(INSTALL_TARGET)"; \
 	if [ ! -e "$$target" ]; then exit 0; fi; \
 	rtarget=$$(cd "$$(dirname "$$target")" 2>/dev/null && pwd -P)/$$(basename "$$target"); \
+	if ! command -v pgrep >/dev/null 2>&1; then \
+		echo ""; \
+		echo "REFUSING TO INSTALL: pgrep not found, so a running kernel cannot be"; \
+		echo "detected. Installing blind could overwrite a live production binary."; \
+		echo ""; \
+		echo "  make install PREFIX=\$$HOME/.cog-dev   # install beside it, not over it"; \
+		echo "  make install ALLOW_RUNNING_INSTALL=1  # override, if you mean it"; \
+		echo ""; \
+		exit 1; \
+	fi; \
 	pids=$$(pgrep -f 'cogos serve' 2>/dev/null || true); \
 	for pid in $$pids; do \
 		exe=""; \

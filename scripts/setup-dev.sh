@@ -34,6 +34,16 @@ refuse_if_running() {
     [ "${ALLOW_RUNNING_INSTALL:-}" = "1" ] && return 0
     [ -e "$target" ] || return 0
     rtarget="$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)/$(basename "$target")"
+    if ! command -v pgrep >/dev/null 2>&1; then
+        echo ""
+        echo "REFUSING: pgrep not found, so a running kernel cannot be detected."
+        echo "Installing blind could overwrite a live production binary."
+        echo ""
+        echo "  PREFIX=\$HOME/.cog-dev ./scripts/setup-dev.sh   # install beside it"
+        echo "  ALLOW_RUNNING_INSTALL=1 ./scripts/setup-dev.sh # override, if you mean it"
+        echo ""
+        exit 1
+    fi
     for pid in $(pgrep -f 'cogos serve' 2>/dev/null || true); do
         exe=""
         if [ -r "/proc/$pid/exe" ]; then
