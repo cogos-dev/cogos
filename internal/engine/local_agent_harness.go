@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 	"github.com/myrgic/cogos/trace"
 )
 
@@ -1055,6 +1056,46 @@ func (c *LocalHarnessController) buildObservation(triggerReason string) string {
 	return b.String()
 }
 
+// buildAmbientBlock assembles the "ambient state of self" context block for
+// looped kernel-interior dispatch batches (cogdoc 16, drafted 2026-05-11).
+// It reuses buildObservation's gathering half — time/workspace/identity/
+// process_state/fovea/last_cycle — the same per-tick ambient assembler the
+// autonomic loop already builds for itself, and layers on a kernel health
+// summary from buildKernelHealthSnapshot (autonomic_ticker.go).
+//
+// This gives bus_kernel_proprio's KernelHealthSnapshot its first reader:
+// that channel has been write-only since birth (a 60s writer with zero
+// readers). Sharing the snapshot source here does not attach a reader to the
+// bus itself, but it does mean the same live-health computation now backs
+// both the write-only bus emission and this in-loop context injection.
+//
+// DispatchToHarness calls this once per batch (not once per fan-out slot) —
+// the ambient state does not vary within a single dispatch call, and probing
+// provider health per-slot would be wasted work under N>1 fan-out.
+func (c *LocalHarnessController) buildAmbientBlock(ctx context.Context) string {
+	var b strings.Builder
+	b.WriteString("=== ambient state of self ===\n")
+	b.WriteString(c.buildObservation(""))
+
+	snap := buildKernelHealthSnapshot(ctx)
+	fmt.Fprintf(&b, "health_counts: healthy=%d degraded=%d missing=%d suspended=%d anomalies=%d\n",
+		snap.Counts.Healthy, snap.Counts.Degraded, snap.Counts.Missing, snap.Counts.Suspended, snap.Anomalies)
+	if !snap.AllGreen() && len(snap.Providers) > 0 {
+		unhealthy := make([]string, 0, len(snap.Providers))
+		for name, st := range snap.Providers {
+			if st.Health != reconcile.HealthHealthy && st.Health != "" {
+				unhealthy = append(unhealthy, fmt.Sprintf("%s=%s", name, st.Health))
+			}
+		}
+		if len(unhealthy) > 0 {
+			sort.Strings(unhealthy)
+			fmt.Fprintf(&b, "degraded_providers: %s\n", strings.Join(unhealthy, ", "))
+		}
+	}
+	b.WriteString("=== end ambient state ===")
+	return b.String()
+}
+
 func (c *LocalHarnessController) localModelHint() string {
 	if c.cfg != nil && strings.TrimSpace(c.cfg.LocalModel) != "" {
 		return strings.TrimSpace(c.cfg.LocalModel)
@@ -1627,13 +1668,24 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		},
 	})
 
+	// req.Ambient (opt-in, default false — existing callers unaffected): build
+	// the ambient-state-of-self block once per batch, not once per fan-out
+	// slot. Health-snapshot probing is real work (probeAllProviders) and the
+	// ambient state does not vary within a single DispatchToHarness call, so
+	// computing it once and sharing it across all N slots is both cheaper and
+	// correct — every slot in the batch observes the same instant.
+	var ambientBlock string
+	if req.Ambient {
+		ambientBlock = c.buildAmbientBlock(ctx)
+	}
+
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < req.N; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote, subject)
+			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote, subject, ambientBlock)
 		}(i)
 	}
 	wg.Wait()
@@ -1656,7 +1708,11 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 
 // dispatchSlot executes one fan-out slot. subject is the resolved dispatch
 // identity (RFC-identity-embedding I1/I2): "anonymous" or req.Identity.Sub.
-func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string, subject string) DispatchResult {
+// ambientBlock is the (possibly empty) ambient-state-of-self block computed
+// once per batch by DispatchToHarness when req.Ambient is set; empty when
+// ambient injection is off (the default), leaving existing callers
+// byte-identical.
+func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string, subject string, ambientBlock string) DispatchResult {
 	res := DispatchResult{
 		Index:        idx,
 		ModelUsed:    routeUsed,
@@ -1673,6 +1729,16 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		// prefix-stable across fan-out slots so KV-cache sharing is preserved.
 		// When req.SystemPrompt is set the caller owns the prompt; use it verbatim.
 		systemPrompt = c.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
+	}
+
+	// Ambient-state injection (cogdoc 16), opt-in via req.Ambient. Prepended
+	// ahead of the resolved system prompt — the same AdditionalContext +
+	// "\n\n" + SystemPrompt pattern the PreInference hook uses on the main
+	// chat/external-CLI path (harness/harness.go RunInference). That path is
+	// wired to the chat harness only; this is the same sandwich applied at
+	// the seam LocalHarnessController.DispatchToHarness never had one.
+	if ambientBlock != "" {
+		systemPrompt = ambientBlock + "\n\n" + systemPrompt
 	}
 	counting := &countingProvider{Provider: provider}
 

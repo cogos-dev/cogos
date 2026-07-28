@@ -155,6 +155,25 @@ type DispatchRequest struct {
 	// Requires cluster.enabled=true and the named peer to be connected.
 	// Empty string (the default) runs locally — unchanged behavior.
 	TargetNode string `json:"target_node,omitempty"`
+
+	// Ambient opts this dispatch batch into the ambient-state-of-self context
+	// block (cogdoc 16, drafted 2026-05-11): a prepended system-prompt block
+	// carrying live kernel health, workspace, and identity state, built once
+	// per batch by LocalHarnessController.buildAmbientBlock and injected into
+	// every fan-out slot via the same AdditionalContext-prepend pattern the
+	// PreInference hook uses on the main chat/external-CLI path
+	// (harness/harness.go RunInference) — a pattern that path has had since
+	// early on, but that LocalHarnessController.DispatchToHarness (the live
+	// backer of cog_dispatch_to_harness) never received.
+	//
+	// Default false so every existing caller of DispatchToHarness is
+	// byte-identical: the field defaults to the zero value, dispatchSlot's
+	// ambientBlock is empty, and the system prompt is composed exactly as
+	// before. Looped kernel-interior callers (ralph runners, RFC-036 seats)
+	// are expected to set this explicitly; the default may flip once the
+	// receipts-up half of the seam (myrgic/cogos#478) lands and the ambient
+	// block earns its keep across the general dispatch population.
+	Ambient bool `json:"ambient,omitempty"`
 }
 
 // DispatchToolCallSummary is the digest of one tool invocation made during a

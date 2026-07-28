@@ -1557,6 +1557,147 @@ func TestDispatchToHarness_ProviderCannotServeModel_FailsLoudly(t *testing.T) {
 	}
 }
 
+// ambientDispatchTestFixture stands up a LocalHarnessController wired to a
+// named "lmstudio" provider backed by an httptest server that records the
+// system-role message content of every /v1/chat/completions request it
+// receives. Shared by the two req.Ambient tests below.
+func ambientDispatchTestFixture(t *testing.T) (ctrl *LocalHarnessController, capturedSystemPrompts *[]string) {
+	t.Helper()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	prompts := make([]string, 0, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			var body struct {
+				Messages []struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for _, m := range body.Messages {
+				if m.Role == "system" {
+					prompts = append(prompts, m.Content)
+					break
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "ambient-test response"},
+					"finish_reason": "stop",
+				}},
+			})
+		default:
+			t.Errorf("ambientDispatchTestFixture: unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  lmstudio:
+    type: openai
+    endpoint: `+srv.URL+`
+    model: gemma-4-e4b
+`)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	c, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, server.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+	return c, &prompts
+}
+
+// TestDispatchToHarness_AmbientFalse_MessageSetUnchanged verifies that
+// leaving req.Ambient at its zero value (false) — the behavior of every
+// caller that predates this field — produces the exact same system prompt
+// DispatchToHarness has always composed: the harness orientation block plus
+// the default dispatch prompt, with no ambient block anywhere in it. This is
+// the "existing callers are byte-identical" half of the opt-in contract.
+func TestDispatchToHarness_AmbientFalse_MessageSetUnchanged(t *testing.T) {
+	ctrl, prompts := ambientDispatchTestFixture(t)
+
+	want := ctrl.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "ambient=false control",
+		Provider:       "lmstudio",
+		N:              1,
+		TimeoutSeconds: 10,
+		// Ambient omitted: zero value, i.e. false.
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if !batch.Results[0].Success {
+		t.Fatalf("Results[0].Success = false; error=%q", batch.Results[0].Error)
+	}
+	if len(*prompts) != 1 {
+		t.Fatalf("captured %d system prompts; want 1", len(*prompts))
+	}
+	got := (*prompts)[0]
+	if got != want {
+		t.Errorf("system prompt with Ambient=false diverged from the pre-existing composition:\ngot:  %q\nwant: %q", got, want)
+	}
+	if strings.Contains(got, "ambient state of self") {
+		t.Errorf("system prompt with Ambient=false unexpectedly contains the ambient block")
+	}
+}
+
+// TestDispatchToHarness_AmbientTrue_PrependsAmbientBlock verifies that
+// req.Ambient=true prepends a block carrying live health/workspace/identity
+// state ahead of the harness's normal system prompt, using the same
+// AdditionalContext-prepend pattern the PreInference hook already uses on
+// the main chat/external-CLI path. The pre-existing prompt content must
+// still be present and untouched — only prefixed.
+func TestDispatchToHarness_AmbientTrue_PrependsAmbientBlock(t *testing.T) {
+	ctrl, prompts := ambientDispatchTestFixture(t)
+
+	base := ctrl.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "ambient=true test",
+		Provider:       "lmstudio",
+		N:              1,
+		TimeoutSeconds: 10,
+		Ambient:        true,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if !batch.Results[0].Success {
+		t.Fatalf("Results[0].Success = false; error=%q", batch.Results[0].Error)
+	}
+	if len(*prompts) != 1 {
+		t.Fatalf("captured %d system prompts; want 1", len(*prompts))
+	}
+	got := (*prompts)[0]
+
+	if !strings.HasPrefix(got, "=== ambient state of self ===") {
+		t.Errorf("system prompt with Ambient=true does not start with the ambient block marker:\n%s", got)
+	}
+	if !strings.Contains(got, "health_counts:") {
+		t.Errorf("ambient block missing health_counts line:\n%s", got)
+	}
+	if !strings.Contains(got, "workspace=") {
+		t.Errorf("ambient block missing workspace= line:\n%s", got)
+	}
+	if !strings.Contains(got, "identity=Cog") {
+		t.Errorf("ambient block missing identity= line:\n%s", got)
+	}
+	if !strings.HasSuffix(got, base) {
+		t.Errorf("ambient-prefixed prompt does not end with the unchanged base prompt:\ngot:  %q\nbase: %q", got, base)
+	}
+}
+
 // TestDispatchToHarness_ConcurrentIdenticalDispatchIsDeduped is the #432
 // retry-discipline regression test: dispatchSlot's RequestID is a
 // content-stable hash of systemPrompt+task+tool-names (for KV-cache sharing
