@@ -15,6 +15,7 @@ package conversations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/myrgic/cogos/pkg/filelock"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 	"gopkg.in/yaml.v3"
 )
@@ -54,6 +56,16 @@ type Provider struct {
 	// means planned work is not resolving, which is the real definition of
 	// OutOfSync.
 	applyFailures int
+
+	// applyBackpressure counts actions in the last apply that failed solely
+	// because an on-disk index lock could not be acquired in time. These are
+	// deliberately NOT counted as indexing errors: losing a race for the meta
+	// lock means another writer (the reconcile daemon, self-heal, or another
+	// process) currently holds it, so the work is contended, not corrupt.
+	// Reporting contention as Degraded closed a feedback loop — Degraded
+	// re-armed self-heal, self-heal raced the daemon, the race produced
+	// another timeout (#482).
+	applyBackpressure int
 
 	// ontology is the loaded L1+L2 ontology set. nil when enforcement is
 	// disabled (ontology_dir not set or absent from the workspace).
@@ -409,6 +421,7 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 	// remove, so it must not be reintroduced through the failure path.
 	if !plan.Summary.HasChanges() {
 		p.applyFailures = 0
+		p.applyBackpressure = 0
 	}
 	p.mu.Unlock()
 
@@ -451,6 +464,9 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 
 	var results []reconcile.Result
 	var errs []string
+	// backpressure counts actions that failed only because an index lock was
+	// contended. See isLockBackpressure.
+	var backpressure int
 	// liveSources collects ingest source names present this cycle, used to
 	// prune coverageCache for removed sources after the action loop.
 	liveSources := make(map[string]struct{})
@@ -510,7 +526,11 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 					res.Status = reconcile.ApplyFailed
 					res.Error = fmt.Sprintf("index ingest source %s: %v", action.Name, applyErr)
 					results = append(results, res)
-					errs = append(errs, res.Error)
+					if isLockBackpressure(applyErr) {
+						backpressure++
+					} else {
+						errs = append(errs, res.Error)
+					}
 					continue
 				}
 				// applyIngestSource parsed + populated cov for this source;
@@ -542,7 +562,11 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				res.Status = reconcile.ApplyFailed
 				res.Error = fmt.Sprintf("index session %s: %v", action.Name, err)
 				results = append(results, res)
-				errs = append(errs, res.Error)
+				if isLockBackpressure(err) {
+					backpressure++
+				} else {
+					errs = append(errs, res.Error)
+				}
 				continue
 			}
 
@@ -550,7 +574,11 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				res.Status = reconcile.ApplyFailed
 				res.Error = fmt.Sprintf("upsert session %s: %v", action.Name, upsertErr)
 				results = append(results, res)
-				errs = append(errs, res.Error)
+				if isLockBackpressure(upsertErr) {
+					backpressure++
+				} else {
+					errs = append(errs, res.Error)
+				}
 				continue
 			}
 
@@ -562,7 +590,11 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 			if delErr := idx.DeleteSession(action.Name); delErr != nil {
 				res.Status = reconcile.ApplyFailed
 				res.Error = delErr.Error()
-				errs = append(errs, res.Error)
+				if isLockBackpressure(delErr) {
+					backpressure++
+				} else {
+					errs = append(errs, res.Error)
+				}
 			} else {
 				res.Status = reconcile.ApplySucceeded
 			}
@@ -587,15 +619,36 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 	// that applied cleanly leaves the provider converged even though the plan
 	// itself contained changes.
 	p.planApplied = true
+	// Lock-contention failures are excluded from applyFailures for the same
+	// reason they are excluded from lastErrors: the action did not land
+	// because a concurrent writer held the index lock and is performing that
+	// same work, so it is contention, not unresolved divergence. Counting it
+	// re-armed self-heal, which produced more contention (#482).
 	p.applyFailures = 0
 	for _, r := range results {
 		if r.Status == reconcile.ApplyFailed {
 			p.applyFailures++
 		}
 	}
+	// Every backpressure action is also an ApplyFailed result, so subtracting
+	// the contended subset leaves the genuine failures. backpressure can never
+	// exceed the ApplyFailed count because it is only incremented on paths
+	// that also append an ApplyFailed result.
+	p.applyFailures -= backpressure
+	p.applyBackpressure = backpressure
 	p.mu.Unlock()
 
 	return results, nil
+}
+
+// isLockBackpressure reports whether err is (or wraps) a filelock acquisition
+// timeout. Such a failure means another writer holds the on-disk index lock —
+// backpressure from concurrency, not corruption of the corpus — so it must not
+// contribute to the Degraded health axis. Matching is done with errors.Is
+// against the filelock.ErrLockTimeout sentinel; every index write path wraps
+// the acquisition error with %w, so the chain is intact.
+func isLockBackpressure(err error) bool {
+	return err != nil && errors.Is(err, filelock.ErrLockTimeout)
 }
 
 // ─── BuildState ──────────────────────────────────────────────────────────────
@@ -677,7 +730,14 @@ func (p *Provider) BuildState(_ any, live any, existing *reconcile.State) (*reco
 //	            plan with changes that has not been applied yet, or an applied
 //	            plan whose actions failed. A plan that contained changes and
 //	            applied cleanly is Synced.
-//	Health    — Degraded when ApplyPlan had errors; Healthy otherwise
+//	Health    — Degraded when ApplyPlan had genuine indexing errors; Healthy
+//	            otherwise. Lock-acquisition timeouts are explicitly excluded:
+//	            they mean another writer holds the on-disk index lock, which is
+//	            backpressure from concurrency, not corpus corruption. Counting
+//	            them as Degraded closed a feedback loop with the autonomic
+//	            ticker's self-heal (#482): Degraded re-armed self-heal,
+//	            self-heal raced the reconcile daemon on the same provider, and
+//	            the race produced another lock timeout, forever.
 //	Operation — Syncing while ApplyPlan is running
 //
 // Sync deliberately does NOT key on "the last plan contained changes" alone.
@@ -695,6 +755,7 @@ func (p *Provider) Health() reconcile.ResourceStatus {
 	op := p.operation
 	applied := p.planApplied
 	failures := p.applyFailures
+	contended := p.applyBackpressure
 	p.mu.Unlock()
 
 	sync := reconcile.SyncStatusSynced
@@ -713,6 +774,9 @@ func (p *Provider) Health() reconcile.ResourceStatus {
 	if errs > 0 {
 		health = reconcile.HealthDegraded
 		msg = fmt.Sprintf("%d session(s) failed to index", errs)
+	} else if contended > 0 {
+		// Informational only — health stays Healthy and sync stays Synced.
+		msg = fmt.Sprintf("%d action(s) deferred on index lock contention", contended)
 	}
 
 	return reconcile.ResourceStatus{
