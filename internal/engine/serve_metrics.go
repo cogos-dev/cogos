@@ -1,9 +1,9 @@
-// serve_metrics.go — GET /metrics (RFC-037 S1).
+// serve_metrics.go — GET /metrics (RFC-040 S1).
 //
 // One HTTP handler exposing the CURRENT kernel health snapshot (provider
-// counts + RFC-037 S0 host gauges) in Prometheus text exposition format
+// counts + RFC-040 S0 host gauges) in Prometheus text exposition format
 // 0.0.4. This is a courtesy interop door, not a commitment to the prom
-// ecosystem (RFC-037 §S1): no history, no aggregation, no query language —
+// ecosystem (RFC-040 §S1): no history, no aggregation, no query language —
 // exactly the values the tick most recently produced, rendered fresh on
 // every scrape.
 //
@@ -11,7 +11,7 @@
 // existing non-consuming form of the snapshot builder (see
 // autonomic_ticker.go), so scraping /metrics can never steal the delta the
 // autonomic ticker's #432 abandoned-inference escalation depends on. Per
-// RFC-037 N1, this endpoint is explicitly exempt from the "no continuous
+// RFC-040 N1, this endpoint is explicitly exempt from the "no continuous
 // gauge readout" rule — N1 governs agent per-turn context injection only; a
 // raw current-value HTTP dump is the whole point of S1.
 package engine
@@ -50,10 +50,10 @@ type promMetric struct {
 
 // renderPrometheusMetrics renders snap as Prometheus text exposition format
 // 0.0.4: current values only, one # HELP and # TYPE line per metric, no
-// history and no aggregation (RFC-037 S1). Provider-count and anomaly
+// history and no aggregation (RFC-040 S1). Provider-count and anomaly
 // metrics are always present (HealthCounts/Anomalies are plain ints, never
 // absent); host-gauge metrics are present only when the corresponding
-// HostVitals field was successfully sampled — RFC-037's soft-degrade
+// HostVitals field was successfully sampled — RFC-040's soft-degrade
 // contract applies here exactly as it does to the JSON snapshot: an
 // unsampled gauge is a missing metric, never a fabricated zero.
 func renderPrometheusMetrics(snap KernelHealthSnapshot) string {
@@ -102,28 +102,28 @@ func renderPrometheusMetrics(snap KernelHealthSnapshot) string {
 		},
 		{
 			name:    "cogos_disk_free_bytes",
-			help:    "Free disk space, in bytes, on the kernel's workspace volume (RFC-037 S0).",
+			help:    "Free disk space, in bytes, on the kernel's workspace volume (RFC-040 S0).",
 			mtype:   "gauge",
 			present: snap.HostVitals.DiskFreeBytes != nil,
 			value:   formatUint64Ptr(snap.HostVitals.DiskFreeBytes),
 		},
 		{
 			name:    "cogos_mem_free_bytes",
-			help:    "Free host memory, in bytes (RFC-037 S0). Omitted on platforms with no cheap non-cgo reading.",
+			help:    "Free host memory, in bytes (RFC-040 S0). Omitted on platforms with no cheap non-cgo reading.",
 			mtype:   "gauge",
 			present: snap.HostVitals.MemFreeBytes != nil,
 			value:   formatUint64Ptr(snap.HostVitals.MemFreeBytes),
 		},
 		{
 			name:    "cogos_load1",
-			help:    "1-minute host load average (RFC-037 S0). Omitted on platforms with no cheap non-cgo reading.",
+			help:    "1-minute host load average (RFC-040 S0). Omitted on platforms with no cheap non-cgo reading.",
 			mtype:   "gauge",
 			present: snap.HostVitals.Load1 != nil,
 			value:   formatFloat64Ptr(snap.HostVitals.Load1),
 		},
 		{
 			name:    "cogos_uptime_seconds",
-			help:    "Kernel process uptime, in seconds — time since this process started, not machine boot time (RFC-037 S0).",
+			help:    "Kernel process uptime, in seconds — time since this process started, not machine boot time (RFC-040 S0).",
 			mtype:   "gauge",
 			present: snap.HostVitals.UptimeSeconds != nil,
 			value:   formatUint64Ptr(snap.HostVitals.UptimeSeconds),

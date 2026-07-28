@@ -224,7 +224,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "GET /v1/reconcile/coherence", s.handleReconcileCoherence)
 	s.route(mux, "GET /v1/kernel/rates", s.handleKernelRates)
 
-	// RFC-037 S1: Prometheus text-exposition interop door over the current
+	// RFC-040 S1: Prometheus text-exposition interop door over the current
 	// kernel health snapshot (provider counts + S0 host gauges). Current
 	// values only — no history, no aggregation. See serve_metrics.go.
 	s.route(mux, "GET /metrics", s.handleMetrics)
