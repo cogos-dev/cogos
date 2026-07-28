@@ -42,6 +42,19 @@ type Provider struct {
 	lastErrors      []string
 	operation       reconcile.OperationPhase
 
+	// planApplied reports whether the plan described by lastPlanSummary has
+	// since been applied. ComputePlan clears it; ApplyPlan sets it. It is the
+	// difference between "changes are pending" (genuine, momentary divergence)
+	// and "changes were planned and then resolved" (the reconciler working
+	// normally). Without it, any actively-appending source holds the provider
+	// in OutOfSync forever — see Health.
+	planApplied bool
+
+	// applyFailures counts actions in the last apply that failed. Non-zero
+	// means planned work is not resolving, which is the real definition of
+	// OutOfSync.
+	applyFailures int
+
 	// ontology is the loaded L1+L2 ontology set. nil when enforcement is
 	// disabled (ontology_dir not set or absent from the workspace).
 	ontology *LoadedOntology
@@ -384,6 +397,19 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 
 	p.mu.Lock()
 	p.lastPlanSummary = plan.Summary
+	// A newly computed plan has not been applied yet. Health reads this to
+	// distinguish pending work from work already resolved.
+	p.planApplied = false
+	// A plan with no changes is itself proof that the corpus is converged —
+	// whatever failed in an earlier apply is no longer outstanding. Without
+	// this reset, applyFailures latches: ApplyPlan is the only other writer,
+	// and the autonomic ticker skips ApplyPlan whenever the plan has no
+	// changes, so a single past failure would pin Sync at OutOfSync forever.
+	// That is the same permanent-divergence bug class this fix exists to
+	// remove, so it must not be reintroduced through the failure path.
+	if !plan.Summary.HasChanges() {
+		p.applyFailures = 0
+	}
 	p.mu.Unlock()
 
 	return plan, nil
@@ -557,6 +583,16 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 		}
 	}
 	p.lastErrors = errs
+	// The plan has now been applied. Count genuinely failed actions: a plan
+	// that applied cleanly leaves the provider converged even though the plan
+	// itself contained changes.
+	p.planApplied = true
+	p.applyFailures = 0
+	for _, r := range results {
+		if r.Status == reconcile.ApplyFailed {
+			p.applyFailures++
+		}
+	}
 	p.mu.Unlock()
 
 	return results, nil
@@ -637,18 +673,38 @@ func (p *Provider) BuildState(_ any, live any, existing *reconcile.State) (*reco
 
 // Health returns three-axis status:
 //
-//	Sync      — Synced when last plan had no non-skip actions
+//	Sync      — OutOfSync only when work is genuinely unresolved: a computed
+//	            plan with changes that has not been applied yet, or an applied
+//	            plan whose actions failed. A plan that contained changes and
+//	            applied cleanly is Synced.
 //	Health    — Degraded when ApplyPlan had errors; Healthy otherwise
 //	Operation — Syncing while ApplyPlan is running
+//
+// Sync deliberately does NOT key on "the last plan contained changes" alone.
+// The observatory watches conversation transcripts that are appended to while
+// the kernel runs, so on a live node there is nearly always a create or update
+// in flight. Treating that as OutOfSync pinned the provider out-of-sync
+// permanently and made the autonomic ticker's self-heal fire every 60s forever
+// (#433) — which both burned CPU and destroyed the signal, since a status that
+// is always OutOfSync cannot report actual divergence. Progress is normal
+// operation; only unresolved work is divergence.
 func (p *Provider) Health() reconcile.ResourceStatus {
 	p.mu.Lock()
 	summary := p.lastPlanSummary
 	errs := len(p.lastErrors)
 	op := p.operation
+	applied := p.planApplied
+	failures := p.applyFailures
 	p.mu.Unlock()
 
 	sync := reconcile.SyncStatusSynced
-	if summary.HasChanges() {
+	switch {
+	case summary.HasChanges() && !applied:
+		// Work is planned but not yet carried out — genuine, momentary
+		// divergence. This is the state self-heal exists to resolve.
+		sync = reconcile.SyncStatusOutOfSync
+	case failures > 0:
+		// Work was attempted and did not land. Still divergent.
 		sync = reconcile.SyncStatusOutOfSync
 	}
 
