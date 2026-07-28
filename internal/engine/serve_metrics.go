@@ -1,0 +1,157 @@
+// serve_metrics.go — GET /metrics (RFC-040 S1).
+//
+// One HTTP handler exposing the CURRENT kernel health snapshot (provider
+// counts + RFC-040 S0 host gauges) in Prometheus text exposition format
+// 0.0.4. This is a courtesy interop door, not a commitment to the prom
+// ecosystem (RFC-040 §S1): no history, no aggregation, no query language —
+// exactly the values the tick most recently produced, rendered fresh on
+// every scrape.
+//
+// Side-effect-free: handleMetrics calls buildKernelHealthSnapshotPeek, the
+// existing non-consuming form of the snapshot builder (see
+// autonomic_ticker.go), so scraping /metrics can never steal the delta the
+// autonomic ticker's #432 abandoned-inference escalation depends on. Per
+// RFC-040 N1, this endpoint is explicitly exempt from the "no continuous
+// gauge readout" rule — N1 governs agent per-turn context injection only; a
+// raw current-value HTTP dump is the whole point of S1.
+package engine
+
+import (
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+// prometheusContentType is the exact Content-Type the Prometheus text
+// exposition format 0.0.4 spec expects.
+const prometheusContentType = "text/plain; version=0.0.4"
+
+// handleMetrics serves GET /metrics: the current KernelHealthSnapshot
+// (provider health counts + host vitals) rendered as Prometheus text
+// exposition format 0.0.4.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	snap := buildKernelHealthSnapshotPeek(r.Context())
+
+	w.Header().Set("Content-Type", prometheusContentType)
+	_, _ = w.Write([]byte(renderPrometheusMetrics(snap)))
+}
+
+// promMetric describes one exposition-format metric block: HELP + TYPE
+// lines followed by exactly one sample. v is pre-formatted so gauge
+// (uint64/float64) and counter (int64) values share one rendering path.
+type promMetric struct {
+	name    string
+	help    string
+	mtype   string // "gauge" or "counter"
+	present bool   // false suppresses the whole block (an omitted host gauge)
+	value   string
+}
+
+// renderPrometheusMetrics renders snap as Prometheus text exposition format
+// 0.0.4: current values only, one # HELP and # TYPE line per metric, no
+// history and no aggregation (RFC-040 S1). Provider-count and anomaly
+// metrics are always present (HealthCounts/Anomalies are plain ints, never
+// absent); host-gauge metrics are present only when the corresponding
+// HostVitals field was successfully sampled — RFC-040's soft-degrade
+// contract applies here exactly as it does to the JSON snapshot: an
+// unsampled gauge is a missing metric, never a fabricated zero.
+func renderPrometheusMetrics(snap KernelHealthSnapshot) string {
+	metrics := []promMetric{
+		{
+			name:    "cogos_providers_healthy",
+			help:    "Number of registered providers currently healthy, per the latest autonomic tick.",
+			mtype:   "gauge",
+			present: true,
+			value:   strconv.Itoa(snap.Counts.Healthy),
+		},
+		{
+			name:    "cogos_providers_degraded",
+			help:    "Number of registered providers currently degraded, per the latest autonomic tick.",
+			mtype:   "gauge",
+			present: true,
+			value:   strconv.Itoa(snap.Counts.Degraded),
+		},
+		{
+			name:    "cogos_providers_missing",
+			help:    "Number of registered providers currently missing, per the latest autonomic tick.",
+			mtype:   "gauge",
+			present: true,
+			value:   strconv.Itoa(snap.Counts.Missing),
+		},
+		{
+			name:    "cogos_providers_suspended",
+			help:    "Number of registered providers currently suspended, per the latest autonomic tick.",
+			mtype:   "gauge",
+			present: true,
+			value:   strconv.Itoa(snap.Counts.Suspended),
+		},
+		{
+			name:    "cogos_anomalies",
+			help:    "Abandoned/canceled internal inference calls (#432) observed since the previous autonomic tick.",
+			mtype:   "gauge",
+			present: true,
+			value:   strconv.Itoa(snap.Anomalies),
+		},
+		{
+			name:    "cogos_anomalies_total",
+			help:    "Cumulative abandoned/canceled internal inference calls (#432) since kernel process start.",
+			mtype:   "counter",
+			present: true,
+			value:   strconv.FormatInt(snap.AnomaliesTotal, 10),
+		},
+		{
+			name:    "cogos_disk_free_bytes",
+			help:    "Free disk space, in bytes, on the kernel's workspace volume (RFC-040 S0).",
+			mtype:   "gauge",
+			present: snap.HostVitals.DiskFreeBytes != nil,
+			value:   formatUint64Ptr(snap.HostVitals.DiskFreeBytes),
+		},
+		{
+			name:    "cogos_mem_free_bytes",
+			help:    "Free host memory, in bytes (RFC-040 S0). Omitted on platforms with no cheap non-cgo reading.",
+			mtype:   "gauge",
+			present: snap.HostVitals.MemFreeBytes != nil,
+			value:   formatUint64Ptr(snap.HostVitals.MemFreeBytes),
+		},
+		{
+			name:    "cogos_load1",
+			help:    "1-minute host load average (RFC-040 S0). Omitted on platforms with no cheap non-cgo reading.",
+			mtype:   "gauge",
+			present: snap.HostVitals.Load1 != nil,
+			value:   formatFloat64Ptr(snap.HostVitals.Load1),
+		},
+		{
+			name:    "cogos_uptime_seconds",
+			help:    "Kernel process uptime, in seconds — time since this process started, not machine boot time (RFC-040 S0).",
+			mtype:   "gauge",
+			present: snap.HostVitals.UptimeSeconds != nil,
+			value:   formatUint64Ptr(snap.HostVitals.UptimeSeconds),
+		},
+	}
+
+	var b strings.Builder
+	for _, m := range metrics {
+		if !m.present {
+			continue
+		}
+		fmt.Fprintf(&b, "# HELP %s %s\n", m.name, m.help)
+		fmt.Fprintf(&b, "# TYPE %s %s\n", m.name, m.mtype)
+		fmt.Fprintf(&b, "%s %s\n", m.name, m.value)
+	}
+	return b.String()
+}
+
+func formatUint64Ptr(v *uint64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatUint(*v, 10)
+}
+
+func formatFloat64Ptr(v *float64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatFloat(*v, 'g', -1, 64)
+}
