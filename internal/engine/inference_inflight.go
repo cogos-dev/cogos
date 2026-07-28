@@ -101,6 +101,28 @@ func abandonedInferenceSnapshot() (total int64, delta int64) {
 	return total, delta
 }
 
+// abandonedInferencePeek is the non-consuming counterpart to
+// abandonedInferenceSnapshot: it returns the same (total, delta-since-last-
+// consuming-read) pair but does NOT advance lastAbandonedInferenceSnapshot.
+//
+// abandonedInferenceSnapshot's swap-and-consume semantics assume a single
+// production reader (the autonomic ticker, which needs "delta since my last
+// tick" to drive #432 escalation). A second concurrent consumer would steal
+// that delta out from under the ticker — it would observe delta=0 on its next
+// tick even though a real abandonment happened, silently suppressing
+// escalateAbandonedInference. Informational callers (e.g. the ambient-state-
+// of-self block surfaced to looped kernel-interior dispatch) must use this
+// peek instead so the ticker remains the sole consumer of the watermark.
+func abandonedInferencePeek() (total int64, delta int64) {
+	total = abandonedInferenceCount.Load()
+	prev := lastAbandonedInferenceSnapshot.Load()
+	delta = total - prev
+	if delta < 0 {
+		delta = 0
+	}
+	return total, delta
+}
+
 // resetAbandonedInferenceCounterForTest zeroes the abandoned-inference delta
 // baseline so a test that asserts an exact anomaly count (including zero,
 // i.e. AllGreen()) is not affected by unrelated tests elsewhere in the

@@ -1557,6 +1557,338 @@ func TestDispatchToHarness_ProviderCannotServeModel_FailsLoudly(t *testing.T) {
 	}
 }
 
+// ambientDispatchTestFixture stands up a LocalHarnessController wired to a
+// named "lmstudio" provider backed by an httptest server that records the
+// system-role message content of every /v1/chat/completions request it
+// receives. Shared by the two req.Ambient tests below.
+func ambientDispatchTestFixture(t *testing.T) (ctrl *LocalHarnessController, capturedSystemPrompts *[]string) {
+	t.Helper()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	prompts := make([]string, 0, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gemma-4-e4b","object":"model"}]}`))
+		case "/v1/chat/completions":
+			var body struct {
+				Messages []struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for _, m := range body.Messages {
+				if m.Role == "system" {
+					prompts = append(prompts, m.Content)
+					break
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": "ambient-test response"},
+					"finish_reason": "stop",
+				}},
+			})
+		default:
+			t.Errorf("ambientDispatchTestFixture: unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
+  lmstudio:
+    type: openai
+    endpoint: `+srv.URL+`
+    model: gemma-4-e4b
+`)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	server := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	c, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, server.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+	return c, &prompts
+}
+
+// TestDispatchToHarness_AmbientFalse_MessageSetUnchanged verifies that
+// leaving req.Ambient at its zero value (false) — the behavior of every
+// caller that predates this field — produces the exact same system prompt
+// DispatchToHarness has always composed: the harness orientation block plus
+// the default dispatch prompt, with no ambient block anywhere in it. This is
+// the "existing callers are byte-identical" half of the opt-in contract.
+func TestDispatchToHarness_AmbientFalse_MessageSetUnchanged(t *testing.T) {
+	ctrl, prompts := ambientDispatchTestFixture(t)
+
+	want := ctrl.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "ambient=false control",
+		Provider:       "lmstudio",
+		N:              1,
+		TimeoutSeconds: 10,
+		// Ambient omitted: zero value, i.e. false.
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if !batch.Results[0].Success {
+		t.Fatalf("Results[0].Success = false; error=%q", batch.Results[0].Error)
+	}
+	if len(*prompts) != 1 {
+		t.Fatalf("captured %d system prompts; want 1", len(*prompts))
+	}
+	got := (*prompts)[0]
+	if got != want {
+		t.Errorf("system prompt with Ambient=false diverged from the pre-existing composition:\ngot:  %q\nwant: %q", got, want)
+	}
+	if strings.Contains(got, "ambient state of self") {
+		t.Errorf("system prompt with Ambient=false unexpectedly contains the ambient block")
+	}
+}
+
+// TestDispatchToHarness_AmbientTrue_PrependsAmbientBlock verifies that
+// req.Ambient=true prepends a block carrying live health/workspace/identity
+// state ahead of the harness's normal system prompt, using the same
+// AdditionalContext-prepend pattern the PreInference hook already uses on
+// the main chat/external-CLI path. The pre-existing prompt content must
+// still be present and untouched — only prefixed.
+func TestDispatchToHarness_AmbientTrue_PrependsAmbientBlock(t *testing.T) {
+	ctrl, prompts := ambientDispatchTestFixture(t)
+
+	base := ctrl.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "ambient=true test",
+		Provider:       "lmstudio",
+		N:              1,
+		TimeoutSeconds: 10,
+		Ambient:        true,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if !batch.Results[0].Success {
+		t.Fatalf("Results[0].Success = false; error=%q", batch.Results[0].Error)
+	}
+	if len(*prompts) != 1 {
+		t.Fatalf("captured %d system prompts; want 1", len(*prompts))
+	}
+	got := (*prompts)[0]
+
+	if !strings.HasPrefix(got, "=== ambient state of self ===") {
+		t.Errorf("system prompt with Ambient=true does not start with the ambient block marker:\n%s", got)
+	}
+	if !strings.Contains(got, "health_counts:") {
+		t.Errorf("ambient block missing health_counts line:\n%s", got)
+	}
+	if !strings.Contains(got, "workspace=") {
+		t.Errorf("ambient block missing workspace= line:\n%s", got)
+	}
+	if !strings.Contains(got, "identity=Cog") {
+		t.Errorf("ambient block missing identity= line:\n%s", got)
+	}
+	if !strings.HasSuffix(got, base) {
+		t.Errorf("ambient-prefixed prompt does not end with the unchanged base prompt:\ngot:  %q\nbase: %q", got, base)
+	}
+}
+
+// TestDispatchToHarness_AmbientTrue_DoesNotConsumeAbandonedInferenceDelta is
+// the #432 regression test for gate finding 1 on the ambient-context PR:
+// buildAmbientBlock used to call the CONSUMING buildKernelHealthSnapshot,
+// whose abandonedInferenceSnapshot() read swaps-and-resets the process-global
+// #432 abandoned-inference watermark. The autonomic ticker (autonomicTick)
+// is the production consumer that relies on "delta since my last tick" to
+// drive escalateAbandonedInference; a concurrent Ambient=true dispatch that
+// read the watermark first would silently zero the delta the ticker needed,
+// suppressing #432's own escalation path — exactly the "vitals reading 0anom
+// for hours" failure mode #432 exists to catch.
+//
+// This test proves: (1) an Ambient=true dispatch still SEES a pending
+// abandoned-inference delta (the block remains informative — it uses the
+// non-consuming buildKernelHealthSnapshotPeek/abandonedInferencePeek), and
+// (2) it does NOT consume that delta — a subsequent (consuming)
+// buildKernelHealthSnapshot call, standing in for the next autonomic tick,
+// still observes the delta and shouldEscalate still returns
+// escalateAbandonedInference.
+func TestDispatchToHarness_AmbientTrue_DoesNotConsumeAbandonedInferenceDelta(t *testing.T) {
+	ctrl, prompts := ambientDispatchTestFixture(t)
+
+	// Baseline the #432 watermark so this test's delta isn't polluted by
+	// other tests sharing the process-global counter (same convention as
+	// TestRecordAbandonedInferenceIncrementsSnapshotDelta).
+	_, _ = abandonedInferenceSnapshot()
+
+	// Simulate a pending #432 abandonment the autonomic ticker has not yet
+	// consumed.
+	recordAbandonedInference("ambient-nonconsume-test", "", errCanceledForTest{})
+
+	batch, dispErr := ctrl.DispatchToHarness(context.Background(), DispatchRequest{
+		Task:           "ambient nonconsume test",
+		Provider:       "lmstudio",
+		N:              1,
+		TimeoutSeconds: 10,
+		Ambient:        true,
+	})
+	if dispErr != nil {
+		t.Fatalf("DispatchToHarness: %v", dispErr)
+	}
+	if !batch.Results[0].Success {
+		t.Fatalf("Results[0].Success = false; error=%q", batch.Results[0].Error)
+	}
+	if len(*prompts) != 1 {
+		t.Fatalf("captured %d system prompts; want 1", len(*prompts))
+	}
+	got := (*prompts)[0]
+	if !strings.Contains(got, "anomalies=1") {
+		t.Errorf("ambient block should report the pending abandoned-inference delta (anomalies=1), got:\n%s", got)
+	}
+
+	// The critical assertion: the autonomic ticker's own (consuming) snapshot
+	// must STILL see the delta after the ambient dispatch ran. Before the
+	// fix, buildAmbientBlock's call to the consuming buildKernelHealthSnapshot
+	// would already have swapped the watermark, so this read would
+	// incorrectly return Anomalies=0 here.
+	snap := buildKernelHealthSnapshot(context.Background())
+	if snap.Anomalies != 1 {
+		t.Fatalf("autonomic ticker's snapshot Anomalies = %d; want 1 (the ambient dispatch must not have consumed the #432 delta)", snap.Anomalies)
+	}
+
+	reason := shouldEscalate(snap, false, time.Time{}, AutonomicConfig{IdleRecheckIn: time.Hour})
+	if reason != escalateAbandonedInference {
+		t.Errorf("shouldEscalate = %q; want %q (a subsequent autonomic tick must still escalate on the abandoned-inference delta)", reason, escalateAbandonedInference)
+	}
+}
+
+// TestDispatchToHarness_AmbientTrue_ConcurrentSameRequestIDIsDeduped is the
+// #432 retry-discipline regression test for gate finding 2 on the
+// ambient-context PR: buildAmbientBlock embeds a live time= line and
+// fluctuating health_counts data, so before the fix the content-stable
+// RequestID hash — computed from systemPrompt+task+tool-names AFTER the
+// ambient block was prepended — differed across two otherwise-identical
+// Ambient=true dispatches, defeating the in-flight dedup guard
+// (beginInflightInference) that
+// TestCompleteWithToolLoop_ConcurrentSameRequestIDIsDeduped exercises for the
+// non-ambient path.
+//
+// This test forces the two calls' ambient blocks to differ (distinct
+// synthetic time= and health_counts content, the same shape buildAmbientBlock
+// itself produces call-to-call) and then asserts the second call still
+// collides with the first at the in-flight registry. A collision is only
+// possible if both calls produced the same RequestID, which only happens if
+// the hash is computed from the pre-ambient base prompt.
+//
+// Exercised directly against dispatchSlot (rather than through
+// DispatchToHarness, whose c.ollamaMu batch-level mutex serializes all
+// local-provider dispatches and would make the second call wait for the
+// first to fully finish — including its timeout — before even attempting
+// registration, masking the very race this test needs to observe) to isolate
+// exactly the mechanism the fix touches, the same reasoning
+// TestCompleteWithToolLoop_ConcurrentSameRequestIDIsDeduped's own doc comment
+// gives for bypassing DispatchToHarness.
+func TestDispatchSlot_AmbientTrue_ConcurrentSameRequestIDIsDeduped(t *testing.T) {
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+
+	releaseFirst := make(chan struct{})
+	var firstArrived sync.WaitGroup
+	firstArrived.Add(1)
+	var firstArrivedOnce sync.Once
+
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"id": "gemma4:e4b", "object": "model"}},
+			})
+		case "/v1/chat/completions":
+			firstArrivedOnce.Do(func() { firstArrived.Done() })
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n")
+			flusher.Flush()
+			// Hold the stream open until the test releases it, simulating a
+			// long-running generation the second (would-be duplicate) call
+			// would race against.
+			<-releaseFirst
+			fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer llm.Close()
+	t.Setenv(localLLMEndpointEnv, llm.URL)
+
+	proc := NewProcess(cfg, makeNucleus("Cog", "tester"))
+	srv := NewServer(cfg, makeNucleus("Cog", "tester"), proc)
+	ctrl, err := NewLocalHarnessController(cfg, makeNucleus("Cog", "tester"), proc, srv.mcpServer)
+	if err != nil {
+		t.Fatalf("NewLocalHarnessController: %v", err)
+	}
+
+	provider := NewOpenAICompatProvider("agent-local", ProviderConfig{
+		Endpoint: llm.URL,
+		Model:    "gemma4:e4b",
+		Timeout:  10,
+	})
+	registry := NewKernelToolRegistry(srv.mcpServer)
+
+	req := DispatchRequest{
+		Task:           "ambient-dedup dispatchSlot task",
+		TimeoutSeconds: 10,
+		Ambient:        true,
+	}
+
+	// Two synthetic ambient blocks that differ exactly the way two real
+	// buildAmbientBlock calls would (different time=, different
+	// health_counts anomalies=), standing in for what a real second call
+	// would compute a moment later without needing to race real wall-clock
+	// or counter state.
+	ambientA := "=== ambient state of self ===\ntime=2026-01-01T00:00:00Z\n" +
+		"health_counts: healthy=1 degraded=0 missing=0 suspended=0 anomalies=0\n" +
+		"=== end ambient state ==="
+	ambientB := "=== ambient state of self ===\ntime=2026-01-01T00:00:05Z\n" +
+		"health_counts: healthy=1 degraded=0 missing=0 suspended=0 anomalies=1\n" +
+		"=== end ambient state ==="
+	if ambientA == ambientB {
+		t.Fatal("test setup bug: ambientA and ambientB must differ")
+	}
+
+	type outcome struct {
+		res DispatchResult
+	}
+	results := make(chan outcome, 1)
+
+	go func() {
+		res := ctrl.dispatchSlot(context.Background(), provider, registry, "gemma4:e4b", DispatchModel(""), req, 0, "", "anonymous", ambientA)
+		results <- outcome{res}
+	}()
+	firstArrived.Wait()
+
+	res2 := ctrl.dispatchSlot(context.Background(), provider, registry, "gemma4:e4b", DispatchModel(""), req, 0, "", "anonymous", ambientB)
+	if res2.Success {
+		t.Fatal("expected the second, concurrent, content-identical Ambient=true dispatchSlot call (differing only in ambient content) to be refused by the in-flight dedup guard, but it succeeded")
+	}
+	if !strings.Contains(res2.Error, "already in flight") {
+		t.Errorf("expected second dispatchSlot call's error to report the in-flight dedup collision, got: %q", res2.Error)
+	}
+
+	close(releaseFirst)
+	first := <-results
+	if !first.res.Success {
+		t.Fatalf("first dispatchSlot call should have succeeded once released, got error: %q", first.res.Error)
+	}
+}
+
 // TestDispatchToHarness_ConcurrentIdenticalDispatchIsDeduped is the #432
 // retry-discipline regression test: dispatchSlot's RequestID is a
 // content-stable hash of systemPrompt+task+tool-names (for KV-cache sharing

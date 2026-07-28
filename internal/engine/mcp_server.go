@@ -897,6 +897,7 @@ type dispatchToHarnessInput struct {
 	Claims       map[string]interface{} `json:"claims,omitempty" jsonschema:"Free-form OIDC claim bag forwarded to the dispatch's trace metadata."`
 	TargetNode   string                 `json:"target_node,omitempty" jsonschema:"Phase 2 S4: when set, forward this dispatch to the named peer node over the authenticated BEP cluster channel. Requires cluster.enabled=true and the peer to be connected. Empty (default) runs on the local harness."`
 	Async        bool                   `json:"async,omitempty" jsonschema:"When true, return a job handle immediately ({job_id, status:\"pending\"}) instead of blocking until the dispatch completes. Poll the job via GET /v1/dispatch-jobs/{id} or the cog_poll_dispatch tool. Default false (synchronous, unchanged behavior)."`
+	Ambient      bool                   `json:"ambient,omitempty" jsonschema:"When true, prepend an ambient-state-of-self block (cogdoc 16) to the system prompt of every fan-out slot in this batch — live kernel health (provider status, anomaly counts), workspace, identity, process state, and fovea top-5, computed once per batch. Default false (unchanged behavior); intended for looped kernel-interior callers (ralph runners, RFC-036 seats) that dispatch repeatedly and benefit from knowing what the kernel's body is doing between runs."`
 }
 
 // dispatchJobReceipt is the immediate response for an async dispatch — the
@@ -2093,6 +2094,7 @@ func (m *MCPServer) toolDispatchToHarness(ctx context.Context, req *mcp.CallTool
 			Claims: input.Claims,
 		},
 		TargetNode: input.TargetNode,
+		Ambient:    input.Ambient,
 	}
 
 	if input.Async {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 	"github.com/myrgic/cogos/trace"
 )
 
@@ -1055,6 +1056,54 @@ func (c *LocalHarnessController) buildObservation(triggerReason string) string {
 	return b.String()
 }
 
+// buildAmbientBlock assembles the "ambient state of self" context block for
+// looped kernel-interior dispatch batches (cogdoc 16, drafted 2026-05-11).
+// It reuses buildObservation's gathering half — time/workspace/identity/
+// process_state/fovea/last_cycle — the same per-tick ambient assembler the
+// autonomic loop already builds for itself, and layers on a kernel health
+// summary from buildKernelHealthSnapshot (autonomic_ticker.go).
+//
+// This gives bus_kernel_proprio's KernelHealthSnapshot its first reader:
+// that channel has been write-only since birth (a 60s writer with zero
+// readers). Sharing the snapshot source here does not attach a reader to the
+// bus itself, but it does mean the same live-health computation now backs
+// both the write-only bus emission and this in-loop context injection.
+//
+// DispatchToHarness calls this once per batch (not once per fan-out slot) —
+// the ambient state does not vary within a single dispatch call, and probing
+// provider health per-slot would be wasted work under N>1 fan-out.
+func (c *LocalHarnessController) buildAmbientBlock(ctx context.Context) string {
+	var b strings.Builder
+	b.WriteString("=== ambient state of self ===\n")
+	b.WriteString(c.buildObservation(""))
+
+	// Use the non-consuming peek form: this is a concurrent, informational
+	// caller relative to the autonomic ticker's own buildKernelHealthSnapshot
+	// call (local_agent_harness.go's autonomicTick, above). Using the
+	// consuming form here would swap-and-reset the #432 abandoned-inference
+	// watermark out from under the ticker, silently suppressing
+	// escalateAbandonedInference on its next tick. See
+	// buildKernelHealthSnapshotPeek and abandonedInferencePeek for the full
+	// rationale.
+	snap := buildKernelHealthSnapshotPeek(ctx)
+	fmt.Fprintf(&b, "health_counts: healthy=%d degraded=%d missing=%d suspended=%d anomalies=%d\n",
+		snap.Counts.Healthy, snap.Counts.Degraded, snap.Counts.Missing, snap.Counts.Suspended, snap.Anomalies)
+	if !snap.AllGreen() && len(snap.Providers) > 0 {
+		unhealthy := make([]string, 0, len(snap.Providers))
+		for name, st := range snap.Providers {
+			if st.Health != reconcile.HealthHealthy && st.Health != "" {
+				unhealthy = append(unhealthy, fmt.Sprintf("%s=%s", name, st.Health))
+			}
+		}
+		if len(unhealthy) > 0 {
+			sort.Strings(unhealthy)
+			fmt.Fprintf(&b, "degraded_providers: %s\n", strings.Join(unhealthy, ", "))
+		}
+	}
+	b.WriteString("=== end ambient state ===")
+	return b.String()
+}
+
 func (c *LocalHarnessController) localModelHint() string {
 	if c.cfg != nil && strings.TrimSpace(c.cfg.LocalModel) != "" {
 		return strings.TrimSpace(c.cfg.LocalModel)
@@ -1627,13 +1676,34 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 		},
 	})
 
+	// start begins the batch timer BEFORE the ambient-state block (below) is
+	// built. buildAmbientBlock -> buildKernelHealthSnapshotPeek ->
+	// probeAllProviders performs a real, sequential per-provider Health()
+	// probe (context_blocks_health.go: up to healthProbeTimeout==200ms per
+	// provider, so worst case N_providers x 200ms of wall time) — confirmed
+	// non-trivial I/O, not free work. Starting the timer first ensures
+	// TotalDurationSec reflects the batch's true wall-clock cost for
+	// Ambient=true callers instead of undercounting by the ambient-probe
+	// latency.
 	start := time.Now()
+
+	// req.Ambient (opt-in, default false — existing callers unaffected): build
+	// the ambient-state-of-self block once per batch, not once per fan-out
+	// slot. Health-snapshot probing is real work (probeAllProviders) and the
+	// ambient state does not vary within a single DispatchToHarness call, so
+	// computing it once and sharing it across all N slots is both cheaper and
+	// correct — every slot in the batch observes the same instant.
+	var ambientBlock string
+	if req.Ambient {
+		ambientBlock = c.buildAmbientBlock(ctx)
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < req.N; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote, subject)
+			batch.Results[idx] = c.dispatchSlot(ctx, provider, registry, model, routeUsed, req, idx, slotNote, subject, ambientBlock)
 		}(i)
 	}
 	wg.Wait()
@@ -1656,7 +1726,11 @@ func (c *LocalHarnessController) DispatchToHarness(ctx context.Context, req Disp
 
 // dispatchSlot executes one fan-out slot. subject is the resolved dispatch
 // identity (RFC-identity-embedding I1/I2): "anonymous" or req.Identity.Sub.
-func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string, subject string) DispatchResult {
+// ambientBlock is the (possibly empty) ambient-state-of-self block computed
+// once per batch by DispatchToHarness when req.Ambient is set; empty when
+// ambient injection is off (the default), leaving existing callers
+// byte-identical.
+func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider Provider, registry *KernelToolRegistry, model string, routeUsed DispatchModel, req DispatchRequest, idx int, slotNote string, subject string, ambientBlock string) DispatchResult {
 	res := DispatchResult{
 		Index:        idx,
 		ModelUsed:    routeUsed,
@@ -1674,6 +1748,7 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		// When req.SystemPrompt is set the caller owns the prompt; use it verbatim.
 		systemPrompt = c.harnessOrientationBlock + "\n\n" + localHarnessDispatchPrompt
 	}
+
 	counting := &countingProvider{Provider: provider}
 
 	// ADR-066 §models-always-swappable: temperature and max_tokens must be
@@ -1688,9 +1763,20 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 	}
 
 	// ADR-066 §KV-Cache-Branching: RequestID must be content-stable so that
-	// identical fan-out slots share a KV-cache prefix. Hash (systemPrompt +
-	// task + sorted tool names); append idx only for per-slot log uniqueness —
-	// the prefix up to the dash is cache-relevant and identical across slots.
+	// identical fan-out slots share a KV-cache prefix, AND so that a retried
+	// identical dispatch dedupes against the in-flight registry (#432 retry
+	// discipline, inference_inflight.go beginInflightInference). Hash the
+	// BASE systemPrompt (pre-ambient) + task + sorted tool names; append idx
+	// only for per-slot log uniqueness — the prefix up to the dash is
+	// cache-relevant and identical across slots.
+	//
+	// Deliberately hashed BEFORE the ambient-state block (below) is prepended:
+	// buildAmbientBlock embeds a live time=<RFC3339> line and fluctuating
+	// health data, so two otherwise-identical retries of the same task would
+	// hash differently if ambient content were included, producing distinct
+	// RequestIDs and silently defeating the dedup guard for every
+	// req.Ambient=true caller. The ambient block affects what the provider
+	// sees, not the request's identity.
 	//
 	// registry.Definitions() returns the registry's own backing slice by
 	// reference (tool_loop.go KernelToolRegistry.Definitions), and registry
@@ -1717,6 +1803,21 @@ func (c *LocalHarnessController) dispatchSlot(parent context.Context, provider P
 		h.Write([]byte(n))
 	}
 	contentKey := hex.EncodeToString(h.Sum(nil))[:16]
+
+	// Ambient-state injection (cogdoc 16), opt-in via req.Ambient. Prepended
+	// ahead of the resolved system prompt — the same AdditionalContext +
+	// "\n\n" + SystemPrompt pattern the PreInference hook uses on the main
+	// chat/external-CLI path (harness/harness.go RunInference). That path is
+	// wired to the chat harness only; this is the same sandwich applied at
+	// the seam LocalHarnessController.DispatchToHarness never had one.
+	//
+	// Applied AFTER contentKey is computed (above) — see the comment there:
+	// the ambient block is live/call-varying content that must reach the
+	// provider without becoming part of the request's content-stable
+	// identity.
+	if ambientBlock != "" {
+		systemPrompt = ambientBlock + "\n\n" + systemPrompt
+	}
 
 	compReq := &CompletionRequest{
 		SystemPrompt: systemPrompt,

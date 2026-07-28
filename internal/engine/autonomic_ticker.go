@@ -156,7 +156,33 @@ func (a AutonomicConfig) idleRecheckIn() time.Duration {
 // aggregate snapshot. Uses the same probeAllProviders machinery as
 // buildHealthBlock (context_blocks_health.go) so the two surfaces stay
 // consistent.
+//
+// This is the CONSUMING form: it reads the abandoned-inference watermark via
+// abandonedInferenceSnapshot, which swaps-and-resets the delta. The autonomic
+// ticker (autonomicTick, below) is the sole production caller of this form —
+// it relies on "delta since my last tick" to drive #432 escalation
+// (shouldEscalate / escalateAbandonedInference). Any other production caller
+// that reads kernel health for informational/display purposes MUST use
+// buildKernelHealthSnapshotPeek instead, or it will silently steal the
+// ticker's delta. See inference_inflight.go's abandonedInferencePeek doc.
 func buildKernelHealthSnapshot(ctx context.Context) KernelHealthSnapshot {
+	return buildKernelHealthSnapshotWith(ctx, abandonedInferenceSnapshot)
+}
+
+// buildKernelHealthSnapshotPeek is identical to buildKernelHealthSnapshot
+// except it reads the abandoned-inference counter via the non-consuming
+// abandonedInferencePeek, leaving the watermark the autonomic ticker depends
+// on untouched. Use this from any concurrent, informational production
+// caller (e.g. the ambient-state-of-self block for looped kernel-interior
+// dispatch) so the ticker remains the only consumer of the delta.
+func buildKernelHealthSnapshotPeek(ctx context.Context) KernelHealthSnapshot {
+	return buildKernelHealthSnapshotWith(ctx, abandonedInferencePeek)
+}
+
+// buildKernelHealthSnapshotWith is the shared implementation behind both
+// forms above; readAbandoned selects consuming vs. non-consuming semantics
+// for the #432 abandoned-inference counter.
+func buildKernelHealthSnapshotWith(ctx context.Context, readAbandoned func() (total int64, delta int64)) KernelHealthSnapshot {
 	snap := KernelHealthSnapshot{
 		Timestamp: time.Now().UTC(),
 		Providers: make(map[string]reconcile.ResourceStatus),
@@ -166,7 +192,7 @@ func buildKernelHealthSnapshot(ctx context.Context) KernelHealthSnapshot {
 	// regardless of provider registry state — this is a control-loop signal,
 	// not a per-provider one, and must not be skipped by the empty-registry
 	// early return below.
-	total, delta := abandonedInferenceSnapshot()
+	total, delta := readAbandoned()
 	snap.Anomalies = int(delta)
 	snap.AnomaliesTotal = total
 
