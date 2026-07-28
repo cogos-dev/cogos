@@ -131,7 +131,7 @@ func TestAllGreen_UnaffectedByHostVitals(t *testing.T) {
 		UptimeSeconds: &extreme,
 	}
 	if !withExtremeVitals.AllGreen() {
-		t.Fatal("RFC-037 N5 violated: extreme HostVitals readings must not affect AllGreen()")
+		t.Fatal("RFC-040 N5 violated: extreme HostVitals readings must not affect AllGreen()")
 	}
 
 	degradedButVitalsEmpty := base

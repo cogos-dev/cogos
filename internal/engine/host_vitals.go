@@ -1,9 +1,9 @@
-// host_vitals.go — RFC-037 S0: host gauges sampled into the existing
+// host_vitals.go — RFC-040 S0: host gauges sampled into the existing
 // autonomic tick.
 //
 // This is deliberately NOT a new loop or daemon: sampleHostVitals is called
 // once per invocation of buildKernelHealthSnapshotWith (autonomic_ticker.go),
-// which is already the tick's aggregation point. Per RFC-037 N5, everything
+// which is already the tick's aggregation point. Per RFC-040 N5, everything
 // here is an OBSERVATION — no gauge value feeds AllGreen() or any
 // escalation decision.
 //
@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// HostVitals is the RFC-037 S0 host-gauge block. Every field is a pointer so
+// HostVitals is the RFC-040 S0 host-gauge block. Every field is a pointer so
 // a gauge that fails to sample is simply absent from the JSON via
 // omitempty — never a zero-value placeholder standing in for "unknown".
 type HostVitals struct {
@@ -42,7 +42,7 @@ type HostVitals struct {
 	// nothing to fail.
 	UptimeSeconds *uint64 `json:"uptime_seconds,omitempty"`
 
-	// InferenceP50Ms and InferenceQueue from the RFC-037 S0 design sketch
+	// InferenceP50Ms and InferenceQueue from the RFC-040 S0 design sketch
 	// are intentionally NOT included in this struct. Neither is cheaply
 	// readable from an existing in-process structure today: no rolling
 	// latency history is retained anywhere (DispatchResult.DurationSec in
@@ -62,7 +62,7 @@ type HostVitals struct {
 // of buildKernelHealthSnapshot/-Peek would need updating to add one).
 var kernelProcessStart = time.Now()
 
-// sampleHostVitals samples every RFC-037 S0 gauge for one tick. Best-effort
+// sampleHostVitals samples every RFC-040 S0 gauge for one tick. Best-effort
 // throughout: any individual failure degrades soft (field left nil) rather
 // than failing the whole sample, panicking, or blocking the tick.
 func sampleHostVitals() HostVitals {
