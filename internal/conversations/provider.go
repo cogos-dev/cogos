@@ -400,6 +400,16 @@ func (p *Provider) ComputePlan(config any, live any, _ *reconcile.State) (*recon
 	// A newly computed plan has not been applied yet. Health reads this to
 	// distinguish pending work from work already resolved.
 	p.planApplied = false
+	// A plan with no changes is itself proof that the corpus is converged —
+	// whatever failed in an earlier apply is no longer outstanding. Without
+	// this reset, applyFailures latches: ApplyPlan is the only other writer,
+	// and the autonomic ticker skips ApplyPlan whenever the plan has no
+	// changes, so a single past failure would pin Sync at OutOfSync forever.
+	// That is the same permanent-divergence bug class this fix exists to
+	// remove, so it must not be reintroduced through the failure path.
+	if !plan.Summary.HasChanges() {
+		p.applyFailures = 0
+	}
 	p.mu.Unlock()
 
 	return plan, nil

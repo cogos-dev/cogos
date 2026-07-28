@@ -93,6 +93,61 @@ func TestHealth_ComputePlanClearsAppliedFlag(t *testing.T) {
 	}
 }
 
+// A past apply failure must not latch. applyFailures is written only by
+// ApplyPlan, and the autonomic ticker skips ApplyPlan whenever the recomputed
+// plan has no changes — so without an explicit reset, one historical failure
+// would pin Sync at OutOfSync forever. That is the same permanent-divergence
+// bug this fix removes, arriving through the failure path instead.
+func TestHealth_StaleApplyFailuresDoNotLatch(t *testing.T) {
+	p := NewProvider()
+
+	// Simulate a prior cycle that applied and had a failure.
+	p.mu.Lock()
+	p.applyFailures = 1
+	p.planApplied = true
+	p.mu.Unlock()
+
+	if got := p.Health().Sync; got != reconcile.SyncStatusOutOfSync {
+		t.Fatalf("with an outstanding failure: want OutOfSync, got %s", got)
+	}
+
+	// A later cycle recomputes and finds nothing to do. The corpus is
+	// converged, so the historical failure is no longer outstanding.
+	// An empty providerConfig/liveState yields a genuinely no-change plan
+	// without depending on whatever sessions happen to exist on the host.
+	cfg := &providerConfig{Root: t.TempDir()}
+	live := &liveState{Entries: map[string]IndexEntry{}}
+	plan, err := p.ComputePlan(cfg, live, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if plan.Summary.HasChanges() {
+		t.Fatalf("precondition: empty corpus should yield a no-change plan, got %+v", plan.Summary)
+	}
+
+	if got := p.Health().Sync; got != reconcile.SyncStatusSynced {
+		t.Fatalf("after a no-change plan: want Synced, got %s — "+
+			"a stale applyFailures latched OutOfSync forever", got)
+	}
+}
+
+// A no-change plan must NOT clear a failure count that is still outstanding in
+// the same cycle: only the recompute-finds-nothing case is proof of
+// convergence. Guards the reset from being widened into a blanket clear.
+func TestHealth_FailuresSurviveWhenPlanStillHasChanges(t *testing.T) {
+	p := NewProvider()
+
+	p.mu.Lock()
+	p.applyFailures = 2
+	p.planApplied = true
+	p.lastPlanSummary.Updates = 1
+	p.mu.Unlock()
+
+	if got := p.Health().Sync; got != reconcile.SyncStatusOutOfSync {
+		t.Fatalf("outstanding failures with pending work: want OutOfSync, got %s", got)
+	}
+}
+
 // End-to-end convergence: the same unchanged corpus reconciled twice must not
 // report OutOfSync on the second pass. This is the property whose absence made
 // the reconciler run forever.
