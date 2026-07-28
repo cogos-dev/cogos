@@ -24,9 +24,21 @@
 # an exact value. Note the release workflow does NOT go through make — it calls
 # `go build` with its own ldflags (release.yml:95) — so releases are unaffected
 # by this default either way.
+#
+# The `dev-` prefix is load-bearing, not cosmetic. A bare `git describe` string
+# like `v0.16.22-6-g4f0acf1-dirty` is VALID semver whose suffix is a PRERELEASE,
+# and prereleases sort BEFORE their base tag under golang.org/x/mod/semver — see
+# internal/providers/selfupdate/version_test.go:35-36. So a bare describe string
+# reads as OLDER than the release it descends from: GATE D (provider.go:272)
+# does not fire because the version parses, and GATE F (provider.go:282) does not
+# fire because versionAfter("v0.16.22", "v0.16.22-6-g4f0acf1-dirty") is TRUE.
+# Self-update would then overwrite the dev binary with the plain release — the
+# exact clobber this PR exists to prevent. Prefixing with `dev-` makes
+# normVersion() return "" so GATE D fires and self-update stays inert, while the
+# full describe string is retained for traceability.
 # Falls back to the honest "dev" (matching internal/engine/cli.go:32's default)
 # when git is unavailable, e.g. a source tarball with no .git.
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION ?= $(shell d=$$(git describe --tags --always --dirty 2>/dev/null) && echo "dev-$$d" || echo dev)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=$(BUILD_TIME) -X github.com/myrgic/cogos/internal/engine.Version=$(VERSION)
 BUILD_TAGS := fts5
