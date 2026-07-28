@@ -1043,9 +1043,31 @@ func loadOrCreateNodeID(cfg *Config) string {
 	// "sealed device identity" — collapses two identity primitives into one).
 	// Reads the cert file directly, so it is independent of whether the BEP
 	// engine is enabled/running (cluster.enabled may be false at this point in
-	// boot). Falls back to a UUID when no cert exists (fresh node, BEP never
-	// initialized) — strictly preserving prior behavior.
+	// boot).
+	//
+	// ORDERING: NewProcess runs at boot.go:196, long before the cluster/BEP
+	// block at boot.go:327, and `bep-cert gen` is a manual CLI step that Boot
+	// never invokes. So on the realistic operator path — boot with
+	// cluster.enabled=false (the default), opt into clustering later — no cert
+	// exists at mint time and, because an existing id is never rewritten, the
+	// anchor would never activate for that node. Reading the cert alone is
+	// therefore not sufficient: we MINT the device identity here if it is
+	// absent, so that the node's first-ever id is device-anchored regardless of
+	// when (or whether) clustering is later enabled.
+	//
+	// This does not weaken dark-by-default: dark-by-default is a statement about
+	// network behavior (no listener, no goroutines, no port bind), and that is
+	// unchanged. Creating the local keypair is a filesystem-only act, the same
+	// class as minting the UUID it replaces.
 	id := bepAnchoredNodeID()
+	if id == "" {
+		if err := ensureBEPDeviceIdentity(); err == nil {
+			id = bepAnchoredNodeID()
+		} else {
+			slog.Debug("nodeid: could not mint BEP device identity; using UUID",
+				"err", fmt.Sprintf("%v", err))
+		}
+	}
 	if id == "" {
 		id = uuid.NewString()
 	}
@@ -1054,6 +1076,11 @@ func loadOrCreateNodeID(cfg *Config) string {
 	}
 	return id
 }
+
+// nodeIDCertDir resolves the BEP cert dir used for node-id anchoring. It is a
+// package var solely so tests can point it at a t.TempDir() and stay hermetic;
+// production always resolves the canonical dir (~/.cog/etc).
+var nodeIDCertDir = func() string { return bep.ExpandCertDir("") }
 
 // bepAnchoredNodeID returns the formatted BEP DeviceID derived from the node's
 // on-disk BEP certificate, or "" when no usable cert is present. Never panics;
@@ -1069,7 +1096,7 @@ func loadOrCreateNodeID(cfg *Config) string {
 // NewProcess to stay consistent; until then such a node anchors to the default
 // dir or falls back to UUID. Tracked as a follow-up, not silently correct.
 func bepAnchoredNodeID() string {
-	cert, err := bep.LoadBEPCert(bep.ExpandCertDir(""))
+	cert, err := bep.LoadBEPCert(nodeIDCertDir())
 	if err != nil {
 		return ""
 	}
@@ -1078,6 +1105,31 @@ func bepAnchoredNodeID() string {
 		return ""
 	}
 	return bep.FormatDeviceID(devID)
+}
+
+// ensureBEPDeviceIdentity generates the node's BEP keypair in the canonical
+// cert dir when none exists, so that node-id minting can anchor to a device
+// identity on a node's very first boot — before, and independently of, any
+// decision to enable clustering. Generating the keypair binds no port and
+// starts no goroutine; the BEP engine remains dark until cluster.enabled=true.
+// Returns an error when the identity could not be established, in which case
+// the caller falls back to a UUID exactly as before.
+func ensureBEPDeviceIdentity() error {
+	dir := nodeIDCertDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create cert dir: %w", err)
+	}
+	if err := bep.GenerateBEPCert(dir); err != nil {
+		// A cert appearing concurrently is success, not failure: the only thing
+		// that matters is that a usable identity is present on disk.
+		if _, statErr := os.Stat(filepath.Join(dir, "bep-cert.pem")); statErr == nil {
+			return nil
+		}
+		return fmt.Errorf("generate BEP cert: %w", err)
+	}
+	slog.Info("nodeid: minted BEP device identity for node-id anchoring (RFC-036)",
+		"cert_dir", dir)
+	return nil
 }
 
 func (p *Process) nucleusDigest() string {
