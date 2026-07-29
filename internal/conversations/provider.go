@@ -521,6 +521,35 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 	// idx.ListSessions(...) scan of the entire index.
 	bySource := idx.SessionIDsBySource()
 
+	// pendingCCUpserts/pendingCCDeletes accumulate the CC (source_dirs)
+	// path's create/update/delete actions across the WHOLE action loop below,
+	// so they can be committed via one UpsertSessions/DeleteSessions call
+	// each after the loop, instead of one idx.UpsertSession/idx.DeleteSession
+	// call — and one full writeMetaFileLocked round trip — per action.
+	//
+	// This is remedy 1 applied to the CC path specifically (cog-review, PR
+	// #495 first pass): the normalized-ingest path (applyIngestSource, just
+	// below) already batches its whole source's sessions into one call, but
+	// this sibling branch of the SAME action loop parses and upserts one CC
+	// session file per action individually. Left unbatched, N actively-used
+	// CC sessions drifting in the same ~30s poll window would reproduce the
+	// identical O(N) full-_meta.json-rewrite-per-cycle defect issue #494
+	// measured, just via this path instead of the ingest one.
+	//
+	// Each pending entry carries its own reconcile.Result template (Phase/
+	// Action/Name already set) so the eventual batch call's single
+	// success/failure can be projected back onto every action it covers,
+	// without a placeholder that would otherwise be reordered.
+	var pendingCCUpserts []struct {
+		res  reconcile.Result
+		name string
+		item SessionAndTurns
+	}
+	var pendingCCDeletes []struct {
+		res  reconcile.Result
+		name string
+	}
+
 	for _, action := range plan.Actions {
 		if action.Action == reconcile.ActionSkip {
 			// For skipped ingest sources the data has NOT drifted (ActionSkip is
@@ -620,24 +649,70 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				continue
 			}
 
-			if upsertErr := idx.UpsertSession(meta, turns); upsertErr != nil {
+			// Deferred: this session's meta write is committed via the
+			// batched idx.UpsertSessions call after the loop, not here. res
+			// (Phase/Action/Name already set above) is finalized once that
+			// batch's outcome is known.
+			pendingCCUpserts = append(pendingCCUpserts, struct {
+				res  reconcile.Result
+				name string
+				item SessionAndTurns
+			}{res: res, name: action.Name, item: SessionAndTurns{Meta: meta, Turns: turns}})
+
+		case reconcile.ActionDelete:
+			// Deferred: committed via the batched idx.DeleteSessions call
+			// after the loop — see pendingCCUpserts' comment above.
+			pendingCCDeletes = append(pendingCCDeletes, struct {
+				res  reconcile.Result
+				name string
+			}{res: res, name: action.Name})
+
+		default:
+			res.Status = reconcile.ApplySkipped
+			results = append(results, res)
+		}
+	}
+
+	// Commit the CC path's batched upserts/deletes now that the action loop
+	// has finished accumulating them — one idx.UpsertSessions call and one
+	// idx.DeleteSessions call for the whole cycle's worth of CC actions,
+	// mirroring applyIngestSource's batching. A single failure here fails
+	// every pending action it covers (each still gets its own Result, so the
+	// per-action reporting callers rely on is unchanged) rather than
+	// resurrecting per-action calls.
+	if len(pendingCCUpserts) > 0 {
+		batch := make([]SessionAndTurns, len(pendingCCUpserts))
+		for i, pu := range pendingCCUpserts {
+			batch[i] = pu.item
+		}
+		upsertErr := idx.UpsertSessions(batch)
+		for _, pu := range pendingCCUpserts {
+			res := pu.res
+			if upsertErr != nil {
 				res.Status = reconcile.ApplyFailed
-				res.Error = fmt.Sprintf("upsert session %s: %v", action.Name, upsertErr)
-				results = append(results, res)
+				res.Error = fmt.Sprintf("upsert session %s: %v", pu.name, upsertErr)
 				if isLockBackpressure(upsertErr) {
 					backpressure++
 				} else {
 					errs = append(errs, res.Error)
 				}
-				continue
+			} else {
+				res.Status = reconcile.ApplySucceeded
+				res.CreatedID = pu.name
 			}
-
-			res.Status = reconcile.ApplySucceeded
-			res.CreatedID = action.Name
 			results = append(results, res)
+		}
+	}
 
-		case reconcile.ActionDelete:
-			if delErr := idx.DeleteSession(action.Name); delErr != nil {
+	if len(pendingCCDeletes) > 0 {
+		names := make([]string, len(pendingCCDeletes))
+		for i, pd := range pendingCCDeletes {
+			names[i] = pd.name
+		}
+		delErr := idx.DeleteSessions(names)
+		for _, pd := range pendingCCDeletes {
+			res := pd.res
+			if delErr != nil {
 				res.Status = reconcile.ApplyFailed
 				res.Error = delErr.Error()
 				if isLockBackpressure(delErr) {
@@ -648,10 +723,6 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 			} else {
 				res.Status = reconcile.ApplySucceeded
 			}
-			results = append(results, res)
-
-		default:
-			res.Status = reconcile.ApplySkipped
 			results = append(results, res)
 		}
 	}
