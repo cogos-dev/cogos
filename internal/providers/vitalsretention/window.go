@@ -22,6 +22,21 @@ import (
 // different request.
 var ErrInvalidQuery = errors.New("vitals-retention: invalid query")
 
+// maxWindowSpan bounds how far back `since` may reach. Without this, a
+// syntactically valid but pathological request (e.g. since=0001-01-01,
+// which parseTimeOrDuration accepts without complaint) makes Window()
+// os.Open one day-file per calendar day back to year 1 — hundreds of
+// thousands of syscalls per request on an otherwise-unauthenticated local
+// surface (cog-review finding on PR #493, commit cb26afa). This codebase's
+// other range-query surfaces bound cost the same way: handleLedger/
+// handleTraces take a `limit`, cog_tail_events takes max_events/
+// max_duration. 2 years is generous relative to today's retention story
+// (1h-tier data is kept indefinitely by default, PruneAfterDays=0) while
+// still rejecting the pathological case outright; like N3's numbers, this
+// is a provisional, testable default, not a claim about how long history
+// should be kept.
+const maxWindowSpan = 2 * 365 * 24 * time.Hour
+
 // validMetricNames is the allowlist Window() checks metric against before
 // it ever reaches a filesystem path. Built once from AllMetricNames()
 // (recorder.go) — the same list HandleBusEvent uses to decide what to
@@ -87,6 +102,10 @@ func (r *Recorder) Window(metric string, since time.Time, resolution string) ([]
 	}
 	if !validTiers[resolution] {
 		return nil, fmt.Errorf("%w: unknown resolution %q (want raw, 5m, or 1h)", ErrInvalidQuery, resolution)
+	}
+	if age := time.Since(since); age > maxWindowSpan {
+		return nil, fmt.Errorf("%w: since is %s in the past, exceeding the %s maximum window span",
+			ErrInvalidQuery, age.Round(time.Hour), maxWindowSpan)
 	}
 
 	// baseDir's only failure mode is "no workspace root resolvable" — a

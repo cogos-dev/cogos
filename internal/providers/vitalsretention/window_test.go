@@ -94,6 +94,34 @@ func TestWindow_ValidationErrorsAreErrInvalidQuery(t *testing.T) {
 	}
 }
 
+// TestWindow_RejectsSinceBeyondMaxSpan is the regression for cog-review's
+// finding on PR #493 (cb26afa): a syntactically valid but pathological
+// `since` (e.g. year 0001) must be rejected up front rather than driving
+// Window() to os.Open one day-file per calendar day back to year 1.
+func TestWindow_RejectsSinceBeyondMaxSpan(t *testing.T) {
+	_ = withWorkspace(t, "node-a")
+	r := &Recorder{}
+
+	pathological := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, err := r.Window("disk_free_bytes", pathological, tierRaw)
+	if err == nil {
+		t.Fatal("expected an error for a since far beyond maxWindowSpan")
+	}
+	if !errors.Is(err, ErrInvalidQuery) {
+		t.Errorf("expected errors.Is(err, ErrInvalidQuery), got %v", err)
+	}
+}
+
+func TestWindow_AcceptsSinceWithinMaxSpan(t *testing.T) {
+	_ = withWorkspace(t, "node-a")
+	r := &Recorder{}
+
+	withinBound := time.Now().Add(-maxWindowSpan + time.Hour)
+	if _, err := r.Window("disk_free_bytes", withinBound, tierRaw); err != nil {
+		t.Fatalf("expected no error for a since just within maxWindowSpan, got %v", err)
+	}
+}
+
 func TestWindow_ReturnsRawPointsSinceFilter(t *testing.T) {
 	root := withWorkspace(t, "node-a")
 	base := vitalsBaseDir(root)

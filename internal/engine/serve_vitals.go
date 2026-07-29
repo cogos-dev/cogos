@@ -32,9 +32,10 @@ type vitalsWindowResponse struct {
 
 // handleVitals serves GET /v1/vitals?metric=&since=&resolution=. Required:
 // metric, since (RFC3339 or duration shorthand like "5m"/"24h" — subtracted
-// from now), resolution (one of raw, 5m, 1h). Missing/invalid params are a
-// 400; a metric/window with no recorded data is a 200 with an empty points
-// array (RFC-040: absent history is not an error — see
+// from now; Window() caps this at 2 years back), resolution (one of raw,
+// 5m, 1h). Missing/invalid params are a 400; a metric/window with no
+// recorded data is a 200 with an empty points array (RFC-040: absent history
+// is not an error — see
 // vitalsretention.Window's doc).
 func (s *Server) handleVitals(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")

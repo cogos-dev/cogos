@@ -62,6 +62,24 @@ func TestHandleVitals_UnknownMetricIs400(t *testing.T) {
 	}
 }
 
+// TestHandleVitals_PathologicalSinceIs400NotAHang is the HTTP-layer
+// regression for cog-review's finding on PR #493 (cb26afa): a syntactically
+// valid RFC3339 timestamp far in the past (parseTimeOrDuration accepts it
+// without complaint) must be rejected by Window()'s maxWindowSpan bound
+// rather than driving hundreds of thousands of day-file opens.
+func TestHandleVitals_PathologicalSinceIs400NotAHang(t *testing.T) {
+	withVitalsWorkspace(t, "node-a")
+	s := &Server{}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/vitals?metric=disk_free_bytes&since=0001-01-01T00:00:00Z&resolution=raw", nil)
+	rec := httptest.NewRecorder()
+	s.handleVitals(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 for a since exceeding maxWindowSpan, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleVitals_EmptyHistoryReturns200WithEmptyPoints(t *testing.T) {
 	withVitalsWorkspace(t, "node-a")
 	s := &Server{}
