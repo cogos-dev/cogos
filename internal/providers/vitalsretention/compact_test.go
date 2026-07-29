@@ -207,6 +207,98 @@ func TestEnforceRawBudget_CompactsOldestFirstUntilUnderBudget(t *testing.T) {
 	}
 }
 
+// TestOldestRawDay_ExcludesGivenDay is the #497 fix-review regression test
+// for oldestRawDay directly: given an older day-file and one matching
+// excludeDay (today, in production use), the older one must win even though
+// it isn't chronologically last, and excludeDay must never be returned even
+// when it is a metric's only remaining raw day.
+func TestOldestRawDay_ExcludesGivenDay(t *testing.T) {
+	base := t.TempDir()
+	nodeKey := "node-a"
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	older := today.AddDate(0, 0, -5)
+
+	// metric "a" has both an older day and today's actively-written file.
+	if err := appendRow(base, nodeKey, tierRaw, "metric_a", older, row{Ts: older.Format(time.RFC3339Nano), V: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendRow(base, nodeKey, tierRaw, "metric_a", today, row{Ts: today.Format(time.RFC3339Nano), V: 2}); err != nil {
+		t.Fatal(err)
+	}
+	// metric "b" has ONLY today's file — must be excluded entirely for this
+	// metric, not just skipped in favor of a's older day.
+	if err := appendRow(base, nodeKey, tierRaw, "metric_b", today, row{Ts: today.Format(time.RFC3339Nano), V: 3}); err != nil {
+		t.Fatal(err)
+	}
+
+	metric, day, ok, err := oldestRawDay(base, nodeKey, today)
+	if err != nil {
+		t.Fatalf("oldestRawDay: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected a candidate (metric_a's older day)")
+	}
+	if metric != "metric_a" || !day.Equal(older) {
+		t.Fatalf("want (metric_a, %v), got (%s, %v)", older, metric, day)
+	}
+
+	// Now the only remaining raw data anywhere is today's — no candidate at
+	// all, not even a mistaken fallback to today.
+	if err := removeDayFile(base, nodeKey, tierRaw, "metric_a", older); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ok, err = oldestRawDay(base, nodeKey, today)
+	if err != nil {
+		t.Fatalf("oldestRawDay: %v", err)
+	}
+	if ok {
+		t.Fatal("expected no candidate once only today's day-files remain")
+	}
+}
+
+// TestEnforceRawBudget_NeverCompactsTodaysActivelyWrittenDay is the #497
+// fix-review regression test at the enforceRawBudget level: this is the
+// exact scenario the reviewer flagged — reaching the read-then-delete path
+// (downsampleOneDay) on the day-file HandleBusEvent may still be appending
+// to concurrently, now that compaction runs off its own goroutine instead
+// of blocking the tick. Even when today's file is the ONLY raw data and is
+// itself over budget, enforceRawBudget must leave it alone rather than
+// racing a concurrent append.
+func TestEnforceRawBudget_NeverCompactsTodaysActivelyWrittenDay(t *testing.T) {
+	base := t.TempDir()
+	nodeKey := "node-a"
+	metric := "disk_free_bytes"
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+
+	// Oversized on purpose: budget enforcement must still refuse to touch
+	// it because it's today's file, not because it happens to fit.
+	rows := make([]row, 0, 13500)
+	for i := 0; i < 13500; i++ {
+		ts := today.Add(time.Duration(i) * time.Second)
+		rows = append(rows, row{Ts: ts.Format(time.RFC3339Nano), V: float64(i)})
+	}
+	if err := writeRows(base, nodeKey, tierRaw, metric, today, rows); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Recorder{}
+	cfg := Config{RawBudgetMB: 1}
+	if err := r.enforceRawBudget(base, nodeKey, cfg); err != nil {
+		t.Fatalf("enforceRawBudget: %v", err)
+	}
+
+	// Today's raw file must survive untouched — no 5m sibling created, no
+	// deletion — even though the tier is still over budget.
+	if _, err := os.Stat(dayFilePath(base, nodeKey, tierRaw, metric, today)); err != nil {
+		t.Fatalf("today's raw file must survive enforceRawBudget: %v", err)
+	}
+	if _, err := os.Stat(dayFilePath(base, nodeKey, tier5m, metric, today)); !os.IsNotExist(err) {
+		t.Fatalf("today's file must not have been downsampled, stat err=%v", err)
+	}
+}
+
 func TestPruneTier_DeletesOnlyOlderThanCutoff(t *testing.T) {
 	base := t.TempDir()
 	nodeKey := "node-a"
