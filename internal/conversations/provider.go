@@ -676,22 +676,29 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 	// Commit the CC path's batched upserts/deletes now that the action loop
 	// has finished accumulating them — one idx.UpsertSessions call and one
 	// idx.DeleteSessions call for the whole cycle's worth of CC actions,
-	// mirroring applyIngestSource's batching. A single failure here fails
-	// every pending action it covers (each still gets its own Result, so the
-	// per-action reporting callers rely on is unchanged) rather than
-	// resurrecting per-action calls.
+	// mirroring applyIngestSource's batching. UpsertSessions/DeleteSessions
+	// report a per-session SessionOpOutcome, so one contended session's
+	// failure is reflected only in that session's own Result — the other,
+	// uncontended actions in the same batch still succeed independently,
+	// exactly matching the fault isolation the pre-batching per-action
+	// idx.UpsertSession/idx.DeleteSession loop had (cog-review, PR #495
+	// third pass).
 	if len(pendingCCUpserts) > 0 {
 		batch := make([]SessionAndTurns, len(pendingCCUpserts))
 		for i, pu := range pendingCCUpserts {
 			batch[i] = pu.item
 		}
-		upsertErr := idx.UpsertSessions(batch)
+		outcomes, _ := idx.UpsertSessions(batch)
+		outcomeBySID := make(map[string]error, len(outcomes))
+		for _, o := range outcomes {
+			outcomeBySID[o.SessionID] = o.Err
+		}
 		for _, pu := range pendingCCUpserts {
 			res := pu.res
-			if upsertErr != nil {
+			if err := outcomeBySID[pu.name]; err != nil {
 				res.Status = reconcile.ApplyFailed
-				res.Error = fmt.Sprintf("upsert session %s: %v", pu.name, upsertErr)
-				if isLockBackpressure(upsertErr) {
+				res.Error = fmt.Sprintf("upsert session %s: %v", pu.name, err)
+				if isLockBackpressure(err) {
 					backpressure++
 				} else {
 					errs = append(errs, res.Error)
@@ -709,13 +716,17 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 		for i, pd := range pendingCCDeletes {
 			names[i] = pd.name
 		}
-		delErr := idx.DeleteSessions(names)
+		outcomes, _ := idx.DeleteSessions(names)
+		outcomeBySID := make(map[string]error, len(outcomes))
+		for _, o := range outcomes {
+			outcomeBySID[o.SessionID] = o.Err
+		}
 		for _, pd := range pendingCCDeletes {
 			res := pd.res
-			if delErr != nil {
+			if err := outcomeBySID[pd.name]; err != nil {
 				res.Status = reconcile.ApplyFailed
-				res.Error = delErr.Error()
-				if isLockBackpressure(delErr) {
+				res.Error = err.Error()
+				if isLockBackpressure(err) {
 					backpressure++
 				} else {
 					errs = append(errs, res.Error)
@@ -1295,7 +1306,16 @@ func applyIngestSource(idx *Index, action reconcile.Action, ont *LoadedOntology,
 	// in a single writeMetaFileLocked round trip, instead of one full
 	// _meta.json rewrite per session.
 	if len(batch) > 0 {
-		if err := idx.UpsertSessions(batch); err != nil {
+		// The aggregate error (ignoring per-session outcomes) is sufficient
+		// here: an ingest source's sessions are already coupled by the
+		// per-source loop structure above it (a parse error anywhere in the
+		// source's files already aborts the whole call — see the file-read
+		// loop earlier in this function), so this doesn't narrow fault
+		// isolation the way the CC path's cross-source batch would; see
+		// ApplyPlan's pendingCCUpserts/pendingCCDeletes handling for the
+		// per-session outcome usage that DOES matter (cog-review, PR #495
+		// third pass, "unverified notes").
+		if _, err := idx.UpsertSessions(batch); err != nil {
 			return fmt.Errorf("upsert sessions for source %s: %w", action.Name, err)
 		}
 	}
@@ -1310,7 +1330,7 @@ func applyIngestSource(idx *Index, action reconcile.Action, ont *LoadedOntology,
 		}
 	}
 	if len(stale) > 0 {
-		if err := idx.DeleteSessions(stale); err != nil {
+		if _, err := idx.DeleteSessions(stale); err != nil {
 			return fmt.Errorf("prune stale sessions for source %s: %w", action.Name, err)
 		}
 	}

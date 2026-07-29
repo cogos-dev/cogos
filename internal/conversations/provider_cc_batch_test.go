@@ -13,7 +13,9 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
+	"github.com/myrgic/cogos/pkg/filelock"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
 )
 
@@ -178,6 +180,114 @@ func TestApplyPlan_CCDeletesAreBatched(t *testing.T) {
 	for i := deleted; i < n; i++ {
 		if _, ok := ls.Entries[sessionIDs[i]]; !ok {
 			t.Errorf("session %s missing after unrelated batched delete cycle", sessionIDs[i])
+		}
+	}
+}
+
+// TestApplyPlan_CCUpsertBatchFaultIsolation is the direct regression test
+// for cog-review's confirmed finding on PR #495's second pass
+// (provider.go:688): batching the CC path's per-cycle upserts into one
+// idx.UpsertSessions call must not let one contended session's lock
+// acquisition failure collaterally fail every OTHER, unrelated CC action in
+// the same cycle. Before the fix (per-session fault isolation in
+// UpsertSessions, PR #495 third pass), a peer holding one session's
+// turnsLockPath made the whole batch fail, misreporting every session in it
+// — including ones whose turns file would have written cleanly — as
+// ApplyFailed.
+func TestApplyPlan_CCUpsertBatchFaultIsolation(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+
+	const n = 3
+	sessionIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		sid := sessionUUIDN(i)
+		sessionIDs[i] = sid
+		lines := []string{
+			makeAITitleRecord(sid, "CC Fault Isolation Session"),
+			makeUserRecord("uuid-u-"+sid, "", sid, "hello from "+sid, "2026-05-01T10:00:00Z"),
+		}
+		writeJSONLFixture(t, srcDir, sid, lines)
+	}
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if plan.Summary.Creates != n {
+		t.Fatalf("expected %d creates, got %d", n, plan.Summary.Creates)
+	}
+
+	// Simulate a peer process (e.g. a concurrently-running "cog reconcile
+	// conversations" CLI — the #449 cross-process scenario) holding the
+	// MIDDLE session's turns lock at apply time. metaLockTimeout is
+	// shrunk so this test doesn't have to wait out the real 5s production
+	// timeout.
+	contended := sessionIDs[1]
+	peer, err := filelock.Acquire(p.index.turnsLockPath(contended), 2*time.Second)
+	if err != nil {
+		t.Fatalf("peer filelock.Acquire: %v", err)
+	}
+	defer peer.Release()
+
+	prevTimeout := metaLockTimeout
+	metaLockTimeout = 200 * time.Millisecond
+	defer func() { metaLockTimeout = prevTimeout }()
+
+	results, err := p.ApplyPlan(ctx, plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan returned a hard error: %v", err)
+	}
+	if len(results) != n {
+		t.Fatalf("expected %d results, got %d", n, len(results))
+	}
+
+	resByName := make(map[string]reconcile.Result, len(results))
+	for _, r := range results {
+		resByName[r.Name] = r
+	}
+
+	if r := resByName[contended]; r.Status != reconcile.ApplyFailed {
+		t.Errorf("contended session %s: status = %s, want ApplyFailed", contended, r.Status)
+	}
+	for i, sid := range sessionIDs {
+		if i == 1 {
+			continue // the contended one, checked above
+		}
+		r, ok := resByName[sid]
+		if !ok {
+			t.Fatalf("no result for uncontended session %s", sid)
+		}
+		if r.Status != reconcile.ApplySucceeded {
+			t.Errorf("uncontended session %s: status = %s (error=%q), want ApplySucceeded — collateral failure from the contended session %s", sid, r.Status, r.Error, contended)
+		}
+	}
+
+	// Confirm on the actual index state too, not just the reported Results.
+	liveAny2, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive 2: %v", err)
+	}
+	ls := liveAny2.(*liveState)
+	if _, ok := ls.Entries[contended]; ok {
+		t.Errorf("contended session %s was indexed despite its lock acquisition failing", contended)
+	}
+	for i, sid := range sessionIDs {
+		if i == 1 {
+			continue
+		}
+		if _, ok := ls.Entries[sid]; !ok {
+			t.Errorf("uncontended session %s missing from the index after apply", sid)
 		}
 	}
 }

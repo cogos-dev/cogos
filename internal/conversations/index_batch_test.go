@@ -69,7 +69,7 @@ func TestUpsertSessionsWritesMetaOnce(t *testing.T) {
 	batch := makeBatch(n, "sess", now)
 
 	writes := countMetaWrites(t, func() {
-		if err := idx.UpsertSessions(batch); err != nil {
+		if _, err := idx.UpsertSessions(batch); err != nil {
 			t.Fatalf("UpsertSessions: %v", err)
 		}
 	})
@@ -110,8 +110,8 @@ func TestUpsertSessionsEmptyBatchIsNoop(t *testing.T) {
 	}
 
 	writes := countMetaWrites(t, func() {
-		if err := idx.UpsertSessions(nil); err != nil {
-			t.Fatalf("UpsertSessions(nil): %v", err)
+		if outcomes, err := idx.UpsertSessions(nil); err != nil || outcomes != nil {
+			t.Fatalf("UpsertSessions(nil): outcomes=%v err=%v, want (nil, nil)", outcomes, err)
 		}
 	})
 	if writes != 0 {
@@ -144,7 +144,10 @@ func TestUpsertSessionsDedupesSameSessionID(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- idx.UpsertSessions(batch) }()
+	go func() {
+		_, err := idx.UpsertSessions(batch)
+		done <- err
+	}()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -180,7 +183,7 @@ func TestDeleteSessionsWritesMetaOnce(t *testing.T) {
 	const n = 100
 	now := time.Now()
 	batch := makeBatch(n, "doomed", now)
-	if err := idx.UpsertSessions(batch); err != nil {
+	if _, err := idx.UpsertSessions(batch); err != nil {
 		t.Fatalf("seed UpsertSessions: %v", err)
 	}
 
@@ -190,7 +193,7 @@ func TestDeleteSessionsWritesMetaOnce(t *testing.T) {
 	}
 
 	writes := countMetaWrites(t, func() {
-		if err := idx.DeleteSessions(ids); err != nil {
+		if _, err := idx.DeleteSessions(ids); err != nil {
 			t.Fatalf("DeleteSessions: %v", err)
 		}
 	})
