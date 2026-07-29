@@ -6,6 +6,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -48,8 +49,19 @@ func (m *MCPServer) toolVitalsWindow(ctx context.Context, req *mcp.CallToolReque
 
 	points, err := vitalsretention.Window(metric, since, resolution)
 	if err != nil {
-		return fallbackResult(fmt.Sprintf("cog_vitals_window: %v", err),
-			"GET /v1/vitals?metric=&since=&resolution=")
+		// Mirrors serve_vitals.go's 400-vs-500 split (cog-review finding on
+		// PR #493, commit 4dcbd00, which fixed the HTTP handler but missed
+		// this sibling caller of the same Window() function): a bad
+		// metric/resolution is the caller's mistake — fallbackResult's
+		// "here's a fix / CLI equivalent" framing fits. A genuine storage
+		// failure is not something retrying with different arguments would
+		// fix, so it goes back as a real MCP-protocol error instead of the
+		// same undifferentiated IsError:true content blob.
+		if errors.Is(err, vitalsretention.ErrInvalidQuery) {
+			return fallbackResult(fmt.Sprintf("cog_vitals_window: %v", err),
+				"GET /v1/vitals?metric=&since=&resolution=")
+		}
+		return nil, nil, fmt.Errorf("cog_vitals_window: %w", err)
 	}
 	if points == nil {
 		points = []vitalsretention.Point{}
