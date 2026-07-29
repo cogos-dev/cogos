@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // TestSampleHostVitals_UptimeAlwaysPresent verifies UptimeSeconds — pure
@@ -14,6 +15,45 @@ func TestSampleHostVitals_UptimeAlwaysPresent(t *testing.T) {
 	hv := sampleHostVitals()
 	if hv.UptimeSeconds == nil {
 		t.Fatal("expected UptimeSeconds to always be sampled")
+	}
+}
+
+// TestSampleHostVitals_InferenceQueueAlwaysPresent is InferenceQueue's
+// analogue of the uptime test above: a pure atomic read, no I/O, nothing to
+// fail, so it must always be populated regardless of whether any internal
+// inference has run yet.
+func TestSampleHostVitals_InferenceQueueAlwaysPresent(t *testing.T) {
+	resetDispatchInferenceMetricsForTest()
+	t.Cleanup(resetDispatchInferenceMetricsForTest)
+
+	hv := sampleHostVitals()
+	if hv.InferenceQueue == nil {
+		t.Fatal("expected InferenceQueue to always be sampled")
+	}
+	if *hv.InferenceQueue != 0 {
+		t.Fatalf("want InferenceQueue 0 with no in-flight calls, got %d", *hv.InferenceQueue)
+	}
+}
+
+// TestSampleHostVitals_InferenceP50MsOmittedUntilASampleExists is RFC-040's
+// soft-degrade contract applied to the rolling-p50 gauge specifically: unlike
+// InferenceQueue, it has a genuine "no data yet" state (a fresh process, or
+// this test's reset), and must be nil — not a fabricated zero — until at
+// least one internal inference call has completed.
+func TestSampleHostVitals_InferenceP50MsOmittedUntilASampleExists(t *testing.T) {
+	resetDispatchInferenceMetricsForTest()
+	t.Cleanup(resetDispatchInferenceMetricsForTest)
+
+	hv := sampleHostVitals()
+	if hv.InferenceP50Ms != nil {
+		t.Fatalf("expected InferenceP50Ms nil with no samples, got %v", *hv.InferenceP50Ms)
+	}
+
+	endDispatchInferenceSample(15 * time.Millisecond)
+
+	hv = sampleHostVitals()
+	if hv.InferenceP50Ms == nil {
+		t.Fatal("expected InferenceP50Ms populated once a sample has been recorded")
 	}
 }
 
@@ -123,12 +163,16 @@ func TestAllGreen_UnaffectedByHostVitals(t *testing.T) {
 
 	extreme := uint64(0)
 	extremeLoad := 999999.0
+	extremeP50 := 999999.0
+	extremeQueue := 999999
 	withExtremeVitals := base
 	withExtremeVitals.HostVitals = HostVitals{
-		DiskFreeBytes: &extreme, // zero free disk
-		MemFreeBytes:  &extreme, // zero free memory
-		Load1:         &extremeLoad,
-		UptimeSeconds: &extreme,
+		DiskFreeBytes:  &extreme, // zero free disk
+		MemFreeBytes:   &extreme, // zero free memory
+		Load1:          &extremeLoad,
+		UptimeSeconds:  &extreme,
+		InferenceP50Ms: &extremeP50,
+		InferenceQueue: &extremeQueue,
 	}
 	if !withExtremeVitals.AllGreen() {
 		t.Fatal("RFC-040 N5 violated: extreme HostVitals readings must not affect AllGreen()")

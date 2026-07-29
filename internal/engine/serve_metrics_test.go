@@ -26,15 +26,19 @@ func TestRenderPrometheusMetrics_ValidExpositionShape(t *testing.T) {
 	mem := uint64(987654321)
 	load := 1.25
 	uptime := uint64(3600)
+	p50 := 42.5
+	queue := 2
 	snap := KernelHealthSnapshot{
 		Counts:         HealthCounts{Healthy: 2, Degraded: 1, Missing: 0, Suspended: 0},
 		Anomalies:      3,
 		AnomaliesTotal: 42,
 		HostVitals: HostVitals{
-			DiskFreeBytes: &disk,
-			MemFreeBytes:  &mem,
-			Load1:         &load,
-			UptimeSeconds: &uptime,
+			DiskFreeBytes:  &disk,
+			MemFreeBytes:   &mem,
+			Load1:          &load,
+			UptimeSeconds:  &uptime,
+			InferenceP50Ms: &p50,
+			InferenceQueue: &queue,
 		},
 	}
 
@@ -99,6 +103,8 @@ func TestRenderPrometheusMetrics_ValidExpositionShape(t *testing.T) {
 		{"cogos_mem_free_bytes", "987654321"},
 		{"cogos_load1", "1.25"},
 		{"cogos_uptime_seconds", "3600"},
+		{"cogos_inference_p50_ms", "42.5"},
+		{"cogos_inference_queue", "2"},
 	} {
 		got, ok := seenSamples[want.name]
 		if !ok {
@@ -128,6 +134,8 @@ func TestRenderPrometheusMetrics_OmittedGaugeHasNoBlock(t *testing.T) {
 		"cogos_mem_free_bytes",
 		"cogos_load1",
 		"cogos_uptime_seconds",
+		"cogos_inference_p50_ms",
+		"cogos_inference_queue",
 	} {
 		if strings.Contains(out, absent) {
 			t.Errorf("expected no %q block when the gauge is unsampled, but found one in:\n%s", absent, out)

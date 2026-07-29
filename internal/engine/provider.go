@@ -79,7 +79,19 @@ type CancelSafeCompleter interface {
 // so that a ctx cancel/timeout actually aborts server-side generation on
 // providers where that matters (#432) without changing behavior for
 // providers where it doesn't apply.
+//
+// This is also the RFC-040 S0 InferenceP50Ms/InferenceQueue tap
+// (dispatch_inference_metrics.go): every call is timed and counted in-flight
+// exactly once here, so the gauge reflects the same population #432's
+// abandoned-inference counter already watches at this chokepoint, without a
+// second instrumentation site per caller.
 func CompleteCancelSafeIfSupported(ctx context.Context, p Provider, req *CompletionRequest) (*CompletionResponse, error) {
+	start := time.Now()
+	beginDispatchInferenceSample()
+	defer func() {
+		endDispatchInferenceSample(time.Since(start))
+	}()
+
 	if cs, ok := p.(CancelSafeCompleter); ok {
 		return cs.CompleteCancelSafe(ctx, req)
 	}
