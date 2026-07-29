@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,6 +34,19 @@ import (
 // Provider implements reconcile.Reconcilable for the Conversations Observatory.
 type Provider struct {
 	mu sync.Mutex
+
+	// applyMu serializes ApplyPlan calls against this Provider instance. See
+	// ApplyPlan's doc comment (issue #494 remedy 4) for why this is needed
+	// even though the on-disk index already has its own cross-process
+	// filelock: flock(2) does not serialize two callers from within the
+	// SAME process, so without this, the reconcile daemon and the autonomic
+	// ticker's self-heal could both enter ApplyPlan for this provider at
+	// once and deadlock each other out on that same flock. Deliberately a
+	// plain sync.Mutex used only via TryLock (never Lock) — the loser skips
+	// its cycle rather than queueing, which is the point: queuing would
+	// still serialize the two callers' large applies back-to-back and keep
+	// the provider busy for their combined duration.
+	applyMu sync.Mutex
 
 	// index is the in-memory queryable index. Populated by ApplyPlan.
 	// nil until first LoadConfig call resolves projDir.
@@ -437,6 +451,36 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 		return nil, fmt.Errorf("conversations: nil plan")
 	}
 
+	// Issue #494 remedy 4: serialize ApplyPlan per Provider instance. The
+	// reconcile daemon (every 30s) and the autonomic ticker's self-heal
+	// (every 30min, whenever Health() is non-Healthy) both drive the SAME
+	// registered Provider — both eventually reach writeMetaFileLocked's
+	// filelock.Acquire(metaLockPath, metaLockTimeout). flock(2) locks attach
+	// to the open file description, not the owning process, so two
+	// independent os.OpenFile calls made from the SAME process still block
+	// each other; metaLockTimeout cannot save either caller here because
+	// both are willing to sit out the full timeout waiting on themselves.
+	// Confirmed live: every apply_failed cycle in the reconcile daemon's log
+	// was preceded by a self-heal kickoff ~77s earlier, exactly the window a
+	// large apply (pre-remedy-1, up to ~104s) takes to run. Once that
+	// happens, the failed apply never reaches InSync, which re-arms the next
+	// self-heal tick — a self-sustaining loop. TryLock (rather than
+	// blocking) means the losing caller's cycle is cheap and it does not
+	// fabricate an ApplyFailed result: the in-flight apply will report
+	// accurate Health() shortly, and remedies 1–3 make that "shortly" close
+	// to instant even for the largest source.
+	if !p.applyMu.TryLock() {
+		slog.Info("conversations: ApplyPlan skipped — another apply already in flight for this provider")
+		return []reconcile.Result{{
+			Phase:  "conversations",
+			Action: "apply",
+			Name:   "provider",
+			Status: reconcile.ApplySkipped,
+			Error:  "another ApplyPlan is already in flight for this provider",
+		}}, nil
+	}
+	defer p.applyMu.Unlock()
+
 	p.mu.Lock()
 	p.operation = reconcile.OperationSyncing
 	idx := p.index
@@ -470,6 +514,41 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 	// liveSources collects ingest source names present this cycle, used to
 	// prune coverageCache for removed sources after the action loop.
 	liveSources := make(map[string]struct{})
+
+	// Issue #494 remedy 2: compute the source -> session IDs grouping ONCE
+	// for the whole cycle (see SessionIDsBySource's doc comment), instead of
+	// each applyIngestSource call re-deriving it via a full sorted
+	// idx.ListSessions(...) scan of the entire index.
+	bySource := idx.SessionIDsBySource()
+
+	// pendingCCUpserts/pendingCCDeletes accumulate the CC (source_dirs)
+	// path's create/update/delete actions across the WHOLE action loop below,
+	// so they can be committed via one UpsertSessions/DeleteSessions call
+	// each after the loop, instead of one idx.UpsertSession/idx.DeleteSession
+	// call — and one full writeMetaFileLocked round trip — per action.
+	//
+	// This is remedy 1 applied to the CC path specifically (cog-review, PR
+	// #495 first pass): the normalized-ingest path (applyIngestSource, just
+	// below) already batches its whole source's sessions into one call, but
+	// this sibling branch of the SAME action loop parses and upserts one CC
+	// session file per action individually. Left unbatched, N actively-used
+	// CC sessions drifting in the same ~30s poll window would reproduce the
+	// identical O(N) full-_meta.json-rewrite-per-cycle defect issue #494
+	// measured, just via this path instead of the ingest one.
+	//
+	// Each pending entry carries its own reconcile.Result template (Phase/
+	// Action/Name already set) so the eventual batch call's single
+	// success/failure can be projected back onto every action it covers,
+	// without a placeholder that would otherwise be reordered.
+	var pendingCCUpserts []struct {
+		res  reconcile.Result
+		name string
+		item SessionAndTurns
+	}
+	var pendingCCDeletes []struct {
+		res  reconcile.Result
+		name string
+	}
 
 	for _, action := range plan.Actions {
 		if action.Action == reconcile.ActionSkip {
@@ -522,7 +601,7 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				// error does not drop it from liveSources and cause a spurious
 				// cache eviction on the same cycle.
 				liveSources[action.Name] = struct{}{}
-				if applyErr := applyIngestSource(idx, action, ont, qw, cov); applyErr != nil {
+				if applyErr := applyIngestSource(idx, action, ont, qw, cov, bySource[action.Name]); applyErr != nil {
 					res.Status = reconcile.ApplyFailed
 					res.Error = fmt.Sprintf("index ingest source %s: %v", action.Name, applyErr)
 					results = append(results, res)
@@ -570,27 +649,84 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				continue
 			}
 
-			if upsertErr := idx.UpsertSession(meta, turns); upsertErr != nil {
+			// Deferred: this session's meta write is committed via the
+			// batched idx.UpsertSessions call after the loop, not here. res
+			// (Phase/Action/Name already set above) is finalized once that
+			// batch's outcome is known.
+			pendingCCUpserts = append(pendingCCUpserts, struct {
+				res  reconcile.Result
+				name string
+				item SessionAndTurns
+			}{res: res, name: action.Name, item: SessionAndTurns{Meta: meta, Turns: turns}})
+
+		case reconcile.ActionDelete:
+			// Deferred: committed via the batched idx.DeleteSessions call
+			// after the loop — see pendingCCUpserts' comment above.
+			pendingCCDeletes = append(pendingCCDeletes, struct {
+				res  reconcile.Result
+				name string
+			}{res: res, name: action.Name})
+
+		default:
+			res.Status = reconcile.ApplySkipped
+			results = append(results, res)
+		}
+	}
+
+	// Commit the CC path's batched upserts/deletes now that the action loop
+	// has finished accumulating them — one idx.UpsertSessions call and one
+	// idx.DeleteSessions call for the whole cycle's worth of CC actions,
+	// mirroring applyIngestSource's batching. UpsertSessions/DeleteSessions
+	// report a per-session SessionOpOutcome, so one contended session's
+	// failure is reflected only in that session's own Result — the other,
+	// uncontended actions in the same batch still succeed independently,
+	// exactly matching the fault isolation the pre-batching per-action
+	// idx.UpsertSession/idx.DeleteSession loop had (cog-review, PR #495
+	// third pass).
+	if len(pendingCCUpserts) > 0 {
+		batch := make([]SessionAndTurns, len(pendingCCUpserts))
+		for i, pu := range pendingCCUpserts {
+			batch[i] = pu.item
+		}
+		outcomes, _ := idx.UpsertSessions(batch)
+		outcomeBySID := make(map[string]error, len(outcomes))
+		for _, o := range outcomes {
+			outcomeBySID[o.SessionID] = o.Err
+		}
+		for _, pu := range pendingCCUpserts {
+			res := pu.res
+			if err := outcomeBySID[pu.name]; err != nil {
 				res.Status = reconcile.ApplyFailed
-				res.Error = fmt.Sprintf("upsert session %s: %v", action.Name, upsertErr)
-				results = append(results, res)
-				if isLockBackpressure(upsertErr) {
+				res.Error = fmt.Sprintf("upsert session %s: %v", pu.name, err)
+				if isLockBackpressure(err) {
 					backpressure++
 				} else {
 					errs = append(errs, res.Error)
 				}
-				continue
+			} else {
+				res.Status = reconcile.ApplySucceeded
+				res.CreatedID = pu.name
 			}
-
-			res.Status = reconcile.ApplySucceeded
-			res.CreatedID = action.Name
 			results = append(results, res)
+		}
+	}
 
-		case reconcile.ActionDelete:
-			if delErr := idx.DeleteSession(action.Name); delErr != nil {
+	if len(pendingCCDeletes) > 0 {
+		names := make([]string, len(pendingCCDeletes))
+		for i, pd := range pendingCCDeletes {
+			names[i] = pd.name
+		}
+		outcomes, _ := idx.DeleteSessions(names)
+		outcomeBySID := make(map[string]error, len(outcomes))
+		for _, o := range outcomes {
+			outcomeBySID[o.SessionID] = o.Err
+		}
+		for _, pd := range pendingCCDeletes {
+			res := pd.res
+			if err := outcomeBySID[pd.name]; err != nil {
 				res.Status = reconcile.ApplyFailed
-				res.Error = delErr.Error()
-				if isLockBackpressure(delErr) {
+				res.Error = err.Error()
+				if isLockBackpressure(err) {
 					backpressure++
 				} else {
 					errs = append(errs, res.Error)
@@ -598,10 +734,6 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 			} else {
 				res.Status = reconcile.ApplySucceeded
 			}
-			results = append(results, res)
-
-		default:
-			res.Status = reconcile.ApplySkipped
 			results = append(results, res)
 		}
 	}
@@ -1106,12 +1238,23 @@ func isIngestDrift(indexed []IndexEntry, src ingestSourceInfo) bool {
 }
 
 // applyIngestSource re-parses every file of an ingest source (action.Name),
-// upserts each resulting session, and prunes index sessions of that source
-// that no longer appear in the parse result.
+// upserts every resulting session in one batch, and prunes — also in one
+// batch — index sessions of that source that no longer appear in the parse
+// result.
 //
 // ont, qw, cov may be nil; when non-nil, ontology enforcement, quarantine
 // routing, and coverage tracking are applied during ConsumeFile.
-func applyIngestSource(idx *Index, action reconcile.Action, ont *LoadedOntology, qw *QuarantineWriter, cov *CoverageTracker) error {
+//
+// existingSourceSessionIDs is this source's slice of the map ApplyPlan
+// computed once via idx.SessionIDsBySource() before its action loop — see
+// that method's doc comment (issue #494 remedy 2) for why this is passed in
+// rather than called here: idx.ListSessions(...) sorts the *entire* index by
+// LastTurnAt, an ordering the prune pass below never uses, and doing that
+// once per ingest source in a cycle with several sources drifting re-sorted
+// the same ~7,500 sessions redundantly. Hoisting the (unsorted, ID-only)
+// computation up to ApplyPlan turns that into one full-index walk shared by
+// every source in the cycle.
+func applyIngestSource(idx *Index, action reconcile.Action, ont *LoadedOntology, qw *QuarantineWriter, cov *CoverageTracker, existingSourceSessionIDs []string) error {
 	sourceDir, _ := action.Details["source_dir"].(string)
 	files := stringSliceDetail(action.Details["ingest_files"])
 	if len(files) == 0 {
@@ -1147,28 +1290,48 @@ func applyIngestSource(idx *Index, action reconcile.Action, ont *LoadedOntology,
 	}
 
 	now := time.Now().UTC()
-	parsed := make(map[string]struct{})
-	for _, sess := range acc.Sessions() {
+	sessions := acc.Sessions()
+	parsed := make(map[string]struct{}, len(sessions))
+	batch := make([]SessionAndTurns, 0, len(sessions))
+	for _, sess := range sessions {
 		sess.Meta.SourcePath = sourceDir
 		sess.Meta.IndexedAt = now
 		sess.Meta.SourceMtime = latestMtime
 		sess.Meta.SourceSize = totalSize
-		if err := idx.UpsertSession(sess.Meta, sess.Turns); err != nil {
-			return fmt.Errorf("upsert session %s: %w", sess.Meta.SessionID, err)
-		}
+		batch = append(batch, SessionAndTurns{Meta: sess.Meta, Turns: sess.Turns})
 		parsed[sess.Meta.SessionID] = struct{}{}
+	}
+	// Issue #494 remedy 1: one UpsertSessions call writes every turns file
+	// under its own per-session lock, then commits ALL of this source's meta
+	// in a single writeMetaFileLocked round trip, instead of one full
+	// _meta.json rewrite per session.
+	if len(batch) > 0 {
+		// The aggregate error (ignoring per-session outcomes) is sufficient
+		// here: an ingest source's sessions are already coupled by the
+		// per-source loop structure above it (a parse error anywhere in the
+		// source's files already aborts the whole call — see the file-read
+		// loop earlier in this function), so this doesn't narrow fault
+		// isolation the way the CC path's cross-source batch would; see
+		// ApplyPlan's pendingCCUpserts/pendingCCDeletes handling for the
+		// per-session outcome usage that DOES matter (cog-review, PR #495
+		// third pass, "unverified notes").
+		if _, err := idx.UpsertSessions(batch); err != nil {
+			return fmt.Errorf("upsert sessions for source %s: %w", action.Name, err)
+		}
 	}
 
 	// Prune sessions of this source that vanished from the parse result
 	// (observer files are append-only, so this is rare — defensive only).
-	for _, meta := range idx.ListSessions(time.Time{}, time.Time{}, "") {
-		if meta.Source != action.Name {
-			continue
+	// Batched via DeleteSessions for the same reason as the upsert above.
+	var stale []string
+	for _, sid := range existingSourceSessionIDs {
+		if _, ok := parsed[sid]; !ok {
+			stale = append(stale, sid)
 		}
-		if _, ok := parsed[meta.SessionID]; !ok {
-			if err := idx.DeleteSession(meta.SessionID); err != nil {
-				return fmt.Errorf("prune stale session %s: %w", meta.SessionID, err)
-			}
+	}
+	if len(stale) > 0 {
+		if _, err := idx.DeleteSessions(stale); err != nil {
+			return fmt.Errorf("prune stale sessions for source %s: %w", action.Name, err)
 		}
 	}
 

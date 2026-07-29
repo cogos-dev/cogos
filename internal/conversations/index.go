@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,7 +34,11 @@ import (
 // the cross-process lock on _meta.json before giving up. Generous relative to
 // the write itself (a few JSON marshals + one rename) but short enough that a
 // wedged peer doesn't hang the caller indefinitely.
-const metaLockTimeout = 5 * time.Second
+//
+// A var rather than a const solely so tests can shrink it (see
+// index_batch_atomicity_test.go) to keep a deliberate-lock-timeout
+// regression test fast; production code never assigns to it.
+var metaLockTimeout = 5 * time.Second
 
 // Index holds all indexed turns in memory plus a reference to the projection
 // directory for persistence.
@@ -75,6 +80,15 @@ type Index struct {
 type metaDelta struct {
 	upserts map[string]SessionMeta
 	deletes []string
+}
+
+// SessionAndTurns pairs a session's meta with its full turns list — the unit
+// UpsertSessions batches. See UpsertSessions for why batching exists (issue
+// #494: one writeMetaFileLocked call per session made a source rebuild of N
+// sessions cost O(N) full-_meta.json rewrites, i.e. O(N²) bytes written).
+type SessionAndTurns struct {
+	Meta  SessionMeta
+	Turns []Turn
 }
 
 // NewIndex creates an Index backed by projDir. projDir is created if absent.
@@ -179,113 +193,394 @@ func (idx *Index) LoadIfChanged() (bool, error) {
 	return true, idx.Load()
 }
 
-// UpsertSession writes session meta + turns to memory and to disk.
+// SessionOpOutcome reports one session's individual outcome within a
+// UpsertSessions/DeleteSessions batch call. Err is nil on success.
 //
-// The on-disk _meta.json is a shared file: the daemon's own reconcile/ticker
-// cycle and a separately-invoked "cog reconcile conversations" CLI process
-// can both call UpsertSession/DeleteSession against the same projDir
-// (issue #449). Without coordination the two read-modify-write cycles
-// interleave and the second writer's plain marshal-of-idx.sessions silently
-// drops whatever the first writer added, because each process's in-memory
-// idx.sessions only reflects its own view as of its last Load.
-//
-// To close that window, the on-disk write is guarded by a cross-process
-// filelock (metaLockPath) and, while holding it, writeMetaFileLocked re-reads
-// the current _meta.json from disk and applies only *this call's* delta
-// (metaDelta) on top of it — never a full re-assertion of this process's
-// entire in-memory idx.sessions snapshot, which could itself be stale
-// relative to a peer's more recent write and would silently resurrect
-// whatever the peer already removed. See writeMetaFileLocked for why a
-// snapshot-merge (rather than a delta-merge) is unsound.
-//
-// UpsertSession and DeleteSession additionally hold ONE per-sessionID
-// cross-process lock (turnsLockPath) across both the turns-file operation
-// and the _meta.json write, rather than acquiring it twice as two separate,
-// independently-released critical sections. cog-review (PR #458, third
-// pass) found that with two separate acquisitions, a concurrent
-// DeleteSession(sid) on one Index instance and UpsertSession(sid, ...) on
-// another could interleave between them: B's turns write completes and
-// releases the turns lock; A acquires that now-free lock, removes the turns
-// file, and moves on to the meta lock; B then writes sid back into
-// _meta.json. Net result: _meta.json lists sid with no turns file on disk —
-// the exact sessions/turns split-brain this whole PR exists to prevent,
-// reached via a path the original fix didn't cover because "the turns lock"
-// and "the meta lock" were two separate atomic units instead of one.
-// Holding a single lock across both operations makes UpsertSession(sid) and
-// DeleteSession(sid) for the identical sessionID fully mutually exclusive
-// end-to-end, closing that interleaving. Different sessionIDs still use
-// different lock files and proceed with no contention.
-//
-// idx.mu is deliberately NOT held across the cross-process locking/disk I/O
-// above — only around the brief in-memory map mutation at the very end.
-// cog-review (PR #458, fifth pass) found that an earlier version held
-// idx.mu.Lock() for the whole call, meaning the up-to-2×metaLockTimeout
-// (≈10s) a writer could block waiting on a peer process's cross-process lock
-// also blocked every concurrent GetMeta/ListSessions/GetTurn/Search call
-// (which take idx.mu.RLock()) on the SAME in-process Index — e.g. the
-// daemon's MCP handlers (cog_search_conversations et al., all sharing one
-// Provider.index) would freeze for that whole window whenever a CLI
-// reconcile process was mid-write. Disk I/O and cross-process coordination
-// now happen with idx.mu unheld; only the final idx.sessions/idx.turns
-// mutation takes the lock, and only briefly.
-func (idx *Index) UpsertSession(meta SessionMeta, turns []Turn) error {
-	lock, err := filelock.Acquire(idx.turnsLockPath(meta.SessionID), metaLockTimeout)
-	if err != nil {
-		return fmt.Errorf("conversations/index: acquire session lock for %s: %w", meta.SessionID, err)
-	}
-	defer lock.Release()
+// This exists so one session's per-sessionID lock-contention failure does
+// not fail every OTHER, unrelated session in the same batch — see
+// UpsertSessions' doc comment, "Per-session fault isolation" (cog-review,
+// PR #495 third pass).
+type SessionOpOutcome struct {
+	SessionID string
+	Err       error
+}
 
-	// Persist turns file (lock for this sessionID already held above).
-	if err := idx.writeTurnsFileLocked(meta.SessionID, turns); err != nil {
-		return fmt.Errorf("conversations/index: write turns %s: %w", meta.SessionID, err)
+// UpsertSession is a thin wrapper over UpsertSessions for single-session
+// callers. See UpsertSessions for the batching rationale (issue #494) and
+// full locking/merge discipline — including the #449 cross-process
+// read-merge-write coordination, the #458 per-sessionID lock spanning both
+// the turns write and the meta commit, and the #458 fifth-pass idx.mu
+// discipline — all of which this call inherits unchanged for the N=1 case.
+func (idx *Index) UpsertSession(meta SessionMeta, turns []Turn) error {
+	_, err := idx.UpsertSessions([]SessionAndTurns{{Meta: meta, Turns: turns}})
+	return err
+}
+
+// heldSessionLock pairs an acquired per-sessionID turnsLockPath lock with
+// the sessionID it guards. Used by UpsertSessions'/DeleteSessions' phase 1
+// via acquireSessionLocks.
+type heldSessionLock struct {
+	sid  string
+	lock *filelock.FileLock
+}
+
+// acquireSessionLocks attempts to acquire every id's turnsLockPath lock
+// under ONE shared deadline for the whole call, rather than giving each
+// sessionID its own full metaLockTimeout budget independently.
+//
+// This is remedy 1's fourth review-round fix (cog-review, PR #495 fourth
+// pass): the per-session-independent design (phase 1 acquiring each lock
+// on its own, continuing past any single failure — see UpsertSessions'
+// "Per-session fault isolation") removed the early-exit an all-or-nothing
+// loop would have had, so a batch with K simultaneously-contended
+// sessionIDs (all peer-held by the SAME wedged process, or several
+// unrelated wedged peers — both plausible under the #449 cross-process
+// scenario this whole PR is about) could each independently poll out a
+// full metaLockTimeout, compounding to K×metaLockTimeout for one batch
+// call. Because remedy 4's applyMu is held for ApplyPlan's entire
+// duration, that also stalls every other reconcile activity for the
+// provider for the same window — undermining metaLockTimeout's documented
+// "a wedged peer doesn't hang the caller indefinitely" bound and remedy
+// 4's own goal, through a different path.
+//
+// A single deadline, computed once and shared across every id's
+// filelock.Acquire call, restores the ONE-metaLockTimeout bound for the
+// batch as a whole: filelock.Acquire always attempts one immediate,
+// non-blocking tryLock before ever consulting its timeout (see
+// pkg/filelock's Acquire), so passing the (possibly already-negative)
+// remaining budget to every call — rather than skipping later ids outright
+// once the budget nominally runs out — costs nothing extra for an
+// uncontended id (it still succeeds on that first free attempt) while
+// still bounding any id that DOES need to wait to whatever's left of the
+// shared window. The trade-off this introduces (an id late in sorted order
+// can get less of the shared budget than one early in it, if earlier ids
+// were genuinely contended) is the same shape as any shared-deadline
+// design (e.g. a context.Context deadline shared across a fan-out); it
+// replaces "every session gets its own full timeout" (unbounded batch
+// total) with "the batch as a whole gets one timeout" (matching the
+// pre-batching per-call bound), which is the trade cog-review's finding
+// asked for.
+//
+// Returns every lock actually acquired (still held — the caller releases
+// them) and a map from sessionID to the reason it did NOT get a lock, for
+// every id that failed. Every id in ids ends up in exactly one of the two.
+func (idx *Index) acquireSessionLocks(ids []string) ([]heldSessionLock, map[string]error) {
+	held := make([]heldSessionLock, 0, len(ids))
+	failed := make(map[string]error, len(ids))
+	deadline := time.Now().Add(metaLockTimeout)
+	for _, sid := range ids {
+		lock, err := filelock.Acquire(idx.turnsLockPath(sid), time.Until(deadline))
+		if err != nil {
+			failed[sid] = fmt.Errorf("conversations/index: acquire session lock for %s: %w", sid, err)
+			continue
+		}
+		held = append(held, heldSessionLock{sid: sid, lock: lock})
 	}
-	// Persist meta index under the SAME per-sessionID lock plus the separate
-	// metaLockPath lock writeMetaFileLocked takes internally (metaLockPath
-	// guards the shared _meta.json map across ALL sessionIDs, so it's still
-	// needed in addition to this per-session lock — the two guard different
-	// things: this lock serializes "turns + meta for sessionID X" as one
-	// unit; metaLockPath serializes concurrent writers of _meta.json itself,
-	// which can be for different sessionIDs at once). Only this call's own
-	// upsert is applied as a delta on top of the current on-disk state — see
-	// writeMetaFileLocked.
-	if err := idx.writeMetaFileLocked(metaDelta{upserts: map[string]SessionMeta{meta.SessionID: meta}}); err != nil {
-		return err
+	return held, failed
+}
+
+// UpsertSessions writes turns + meta for a whole batch of sessions,
+// performing exactly ONE writeMetaFileLocked call regardless of batch size.
+//
+// This is remedy 1 for issue #494: UpsertSession's per-call writeMetaFileLocked
+// does a full read+json.Unmarshal+merge+json.MarshalIndent+write of the
+// entire _meta.json map (see that method's doc comment for why the
+// read-merge-write is necessary — a peer process's concurrent write must
+// never be clobbered). Calling it once per session turns an N-session
+// rebuild (e.g. applyIngestSource re-parsing one ingest source) into N full
+// rewrites of the file, i.e. O(N²) bytes written for a source of N sessions
+// — measured on the live node as ~10.5 GB to rewrite a 4 MB file across
+// 2,649 sessions. Collapsing every session's meta into ONE delta and calling
+// writeMetaFileLocked once turns that into a single ~4 MB rewrite.
+//
+// Locking, in order:
+//
+//  1. Every session's turns file is written under its own per-sessionID
+//     turnsLockPath lock — the same lock, and same reason, UpsertSession has
+//     always taken (see its historical doc comment, preserved below):
+//     serializing "turns + meta for sessionID X" as one unit so a concurrent
+//     DeleteSession(X)/UpsertSession(X) on a peer Index instance can never
+//     interleave between this call's turns write and its share of the meta
+//     commit (cog-review, PR #458, third pass).
+//  2. Because ALL of the batch's per-sessionID locks are still held when the
+//     single writeMetaFileLocked call runs (released only via the deferred
+//     loop after this method returns), that same interleaving guarantee
+//     holds for the whole batch, not just one session — the meta commit for
+//     session X cannot race a peer's turns-file operation for session X.
+//  3. Per-sessionID locks are acquired in sorted-by-sessionID order (after
+//     de-duplicating the batch by SessionID, last-write-wins) rather than
+//     caller-supplied order. Two concurrent UpsertSessions/DeleteSessions
+//     batches that share a sessionID but list it in different relative
+//     positions could otherwise deadlock (batch A holds lock(X), waiting on
+//     lock(Y); batch B holds lock(Y), waiting on lock(X)) — a classic
+//     lock-ordering cycle. A single global order across every batch caller
+//     removes the cycle. De-duplicating first also matters on its own: two
+//     entries for the same sessionID in one batch would otherwise attempt to
+//     Acquire that sessionID's lock file twice without an intervening
+//     Release, which — like the flock self-collision issue #494 documents
+//     for metaLockPath — self-blocks, since flock(2) is not re-entrant
+//     within a process.
+//
+// Trade-off: holding one open, locked file descriptor per session in the
+// batch for the duration of the call bounds this to the batch size (the
+// largest observed source is ~2,650 sessions) rather than one at a time.
+// That is a deliberate choice to preserve the exact same peer-safety
+// guarantee UpsertSession has always provided, for every session in the
+// batch, rather than only for the first/last. If a source's session count
+// grows large enough for this to threaten a process's open-file limit,
+// chunking the batch (trading one writeMetaFileLocked call for a few) is the
+// next lever — not implemented here since no observed source is remotely
+// close to that scale.
+//
+// Per-session fault isolation (cog-review, PR #495 third pass): an earlier
+// version of this method acquired every lock in a first pass and aborted
+// the WHOLE batch — including sessions whose locks it already held — the
+// instant any single session's lock acquisition failed. That closed the
+// atomicity gap the second review pass found (see below), but introduced a
+// real regression for the CC (source_dirs) path specifically: before this
+// PR, ApplyPlan called idx.UpsertSession once per action independently, so
+// one contended session only failed that session's Result; the
+// all-or-nothing batch coupled every other, uncontended session in the same
+// cycle to that one session's bad luck. UpsertSessions now attempts every
+// session's lock acquisition and turns-file write independently — a
+// failure for session X only excludes X from the batch, recorded in X's
+// SessionOpOutcome — and the single shared writeMetaFileLocked call at the
+// end commits only the subset that succeeded through both steps. A session
+// is never included in that shared commit without its own lock having been
+// held across its own turns write, so the atomicity guarantee the second
+// review pass required is preserved for every session that DOES make it
+// into the commit; only sessions that independently failed are excluded,
+// exactly mirroring the pre-batching per-action fault isolation.
+//
+// The one remaining shared-fate step is the meta commit itself: if
+// writeMetaFileLocked fails (a metaLockPath contention or write failure,
+// a different and much rarer failure mode than a single sessionID's
+// turnsLockPath being contended), every session that succeeded through its
+// own lock+write is affected together. This is not a new exposure —
+// it is the exact same risk a single-session UpsertSession call has always
+// carried for itself (turns already written, its own meta commit still
+// pending) — remedy 1's whole premise is committing many sessions' meta via
+// one shared write, so sessions that reach that step necessarily share its
+// fate. The finer-grained failure mode cog-review's second pass actually
+// found (abandoning already-completed work belonging to sessions that were
+// never going to be part of the failing session's own commit) is what
+// per-session independence above eliminates.
+//
+// The turns write path, per-sessionID locking, and idx.mu discipline below
+// are otherwise identical to the original single-session UpsertSession:
+//
+//	The on-disk _meta.json is a shared file: the daemon's own reconcile/ticker
+//	cycle and a separately-invoked "cog reconcile conversations" CLI process
+//	can both call UpsertSession/DeleteSession against the same projDir
+//	(issue #449). Without coordination the two read-modify-write cycles
+//	interleave and the second writer's plain marshal-of-idx.sessions silently
+//	drops whatever the first writer added, because each process's in-memory
+//	idx.sessions only reflects its own view as of its last Load.
+//
+//	To close that window, the on-disk write is guarded by a cross-process
+//	filelock (metaLockPath) and, while holding it, writeMetaFileLocked re-reads
+//	the current _meta.json from disk and applies only *this call's* delta
+//	(metaDelta) on top of it — never a full re-assertion of this process's
+//	entire in-memory idx.sessions snapshot, which could itself be stale
+//	relative to a peer's more recent write and would silently resurrect
+//	whatever the peer already removed. See writeMetaFileLocked for why a
+//	snapshot-merge (rather than a delta-merge) is unsound.
+//
+//	idx.mu is deliberately NOT held across the cross-process locking/disk I/O
+//	above — only around the brief in-memory map mutation at the very end.
+//	cog-review (PR #458, fifth pass) found that an earlier version held
+//	idx.mu.Lock() for the whole call, meaning the up-to-2×metaLockTimeout
+//	(≈10s) a writer could block waiting on a peer process's cross-process lock
+//	also blocked every concurrent GetMeta/ListSessions/GetTurn/Search call
+//	(which take idx.mu.RLock()) on the SAME in-process Index. Disk I/O and
+//	cross-process coordination now happen with idx.mu unheld; only the final
+//	idx.sessions/idx.turns mutation takes the lock, and only briefly.
+func (idx *Index) UpsertSessions(batch []SessionAndTurns) ([]SessionOpOutcome, error) {
+	if len(batch) == 0 {
+		return nil, nil
+	}
+
+	// De-duplicate by SessionID (last entry for a given ID wins, matching
+	// ordinary map-assignment semantics) before computing the lock
+	// acquisition order — see the doc comment above for why both the
+	// de-duplication and the sort are required for correctness, not just
+	// determinism.
+	dedup := make(map[string]SessionAndTurns, len(batch))
+	for _, item := range batch {
+		dedup[item.Meta.SessionID] = item
+	}
+	ids := make([]string, 0, len(dedup))
+	for sid := range dedup {
+		ids = append(ids, sid)
+	}
+	sort.Strings(ids)
+
+	// Phase 1: attempt to acquire every per-sessionID lock, independently,
+	// under one shared deadline for the whole batch (see
+	// acquireSessionLocks). A failure for one sessionID (most plausibly a
+	// peer process holding its turnsLockPath — exactly the cross-process
+	// contention this whole PR is about) excludes only that sessionID; it
+	// does not stop the loop or prevent other, uncontended sessions from
+	// being attempted. See "Per-session fault isolation" above for why this
+	// must be independent rather than all-or-nothing.
+	held, failed := idx.acquireSessionLocks(ids)
+	defer func() {
+		for _, h := range held {
+			h.lock.Release()
+		}
+	}()
+
+	// Phase 2: for every successfully-locked session, write its turns file
+	// independently. A write failure here (a genuine disk I/O error, not
+	// lock contention) also excludes only that session — the same
+	// independence as phase 1, for the same reason.
+	upserts := make(map[string]SessionMeta, len(held))
+	committed := make([]string, 0, len(held))
+	for _, h := range held {
+		item := dedup[h.sid]
+		if err := idx.writeTurnsFileLocked(h.sid, item.Turns); err != nil {
+			failed[h.sid] = fmt.Errorf("conversations/index: write turns %s: %w", h.sid, err)
+			continue
+		}
+		upserts[h.sid] = item.Meta
+		committed = append(committed, h.sid)
+	}
+
+	// Phase 3: exactly ONE writeMetaFileLocked call, covering only the
+	// sessions that succeeded through phases 1 and 2 — this is remedy 1
+	// itself. Their locks are still held at this point. A failure here is
+	// shared by every session in this subset (see the doc comment above for
+	// why that is an accepted, pre-existing risk shape, not a new one).
+	if len(upserts) > 0 {
+		if err := idx.writeMetaFileLocked(metaDelta{upserts: upserts}); err != nil {
+			for _, sid := range committed {
+				failed[sid] = fmt.Errorf("conversations/index: commit meta for %s: %w", sid, err)
+			}
+			committed = nil
+		}
 	}
 
 	// Commit the in-memory view last, under a short-lived write lock — no
-	// disk I/O or cross-process locking happens while idx.mu is held.
-	idx.mu.Lock()
-	idx.sessions[meta.SessionID] = meta
-	idx.turns[meta.SessionID] = turns
-	idx.mu.Unlock()
-	return nil
+	// disk I/O or cross-process locking happens while idx.mu is held. Only
+	// the sessions that made it all the way through phase 3.
+	if len(committed) > 0 {
+		idx.mu.Lock()
+		for _, sid := range committed {
+			item := dedup[sid]
+			idx.sessions[sid] = item.Meta
+			idx.turns[sid] = item.Turns
+		}
+		idx.mu.Unlock()
+	}
+
+	outcomes := make([]SessionOpOutcome, 0, len(ids))
+	var errs []error
+	for _, sid := range ids {
+		outcomes = append(outcomes, SessionOpOutcome{SessionID: sid, Err: failed[sid]})
+		if err := failed[sid]; err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return outcomes, errors.Join(errs...)
 }
 
-// DeleteSession removes a session from memory and disk.
-//
-// See UpsertSession's doc comment for why this holds one turnsLockPath(sessionID)
-// cross-process lock across both the turns-file removal and the _meta.json
-// write (rather than two separate acquisitions), and why idx.mu is held only
-// briefly at the end rather than across the whole call.
+// DeleteSession is a thin wrapper over DeleteSessions for single-session
+// callers. See DeleteSessions for the batching rationale.
 func (idx *Index) DeleteSession(sessionID string) error {
-	lock, err := filelock.Acquire(idx.turnsLockPath(sessionID), metaLockTimeout)
-	if err != nil {
-		return fmt.Errorf("conversations/index: acquire session lock for %s: %w", sessionID, err)
-	}
-	defer lock.Release()
+	_, err := idx.DeleteSessions([]string{sessionID})
+	return err
+}
 
-	if err := idx.removeTurnsFileLocked(sessionID); err != nil {
-		return fmt.Errorf("conversations/index: remove turns file: %w", err)
-	}
-	if err := idx.writeMetaFileLocked(metaDelta{deletes: []string{sessionID}}); err != nil {
-		return err
+// DeleteSessions removes a batch of sessions from memory and disk, performing
+// exactly ONE writeMetaFileLocked call regardless of batch size — the same
+// treatment UpsertSessions gives the upsert path (issue #494 remedy 1,
+// applied to the prune path applyIngestSource runs after every ingest-source
+// re-parse).
+//
+// Locking and per-session fault isolation follow UpsertSessions exactly:
+// sessionIDs are de-duplicated and sorted (avoiding both a self-collision on
+// a duplicate ID and a lock-ordering deadlock against a concurrent batch
+// call that shares an ID); each sessionID's lock acquisition and turns-file
+// removal are attempted independently, so one contended sessionID excludes
+// only itself rather than failing every other session in the batch
+// (cog-review, PR #495 third pass); a session is only removed from
+// _meta.json in the one shared writeMetaFileLocked call if its own turns
+// file was already successfully removed under its own lock — never before.
+// See UpsertSessions' doc comment for the full rationale, which applies
+// unchanged here (with removeTurnsFileLocked in place of
+// writeTurnsFileLocked, and metaDelta.deletes in place of .upserts).
+func (idx *Index) DeleteSessions(sessionIDs []string) ([]SessionOpOutcome, error) {
+	if len(sessionIDs) == 0 {
+		return nil, nil
 	}
 
-	idx.mu.Lock()
-	delete(idx.sessions, sessionID)
-	delete(idx.turns, sessionID)
-	idx.mu.Unlock()
-	return nil
+	seen := make(map[string]struct{}, len(sessionIDs))
+	ids := make([]string, 0, len(sessionIDs))
+	for _, sid := range sessionIDs {
+		if _, dup := seen[sid]; dup {
+			continue
+		}
+		seen[sid] = struct{}{}
+		ids = append(ids, sid)
+	}
+	sort.Strings(ids)
+
+	// Phase 1: attempt to acquire every per-sessionID lock independently,
+	// under one shared deadline for the whole batch (see
+	// acquireSessionLocks) — see UpsertSessions' phase-1 comment for the
+	// full rationale. A failure for one sessionID excludes only that
+	// sessionID from phase 2 below.
+	held, failed := idx.acquireSessionLocks(ids)
+	defer func() {
+		for _, h := range held {
+			h.lock.Release()
+		}
+	}()
+
+	// Phase 2: for every successfully-locked session, remove its turns file
+	// independently. A removal failure here also excludes only that
+	// session.
+	committed := make([]string, 0, len(held))
+	for _, h := range held {
+		if err := idx.removeTurnsFileLocked(h.sid); err != nil {
+			failed[h.sid] = fmt.Errorf("conversations/index: remove turns file for %s: %w", h.sid, err)
+			continue
+		}
+		committed = append(committed, h.sid)
+	}
+
+	// Phase 3: exactly ONE writeMetaFileLocked call, covering only the
+	// sessions that succeeded through phases 1 and 2 — this is remedy 1
+	// itself. A failure here is shared by every session in this subset (see
+	// UpsertSessions' doc comment for why that is an accepted, pre-existing
+	// risk shape, not a new one).
+	if len(committed) > 0 {
+		if err := idx.writeMetaFileLocked(metaDelta{deletes: committed}); err != nil {
+			for _, sid := range committed {
+				failed[sid] = fmt.Errorf("conversations/index: commit meta delete for %s: %w", sid, err)
+			}
+			committed = nil
+		}
+	}
+
+	if len(committed) > 0 {
+		idx.mu.Lock()
+		for _, sid := range committed {
+			delete(idx.sessions, sid)
+			delete(idx.turns, sid)
+		}
+		idx.mu.Unlock()
+	}
+
+	outcomes := make([]SessionOpOutcome, 0, len(ids))
+	var errs []error
+	for _, sid := range ids {
+		outcomes = append(outcomes, SessionOpOutcome{SessionID: sid, Err: failed[sid]})
+		if err := failed[sid]; err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return outcomes, errors.Join(errs...)
 }
 
 // removeTurnsFileLocked deletes sessionID's turns file. Callers must already
@@ -326,6 +621,33 @@ func (idx *Index) ListSessions(since, until time.Time, identity string) []Sessio
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].LastTurnAt.After(out[j].LastTurnAt)
 	})
+	return out
+}
+
+// SessionIDsBySource groups every indexed session ID by its Source field in
+// a single unsorted O(n) pass over idx.sessions.
+//
+// This is remedy 2 for issue #494: applyIngestSource's prune pass used to
+// call idx.ListSessions(time.Time{}, time.Time{}, "") — which allocates a
+// full copy of every indexed SessionMeta and then sort.Slice's it by
+// LastTurnAt, an ordering the prune pass never uses — once per ingest source
+// with a create/update action in the plan, every reconcile cycle. With
+// several ingest sources typically drifting in the same cycle, that meant
+// several redundant full-index sorts of the same ~7,500 sessions just to
+// answer "which session IDs belong to source X" for each X in turn. Calling
+// this once per ApplyPlan cycle (hoisted out of the per-source
+// applyIngestSource call into the action loop in ApplyPlan) turns that into
+// one full-index walk — with no sort — shared by every source that needs it,
+// and returns only session IDs, which is all the prune pass compares against
+// its parsed set.
+func (idx *Index) SessionIDsBySource() map[string][]string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	out := make(map[string][]string)
+	for sid, m := range idx.sessions {
+		out[m.Source] = append(out[m.Source], sid)
+	}
 	return out
 }
 
@@ -571,7 +893,20 @@ func (idx *Index) turnsPath(sessionID string) string {
 // baseline and performs a full reload — sessions map AND turns map together —
 // keeping the two maps consistent with each other at the cost of that one
 // reload.
+//
+// writeMetaFileLockedHook, when non-nil, is invoked once at the start of
+// every writeMetaFileLocked call. Production code never sets it; it exists
+// so tests can count how many times the full _meta.json read-merge-write
+// round trip actually runs — the cost issue #494 is about — without
+// resorting to fragile mtime/inode polling around a call that (post-fix)
+// completes in well under a second. See index_batch_test.go.
+var writeMetaFileLockedHook func()
+
 func (idx *Index) writeMetaFileLocked(delta metaDelta) error {
+	if writeMetaFileLockedHook != nil {
+		writeMetaFileLockedHook()
+	}
+
 	lock, err := filelock.Acquire(idx.metaLockPath(), metaLockTimeout)
 	if err != nil {
 		return fmt.Errorf("conversations/index: acquire meta lock: %w", err)
@@ -655,26 +990,30 @@ func (idx *Index) writeMetaFileLocked(delta metaDelta) error {
 }
 
 // sessionMapsEqual reports whether a and b contain exactly the same set of
-// session IDs mapped to byte-for-byte-equal SessionMeta values, using each
-// value's JSON encoding for the comparison (SessionMeta has no slice/map
-// fields, so this is equivalent to a field-by-field equality check but
-// avoids having to keep a manual comparator in sync with the struct).
+// session IDs mapped to byte-for-byte-equal SessionMeta values.
+//
+// This is remedy 3 for issue #494. The original implementation range'd over
+// every key and called json.Marshal on each side's value individually — up
+// to 2 marshals per common key, i.e. O(n) *small* marshals plus O(n) string
+// comparisons, measured at ~24ms of the ~66ms writeMetaFileLocked round trip
+// against the live 7,547-session index. encoding/json marshals
+// map[string]T's keys in sorted order (guaranteed by the stdlib since map
+// key ordering is otherwise undefined), so two maps with identical
+// key/value content always produce byte-identical JSON regardless of Go's
+// randomized map iteration order. That makes one whole-map marshal per side
+// plus a single byte comparison exactly equivalent to the old per-value
+// walk, at a fraction of the allocation and call overhead — 2 marshals
+// total instead of up to 2n.
 func sessionMapsEqual(a, b map[string]SessionMeta) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for k, av := range a {
-		bv, ok := b[k]
-		if !ok {
-			return false
-		}
-		aj, aerr := json.Marshal(av)
-		bj, berr := json.Marshal(bv)
-		if aerr != nil || berr != nil || string(aj) != string(bj) {
-			return false
-		}
+	aj, aerr := json.Marshal(a)
+	bj, berr := json.Marshal(b)
+	if aerr != nil || berr != nil {
+		return false
 	}
-	return true
+	return string(aj) == string(bj)
 }
 
 // turnsLockPath is the advisory cross-process lock file guarding a single
