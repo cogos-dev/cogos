@@ -205,6 +205,53 @@ func (d *ReconcileDaemon) clearPhaseFailureThrottle(providerType, phase string) 
 	d.lastPhaseErrMu.Unlock()
 }
 
+// warnActionFailureThrottled is warnPhaseFailureThrottled's counterpart for
+// per-action ApplyFailed results (issue #494, cog-review PR #496 second
+// pass). It shares the same lastPhaseErr map/mutex but keys on
+// (providerType, action, name) instead of (providerType, phase): a single
+// provider can return many independent actions per ApplyPlan call, each
+// able to fail for its own unrelated reason (e.g. one site CRD with a bad
+// strategy while another site CRD deploys fine), so throttling at the
+// coarser per-phase granularity would let one action's failure streak mask,
+// or be masked by, a genuinely new failure on a different action. The
+// logged message and field shape (provider/action/name/err as separate slog
+// attributes, message text "reconcile-daemon: action failed") match exactly
+// what this call site logged before throttling existed — only the decision
+// of Warn-vs-Debug is new.
+//
+// The "action|" key prefix can never collide with a phase key: phase names
+// (LoadConfig, FetchLive, ComputePlan, ...) never contain a literal "|",
+// so providerType+"|"+phase and providerType+"|action|"+action+"|"+name
+// occupy disjoint regions of the same map by construction.
+func (d *ReconcileDaemon) warnActionFailureThrottled(providerType, action, name, errText string) {
+	key := providerType + "|action|" + action + "|" + name
+
+	d.lastPhaseErrMu.Lock()
+	prev, seen := d.lastPhaseErr[key]
+	changed := !seen || prev != errText
+	d.lastPhaseErr[key] = errText
+	d.lastPhaseErrMu.Unlock()
+
+	args := []any{"provider", providerType, "action", action, "name", name, "err", errText}
+	if changed {
+		slog.Warn("reconcile-daemon: action failed", args...)
+		return
+	}
+	slog.Debug("reconcile-daemon: action failed", args...)
+}
+
+// clearActionFailureThrottle is clearPhaseFailureThrottle's counterpart for
+// warnActionFailureThrottled's (providerType, action, name) keys — called
+// when that specific action succeeds, so a later recurrence of the same
+// failure text after a period of health is treated as fresh, not a
+// continuation of an old streak.
+func (d *ReconcileDaemon) clearActionFailureThrottle(providerType, action, name string) {
+	key := providerType + "|action|" + action + "|" + name
+	d.lastPhaseErrMu.Lock()
+	delete(d.lastPhaseErr, key)
+	d.lastPhaseErrMu.Unlock()
+}
+
 // LastCycleSerial returns the current monotonic cycle-completion counter for
 // providerType and true if at least one cycle has completed for it. Returns
 // (0, false) if no cycle for that provider type has completed yet.
@@ -760,17 +807,26 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	}
 	d.clearPhaseFailureThrottle(providerType, "ApplyPlan")
 
-	// Count apply failures.
+	// Count apply failures. Per-action logging is throttled like every
+	// phase-level failure above (issue #494, cog-review PR #496 second
+	// pass): a single persistently-failing action (e.g. a site CRD with an
+	// invalid strategy — ApplyPlan returns one ApplyFailed result with no
+	// top-level error, so this loop is the ONLY place that error is ever
+	// logged) would otherwise repeat the identical line every tick forever.
+	// warnActionFailureThrottled keys on (providerType, action, name) —
+	// finer than the phase-level helper's (providerType, phase) — so one
+	// action's failure streak never suppresses, or is suppressed by, a
+	// different action's genuinely new failure on the same provider. A
+	// succeeded result clears that action's streak so a later recurrence
+	// after recovery is treated as fresh.
 	applyFailed := 0
 	for _, r := range results {
-		if r.Status == reconcile.ApplyFailed {
+		switch r.Status {
+		case reconcile.ApplyFailed:
 			applyFailed++
-			slog.Warn("reconcile-daemon: action failed",
-				"provider", providerType,
-				"action", r.Action,
-				"name", r.Name,
-				"err", r.Error,
-			)
+			d.warnActionFailureThrottled(providerType, r.Action, r.Name, r.Error)
+		case reconcile.ApplySucceeded:
+			d.clearActionFailureThrottle(providerType, r.Action, r.Name)
 		}
 	}
 

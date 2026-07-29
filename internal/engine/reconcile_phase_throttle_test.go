@@ -476,3 +476,141 @@ func TestReconcileDaemon_ChronicWriteStateFailureIsThrottled(t *testing.T) {
 		t.Errorf("got %d DEBUG-level 'WriteState failed' lines, want at least %d", debugCount, ticks-1)
 	}
 }
+
+// ─── cog-review PR #496 second-pass follow-up: per-action ApplyFailed ─────────
+
+// TestWarnActionFailureThrottled_LogLevels drives warnActionFailureThrottled/
+// clearActionFailureThrottle directly, mirroring
+// TestWarnPhaseFailureThrottled_LogLevels: first occurrence and any text
+// change WARN, exact repeats DEBUG, clearing resets the streak, and a
+// different action or name is an independent key even for the same
+// providerType (the whole point of keying finer than the phase-level
+// helper).
+func TestWarnActionFailureThrottled_LogLevels(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	d := &ReconcileDaemon{lastPhaseErr: make(map[string]string)}
+
+	d.warnActionFailureThrottled("site", "create", "app-a", "strategy lookup: unsupported deploy strategy \"\"")
+	d.warnActionFailureThrottled("site", "create", "app-a", "strategy lookup: unsupported deploy strategy \"\"")
+	d.warnActionFailureThrottled("site", "create", "app-a", "strategy lookup: unsupported deploy strategy \"\"")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 log lines for 3 calls, got %d:\n%s", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[0], "level=WARN") {
+		t.Errorf("first occurrence should log at WARN, got: %s", lines[0])
+	}
+	for i, line := range lines[1:] {
+		if !strings.Contains(line, "level=DEBUG") {
+			t.Errorf("repeat occurrence #%d should log at DEBUG (throttled), got: %s", i+2, line)
+		}
+	}
+
+	// A different action's failure on the SAME provider is an independent
+	// key and must WARN, even while app-a's streak is still active.
+	buf.Reset()
+	d.warnActionFailureThrottled("site", "create", "app-b", "strategy lookup: unsupported deploy strategy \"\"")
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("a different action name must WARN independently of app-a's streak, got: %s", buf.String())
+	}
+
+	// clearActionFailureThrottle resets app-a's streak: a later repeat of
+	// the same text must WARN again.
+	d.clearActionFailureThrottle("site", "create", "app-a")
+	buf.Reset()
+	d.warnActionFailureThrottled("site", "create", "app-a", "strategy lookup: unsupported deploy strategy \"\"")
+	if !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("after clearActionFailureThrottle, a repeat must WARN again (fresh recurrence), got: %s", buf.String())
+	}
+}
+
+// actionFailingReconcilable always has one action to apply, and that
+// action's ApplyPlan result is ApplyFailed with a fixed error text every
+// cycle (ApplyPlan itself returns a nil top-level error, matching
+// site.applyAction's shape: a bad strategy fails one action, not the whole
+// ApplyPlan call) — exercises warnActionFailureThrottled's wiring into
+// runOneCycle's per-action results loop (cog-review, PR #496 second pass).
+type actionFailingReconcilable struct {
+	typeName  string
+	loadCount atomic.Int32
+}
+
+func (r *actionFailingReconcilable) Type() string { return r.typeName }
+func (r *actionFailingReconcilable) LoadConfig(_ string) (any, error) {
+	r.loadCount.Add(1)
+	return map[string]any{}, nil
+}
+func (r *actionFailingReconcilable) FetchLive(_ context.Context, _ any) (any, error) {
+	return map[string]any{}, nil
+}
+func (r *actionFailingReconcilable) ComputePlan(_ any, _ any, _ *reconcile.State) (*reconcile.Plan, error) {
+	return &reconcile.Plan{
+		ResourceType: r.typeName,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+		Actions: []reconcile.Action{{
+			Action: reconcile.ActionCreate, ResourceType: r.typeName, Name: "test-resource",
+			Details: map[string]any{},
+		}},
+		Summary: reconcile.Summary{Creates: 1},
+	}, nil
+}
+func (r *actionFailingReconcilable) ApplyPlan(_ context.Context, plan *reconcile.Plan) ([]reconcile.Result, error) {
+	var results []reconcile.Result
+	for _, a := range plan.Actions {
+		results = append(results, reconcile.Result{
+			Phase: "apply", Action: string(a.Action), Name: a.Name,
+			Status: reconcile.ApplyFailed, Error: "simulated action failure",
+		})
+	}
+	return results, nil
+}
+func (r *actionFailingReconcilable) BuildState(_ any, _ any, _ *reconcile.State) (*reconcile.State, error) {
+	return reconcile.NewState(r.typeName), nil
+}
+func (r *actionFailingReconcilable) Health() reconcile.ResourceStatus {
+	return reconcile.NewResourceStatus(reconcile.SyncStatusUnknown, reconcile.HealthDegraded)
+}
+
+// TestReconcileDaemon_ChronicActionFailureIsThrottled is the end-to-end
+// regression test: a provider whose ApplyPlan succeeds overall but always
+// reports the SAME action as ApplyFailed (mirroring a site CRD with an
+// invalid strategy — ApplyPlan itself returns no top-level error, so the
+// per-action results loop is the only place this failure is ever logged)
+// must produce exactly one Warn "action failed" line across many ticks.
+func TestReconcileDaemon_ChronicActionFailureIsThrottled(t *testing.T) {
+	reconcile.ResetProviders()
+	defer reconcile.ResetProviders()
+
+	var buf syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	bad := &actionFailingReconcilable{typeName: "test-chronic-action-failure"}
+	reconcile.UpsertProvider(bad.Type(), bad)
+
+	daemon := newTestDaemon(t.TempDir(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	daemon.Start(ctx)
+	<-ctx.Done()
+	cancel()
+	waitForShutdown(t, daemon)
+
+	ticks := bad.loadCount.Load()
+	if ticks < 3 {
+		t.Fatalf("test setup: expected several ticks, got %d — increase the test window", ticks)
+	}
+
+	warnCount, debugCount := countLevelledLines(buf.String(), "reconcile-daemon: action failed")
+	if warnCount != 1 {
+		t.Errorf("got %d WARN-level 'action failed' lines across %d ticks, want exactly 1", warnCount, ticks)
+	}
+	if debugCount < int(ticks)-1 {
+		t.Errorf("got %d DEBUG-level 'action failed' lines, want at least %d", debugCount, ticks-1)
+	}
+}
