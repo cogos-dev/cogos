@@ -1,6 +1,7 @@
 package vitalsretention
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -61,6 +62,35 @@ func TestWindow_TraversalMetricNeverReadsPlantedFileOutsideBase(t *testing.T) {
 	r := &Recorder{}
 	if _, err := r.Window("../../../planted", time.Now().Add(-time.Hour), tierRaw); err == nil {
 		t.Fatal("expected traversal metric to be rejected before any file access")
+	}
+}
+
+// TestWindow_ValidationErrorsAreErrInvalidQuery lets HTTP/MCP callers
+// (serve_vitals.go, mcp_tool_vitals.go) distinguish "you sent a bad
+// request" from "this node's storage failed" via errors.Is, rather than
+// mapping every Window() failure to the same status uniformly.
+func TestWindow_ValidationErrorsAreErrInvalidQuery(t *testing.T) {
+	_ = withWorkspace(t, "node-a")
+	r := &Recorder{}
+
+	cases := []struct {
+		name       string
+		metric     string
+		resolution string
+	}{
+		{"empty metric", "", tierRaw},
+		{"unknown metric", "not_a_real_metric", tierRaw},
+		{"unknown resolution", "disk_free_bytes", "15m"},
+	}
+	for _, tc := range cases {
+		_, err := r.Window(tc.metric, time.Now(), tc.resolution)
+		if err == nil {
+			t.Errorf("%s: expected an error", tc.name)
+			continue
+		}
+		if !errors.Is(err, ErrInvalidQuery) {
+			t.Errorf("%s: expected errors.Is(err, ErrInvalidQuery), got %v", tc.name, err)
+		}
 	}
 }
 

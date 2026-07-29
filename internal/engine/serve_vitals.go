@@ -15,6 +15,7 @@ package engine
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -64,7 +65,17 @@ func (s *Server) handleVitals(w http.ResponseWriter, r *http.Request) {
 
 	points, err := vitalsretention.Window(metric, since, resolution)
 	if err != nil {
-		writeVitalsError(w, http.StatusBadRequest, err.Error())
+		// ErrInvalidQuery marks a bad metric/resolution — the caller's fault,
+		// 400. Anything else (e.g. a day-file that exists but can't be read)
+		// is this node's storage, not the request — 500. Distinguishing
+		// these was a confirmed cog-review finding on the initial version of
+		// this handler (PR #493, fb9a291), which mapped every Window() error
+		// to 400 uniformly.
+		status := http.StatusInternalServerError
+		if errors.Is(err, vitalsretention.ErrInvalidQuery) {
+			status = http.StatusBadRequest
+		}
+		writeVitalsError(w, status, err.Error())
 		return
 	}
 	if points == nil {

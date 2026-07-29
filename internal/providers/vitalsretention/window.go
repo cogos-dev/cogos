@@ -6,11 +6,21 @@
 package vitalsretention
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 )
+
+// ErrInvalidQuery marks a Window() failure as a caller-input problem (bad
+// metric/resolution) rather than a server-side one (a day-file that exists
+// but can't be read). Wrap with %w so callers can distinguish the two via
+// errors.Is — cog-review on PR #493 (fb9a291) noted that without this,
+// GET /v1/vitals mapped every Window() error to HTTP 400 uniformly,
+// including genuine I/O failures a caller has no way to "fix" by sending a
+// different request.
+var ErrInvalidQuery = errors.New("vitals-retention: invalid query")
 
 // validMetricNames is the allowlist Window() checks metric against before
 // it ever reaches a filesystem path. Built once from AllMetricNames()
@@ -70,15 +80,19 @@ type Point struct {
 // not this one's default.
 func (r *Recorder) Window(metric string, since time.Time, resolution string) ([]Point, error) {
 	if metric == "" {
-		return nil, fmt.Errorf("vitals-retention: metric is required")
+		return nil, fmt.Errorf("%w: metric is required", ErrInvalidQuery)
 	}
 	if !isValidMetricName(metric) {
-		return nil, fmt.Errorf("vitals-retention: unknown metric %q (see AllMetricNames)", metric)
+		return nil, fmt.Errorf("%w: unknown metric %q (see AllMetricNames)", ErrInvalidQuery, metric)
 	}
 	if !validTiers[resolution] {
-		return nil, fmt.Errorf("vitals-retention: unknown resolution %q (want raw, 5m, or 1h)", resolution)
+		return nil, fmt.Errorf("%w: unknown resolution %q (want raw, 5m, or 1h)", ErrInvalidQuery, resolution)
 	}
 
+	// baseDir's only failure mode is "no workspace root resolvable" — a
+	// server-side configuration problem, not something a caller can fix by
+	// changing metric/since/resolution, so it is deliberately NOT wrapped
+	// with ErrInvalidQuery (same reasoning as the readDayFile error below).
 	base, err := r.baseDir()
 	if err != nil {
 		return nil, err
