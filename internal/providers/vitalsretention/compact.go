@@ -28,10 +28,14 @@ func bucketDuration(tier string) time.Duration {
 	}
 }
 
-// maybeCompact runs a compaction pass for nodeKey if the check interval has
-// elapsed since the last pass. Never returns an error to the caller (the
-// bus-handler dispatch context) — outcomes are recorded via
-// recordCompactResult for Health() to surface instead.
+// maybeCompact hands a compaction pass for nodeKey off to its own goroutine
+// if the check interval has elapsed since the last pass and no compaction is
+// already in flight. It never blocks on compaction I/O — the caller is the
+// bus-handler dispatch context (HandleBusEvent, synchronous inside
+// BusSessionManager.AppendEvent), and per #497 that path must return as soon
+// as the (cheap) sample append is durable, without waiting on compaction's
+// file I/O. Outcomes are recorded via recordCompactResult for Health() to
+// surface instead of returning an error here.
 func (r *Recorder) maybeCompact(base, nodeKey string) {
 	root, err := resolveWorkspaceRoot()
 	if err != nil {
@@ -39,18 +43,59 @@ func (r *Recorder) maybeCompact(base, nodeKey string) {
 	}
 	cfg := loadConfigCached(root)
 
-	r.mu.Lock()
-	due := time.Since(r.lastCompactAt) >= cfg.compactCheckInterval()
-	r.mu.Unlock()
-	if !due {
+	if !r.claimCompactSlot(cfg) {
 		return
 	}
 
-	err = r.compactNode(base, nodeKey, cfg)
-	r.recordCompactResult(err)
-	if err != nil {
-		warnf("vitals-retention: compaction pass failed for node=%s: %v", nodeKey, err)
+	go func() {
+		err := compactHook(r, base, nodeKey, cfg)
+		r.recordCompactResult(err)
+		if err != nil {
+			warnf("vitals-retention: compaction pass failed for node=%s: %v", nodeKey, err)
+		}
+	}()
+}
+
+// claimCompactSlot atomically checks whether a compaction pass is due
+// (interval elapsed) and, if so and none is already in flight, claims the
+// single-flight slot and stamps lastCompactAt immediately — before the pass
+// itself has run. Doing the due-check and the claim inside one critical
+// section closes the check-then-act race on lastCompactAt flagged
+// non-blocking in #493's final review: previously two concurrent callers
+// could both observe "due" before either updated lastCompactAt, since the
+// update only happened after compactNode returned. Now the claim and the
+// stamp are the same atomic step, so at most one caller ever proceeds per
+// interval, and the `compacting` guard additionally covers the case where a
+// single pass runs longer than the check interval itself.
+func (r *Recorder) claimCompactSlot(cfg Config) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.compacting {
+		return false
 	}
+	if time.Since(r.lastCompactAt) < cfg.compactCheckInterval() {
+		return false
+	}
+	r.compacting = true
+	r.lastCompactAt = time.Now()
+	return true
+}
+
+// compactHook performs the actual compaction pass. It is a package-level
+// seam (rather than calling r.compactNode directly) so tests can inject a
+// slow or instrumented compaction without real slow disk I/O — see
+// SetCompactHookForTest.
+var compactHook = func(r *Recorder, base, nodeKey string, cfg Config) error {
+	return r.compactNode(base, nodeKey, cfg)
+}
+
+// SetCompactHookForTest overrides compactHook for the duration of a test.
+// Callers must invoke the returned restore func (typically via t.Cleanup)
+// to avoid leaking the override into other tests.
+func SetCompactHookForTest(f func(r *Recorder, base, nodeKey string, cfg Config) error) (restore func()) {
+	prev := compactHook
+	compactHook = f
+	return func() { compactHook = prev }
 }
 
 // compactNode runs one full compaction pass: raw->5m aging, 5m->1h aging,

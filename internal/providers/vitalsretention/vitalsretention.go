@@ -131,6 +131,16 @@ type Recorder struct {
 	lastAppendAt   time.Time
 	lastCompactErr error
 	lastCompactAt  time.Time
+
+	// compacting is the single-flight guard: true while a compaction
+	// goroutine is running for this recorder. Read and written only under
+	// mu, alongside the lastCompactAt check-then-claim in
+	// claimCompactSlot (compact.go) — see #497: this closes the
+	// check-then-act race on lastCompactAt flagged non-blocking in #493's
+	// final review, since claiming the slot and stamping lastCompactAt now
+	// happen atomically in the same critical section instead of a
+	// check-then-later-set split across the compaction pass.
+	compacting bool
 }
 
 // globalRecorder is the process-wide recorder instance. A package-level
@@ -219,11 +229,17 @@ func (r *Recorder) recordAppendResult(err error) {
 	r.lastAppendAt = time.Now()
 }
 
+// recordCompactResult records the outcome of a finished compaction pass and
+// releases the single-flight slot claimed by claimCompactSlot (compact.go)
+// — the two are folded into one critical section so "compaction finished"
+// and "a new one may be claimed" become visible to other goroutines
+// atomically.
 func (r *Recorder) recordCompactResult(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lastCompactErr = err
 	r.lastCompactAt = time.Now()
+	r.compacting = false
 }
 
 // --- providerAdapter: pkg/substrate/reconcile.Reconcilable wiring -------
