@@ -74,17 +74,27 @@ type CancelSafeCompleter interface {
 
 // CompleteCancelSafeIfSupported calls p.CompleteCancelSafe when the provider
 // implements CancelSafeCompleter, otherwise falls back to plain Complete.
-// Internal non-interactive call sites (autonomic consult, dispatch, tool-loop
-// re-calls) should route through this rather than calling Complete directly,
-// so that a ctx cancel/timeout actually aborts server-side generation on
-// providers where that matters (#432) without changing behavior for
-// providers where it doesn't apply.
+// Non-streaming call sites — dispatch, tool-loop re-calls, the autonomic
+// consult, AND the external non-streaming chat/Anthropic-compat HTTP
+// handlers (serve.go, serve_anthropic.go) — route through this rather than
+// calling Complete directly, so that a ctx cancel/timeout actually aborts
+// server-side generation on providers where that matters (#432) without
+// changing behavior for providers where it doesn't apply.
 //
 // This is also the RFC-040 S0 InferenceP50Ms/InferenceQueue tap
 // (dispatch_inference_metrics.go): every call is timed and counted in-flight
-// exactly once here, so the gauge reflects the same population #432's
-// abandoned-inference counter already watches at this chokepoint, without a
-// second instrumentation site per caller.
+// exactly once here. See that file's package doc for the exact, corrected
+// scope of what these gauges measure and — importantly — what they don't
+// (streaming completions bypass this function entirely).
+//
+// Wrapper providers that need to preserve cancel-safety semantics on their
+// own embedded Provider (e.g. countingProvider in local_agent_harness.go,
+// whose CompleteCancelSafe must still reach the inner provider's
+// cancel-safe path) MUST call completeCancelSafeIfSupportedRaw, not this
+// function — calling this function again from inside a CancelSafeCompleter
+// implementation that this function itself just dispatched into would
+// double-count the same logical call in both the queue-depth and p50
+// instrumentation below.
 func CompleteCancelSafeIfSupported(ctx context.Context, p Provider, req *CompletionRequest) (*CompletionResponse, error) {
 	start := time.Now()
 	beginDispatchInferenceSample()
@@ -92,6 +102,16 @@ func CompleteCancelSafeIfSupported(ctx context.Context, p Provider, req *Complet
 		endDispatchInferenceSample(time.Since(start))
 	}()
 
+	return completeCancelSafeIfSupportedRaw(ctx, p, req)
+}
+
+// completeCancelSafeIfSupportedRaw is the uninstrumented fallback logic
+// behind CompleteCancelSafeIfSupported, extracted so a CancelSafeCompleter
+// wrapper's own CompleteCancelSafe method can delegate to its embedded
+// provider without re-entering (and double-instrumenting) the exported,
+// metered entry point. See CompleteCancelSafeIfSupported's doc for why this
+// matters.
+func completeCancelSafeIfSupportedRaw(ctx context.Context, p Provider, req *CompletionRequest) (*CompletionResponse, error) {
 	if cs, ok := p.(CancelSafeCompleter); ok {
 		return cs.CompleteCancelSafe(ctx, req)
 	}

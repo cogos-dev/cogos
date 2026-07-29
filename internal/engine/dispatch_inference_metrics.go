@@ -8,34 +8,56 @@
 // in-flight inference. Per the no-stubs directive, both were left out rather
 // than backed by a misleading reading.
 //
-// This file closes that gap by tapping the one chokepoint that already
-// carries exactly the traffic these gauges are meant to describe:
-// CompleteCancelSafeIfSupported (provider.go). Its own doc comment scopes it
-// precisely: "Internal non-interactive call sites (autonomic consult,
-// dispatch, tool-loop re-calls)" — concretely, every call LocalHarnessController
-// makes on the dispatch fan-out path (agent_dispatch.go/local_agent_harness.go
-// dispatchSlot -> completeWithToolLoop -> tool_loop.go re-calls) and the
-// autonomic assess-cycle consult (local_agent_harness.go assessCycle). That is
-// the same population inference_inflight.go's abandoned-inference counter
-// (#432) already instruments at these exact call sites — this is a second tap
-// on the same funnel, not a new subsystem.
+// This file closes that gap by tapping the one chokepoint every non-streaming
+// completion in this kernel already funnels through: CompleteCancelSafeIfSupported
+// (provider.go). Corrected scope (a fix-review finding on the first version
+// of this PR named the original claim inaccurate — see git history on this
+// file for the wrong version): that function is called by dispatch fan-out
+// (agent_dispatch.go/local_agent_harness.go dispatchSlot -> completeWithToolLoop
+// -> tool_loop.go re-calls), the autonomic assess-cycle consult
+// (local_agent_harness.go assessCycle), AND the external, interactive
+// non-streaming chat/Anthropic-compat HTTP handlers (serve.go completeChat,
+// serve_anthropic.go completeAnthropicMessages). It is NOT scoped to
+// "internal-only" traffic, and it explicitly EXCLUDES every streaming
+// completion (streamChat, streamAnthropicMessages, and any other caller of
+// provider.Stream directly) — including interactive chat UIs, which are the
+// common case there. Per issue #427, the local LM Studio backend serializes
+// concurrent inference server-side regardless of transport, so streaming
+// traffic contends for the same resource these gauges are meant to observe
+// but is invisible to them; conversely, ordinary non-streaming chat traffic
+// with no dispatch or autonomic involvement at all does move these gauges.
+// Read InferenceQueue/InferenceP50Ms as "contention across all non-streaming
+// completions this process is inflight on," not "dispatch-only contention."
 //
 // Honesty about what these gauges measure:
 //   - InferenceQueue is NOT a literal FIFO queue depth — no queue exists on
 //     this path (fan-out is unbounded goroutines, no worker pool or
-//     semaphore). It is the number of these internal completions currently
-//     between call and return, which is exactly the contention signal the
-//     RFC-040 gauge exists to surface: issue #427 documents that the local LM
-//     Studio provider serializes concurrent inference server-side, so a
-//     nonzero reading here is real queueing pressure on that single-capacity
-//     resource, and is the sensor the 2026-07-29 scheduling census's
-//     manned-valve design (Claim{Resource: "inference:<node>-lms", Capacity:
-//     1}) and load-balancing v0 gate on.
+//     semaphore). It is the number of non-streaming completions currently
+//     between call and return, which is a real (if partial — see the
+//     streaming exclusion above) contention signal: issue #427 documents
+//     that the local LM Studio provider serializes concurrent inference
+//     server-side, so a nonzero reading here is real queueing pressure on
+//     that single-capacity resource. It is one input the 2026-07-29
+//     scheduling census's manned-valve design (Claim{Resource:
+//     "inference:<node>-lms", Capacity: 1}) and load-balancing v0 name as a
+//     needed gate — not a complete signal on its own, since it misses
+//     streaming traffic on the same resource.
 //   - InferenceP50Ms is the rolling median of the last dispatchDurationRingCap
-//     completed calls' wall-clock duration, in milliseconds. A small
-//     fixed-capacity ring buffer behind one mutex — bounded and lock-cheap,
-//     per RFC-040 S0's explicit allowance for exactly this shape rather than
-//     a new tracking subsystem.
+//     completed calls' wall-clock duration, in milliseconds, over the same
+//     non-streaming population described above. A small fixed-capacity ring
+//     buffer behind one mutex — bounded and lock-cheap, per RFC-040 S0's
+//     explicit allowance for exactly this shape rather than a new tracking
+//     subsystem.
+//
+// Double-counting note: CompleteCancelSafeIfSupported is instrumented once,
+// at its top level. countingProvider (local_agent_harness.go), which wraps
+// the provider on the dispatch path to count turns, implements
+// CancelSafeCompleter itself — so without care, a top-level instrumented
+// call into countingProvider.CompleteCancelSafe that then called the
+// instrumented function again on the inner provider would count one logical
+// dispatch completion twice. countingProvider.CompleteCancelSafe therefore
+// delegates to completeCancelSafeIfSupportedRaw (provider.go), the
+// uninstrumented core, not back through CompleteCancelSafeIfSupported.
 //
 // Per RFC-040 N5, both are pure observation: neither is read by AllGreen(),
 // neither participates in dispatch timeout/retry/routing decisions today —

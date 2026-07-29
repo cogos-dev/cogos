@@ -130,14 +130,14 @@ func renderPrometheusMetrics(snap KernelHealthSnapshot) string {
 		},
 		{
 			name:    "cogos_inference_p50_ms",
-			help:    "Rolling median duration, in milliseconds, of recent internal inference calls (dispatch fan-out + autonomic consult) (RFC-040 S0). Absent until at least one such call has completed.",
+			help:    "Rolling median duration, in ms, of non-streaming completions: dispatch, tool-loop, autonomic consult, and external chat/Anthropic-compat HTTP. Excludes streaming (RFC-040 S0). Absent until at least one such call has completed.",
 			mtype:   "gauge",
 			present: snap.HostVitals.InferenceP50Ms != nil,
 			value:   formatFloat64Ptr(snap.HostVitals.InferenceP50Ms),
 		},
 		{
 			name:    "cogos_inference_queue",
-			help:    "Current count of internal inference calls in flight (dispatch fan-out + autonomic consult) (RFC-040 S0). Not a literal FIFO queue depth; see dispatch_inference_metrics.go.",
+			help:    "Current count of in-flight non-streaming completions (dispatch, tool-loop, autonomic consult, external chat/Anthropic-compat HTTP; excludes streaming) (RFC-040 S0). Not a literal FIFO queue depth; see dispatch_inference_metrics.go.",
 			mtype:   "gauge",
 			present: snap.HostVitals.InferenceQueue != nil,
 			value:   formatIntPtr(snap.HostVitals.InferenceQueue),

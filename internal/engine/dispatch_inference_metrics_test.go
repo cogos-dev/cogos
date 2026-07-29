@@ -2,6 +2,10 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -147,5 +151,63 @@ func TestCompleteCancelSafeIfSupported_RecordsQueueAndDuration(t *testing.T) {
 	}
 	if p50 <= 0 {
 		t.Fatalf("want a positive p50 given 30ms stub latency, got %v", p50)
+	}
+}
+
+// TestCompleteCancelSafeIfSupported_CountingProviderDoesNotDoubleCount is the
+// fix-review regression test: dispatchSlot always wraps its provider in
+// countingProvider (local_agent_harness.go) before calling
+// CompleteCancelSafeIfSupported. Because *countingProvider itself implements
+// CancelSafeCompleter, the top-level call dispatches into
+// countingProvider.CompleteCancelSafe — which, before this fix, called
+// CompleteCancelSafeIfSupported a second time on the embedded provider,
+// recording two samples (and two in-flight increments) for one logical
+// dispatch completion. countingProvider.CompleteCancelSafe now delegates to
+// completeCancelSafeIfSupportedRaw instead, so exactly one sample should
+// land per call, no matter how many CancelSafeCompleter layers wrap the
+// real provider.
+func TestCompleteCancelSafeIfSupported_CountingProviderDoesNotDoubleCount(t *testing.T) {
+	resetDispatchInferenceMetricsForTest()
+	t.Cleanup(resetDispatchInferenceMetricsForTest)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload openaiChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if payload.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+		_ = json.NewEncoder(w).Encode(openaiChatResponseJSON("hi", "stop"))
+	}))
+	defer srv.Close()
+
+	inner := newTestOpenAIProvider(t, srv.URL, "m")
+	counting := &countingProvider{Provider: inner}
+
+	// countingProvider itself implements CancelSafeCompleter (see
+	// local_agent_harness.go), so this is exactly dispatchSlot's call shape:
+	// CompleteCancelSafeIfSupported(ctx, counting, req).
+	if _, ok := Provider(counting).(CancelSafeCompleter); !ok {
+		t.Fatal("test assumption violated: countingProvider must implement CancelSafeCompleter")
+	}
+
+	_, err := CompleteCancelSafeIfSupported(context.Background(), counting, &CompletionRequest{
+		Messages: []ProviderMessage{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("CompleteCancelSafeIfSupported: %v", err)
+	}
+
+	if got := dispatchQueueDepth(); got != 0 {
+		t.Fatalf("want queue depth 0 after the call returns, got %d", got)
+	}
+	dispatchDurationMu.Lock()
+	n := dispatchDurationLen
+	dispatchDurationMu.Unlock()
+	if n != 1 {
+		t.Fatalf("want exactly 1 recorded sample for one logical dispatch call through countingProvider, got %d", n)
 	}
 }

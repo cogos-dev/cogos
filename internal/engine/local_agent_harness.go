@@ -2032,9 +2032,18 @@ func (p *countingProvider) Complete(ctx context.Context, req *CompletionRequest)
 // plain Complete, reintroducing the zombie-generation risk specifically on
 // the dispatch path (dispatchSlot always wraps its provider in
 // countingProvider to track turn counts).
+//
+// Delegates to completeCancelSafeIfSupportedRaw, NOT CompleteCancelSafeIfSupported:
+// dispatchSlot's call to completeWithToolLoop already invokes
+// CompleteCancelSafeIfSupported(ctx, counting, req) once, which — because
+// *countingProvider implements CancelSafeCompleter — dispatches straight
+// into this method. Calling the instrumented CompleteCancelSafeIfSupported
+// again here would re-enter the RFC-040 S0 queue/p50 tap
+// (dispatch_inference_metrics.go) a second time for the same logical call,
+// double-counting every dispatch-path completion.
 func (p *countingProvider) CompleteCancelSafe(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error) {
 	p.completeCalls.Add(1)
-	return CompleteCancelSafeIfSupported(ctx, p.Provider, req)
+	return completeCancelSafeIfSupportedRaw(ctx, p.Provider, req)
 }
 
 func (p *countingProvider) CompleteCalls() int {
