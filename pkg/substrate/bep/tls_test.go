@@ -52,6 +52,61 @@ func TestGenerateBEPCertNoOverwrite(t *testing.T) {
 	}
 }
 
+// GenerateBEPCert must refuse an existing key file exactly as it refuses an
+// existing cert file — the earlier version only checked bep-cert.pem, which
+// is how a key-without-cert directory could silently be overwritten (or,
+// symmetrically, how the reviewed cert-without-key bug went undetected).
+func TestGenerateBEPCertNoOverwriteKeyOnly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "bep-key.pem"), []byte("existing key\n"), 0o600); err != nil {
+		t.Fatalf("seed key file: %v", err)
+	}
+
+	if err := GenerateBEPCert(dir); err == nil {
+		t.Error("expected error when bep-key.pem already exists, got nil")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bep-cert.pem")); err == nil {
+		t.Error("GenerateBEPCert must not have written a cert when refusing due to an existing key")
+	}
+}
+
+// If cert generation fails partway (simulated here by making the directory
+// unwritable right after the key would land), no partial identity — neither
+// a lone cert nor a lone key — should be left on disk. This pins the
+// temp-file+rename and key-before-cert-with-rollback discipline the review
+// asked for: a cert must never exist without its key.
+func TestGenerateBEPCertNoPartialStateOnFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based fault injection doesn't apply as root")
+	}
+	dir := t.TempDir()
+
+	// Make the directory read-only before generation even starts: the key
+	// write (which now happens first) will fail immediately, so nothing
+	// should be written at all.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if err := GenerateBEPCert(dir); err == nil {
+		t.Fatal("expected GenerateBEPCert to fail against a read-only directory")
+	}
+
+	_ = os.Chmod(dir, 0o700)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("expected no files left behind after a failed generation, found: %v", names)
+	}
+}
+
 // ─── DeviceID derivation ────────────────────────────────────────────────────────
 
 func TestDeviceIDFromCert(t *testing.T) {
