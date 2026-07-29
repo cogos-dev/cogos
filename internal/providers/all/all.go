@@ -53,6 +53,7 @@ import (
 	"github.com/myrgic/cogos/internal/providers/daemon"
 	"github.com/myrgic/cogos/internal/providers/marginbridge" // registers "margin-bridge" with pkg/reconcile
 	_ "github.com/myrgic/cogos/internal/providers/site"       // registers "site" with pkg/reconcile
+	"github.com/myrgic/cogos/internal/providers/vitalsretention"
 	"github.com/myrgic/cogos/internal/workspace"
 	subidentity "github.com/myrgic/cogos/pkg/substrate/identity"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
@@ -176,6 +177,11 @@ func Register(evalProvider *eval.EvalProvider, harnessRegistry *subidentity.Harn
 	engine.SetProvidersWorkspace = func(workspaceRoot string) {
 		daemon.SetWorkspaceRoot(workspaceRoot)
 		component.SetWorkspaceRoot(workspaceRoot)
+		// RFC-040 S2: give the vitals-retention recorder its workspace root
+		// so Health()/Window() and the bus-handler wiring below (see
+		// WireProviderRuntime) all resolve the same .cog/observatory/vitals
+		// base, in both the daemon and `cog reconcile`/`cog health` CLI paths.
+		vitalsretention.SetWorkspaceRoot(workspaceRoot)
 		if workspaceRoot != "" {
 			engine.RegisterWorktreeReconciler(workspaceRoot, nil, nil, nil)
 		}
@@ -204,14 +210,21 @@ func Register(evalProvider *eval.EvalProvider, harnessRegistry *subidentity.Harn
 	// runs after NewServer, when Process/BusSessions/BusBroker all exist.
 	engine.WireProviderRuntime = func(s *engine.Server) {
 		p, err := reconcile.GetProvider("margin-bridge")
-		if err != nil {
-			return
+		if err == nil {
+			if mb, ok := p.(*marginbridge.Provider); ok {
+				mb.SetEventSink(&kernelEventSink{server: s})
+			}
 		}
-		mb, ok := p.(*marginbridge.Provider)
-		if !ok {
-			return
+
+		// RFC-040 S2: subscribe the vitals-retention recorder to
+		// bus_kernel_proprio. AddEventHandler dispatches synchronously
+		// inside BusSessionManager.AppendEvent, once per autonomic tick —
+		// see internal/providers/vitalsretention/recorder.go for the
+		// best-effort contract (never blocks, never panics, records
+		// failures for Health() instead of returning them).
+		if mgr := s.BusSessions(); mgr != nil {
+			mgr.AddEventHandler("vitals-retention-recorder", vitalsretention.HandleBusEvent)
 		}
-		mb.SetEventSink(&kernelEventSink{server: s})
 	}
 }
 

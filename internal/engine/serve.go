@@ -228,6 +228,11 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// kernel health snapshot (provider counts + S0 host gauges). Current
 	// values only — no history, no aggregation. See serve_metrics.go.
 	s.route(mux, "GET /metrics", s.handleMetrics)
+
+	// RFC-040 S2: retained vitals history. The ONE query helper
+	// (window(metric, since, resolution) — N2) over /v1/vitals. See
+	// serve_vitals.go.
+	s.route(mux, "GET /v1/vitals", s.handleVitals)
 	s.registerAgentRoutes(mux)
 	s.registerSkillRoutes(mux)
 
