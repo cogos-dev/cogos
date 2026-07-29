@@ -244,6 +244,87 @@ func TestHandleAgentDispatch_SyncPathUnaffected(t *testing.T) {
 	}
 }
 
+// --- POST /v1/agents/{id}/dispatch (target_node cluster routing) -----------
+//
+// Regression coverage for #490: handleAgentDispatch called the un-routed
+// QueryDispatchToHarness (router hard-coded nil) instead of
+// QueryDispatchToHarnessRouted(..., s.bepEngine, ...), so a target_node
+// dispatch over HTTP always failed cluster_disabled even when the BEP engine
+// was up and the MCP surface (toolDispatchToHarness) routed the identical
+// request fine. Mirrors cluster_dispatch_test.go's router-nil case, but
+// exercised through the real HTTP handler rather than
+// QueryDispatchToHarnessRouted directly.
+
+// TestHandleAgentDispatch_TargetNodeWithoutClusterReturnsClusterDisabled
+// covers the defect: a Server with no BEP engine wired (s.bepEngine == nil,
+// the default for every test server and any node with cluster.enabled=false)
+// must still fail fast with code="cluster_disabled" for a target_node
+// request over HTTP, matching the MCP tool's behavior — not hang, not panic
+// on a nil-pointer RemoteDispatch call, and not silently run the dispatch
+// locally.
+func TestHandleAgentDispatch_TargetNodeWithoutClusterReturnsClusterDisabled(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+	disp := &fakeAgentDispatcher{cannedOk: true}
+	srv.SetAgentController(disp)
+
+	if srv.bepEngine != nil {
+		t.Fatal("test server unexpectedly has a bepEngine wired; test assumes cluster is dark")
+	}
+
+	body := `{"task":"do the thing","target_node":"nodeB"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/agents/"+DefaultAgentID+"/dispatch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(w, req)
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp["code"] != "cluster_disabled" {
+		t.Fatalf(`body["code"] = %v, want "cluster_disabled" (status=%d, body=%v)`, resp["code"], w.Code, resp)
+	}
+	// The local dispatcher must never have been invoked for a target_node
+	// request — a nil router is a hard fail-fast, not a silent local fallback.
+	if disp.lastReq.Task != "" {
+		t.Errorf("local dispatcher was invoked (lastReq=%+v); target_node request should fail before reaching it", disp.lastReq)
+	}
+}
+
+// TestHandleAgentDispatch_EmptyTargetNodeUsesLocalPath is the sibling
+// regression guard: omitting target_node must keep using the local dispatch
+// path exactly as before the #490 fix — the new router plumbing must not
+// change behavior for the (overwhelmingly common) non-cluster request shape.
+func TestHandleAgentDispatch_EmptyTargetNodeUsesLocalPath(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+	disp := &fakeAgentDispatcher{canned: &DispatchBatchResult{
+		Results: []DispatchResult{{Index: 0, Success: true, Content: "local-result"}},
+	}}
+	srv.SetAgentController(disp)
+
+	body := `{"task":"do the thing"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/agents/"+DefaultAgentID+"/dispatch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200; body=%s", w.Code, w.Body.String())
+	}
+	var batch DispatchBatchResult
+	if err := json.NewDecoder(w.Body).Decode(&batch); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(batch.Results) != 1 || batch.Results[0].Content != "local-result" {
+		t.Fatalf("local result mismatch: %+v", batch)
+	}
+	if disp.lastReq.TargetNode != "" {
+		t.Errorf("lastReq.TargetNode = %q, want empty", disp.lastReq.TargetNode)
+	}
+}
+
 // pollHTTPUntilTerminal polls GET /v1/dispatch-jobs/{id} through srv.Handler()
 // until the job reaches a terminal state (done/failed) or a 5s deadline
 // elapses. Mirrors dispatch_jobs_test.go's waitForTerminalJob (MCP side) —

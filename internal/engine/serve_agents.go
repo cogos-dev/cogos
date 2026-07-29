@@ -113,7 +113,20 @@ func (s *Server) handleAgentDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := QueryDispatchToHarness(r.Context(), s.agentController, input)
+	// Cluster-aware routing (Phase 2 S4), mirrored from toolDispatchToHarness
+	// in mcp_server.go: pass the server's BEP engine as the router so a
+	// target_node dispatch forwards over the authenticated BEP channel
+	// instead of always failing fast with cluster_disabled. Nil-safe by
+	// construction — router is only ever assigned a genuinely non-nil
+	// *BEPEngine, so a dark cluster (s.bepEngine == nil) leaves router as a
+	// true nil interface rather than a non-nil interface wrapping a nil
+	// pointer (the classic Go footgun QueryDispatchToHarnessRouted's
+	// `router == nil` check would otherwise miss).
+	var router RemoteDispatchRouter
+	if s.bepEngine != nil {
+		router = s.bepEngine
+	}
+	resp, err := QueryDispatchToHarnessRouted(r.Context(), s.agentController, router, input)
 	if err != nil {
 		writeAgentHTTPError(w, err)
 		return
