@@ -313,7 +313,6 @@ func removeDayFile(base, nodeKey, tier, metric string, day time.Time) error {
 func (r *Recorder) enforceRawBudget(base, nodeKey string, cfg Config) error {
 	budget := cfg.rawBudgetBytes()
 	rawDir := filepath.Join(base, nodeKey, tierRaw)
-	today := time.Now().UTC().Truncate(24 * time.Hour)
 	for {
 		size, err := dirSize(rawDir)
 		if err != nil {
@@ -322,6 +321,12 @@ func (r *Recorder) enforceRawBudget(base, nodeKey string, cfg Config) error {
 		if size <= budget {
 			return nil
 		}
+		// Recomputed each iteration, not snapshotted at entry: a long pass
+		// that crosses UTC midnight must start excluding the NEW actively-
+		// written day immediately, or the exclusion above stops protecting
+		// exactly the file HandleBusEvent is appending to (gate finding on
+		// head 2682919).
+		today := time.Now().UTC().Truncate(24 * time.Hour)
 		metric, day, ok, err := oldestRawDay(base, nodeKey, today)
 		if err != nil {
 			return err

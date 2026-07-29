@@ -16,6 +16,9 @@ func TestMaybeCompact_ConcurrentCallsTriggerAtMostOneCompaction(t *testing.T) {
 
 	var calls int32
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseFn) // failure paths (t.Fatal) must not leak the blocked hook goroutine
 	restore := SetCompactHookForTest(func(r *Recorder, base, nodeKey string, cfg Config) error {
 		atomic.AddInt32(&calls, 1)
 		<-release
@@ -35,7 +38,7 @@ func TestMaybeCompact_ConcurrentCallsTriggerAtMostOneCompaction(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	close(release)
+	releaseFn()
 
 	// Give the single (if any) compaction goroutine time to finish and
 	// record its result before asserting.
@@ -60,6 +63,9 @@ func TestHandleBusEvent_DoesNotBlockOnSlowCompaction(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseFn)
 	restore := SetCompactHookForTest(func(r *Recorder, base, nodeKey string, cfg Config) error {
 		close(started)
 		<-release // never released during this test's HandleBusEvent call
@@ -90,5 +96,5 @@ func TestHandleBusEvent_DoesNotBlockOnSlowCompaction(t *testing.T) {
 		t.Fatal("compaction goroutine never started")
 	}
 
-	close(release)
+	releaseFn()
 }
