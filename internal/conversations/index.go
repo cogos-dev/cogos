@@ -33,7 +33,11 @@ import (
 // the cross-process lock on _meta.json before giving up. Generous relative to
 // the write itself (a few JSON marshals + one rename) but short enough that a
 // wedged peer doesn't hang the caller indefinitely.
-const metaLockTimeout = 5 * time.Second
+//
+// A var rather than a const solely so tests can shrink it (see
+// index_batch_atomicity_test.go) to keep a deliberate-lock-timeout
+// regression test fast; production code never assigns to it.
+var metaLockTimeout = 5 * time.Second
 
 // Index holds all indexed turns in memory plus a reference to the projection
 // directory for persistence.
@@ -300,30 +304,54 @@ func (idx *Index) UpsertSessions(batch []SessionAndTurns) error {
 	}
 	sort.Strings(ids)
 
+	// Phase 1: acquire EVERY per-sessionID lock before writing anything to
+	// disk. This is what makes the batch atomic with respect to a mid-batch
+	// lock-acquisition failure (cog-review, PR #495 second pass): the most
+	// plausible way for this loop to fail partway through is a peer process
+	// holding one particular sessionID's turnsLockPath past metaLockTimeout
+	// — exactly the cross-process contention this whole PR is about.
+	// Acquiring-then-immediately-writing one session at a time (the original
+	// version of this method) would leave every earlier session's turns
+	// file already written to disk with no corresponding _meta.json commit
+	// when a later session's lock times out, since the single shared
+	// writeMetaFileLocked call never runs. Acquiring every lock FIRST means
+	// that failure mode aborts before any turns file has been touched: on
+	// error here, the deferred release loop above hands back every lock
+	// this call did manage to acquire, and disk state is exactly as it was
+	// before the call, for every session in the batch — not just the ones
+	// that failed.
 	locks := make([]*filelock.FileLock, 0, len(ids))
 	defer func() {
 		for _, l := range locks {
 			l.Release()
 		}
 	}()
-
-	upserts := make(map[string]SessionMeta, len(ids))
 	for _, sid := range ids {
-		item := dedup[sid]
 		lock, err := filelock.Acquire(idx.turnsLockPath(sid), metaLockTimeout)
 		if err != nil {
 			return fmt.Errorf("conversations/index: acquire session lock for %s: %w", sid, err)
 		}
 		locks = append(locks, lock)
+	}
 
+	// Phase 2: with every lock held, write every turns file. A failure here
+	// is a genuine disk I/O error (e.g. out of space) rather than lock
+	// contention — far rarer, and no worse than the residual risk
+	// UpsertSession has always carried for a single session; batching does
+	// not add new exposure to this class of failure, only to the
+	// lock-contention class phase 1 above eliminates.
+	upserts := make(map[string]SessionMeta, len(ids))
+	for _, sid := range ids {
+		item := dedup[sid]
 		if err := idx.writeTurnsFileLocked(sid, item.Turns); err != nil {
 			return fmt.Errorf("conversations/index: write turns %s: %w", sid, err)
 		}
 		upserts[sid] = item.Meta
 	}
 
-	// Exactly ONE writeMetaFileLocked call for the whole batch — this is the
-	// fix. All per-sessionID locks above are still held at this point.
+	// Phase 3: exactly ONE writeMetaFileLocked call for the whole batch —
+	// this is remedy 1 itself. All per-sessionID locks above are still held
+	// at this point.
 	if err := idx.writeMetaFileLocked(metaDelta{upserts: upserts}); err != nil {
 		return err
 	}
@@ -375,27 +403,41 @@ func (idx *Index) DeleteSessions(sessionIDs []string) error {
 	}
 	sort.Strings(ids)
 
+	// Phase 1: acquire EVERY per-sessionID lock before deleting anything —
+	// see UpsertSessions' phase-1 comment for the full rationale (cog-review,
+	// PR #495 second pass). Critically for deletes, failing partway through
+	// a acquire-then-immediately-remove loop (the original version of this
+	// method) is worse than the upsert case: it leaves already-processed
+	// sessions' turns files ALREADY DELETED from disk while _meta.json and
+	// the in-memory index still list them as present — the exact
+	// sessions/turns split-brain issues #449/#458 were fixed to prevent for
+	// a single session, reachable again across a multi-session batch.
+	// Acquiring every lock first means a failure here leaves every
+	// session's turns file untouched, for every session in the batch.
 	locks := make([]*filelock.FileLock, 0, len(ids))
 	defer func() {
 		for _, l := range locks {
 			l.Release()
 		}
 	}()
-
 	for _, sid := range ids {
 		lock, err := filelock.Acquire(idx.turnsLockPath(sid), metaLockTimeout)
 		if err != nil {
 			return fmt.Errorf("conversations/index: acquire session lock for %s: %w", sid, err)
 		}
 		locks = append(locks, lock)
+	}
 
+	// Phase 2: with every lock held, remove every turns file.
+	for _, sid := range ids {
 		if err := idx.removeTurnsFileLocked(sid); err != nil {
 			return fmt.Errorf("conversations/index: remove turns file: %w", err)
 		}
 	}
 
-	// Exactly ONE writeMetaFileLocked call for the whole batch — this is the
-	// fix. All per-sessionID locks above are still held at this point.
+	// Phase 3: exactly ONE writeMetaFileLocked call for the whole batch —
+	// this is remedy 1 itself. All per-sessionID locks above are still held
+	// at this point.
 	if err := idx.writeMetaFileLocked(metaDelta{deletes: ids}); err != nil {
 		return err
 	}
