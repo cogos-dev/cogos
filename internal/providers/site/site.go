@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -510,7 +511,24 @@ func siteBuild(ctx context.Context, appDir, name string) error {
 	if err != nil {
 		return fmt.Errorf("build.sh for %s: %w\n%s", name, err, out)
 	}
-	log.Printf("[site] build %s: %s", name, out)
+	// Issue #494 (unrelated observation): ComputePlan's drift-detection hash
+	// runs this build on every reconcile cycle (default 30s) for every
+	// deployed site, whether or not anything changed — see the doc comment
+	// on ComputePlan's build-and-hash step. Logging the FULL combined
+	// stdout+stderr of `bash build.sh` at every one of those cycles, via the
+	// stdlib log package (which has no level and always writes to
+	// os.Stderr), was the single largest contributor to
+	// ~/.cog/var/logs/serve.log's observed 488 MB — almost entirely
+	// "MallocStackLogging: can't turn off malloc stack logging because it
+	// was not enabled." emitted by the forked build subprocess to its own
+	// stderr and captured verbatim by CombinedOutput. A successful build's
+	// full output is a debugging aid, not routine operational signal, so it
+	// moves to slog.Debug (suppressed by default; opt in with
+	// COG_LOG_DEBUG=1, see log_capture.go) rather than being dropped
+	// outright — the failure path below (fmt.Errorf, still including out)
+	// is unchanged, so a genuine build failure's output is still surfaced at
+	// whatever level the caller logs the returned error.
+	slog.Debug("site: build succeeded", "name", name, "output", string(out))
 	return nil
 }
 

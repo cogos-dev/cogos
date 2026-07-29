@@ -136,6 +136,17 @@ type ReconcileDaemon struct {
 	// score C_B without re-running ComputePlan out of band.
 	lastSummariesMu sync.Mutex
 	lastSummaries   map[string]reconcile.Summary
+
+	// lastPhaseErr caches the last-logged error text per (providerType,
+	// phase) key, used by warnPhaseFailureThrottled (issue #494, "unrelated
+	// observation": a chronically unconfigured provider — e.g. discord with
+	// no bot token — fails the identical phase every single tick forever,
+	// and logging every one of those at Warn contributed to
+	// ~/.cog/var/logs/serve.log growing unbounded). Telemetry, not kernel
+	// state (First Instruments §0): purely a log-level decision, never
+	// consulted for control flow.
+	lastPhaseErrMu sync.Mutex
+	lastPhaseErr   map[string]string
 }
 
 // NewReconcileDaemon creates a ReconcileDaemon with the given config.
@@ -149,7 +160,49 @@ func NewReconcileDaemon(cfg ReconcileDaemonConfig) *ReconcileDaemon {
 		health:        newConvergenceTracker(cfg.Convergence),
 		cycleSerials:  make(map[string]*atomic.Int64),
 		lastSummaries: make(map[string]reconcile.Summary),
+		lastPhaseErr:  make(map[string]string),
 	}
+}
+
+// warnPhaseFailureThrottled logs a cycle-aborting phase failure ("LoadConfig
+// failed", "FetchLive failed", etc.) at Warn the first time this
+// (providerType, phase) pair fails, or whenever the error text changes from
+// the last time it failed, and at Debug for every subsequent occurrence of
+// the byte-identical error. See the doc comment on lastPhaseErr for why this
+// exists: a provider that fails the same phase for the same reason on every
+// tick (the common shape for "not configured yet" rather than a transient
+// fault) previously logged that at Warn forever. A fresh failure, or a
+// change in the failure's text, is still new information and still gets a
+// Warn — only the noise of repeating the identical message is suppressed.
+func (d *ReconcileDaemon) warnPhaseFailureThrottled(providerType, phase string, err error) {
+	msg := err.Error()
+	key := providerType + "|" + phase
+
+	d.lastPhaseErrMu.Lock()
+	prev, seen := d.lastPhaseErr[key]
+	changed := !seen || prev != msg
+	d.lastPhaseErr[key] = msg
+	d.lastPhaseErrMu.Unlock()
+
+	logMsg := "reconcile-daemon: " + phase + " failed"
+	if changed {
+		slog.Warn(logMsg, "provider", providerType, "err", err)
+		return
+	}
+	slog.Debug(logMsg, "provider", providerType, "err", err)
+}
+
+// clearPhaseFailureThrottle forgets any cached failure text for
+// (providerType, phase), called right after that phase succeeds. Without
+// this, a phase that fails, later succeeds, and then fails again with the
+// exact same error text as its earlier failure would be treated as a
+// continuation of the old streak (logged at Debug) rather than the fresh
+// recurrence it actually is.
+func (d *ReconcileDaemon) clearPhaseFailureThrottle(providerType, phase string) {
+	key := providerType + "|" + phase
+	d.lastPhaseErrMu.Lock()
+	delete(d.lastPhaseErr, key)
+	d.lastPhaseErrMu.Unlock()
 }
 
 // LastCycleSerial returns the current monotonic cycle-completion counter for
@@ -585,20 +638,24 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	config, err := provider.LoadConfig(d.cfg.WorkspaceRoot)
 	loadMs = time.Since(loadStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: LoadConfig failed",
-			"provider", providerType, "err", err)
+		d.warnPhaseFailureThrottled(providerType, "LoadConfig", err)
 		return fmt.Errorf("LoadConfig %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "LoadConfig")
 
 	// Step 2: FetchLive — read-only observation of world state.
 	fetchStart := time.Now()
 	live, err := provider.FetchLive(spanCtx, config)
 	fetchMs = time.Since(fetchStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: FetchLive failed",
-			"provider", providerType, "err", err)
+		// Issue #494 (unrelated observation): throttled rather than a plain
+		// slog.Warn — a chronically unconfigured provider (e.g. discord with
+		// no bot token) previously logged this exact failure at Warn on
+		// every tick forever. See warnPhaseFailureThrottled's doc comment.
+		d.warnPhaseFailureThrottled(providerType, "FetchLive", err)
 		return fmt.Errorf("FetchLive %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "FetchLive")
 
 	// Acquire the cross-process state lock for the full
 	// LoadState → ComputePlan → ApplyPlan → BuildState → WriteState cycle
@@ -612,10 +669,10 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	// and skip this cycle, retried on the next tick.
 	lock, lockErr := reconcile.AcquireStateLock(d.cfg.WorkspaceRoot, providerType)
 	if lockErr != nil {
-		slog.Warn("reconcile-daemon: acquire state lock failed",
-			"provider", providerType, "err", lockErr)
+		d.warnPhaseFailureThrottled(providerType, "acquire state lock", lockErr)
 		return fmt.Errorf("acquire state lock %s: %w", providerType, lockErr)
 	}
+	d.clearPhaseFailureThrottle(providerType, "acquire state lock")
 	defer lock.Release()
 
 	// Step 3: Load persisted state.
@@ -636,10 +693,10 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	plan, err := provider.ComputePlan(config, live, state)
 	planMs = time.Since(planStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: ComputePlan failed",
-			"provider", providerType, "err", err)
+		d.warnPhaseFailureThrottled(providerType, "ComputePlan", err)
 		return fmt.Errorf("ComputePlan %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "ComputePlan")
 
 	// Cache this cycle's Summary for LastCoherence (First Instruments B2/
 	// M1-B). Telemetry, not kernel state (§0) — already computed above, so
@@ -692,10 +749,10 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	results, err := provider.ApplyPlan(spanCtx, plan)
 	applyMs = time.Since(applyStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: ApplyPlan failed",
-			"provider", providerType, "err", err)
+		d.warnPhaseFailureThrottled(providerType, "ApplyPlan", err)
 		return fmt.Errorf("ApplyPlan %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "ApplyPlan")
 
 	// Count apply failures.
 	applyFailed := 0
