@@ -136,6 +136,17 @@ type ReconcileDaemon struct {
 	// score C_B without re-running ComputePlan out of band.
 	lastSummariesMu sync.Mutex
 	lastSummaries   map[string]reconcile.Summary
+
+	// lastPhaseErr caches the last-logged error text per (providerType,
+	// phase) key, used by warnPhaseFailureThrottled (issue #494, "unrelated
+	// observation": a chronically unconfigured provider — e.g. discord with
+	// no bot token — fails the identical phase every single tick forever,
+	// and logging every one of those at Warn contributed to
+	// ~/.cog/var/logs/serve.log growing unbounded). Telemetry, not kernel
+	// state (First Instruments §0): purely a log-level decision, never
+	// consulted for control flow.
+	lastPhaseErrMu sync.Mutex
+	lastPhaseErr   map[string]string
 }
 
 // NewReconcileDaemon creates a ReconcileDaemon with the given config.
@@ -149,7 +160,96 @@ func NewReconcileDaemon(cfg ReconcileDaemonConfig) *ReconcileDaemon {
 		health:        newConvergenceTracker(cfg.Convergence),
 		cycleSerials:  make(map[string]*atomic.Int64),
 		lastSummaries: make(map[string]reconcile.Summary),
+		lastPhaseErr:  make(map[string]string),
 	}
+}
+
+// warnPhaseFailureThrottled logs a cycle-aborting phase failure ("LoadConfig
+// failed", "FetchLive failed", etc.) at Warn the first time this
+// (providerType, phase) pair fails, or whenever the error text changes from
+// the last time it failed, and at Debug for every subsequent occurrence of
+// the byte-identical error. See the doc comment on lastPhaseErr for why this
+// exists: a provider that fails the same phase for the same reason on every
+// tick (the common shape for "not configured yet" rather than a transient
+// fault) previously logged that at Warn forever. A fresh failure, or a
+// change in the failure's text, is still new information and still gets a
+// Warn — only the noise of repeating the identical message is suppressed.
+func (d *ReconcileDaemon) warnPhaseFailureThrottled(providerType, phase string, err error) {
+	msg := err.Error()
+	key := providerType + "|" + phase
+
+	d.lastPhaseErrMu.Lock()
+	prev, seen := d.lastPhaseErr[key]
+	changed := !seen || prev != msg
+	d.lastPhaseErr[key] = msg
+	d.lastPhaseErrMu.Unlock()
+
+	logMsg := "reconcile-daemon: " + phase + " failed"
+	if changed {
+		slog.Warn(logMsg, "provider", providerType, "err", err)
+		return
+	}
+	slog.Debug(logMsg, "provider", providerType, "err", err)
+}
+
+// clearPhaseFailureThrottle forgets any cached failure text for
+// (providerType, phase), called right after that phase succeeds. Without
+// this, a phase that fails, later succeeds, and then fails again with the
+// exact same error text as its earlier failure would be treated as a
+// continuation of the old streak (logged at Debug) rather than the fresh
+// recurrence it actually is.
+func (d *ReconcileDaemon) clearPhaseFailureThrottle(providerType, phase string) {
+	key := providerType + "|" + phase
+	d.lastPhaseErrMu.Lock()
+	delete(d.lastPhaseErr, key)
+	d.lastPhaseErrMu.Unlock()
+}
+
+// warnActionFailureThrottled is warnPhaseFailureThrottled's counterpart for
+// per-action ApplyFailed results (issue #494, cog-review PR #496 second
+// pass). It shares the same lastPhaseErr map/mutex but keys on
+// (providerType, action, name) instead of (providerType, phase): a single
+// provider can return many independent actions per ApplyPlan call, each
+// able to fail for its own unrelated reason (e.g. one site CRD with a bad
+// strategy while another site CRD deploys fine), so throttling at the
+// coarser per-phase granularity would let one action's failure streak mask,
+// or be masked by, a genuinely new failure on a different action. The
+// logged message and field shape (provider/action/name/err as separate slog
+// attributes, message text "reconcile-daemon: action failed") match exactly
+// what this call site logged before throttling existed — only the decision
+// of Warn-vs-Debug is new.
+//
+// The "action|" key prefix can never collide with a phase key: phase names
+// (LoadConfig, FetchLive, ComputePlan, ...) never contain a literal "|",
+// so providerType+"|"+phase and providerType+"|action|"+action+"|"+name
+// occupy disjoint regions of the same map by construction.
+func (d *ReconcileDaemon) warnActionFailureThrottled(providerType, action, name, errText string) {
+	key := providerType + "|action|" + action + "|" + name
+
+	d.lastPhaseErrMu.Lock()
+	prev, seen := d.lastPhaseErr[key]
+	changed := !seen || prev != errText
+	d.lastPhaseErr[key] = errText
+	d.lastPhaseErrMu.Unlock()
+
+	args := []any{"provider", providerType, "action", action, "name", name, "err", errText}
+	if changed {
+		slog.Warn("reconcile-daemon: action failed", args...)
+		return
+	}
+	slog.Debug("reconcile-daemon: action failed", args...)
+}
+
+// clearActionFailureThrottle is clearPhaseFailureThrottle's counterpart for
+// warnActionFailureThrottled's (providerType, action, name) keys — called
+// when that specific action succeeds, so a later recurrence of the same
+// failure text after a period of health is treated as fresh, not a
+// continuation of an old streak.
+func (d *ReconcileDaemon) clearActionFailureThrottle(providerType, action, name string) {
+	key := providerType + "|action|" + action + "|" + name
+	d.lastPhaseErrMu.Lock()
+	delete(d.lastPhaseErr, key)
+	d.lastPhaseErrMu.Unlock()
 }
 
 // LastCycleSerial returns the current monotonic cycle-completion counter for
@@ -585,20 +685,24 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	config, err := provider.LoadConfig(d.cfg.WorkspaceRoot)
 	loadMs = time.Since(loadStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: LoadConfig failed",
-			"provider", providerType, "err", err)
+		d.warnPhaseFailureThrottled(providerType, "LoadConfig", err)
 		return fmt.Errorf("LoadConfig %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "LoadConfig")
 
 	// Step 2: FetchLive — read-only observation of world state.
 	fetchStart := time.Now()
 	live, err := provider.FetchLive(spanCtx, config)
 	fetchMs = time.Since(fetchStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: FetchLive failed",
-			"provider", providerType, "err", err)
+		// Issue #494 (unrelated observation): throttled rather than a plain
+		// slog.Warn — a chronically unconfigured provider (e.g. discord with
+		// no bot token) previously logged this exact failure at Warn on
+		// every tick forever. See warnPhaseFailureThrottled's doc comment.
+		d.warnPhaseFailureThrottled(providerType, "FetchLive", err)
 		return fmt.Errorf("FetchLive %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "FetchLive")
 
 	// Acquire the cross-process state lock for the full
 	// LoadState → ComputePlan → ApplyPlan → BuildState → WriteState cycle
@@ -612,10 +716,10 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	// and skip this cycle, retried on the next tick.
 	lock, lockErr := reconcile.AcquireStateLock(d.cfg.WorkspaceRoot, providerType)
 	if lockErr != nil {
-		slog.Warn("reconcile-daemon: acquire state lock failed",
-			"provider", providerType, "err", lockErr)
+		d.warnPhaseFailureThrottled(providerType, "acquire state lock", lockErr)
 		return fmt.Errorf("acquire state lock %s: %w", providerType, lockErr)
 	}
+	d.clearPhaseFailureThrottle(providerType, "acquire state lock")
 	defer lock.Release()
 
 	// Step 3: Load persisted state.
@@ -626,8 +730,14 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		// corruption or a permission/read fault. Surface it instead of silently
 		// resetting lineage serials, mirroring the WriteState warning below.
 		// Continue with the nil state — providers already handle a nil state.
-		slog.Warn("reconcile-daemon: LoadState failed; continuing with empty state",
-			"provider", providerType, "err", stateErr)
+		//
+		// Throttled like every other phase failure in this function
+		// (cog-review, PR #496 first pass): a persistently corrupted or
+		// unreadable state file fails with the same text on every tick
+		// forever otherwise, reproducing this PR's own log-spam bug class.
+		d.warnPhaseFailureThrottled(providerType, "LoadState", stateErr)
+	} else {
+		d.clearPhaseFailureThrottle(providerType, "LoadState")
 	}
 	stateMs = time.Since(stateStart).Milliseconds()
 
@@ -636,10 +746,10 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	plan, err := provider.ComputePlan(config, live, state)
 	planMs = time.Since(planStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: ComputePlan failed",
-			"provider", providerType, "err", err)
+		d.warnPhaseFailureThrottled(providerType, "ComputePlan", err)
 		return fmt.Errorf("ComputePlan %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "ComputePlan")
 
 	// Cache this cycle's Summary for LastCoherence (First Instruments B2/
 	// M1-B). Telemetry, not kernel state (§0) — already computed above, so
@@ -692,38 +802,56 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	results, err := provider.ApplyPlan(spanCtx, plan)
 	applyMs = time.Since(applyStart).Milliseconds()
 	if err != nil {
-		slog.Warn("reconcile-daemon: ApplyPlan failed",
-			"provider", providerType, "err", err)
+		d.warnPhaseFailureThrottled(providerType, "ApplyPlan", err)
 		return fmt.Errorf("ApplyPlan %s: %w", providerType, err)
 	}
+	d.clearPhaseFailureThrottle(providerType, "ApplyPlan")
 
-	// Count apply failures.
+	// Count apply failures. Per-action logging is throttled like every
+	// phase-level failure above (issue #494, cog-review PR #496 second
+	// pass): a single persistently-failing action (e.g. a site CRD with an
+	// invalid strategy — ApplyPlan returns one ApplyFailed result with no
+	// top-level error, so this loop is the ONLY place that error is ever
+	// logged) would otherwise repeat the identical line every tick forever.
+	// warnActionFailureThrottled keys on (providerType, action, name) —
+	// finer than the phase-level helper's (providerType, phase) — so one
+	// action's failure streak never suppresses, or is suppressed by, a
+	// different action's genuinely new failure on the same provider. A
+	// succeeded result clears that action's streak so a later recurrence
+	// after recovery is treated as fresh.
 	applyFailed := 0
 	for _, r := range results {
-		if r.Status == reconcile.ApplyFailed {
+		switch r.Status {
+		case reconcile.ApplyFailed:
 			applyFailed++
-			slog.Warn("reconcile-daemon: action failed",
-				"provider", providerType,
-				"action", r.Action,
-				"name", r.Name,
-				"err", r.Error,
-			)
+			d.warnActionFailureThrottled(providerType, r.Action, r.Name, r.Error)
+		case reconcile.ApplySucceeded:
+			d.clearActionFailureThrottle(providerType, r.Action, r.Name)
 		}
 	}
 
 	// Steps 6-7: BuildState (pure) + WriteState (atomic tmp+rename), timed
 	// together as the persist phase.
 	writeStart := time.Now()
+	// Both BuildState and WriteState failures are throttled the same way as
+	// every other phase in this function (cog-review, PR #496 first pass:
+	// these two were the remaining unthrottled sibling sites — a workspace
+	// that loses write access to its state directory, or a provider whose
+	// BuildState step is persistently broken, otherwise fails identically
+	// on every tick forever, reproducing this PR's own log-spam bug class).
 	newState, buildErr := provider.BuildState(config, live, state)
-	if buildErr == nil && newState != nil {
-		// Step 7: WriteState — atomic tmp+rename.
-		if writeErr := reconcile.WriteState(d.cfg.WorkspaceRoot, providerType, newState); writeErr != nil {
-			slog.Warn("reconcile-daemon: WriteState failed",
-				"provider", providerType, "err", writeErr)
+	if buildErr != nil {
+		d.warnPhaseFailureThrottled(providerType, "BuildState", buildErr)
+	} else {
+		d.clearPhaseFailureThrottle(providerType, "BuildState")
+		if newState != nil {
+			// Step 7: WriteState — atomic tmp+rename.
+			if writeErr := reconcile.WriteState(d.cfg.WorkspaceRoot, providerType, newState); writeErr != nil {
+				d.warnPhaseFailureThrottled(providerType, "WriteState", writeErr)
+			} else {
+				d.clearPhaseFailureThrottle(providerType, "WriteState")
+			}
 		}
-	} else if buildErr != nil {
-		slog.Warn("reconcile-daemon: BuildState failed",
-			"provider", providerType, "err", buildErr)
 	}
 	writeMs = time.Since(writeStart).Milliseconds()
 

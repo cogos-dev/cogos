@@ -33,6 +33,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -221,6 +222,40 @@ type Provider struct {
 	// The apply-side analogue of FailedDirs/FailedFiles' fetch-side
 	// carry-forward (PR #468 round-3 cog-review).
 	failedApplyAddrs map[string]bool
+
+	// lastLogErr throttles repeated per-resource FetchLive warnings the
+	// same way internal/engine/reconcile_daemon.go's
+	// warnPhaseFailureThrottled and internal/providers/site's
+	// (*siteProvider).logThrottled do (issue #494, cog-review PR #496
+	// fourth pass): FetchLive swallows per-dir/per-file gh errors into
+	// FailedDirs/FailedFiles and always returns (snap, nil) overall — one
+	// broken watch target must not fail FetchLive for every other target —
+	// so reconcile_daemon.go's phase-level throttle around FetchLive never
+	// sees these at all. A persistently unreachable dir or file otherwise
+	// repeats the identical warning every ~30s tick forever.
+	lastLogErrMu sync.Mutex
+	lastLogErr   map[string]string
+}
+
+// logThrottled logs msg (via slog, with args as structured attributes) at
+// level the first time key's associated text is seen, or whenever that text
+// changes from what was last recorded for key, and at Debug for an exact
+// repeat. Same shape as internal/providers/site's (*siteProvider).logThrottled.
+func (p *Provider) logThrottled(key, text string, level slog.Level, msg string, args ...any) {
+	p.lastLogErrMu.Lock()
+	if p.lastLogErr == nil {
+		p.lastLogErr = make(map[string]string)
+	}
+	prev, seen := p.lastLogErr[key]
+	changed := !seen || prev != text
+	p.lastLogErr[key] = text
+	p.lastLogErrMu.Unlock()
+
+	if changed {
+		slog.Log(context.Background(), level, msg, args...)
+		return
+	}
+	slog.Debug(msg, args...)
 }
 
 // NewProvider constructs an unwired Provider. Call SetEventSink once the

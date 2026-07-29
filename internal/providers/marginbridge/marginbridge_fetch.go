@@ -31,7 +31,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
@@ -77,8 +77,16 @@ func (p *Provider) FetchLive(ctx context.Context, config any) (any, error) {
 			// Next cycle retries. Recorded in FailedDirs (never silent) so
 			// BuildState carries this dir's previously-tracked resources
 			// forward instead of dropping them.
+			//
+			// Throttled (cog-review, PR #496 fourth pass): FetchLive always
+			// returns (snap, nil) overall — one broken watch dir must not
+			// fail FetchLive for every other dir — so a persistently
+			// unreachable dir otherwise repeats this exact warning every
+			// ~30s tick forever, invisible to reconcile_daemon.go's
+			// phase-level throttle around the FetchLive call.
 			snap.FailedDirs[dir] = true
-			log.Printf("[margin-bridge] warning: FetchLive listDir %s: %v", dir, err)
+			p.logThrottled("fetchlive-dir:"+dir, err.Error(), slog.LevelWarn,
+				"margin-bridge: FetchLive listDir failed", "dir", dir, "err", err)
 			continue
 		}
 		if len(entries) > 0 {
@@ -94,8 +102,11 @@ func (p *Provider) FetchLive(ctx context.Context, config any) (any, error) {
 			// snapshot entirely. Recorded in FailedFiles (never silent) so
 			// BuildState carries this file's previously-tracked resource
 			// forward instead of dropping it.
+			//
+			// Throttled for the same reason as the listDir failure above.
 			snap.FailedFiles[wf] = true
-			log.Printf("[margin-bridge] warning: FetchLive fetchContentSHA %s: %v", wf, err)
+			p.logThrottled("fetchlive-file:"+wf, err.Error(), slog.LevelWarn,
+				"margin-bridge: FetchLive fetchContentSHA failed", "file", wf, "err", err)
 			continue
 		}
 		snap.WatchFiles[wf] = sha
