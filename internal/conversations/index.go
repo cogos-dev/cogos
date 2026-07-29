@@ -216,6 +216,69 @@ func (idx *Index) UpsertSession(meta SessionMeta, turns []Turn) error {
 	return err
 }
 
+// heldSessionLock pairs an acquired per-sessionID turnsLockPath lock with
+// the sessionID it guards. Used by UpsertSessions'/DeleteSessions' phase 1
+// via acquireSessionLocks.
+type heldSessionLock struct {
+	sid  string
+	lock *filelock.FileLock
+}
+
+// acquireSessionLocks attempts to acquire every id's turnsLockPath lock
+// under ONE shared deadline for the whole call, rather than giving each
+// sessionID its own full metaLockTimeout budget independently.
+//
+// This is remedy 1's fourth review-round fix (cog-review, PR #495 fourth
+// pass): the per-session-independent design (phase 1 acquiring each lock
+// on its own, continuing past any single failure — see UpsertSessions'
+// "Per-session fault isolation") removed the early-exit an all-or-nothing
+// loop would have had, so a batch with K simultaneously-contended
+// sessionIDs (all peer-held by the SAME wedged process, or several
+// unrelated wedged peers — both plausible under the #449 cross-process
+// scenario this whole PR is about) could each independently poll out a
+// full metaLockTimeout, compounding to K×metaLockTimeout for one batch
+// call. Because remedy 4's applyMu is held for ApplyPlan's entire
+// duration, that also stalls every other reconcile activity for the
+// provider for the same window — undermining metaLockTimeout's documented
+// "a wedged peer doesn't hang the caller indefinitely" bound and remedy
+// 4's own goal, through a different path.
+//
+// A single deadline, computed once and shared across every id's
+// filelock.Acquire call, restores the ONE-metaLockTimeout bound for the
+// batch as a whole: filelock.Acquire always attempts one immediate,
+// non-blocking tryLock before ever consulting its timeout (see
+// pkg/filelock's Acquire), so passing the (possibly already-negative)
+// remaining budget to every call — rather than skipping later ids outright
+// once the budget nominally runs out — costs nothing extra for an
+// uncontended id (it still succeeds on that first free attempt) while
+// still bounding any id that DOES need to wait to whatever's left of the
+// shared window. The trade-off this introduces (an id late in sorted order
+// can get less of the shared budget than one early in it, if earlier ids
+// were genuinely contended) is the same shape as any shared-deadline
+// design (e.g. a context.Context deadline shared across a fan-out); it
+// replaces "every session gets its own full timeout" (unbounded batch
+// total) with "the batch as a whole gets one timeout" (matching the
+// pre-batching per-call bound), which is the trade cog-review's finding
+// asked for.
+//
+// Returns every lock actually acquired (still held — the caller releases
+// them) and a map from sessionID to the reason it did NOT get a lock, for
+// every id that failed. Every id in ids ends up in exactly one of the two.
+func (idx *Index) acquireSessionLocks(ids []string) ([]heldSessionLock, map[string]error) {
+	held := make([]heldSessionLock, 0, len(ids))
+	failed := make(map[string]error, len(ids))
+	deadline := time.Now().Add(metaLockTimeout)
+	for _, sid := range ids {
+		lock, err := filelock.Acquire(idx.turnsLockPath(sid), time.Until(deadline))
+		if err != nil {
+			failed[sid] = fmt.Errorf("conversations/index: acquire session lock for %s: %w", sid, err)
+			continue
+		}
+		held = append(held, heldSessionLock{sid: sid, lock: lock})
+	}
+	return held, failed
+}
+
 // UpsertSessions writes turns + meta for a whole batch of sessions,
 // performing exactly ONE writeMetaFileLocked call regardless of batch size.
 //
@@ -352,32 +415,20 @@ func (idx *Index) UpsertSessions(batch []SessionAndTurns) ([]SessionOpOutcome, e
 	}
 	sort.Strings(ids)
 
-	// Phase 1: attempt to acquire every per-sessionID lock, independently.
-	// A failure for one sessionID (most plausibly a peer process holding
-	// its turnsLockPath — exactly the cross-process contention this whole
-	// PR is about) excludes only that sessionID; it does not stop the loop
-	// or prevent other, uncontended sessions from being attempted. See
-	// "Per-session fault isolation" above for why this must be independent
-	// rather than all-or-nothing.
-	type heldLock struct {
-		sid  string
-		lock *filelock.FileLock
-	}
-	held := make([]heldLock, 0, len(ids))
-	failed := make(map[string]error, len(ids))
+	// Phase 1: attempt to acquire every per-sessionID lock, independently,
+	// under one shared deadline for the whole batch (see
+	// acquireSessionLocks). A failure for one sessionID (most plausibly a
+	// peer process holding its turnsLockPath — exactly the cross-process
+	// contention this whole PR is about) excludes only that sessionID; it
+	// does not stop the loop or prevent other, uncontended sessions from
+	// being attempted. See "Per-session fault isolation" above for why this
+	// must be independent rather than all-or-nothing.
+	held, failed := idx.acquireSessionLocks(ids)
 	defer func() {
 		for _, h := range held {
 			h.lock.Release()
 		}
 	}()
-	for _, sid := range ids {
-		lock, err := filelock.Acquire(idx.turnsLockPath(sid), metaLockTimeout)
-		if err != nil {
-			failed[sid] = fmt.Errorf("conversations/index: acquire session lock for %s: %w", sid, err)
-			continue
-		}
-		held = append(held, heldLock{sid: sid, lock: lock})
-	}
 
 	// Phase 2: for every successfully-locked session, write its turns file
 	// independently. A write failure here (a genuine disk I/O error, not
@@ -474,28 +525,17 @@ func (idx *Index) DeleteSessions(sessionIDs []string) ([]SessionOpOutcome, error
 	}
 	sort.Strings(ids)
 
-	// Phase 1: attempt to acquire every per-sessionID lock independently —
-	// see UpsertSessions' phase-1 comment for the full rationale. A failure
-	// for one sessionID excludes only that sessionID from phase 2 below.
-	type heldLock struct {
-		sid  string
-		lock *filelock.FileLock
-	}
-	held := make([]heldLock, 0, len(ids))
-	failed := make(map[string]error, len(ids))
+	// Phase 1: attempt to acquire every per-sessionID lock independently,
+	// under one shared deadline for the whole batch (see
+	// acquireSessionLocks) — see UpsertSessions' phase-1 comment for the
+	// full rationale. A failure for one sessionID excludes only that
+	// sessionID from phase 2 below.
+	held, failed := idx.acquireSessionLocks(ids)
 	defer func() {
 		for _, h := range held {
 			h.lock.Release()
 		}
 	}()
-	for _, sid := range ids {
-		lock, err := filelock.Acquire(idx.turnsLockPath(sid), metaLockTimeout)
-		if err != nil {
-			failed[sid] = fmt.Errorf("conversations/index: acquire session lock for %s: %w", sid, err)
-			continue
-		}
-		held = append(held, heldLock{sid: sid, lock: lock})
-	}
 
 	// Phase 2: for every successfully-locked session, remove its turns file
 	// independently. A removal failure here also excludes only that
