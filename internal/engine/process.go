@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/myrgic/cogos/pkg/filelock"
 	"github.com/myrgic/cogos/pkg/substrate/bep"
 	"github.com/myrgic/cogos/trace"
 )
@@ -1045,9 +1046,10 @@ func loadOrCreateNodeID(cfg *Config) string {
 	// engine is enabled/running (cluster.enabled may be false at this point in
 	// boot).
 	//
-	// ORDERING: NewProcess runs at boot.go:196, long before the cluster/BEP
-	// block at boot.go:327, and `bep-cert gen` is a manual CLI step that Boot
-	// never invokes. So on the realistic operator path — boot with
+	// ORDERING: NewProcess runs at boot.go:246, long before the cluster/BEP
+	// block (boot.go:432, branching on cluster.enabled at boot.go:445/516),
+	// and `bep-cert gen` is a manual CLI step that Boot never invokes. So on
+	// the realistic operator path — boot with
 	// cluster.enabled=false (the default), opt into clustering later — no cert
 	// exists at mint time and, because an existing id is never rewritten, the
 	// anchor would never activate for that node. Reading the cert alone is
@@ -1107,24 +1109,76 @@ func bepAnchoredNodeID() string {
 	return bep.FormatDeviceID(devID)
 }
 
+// bepCertLockTimeout bounds how long ensureBEPDeviceIdentity waits for the
+// cross-process cert-generation lock before giving up and falling back to a
+// UUID for this boot. Cert generation itself is a few milliseconds of ECDSA
+// key generation and two small file writes, so this is generous headroom
+// for a contending process, not a tuning knob for slow I/O.
+const bepCertLockTimeout = 5 * time.Second
+
 // ensureBEPDeviceIdentity generates the node's BEP keypair in the canonical
-// cert dir when none exists, so that node-id minting can anchor to a device
-// identity on a node's very first boot — before, and independently of, any
-// decision to enable clustering. Generating the keypair binds no port and
-// starts no goroutine; the BEP engine remains dark until cluster.enabled=true.
-// Returns an error when the identity could not be established, in which case
-// the caller falls back to a UUID exactly as before.
+// cert dir when none (usable) exists, so that node-id minting can anchor to
+// a device identity on a node's very first boot — before, and independently
+// of, any decision to enable clustering. Generating the keypair binds no
+// port and starts no goroutine; the BEP engine remains dark until
+// cluster.enabled=true. Returns an error when the identity could not be
+// established, in which case the caller falls back to a UUID exactly as
+// before.
+//
+// Single-flighted via the same pkg/filelock pattern used elsewhere in this
+// codebase for comparable file mutations (pkg/alias, internal/conversations,
+// internal/engine/bus_session.go) because NewProcess is called from multiple
+// independent entrypoints (boot.go, cli_mcp.go, experiment.go, benchmark.go)
+// that can all race against the same default cert dir on a fresh node's
+// first boot.
 func ensureBEPDeviceIdentity() error {
 	dir := nodeIDCertDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create cert dir: %w", err)
 	}
-	if err := bep.GenerateBEPCert(dir); err != nil {
-		// A cert appearing concurrently is success, not failure: the only thing
-		// that matters is that a usable identity is present on disk.
-		if _, statErr := os.Stat(filepath.Join(dir, "bep-cert.pem")); statErr == nil {
-			return nil
+
+	lock, err := filelock.Acquire(filepath.Join(dir, "bep-cert.lock"), bepCertLockTimeout)
+	if err != nil {
+		return fmt.Errorf("acquire BEP cert lock: %w", err)
+	}
+	defer lock.Release()
+
+	certPath := filepath.Join(dir, "bep-cert.pem")
+	keyPath := filepath.Join(dir, "bep-key.pem")
+	_, certErr := os.Stat(certPath)
+	_, keyErr := os.Stat(keyPath)
+	certExists := certErr == nil
+	keyExists := keyErr == nil
+
+	switch {
+	case certExists && keyExists:
+		// Another process finished generation while we waited for the lock
+		// (or a prior boot already did). A usable identity is present;
+		// nothing to do.
+		return nil
+
+	case certExists != keyExists:
+		// Loud, not silent: a cert without its key (or the symmetric case)
+		// is not "mostly done", it's a broken identity that would otherwise
+		// make bepAnchoredNodeID fail forever and silently downgrade every
+		// future boot to a UUID (RFC-036 anchoring never activates), while
+		// also setting up a much later, seemingly-unrelated hard failure in
+		// NewBEPEngine's LoadBEPCert the first time cluster.enabled flips to
+		// true. We hold the cross-process lock here, so no concurrent writer
+		// can be mid-write on these files right now — it is safe to reclaim
+		// the orphan and regenerate cleanly.
+		orphan, orphanKind := certPath, "cert"
+		if keyExists {
+			orphan, orphanKind = keyPath, "key"
 		}
+		slog.Warn("nodeid: found orphaned BEP "+orphanKind+" with no matching pair; removing and regenerating",
+			"cert_dir", dir, "orphan", orphan)
+		if rmErr := os.Remove(orphan); rmErr != nil && !os.IsNotExist(rmErr) {
+			return fmt.Errorf("remove orphaned BEP %s: %w", orphanKind, rmErr)
+		}
+	}
+
+	if err := bep.GenerateBEPCert(dir); err != nil {
 		return fmt.Errorf("generate BEP cert: %w", err)
 	}
 	slog.Info("nodeid: minted BEP device identity for node-id anchoring (RFC-036)",

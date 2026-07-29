@@ -3,6 +3,7 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/myrgic/cogos/pkg/substrate/bep"
@@ -137,6 +138,103 @@ func TestBepAnchoredNodeID_EmptyWithoutCert(t *testing.T) {
 	useTempCertDir(t)
 	if id := bepAnchoredNodeID(); id != "" {
 		t.Fatalf("expected \"\" with no cert on disk, got %q", id)
+	}
+}
+
+// The confirmed cog-review finding on this PR: a cert-without-key directory
+// (from a crash mid-generation, or two processes racing on first boot before
+// this fix) must not be treated as "identity established". Recovery must be
+// loud (a Warn log, reclaiming the orphan) and must actually produce a
+// working device-anchored id on this boot, not silently and permanently fall
+// back to a UUID.
+func TestNodeID_RecoversFromCertWithoutKey(t *testing.T) {
+	certDir := useTempCertDir(t)
+
+	// Seed the exact broken state the review flagged: a cert with no
+	// matching key, as GenerateBEPCert could previously leave behind if it
+	// died after writing the cert but before the key.
+	if err := os.WriteFile(filepath.Join(certDir, "bep-cert.pem"), []byte("not a real cert\n"), 0o644); err != nil {
+		t.Fatalf("seed orphaned cert: %v", err)
+	}
+	if fileExists(filepath.Join(certDir, "bep-key.pem")) {
+		t.Fatal("precondition: no key should exist yet")
+	}
+
+	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+
+	if !fileExists(filepath.Join(certDir, "bep-cert.pem")) {
+		t.Fatal("expected a regenerated cert after recovery")
+	}
+	if !fileExists(filepath.Join(certDir, "bep-key.pem")) {
+		t.Fatal("expected a regenerated key after recovery; orphaned cert-without-key must not be reported as success")
+	}
+	if _, err := bep.LoadBEPCert(certDir); err != nil {
+		t.Fatalf("regenerated identity is not a usable TLS keypair: %v", err)
+	}
+	if _, err := bep.ParseDeviceID(got); err != nil {
+		t.Fatalf("node id %q is not device-anchored after recovery (silent UUID fallback): %v", got, err)
+	}
+	if want := bepAnchoredNodeID(); got != want {
+		t.Fatalf("node id %q != device id derived from recovered cert %q", got, want)
+	}
+}
+
+// Symmetric partial state: a key with no matching cert must be reclaimed the
+// same way, rather than assumed impossible because of write ordering.
+func TestNodeID_RecoversFromKeyWithoutCert(t *testing.T) {
+	certDir := useTempCertDir(t)
+
+	if err := os.WriteFile(filepath.Join(certDir, "bep-key.pem"), []byte("not a real key\n"), 0o600); err != nil {
+		t.Fatalf("seed orphaned key: %v", err)
+	}
+	if fileExists(filepath.Join(certDir, "bep-cert.pem")) {
+		t.Fatal("precondition: no cert should exist yet")
+	}
+
+	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+
+	if !fileExists(filepath.Join(certDir, "bep-cert.pem")) || !fileExists(filepath.Join(certDir, "bep-key.pem")) {
+		t.Fatal("expected a full regenerated pair after recovery")
+	}
+	if _, err := bep.ParseDeviceID(got); err != nil {
+		t.Fatalf("node id %q is not device-anchored after recovery: %v", got, err)
+	}
+}
+
+// ensureBEPDeviceIdentity is the automatic, unattended entrypoint that fires
+// from every NewProcess call on a node with no persisted node_id yet — unlike
+// the manual `bep-cert gen` CLI, several independent boot paths can invoke it
+// concurrently against the same cert dir. It must be single-flighted (via
+// pkg/filelock, matching the pattern used elsewhere in this codebase) so a
+// concurrent race can never produce anything other than exactly one valid
+// cert/key pair.
+func TestEnsureBEPDeviceIdentity_ConcurrentCallsAreSingleFlighted(t *testing.T) {
+	certDir := useTempCertDir(t)
+
+	const n = 8
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- ensureBEPDeviceIdentity()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("ensureBEPDeviceIdentity: %v", err)
+		}
+	}
+
+	if !fileExists(filepath.Join(certDir, "bep-cert.pem")) || !fileExists(filepath.Join(certDir, "bep-key.pem")) {
+		t.Fatal("expected exactly one cert/key pair to exist after concurrent generation")
+	}
+	if _, err := bep.LoadBEPCert(certDir); err != nil {
+		t.Fatalf("resulting identity is not a usable TLS keypair: %v", err)
 	}
 }
 

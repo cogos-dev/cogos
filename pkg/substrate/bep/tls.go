@@ -31,14 +31,31 @@ type DeviceID [32]byte
 
 // GenerateBEPCert creates an ECDSA P-256 TLS certificate for BEP transport.
 // Writes cert and key to certDir/bep-cert.pem and certDir/bep-key.pem.
-// Returns an error if cert files already exist.
+// Returns an error if either file already exists.
+//
+// Both files are written key-first via temp-file+rename so that a crash,
+// disk-full, or permission error partway through never leaves a cert on
+// disk with no matching key (or vice versa): each rename is atomic, and if
+// the second write fails after the first succeeded, the first file is
+// rolled back so the directory doesn't linger in a partial state. Callers
+// that need cross-process single-flighting around this function (multiple
+// processes racing to mint on first boot) must take their own lock — see
+// ensureBEPDeviceIdentity in internal/engine/process.go for the caller that
+// does.
 func GenerateBEPCert(certDir string) error {
 	certPath := filepath.Join(certDir, "bep-cert.pem")
 	keyPath := filepath.Join(certDir, "bep-key.pem")
 
-	// Don't overwrite existing certs.
+	// Don't overwrite an existing identity. Checked for both files: a
+	// cert-without-key (or key-without-cert) directory is leftover partial
+	// state from an earlier failure, not a valid "already exists" — the
+	// caller is responsible for clearing an orphan before calling this
+	// function (see ensureBEPDeviceIdentity's recovery path).
 	if _, err := os.Stat(certPath); err == nil {
 		return fmt.Errorf("certificate already exists at %s", certPath)
+	}
+	if _, err := os.Stat(keyPath); err == nil {
+		return fmt.Errorf("key already exists at %s", keyPath)
 	}
 
 	if err := os.MkdirAll(certDir, 0700); err != nil {
@@ -71,30 +88,62 @@ func GenerateBEPCert(certDir string) error {
 		return fmt.Errorf("create certificate: %w", err)
 	}
 
-	// Write cert PEM.
-	certFile, err := os.OpenFile(certPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
-	if err != nil {
-		return fmt.Errorf("create cert file: %w", err)
-	}
-	defer certFile.Close()
-	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
-		return fmt.Errorf("encode cert: %w", err)
-	}
-
-	// Write key PEM.
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		return fmt.Errorf("marshal key: %w", err)
 	}
-	keyFile, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return fmt.Errorf("create key file: %w", err)
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+	// Key before cert: if we die after this line but before the cert lands,
+	// the directory has a key-without-cert, which LoadBEPCert (and the
+	// cert-without-key recovery check) both reject cleanly as "not usable
+	// yet" rather than silently reading as a valid identity.
+	if err := writeFileAtomic(keyPath, 0600, keyPEM); err != nil {
+		return fmt.Errorf("write key: %w", err)
 	}
-	defer keyFile.Close()
-	if err := pem.Encode(keyFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}); err != nil {
-		return fmt.Errorf("encode key: %w", err)
+	if err := writeFileAtomic(certPath, 0644, certPEM); err != nil {
+		// Roll back the key so we don't leave key-without-cert lying around
+		// for a future caller to trip over.
+		_ = os.Remove(keyPath)
+		return fmt.Errorf("write cert: %w", err)
 	}
 
+	return nil
+}
+
+// writeFileAtomic writes data to a temp file in path's directory, then
+// renames it into place. The temp file lives alongside the destination so
+// the rename stays within one filesystem (and is therefore atomic); it is
+// best-effort removed if any step before the rename fails.
+func writeFileAtomic(path string, perm os.FileMode, data []byte) (err error) {
+	dir := filepath.Dir(path)
+	tmpPath := filepath.Join(dir, fmt.Sprintf(".%s.tmp-%d-%d", filepath.Base(path), os.Getpid(), time.Now().UnixNano()))
+
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, werr := f.Write(data); werr != nil {
+		f.Close()
+		err = fmt.Errorf("write temp file: %w", werr)
+		return err
+	}
+	if cerr := f.Close(); cerr != nil {
+		err = fmt.Errorf("close temp file: %w", cerr)
+		return err
+	}
+	if rerr := os.Rename(tmpPath, path); rerr != nil {
+		err = fmt.Errorf("rename temp file: %w", rerr)
+		return err
+	}
 	return nil
 }
 
