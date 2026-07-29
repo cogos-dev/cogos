@@ -42,18 +42,24 @@ type HostVitals struct {
 	// nothing to fail.
 	UptimeSeconds *uint64 `json:"uptime_seconds,omitempty"`
 
-	// InferenceP50Ms and InferenceQueue from the RFC-040 S0 design sketch
-	// are intentionally NOT included in this struct. Neither is cheaply
-	// readable from an existing in-process structure today: no rolling
-	// latency history is retained anywhere (DispatchResult.DurationSec in
-	// agent_dispatch.go is per-call and ephemeral, not accumulated into a
-	// queryable series), and the one inflight-tracking structure that does
-	// exist (inflightRequests in inference_inflight.go) is an opt-in dedup
-	// map for a handful of retry-sensitive call sites, not a count of all
-	// in-flight inference — treating its size as "the inference queue"
-	// would be a misleading reading dressed up as a measurement, not a
-	// cheap accurate one. Per the no-stubs directive, both are omitted
-	// rather than stubbed; see the PR body for the same rationale.
+	// InferenceP50Ms is the rolling median duration, in milliseconds, of
+	// recent CompleteCancelSafeIfSupported-routed completions — dispatch
+	// fan-out, tool-loop re-calls, the autonomic assess-cycle consult, AND
+	// ordinary non-streaming external chat/Anthropic-compat HTTP traffic.
+	// Streaming completions are NOT included (they bypass this call path
+	// entirely). See dispatch_inference_metrics.go's package doc for the
+	// full, corrected call-site scope. Omitted (nil) until at least one such
+	// call has completed since process start — never a fabricated zero.
+	InferenceP50Ms *float64 `json:"inference_p50_ms,omitempty"`
+
+	// InferenceQueue is the current count of in-flight calls in the same
+	// population as InferenceP50Ms (see above). Always populated: a pure
+	// atomic read, no I/O, nothing to fail. Not a literal FIFO queue, and
+	// not dispatch-exclusive — see dispatch_inference_metrics.go's package
+	// doc for what "queue" means here, what it does and doesn't cover, and
+	// why it's still an honest (if partial) proxy for contention on the
+	// single-capacity local inference resource.
+	InferenceQueue *int `json:"inference_queue,omitempty"`
 }
 
 // kernelProcessStart is captured at package init and used to compute
@@ -84,6 +90,12 @@ func sampleHostVitals() HostVitals {
 
 	up := uint64(time.Since(kernelProcessStart).Seconds())
 	hv.UptimeSeconds = &up
+
+	if p50, ok := dispatchP50Ms(); ok {
+		hv.InferenceP50Ms = &p50
+	}
+	queue := dispatchQueueDepth()
+	hv.InferenceQueue = &queue
 
 	return hv
 }
