@@ -1152,10 +1152,36 @@ func ensureBEPDeviceIdentity() error {
 
 	switch {
 	case certExists && keyExists:
-		// Another process finished generation while we waited for the lock
-		// (or a prior boot already did). A usable identity is present;
-		// nothing to do.
-		return nil
+		// Both files exist, but existence alone is not proof of a usable
+		// identity: verify the pair actually loads as a matching TLS
+		// keypair, via the exact same load path bepAnchoredNodeID (and
+		// ultimately NewBEPEngine's LoadBEPCert) uses. Disk corruption, a
+		// restored backup that mixes cert/key from two different nodes, or
+		// a race against the unlocked `bep-cert gen` CLI can leave two
+		// files that both pass os.Stat but do not form a valid pair —
+		// treating that as "identity established" is the same
+		// silent-permanent-UUID bug this function exists to close, one
+		// layer deeper.
+		if bepAnchoredNodeID() != "" {
+			// Another process finished generation while we waited for the
+			// lock (or a prior boot already did), and the pair is genuinely
+			// usable. Nothing to do.
+			return nil
+		}
+		suffix := fmt.Sprintf(".broken-%d", time.Now().UnixNano())
+		slog.Warn("nodeid: BEP cert and key both exist but do not load as a valid matching identity; backing up and regenerating",
+			"cert_dir", dir, "backup_suffix", suffix)
+		for _, p := range []string{certPath, keyPath} {
+			if err := os.Rename(p, p+suffix); err != nil && !os.IsNotExist(err) {
+				// Backing up is best-effort: leaving the broken file in
+				// place would recreate the exact silent-fallback bug this
+				// recovery exists to close, so fall back to removing it
+				// outright rather than give up.
+				if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
+					return fmt.Errorf("clear broken BEP file %s: %w", p, rmErr)
+				}
+			}
+		}
 
 	case certExists != keyExists:
 		// Loud, not silent: a cert without its key (or the symmetric case)

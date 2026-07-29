@@ -16,9 +16,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/myrgic/cogos/pkg/filelock"
 	bep "github.com/myrgic/cogos/pkg/substrate/bep"
 )
+
+// bepCertLockTimeout matches internal/engine's ensureBEPDeviceIdentity: this
+// CLI and the kernel's automatic boot-time mint both call bep.GenerateBEPCert
+// against the same default cert dir, so they must single-flight through the
+// same lock file rather than racing to interleave key/cert writes.
+const bepCertLockTimeout = 5 * time.Second
 
 const usage = `bep-cert — BEP transport certificate tool
 
@@ -91,6 +99,21 @@ func runGen(args []string) error {
 	certDir := bep.ExpandCertDir(dir)
 	certPath := filepath.Join(certDir, "bep-cert.pem")
 	keyPath := filepath.Join(certDir, "bep-key.pem")
+
+	if err := os.MkdirAll(certDir, 0700); err != nil {
+		return fmt.Errorf("create cert dir: %w", err)
+	}
+
+	// Single-flight against internal/engine's ensureBEPDeviceIdentity, which
+	// can run unattended at any node's first boot: without this lock, this
+	// CLI's remove-then-GenerateBEPCert sequence below could interleave with
+	// the kernel's own key/cert writes and leave a mismatched pair that
+	// passes os.Stat but doesn't load as a valid identity.
+	lock, err := filelock.Acquire(filepath.Join(certDir, "bep-cert.lock"), bepCertLockTimeout)
+	if err != nil {
+		return fmt.Errorf("acquire BEP cert lock: %w", err)
+	}
+	defer lock.Release()
 
 	// Refuse to overwrite unless --force.
 	if _, err := os.Stat(certPath); err == nil && !force {
@@ -168,4 +191,3 @@ func runDeviceID(args []string) error {
 	fmt.Printf("cert:      %s\n", certPath)
 	return nil
 }
-

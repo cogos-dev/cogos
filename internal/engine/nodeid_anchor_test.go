@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -198,6 +201,101 @@ func TestNodeID_RecoversFromKeyWithoutCert(t *testing.T) {
 	}
 	if _, err := bep.ParseDeviceID(got); err != nil {
 		t.Fatalf("node id %q is not device-anchored after recovery: %v", got, err)
+	}
+}
+
+// Round-2 cog-review finding on this PR: os.Stat-only presence checks are
+// not enough. A cert and key can both exist and both parse as valid PEM
+// individually while not forming a matching pair — a restored backup that
+// mixes files from two different nodes, or disk corruption. That must be
+// treated exactly like the cert-without-key orphan case above: reclaimed
+// loudly (a Warn log, broken files backed up aside rather than silently
+// dropped) and regenerated into a working device-anchored id, never a
+// silent permanent UUID fallback.
+func TestNodeID_RecoversFromCorruptOrMismatchedPair(t *testing.T) {
+	certDir := useTempCertDir(t)
+
+	// Seed a mismatched-but-well-formed pair: a genuine cert from one
+	// identity paired with a genuine key from a different one. Both files
+	// individually parse as valid PEM/DER; only cross-checking that the key
+	// matches the cert (what tls.LoadX509KeyPair, and therefore
+	// bep.LoadBEPCert, does) reveals the break.
+	dirA, dirB := t.TempDir(), t.TempDir()
+	if err := bep.GenerateBEPCert(dirA); err != nil {
+		t.Fatalf("generate pair A: %v", err)
+	}
+	if err := bep.GenerateBEPCert(dirB); err != nil {
+		t.Fatalf("generate pair B: %v", err)
+	}
+	certBytes, err := os.ReadFile(filepath.Join(dirA, "bep-cert.pem"))
+	if err != nil {
+		t.Fatalf("read pair A cert: %v", err)
+	}
+	keyBytes, err := os.ReadFile(filepath.Join(dirB, "bep-key.pem"))
+	if err != nil {
+		t.Fatalf("read pair B key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "bep-cert.pem"), certBytes, 0o644); err != nil {
+		t.Fatalf("seed mismatched cert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "bep-key.pem"), keyBytes, 0o600); err != nil {
+		t.Fatalf("seed mismatched key: %v", err)
+	}
+
+	// Precondition: both files exist (os.Stat would wrongly call this done)
+	// but do not form a usable identity.
+	if !fileExists(filepath.Join(certDir, "bep-cert.pem")) || !fileExists(filepath.Join(certDir, "bep-key.pem")) {
+		t.Fatal("precondition: both files should exist")
+	}
+	if id := bepAnchoredNodeID(); id != "" {
+		t.Fatalf("precondition: mismatched pair should not load, got id %q", id)
+	}
+
+	// Capture logs: the recovery must be loud (Warn), not the silent
+	// fallback path (which only logs at Debug, and only on a returned
+	// error -- this recovery must succeed and must still have logged).
+	var logBuf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+
+	slog.SetDefault(prevLogger)
+	logOut := logBuf.String()
+	if !strings.Contains(logOut, "level=WARN") {
+		t.Fatalf("expected a loud (Warn-level) log for the corrupt/mismatched pair, got:\n%s", logOut)
+	}
+	if !strings.Contains(logOut, "do not load as a valid matching identity") {
+		t.Fatalf("expected the corrupt-pair recovery log message, got:\n%s", logOut)
+	}
+
+	// The broken files must be backed up aside, not silently dropped.
+	entries, err := os.ReadDir(certDir)
+	if err != nil {
+		t.Fatalf("read cert dir: %v", err)
+	}
+	brokenFound := false
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".broken-") {
+			brokenFound = true
+			break
+		}
+	}
+	if !brokenFound {
+		t.Fatalf("expected the broken cert/key to be backed up (a .broken-* file), found: %v", entries)
+	}
+
+	// And recovery must actually produce a working device-anchored id, not
+	// a silent, permanent UUID fallback.
+	if _, err := bep.LoadBEPCert(certDir); err != nil {
+		t.Fatalf("regenerated identity is not a usable TLS keypair: %v", err)
+	}
+	if _, err := bep.ParseDeviceID(got); err != nil {
+		t.Fatalf("node id %q is not device-anchored after recovery (silent UUID fallback): %v", got, err)
+	}
+	if want := bepAnchoredNodeID(); got != want {
+		t.Fatalf("node id %q != device id derived from recovered cert %q", got, want)
 	}
 }
 
