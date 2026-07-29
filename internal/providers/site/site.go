@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -190,6 +189,46 @@ type siteProvider struct {
 	// Injectable so tests can drive ComputePlan's drift logic without running a
 	// real build; defaults to (*siteProvider).buildAndHash.
 	buildHashFn func(ctx context.Context, appDir, name string) (string, error)
+
+	// lastLogErr throttles repeated per-resource log lines the same way
+	// internal/engine/reconcile_daemon.go's warnPhaseFailureThrottled does
+	// (issue #494, cog-review PR #496 third pass). Several call sites in
+	// this file log a per-CRD warning/notice on every reconcile cycle with
+	// no way for the daemon's own phase-level throttle to see them:
+	// FetchLive swallows per-CRD strategy-lookup/live-fetch errors into
+	// per-resource state and always returns (live, nil); loadCRDs swallows
+	// validation errors into a log line and still returns the CRD;
+	// applyAction's delete no-op path isn't gated on ApplyFailed at all.
+	// A persistently failing/no-op resource would otherwise repeat the
+	// identical line every ~30s tick forever — the exact bug class this PR
+	// fixes for reconcile_daemon.go's own phases and actions, reproduced
+	// here via call sites this PR's earlier passes left untouched. See
+	// logThrottled.
+	lastLogErrMu sync.Mutex
+	lastLogErr   map[string]string
+}
+
+// logThrottled logs msg (via slog, with args as structured attributes) at
+// level the first time key's associated text is seen, or whenever that text
+// changes from what was last recorded for key, and at Debug for an exact
+// repeat. text is typically an error's .Error() string, but for a
+// non-error repeating notice (e.g. the delete no-op path) any stable string
+// works — the mechanism only cares whether it changed.
+func (s *siteProvider) logThrottled(key, text string, level slog.Level, msg string, args ...any) {
+	s.lastLogErrMu.Lock()
+	if s.lastLogErr == nil {
+		s.lastLogErr = make(map[string]string)
+	}
+	prev, seen := s.lastLogErr[key]
+	changed := !seen || prev != text
+	s.lastLogErr[key] = text
+	s.lastLogErrMu.Unlock()
+
+	if changed {
+		slog.Log(context.Background(), level, msg, args...)
+		return
+	}
+	slog.Debug(msg, args...)
 }
 
 func newSiteProvider() *siteProvider {
@@ -224,7 +263,7 @@ func (s *siteProvider) LoadConfig(root string) (any, error) {
 	s.mu.Lock()
 	s.root = root
 	s.mu.Unlock()
-	crds, err := loadCRDs(root)
+	crds, err := s.loadCRDs(root)
 	if err != nil {
 		return nil, err
 	}
@@ -243,13 +282,26 @@ func (s *siteProvider) FetchLive(ctx context.Context, config any) (any, error) {
 	for _, crd := range crds {
 		strat, err := s.lookupStrategy(crd.Spec.Deploy.Strategy)
 		if err != nil {
-			log.Printf("[site] warning: FetchLive %s: %v", crd.Metadata.Name, err)
+			// Throttled (cog-review, PR #496 third pass): a CRD naming an
+			// unregistered strategy fails identically every ~30s tick
+			// forever, and this loop always returns (live, nil) overall —
+			// one broken CRD must not fail FetchLive for every other CRD
+			// (ADR-095 §2 per-resource isolation) — so reconcile_daemon.go's
+			// own phase-level throttle around the FetchLive call never sees
+			// this failure at all. Keyed per CRD name, independent of the
+			// live-fetch throttle key below.
+			s.logThrottled("fetchlive-strategy:"+crd.Metadata.Name, err.Error(), slog.LevelWarn,
+				"site: FetchLive strategy lookup failed", "name", crd.Metadata.Name, "err", err)
 			live[crd.Metadata.Name] = liveSiteState{}
 			continue
 		}
 		state, err := strat.FetchLive(ctx, crd)
 		if err != nil {
-			log.Printf("[site] warning: FetchLive %s: %v", crd.Metadata.Name, err)
+			// Throttled for the same reason as the strategy-lookup failure
+			// above — a persistently unreachable deploy target repeats this
+			// line every tick otherwise.
+			s.logThrottled("fetchlive:"+crd.Metadata.Name, err.Error(), slog.LevelWarn,
+				"site: FetchLive failed", "name", crd.Metadata.Name, "err", err)
 			live[crd.Metadata.Name] = liveSiteState{}
 			continue
 		}
@@ -388,7 +440,17 @@ func (s *siteProvider) applyAction(ctx context.Context, action reconcile.Action)
 		Name:   action.Name,
 	}
 	if action.Action == reconcile.ActionDelete {
-		log.Printf("[site] delete %s: no-op in v0.0.1 (manual teardown required)", action.Name)
+		// Throttled (cog-review, PR #496 third pass): teardown is manual in
+		// v0.0.1, so ComputePlan keeps re-emitting this ActionDelete every
+		// ~30s cycle until an operator does that teardown — the common
+		// case, not the exception. Unlike the ApplyFailed-gated throttling
+		// elsewhere in this PR, this path always reports ApplySucceeded, so
+		// it needed its own throttle rather than reusing
+		// warnActionFailureThrottled. First occurrence (or any future CRD
+		// change under the same name) logs at Info; an exact repeat logs at
+		// Debug.
+		s.logThrottled("delete-noop:"+action.Name, "no-op", slog.LevelInfo,
+			"site: delete no-op (manual teardown required)", "name", action.Name)
 		base.Status = reconcile.ApplySucceeded
 		return base
 	}
@@ -421,7 +483,7 @@ func (s *siteProvider) applyAction(ctx context.Context, action reconcile.Action)
 	s.mu.Lock()
 	root := s.root
 	s.mu.Unlock()
-	crds, err := loadCRDs(root)
+	crds, err := s.loadCRDs(root)
 	if err != nil {
 		base.Status = reconcile.ApplyFailed
 		base.Error = fmt.Sprintf("reload config: %v", err)
@@ -479,7 +541,14 @@ func (s *siteProvider) BuildState(config any, live any, existing *reconcile.Stat
 
 // ─── Config helpers ──────────────────────────────────────────────────────────
 
-func loadCRDs(root string) ([]siteCRD, error) {
+// loadCRDs is a method (not a free function) specifically so its validation
+// warning can go through s.logThrottled (cog-review, PR #496 third pass): a
+// persistently invalid site.yaml (typo'd strategy, missing domain, etc.)
+// otherwise logs the identical warning on every LoadConfig call — every
+// reconcile tick — forever, and since the error is swallowed here rather
+// than returned, reconcile_daemon.go's phase-level throttle around
+// LoadConfig never sees it either.
+func (s *siteProvider) loadCRDs(root string) ([]siteCRD, error) {
 	pattern := filepath.Join(root, "apps", "*", "site.yaml")
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
@@ -496,7 +565,8 @@ func loadCRDs(root string) ([]siteCRD, error) {
 			return nil, fmt.Errorf("site provider: parse %s: %w", yamlPath, err)
 		}
 		if err := crd.Validate(); err != nil {
-			log.Printf("[site] warning: %s validation: %v", yamlPath, err)
+			s.logThrottled("validate:"+yamlPath, err.Error(), slog.LevelWarn,
+				"site: CRD validation failed", "path", yamlPath, "err", err)
 		}
 		crds = append(crds, crd)
 	}
