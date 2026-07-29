@@ -8,8 +8,38 @@ package vitalsretention
 import (
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
+
+// validMetricNames is the allowlist Window() checks metric against before
+// it ever reaches a filesystem path. Built once from AllMetricNames()
+// (recorder.go) — the same list HandleBusEvent uses to decide what to
+// record, so a query can never name a metric the recorder wouldn't have
+// written in the first place.
+//
+// This check exists here, not only at the HTTP/MCP call sites, because this
+// function — not its callers — is the actual security boundary: metric
+// flows unsanitized into dayFilePath -> filepath.Join(base, nodeKey, tier,
+// metric, ...), exactly like nodeKey (sanitizeNodeKey, nodekey.go) and
+// resolution (validTiers, below) are already guarded at this same layer.
+// Without this check a caller-supplied metric containing ".." segments
+// could escape the .cog/observatory/vitals sandbox entirely.
+var (
+	validMetricNamesOnce sync.Once
+	validMetricNames     map[string]bool
+)
+
+func isValidMetricName(metric string) bool {
+	validMetricNamesOnce.Do(func() {
+		names := AllMetricNames()
+		validMetricNames = make(map[string]bool, len(names))
+		for _, n := range names {
+			validMetricNames[n] = true
+		}
+	})
+	return validMetricNames[metric]
+}
 
 // Point is one returned sample. Min/Max/Count are populated for compacted
 // tiers (5m/1h) and nil/zero for raw points, which are already
@@ -41,6 +71,9 @@ type Point struct {
 func (r *Recorder) Window(metric string, since time.Time, resolution string) ([]Point, error) {
 	if metric == "" {
 		return nil, fmt.Errorf("vitals-retention: metric is required")
+	}
+	if !isValidMetricName(metric) {
+		return nil, fmt.Errorf("vitals-retention: unknown metric %q (see AllMetricNames)", metric)
 	}
 	if !validTiers[resolution] {
 		return nil, fmt.Errorf("vitals-retention: unknown resolution %q (want raw, 5m, or 1h)", resolution)

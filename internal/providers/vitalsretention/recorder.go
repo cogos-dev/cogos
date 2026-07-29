@@ -38,9 +38,12 @@ const (
 )
 
 // AllMetricNames returns every metric name this recorder knows how to
-// extract, in a stable order. Exposed for the HTTP/MCP surfaces so they can
-// validate a caller-supplied metric name up front instead of silently
-// returning an empty window for a typo.
+// extract, in a stable order. Window() (window.go) validates every
+// caller-supplied metric against exactly this list before it can reach a
+// filesystem path — metric is not just documentation here, it is the
+// allowlist. Also exposed so the HTTP/MCP surfaces (serve_vitals.go,
+// mcp_tool_vitals.go) and their tool-description text stay in sync with
+// what the recorder actually writes, instead of drifting from it.
 func AllMetricNames() []string {
 	return []string{
 		metricDiskFreeBytes, metricMemFreeBytes, metricLoad1, metricUptimeSeconds,

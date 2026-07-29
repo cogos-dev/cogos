@@ -22,6 +22,48 @@ func TestWindow_RejectsEmptyMetric(t *testing.T) {
 	}
 }
 
+// TestWindow_RejectsUnknownMetric guards against path traversal: metric
+// flows into dayFilePath -> filepath.Join(base, nodeKey, tier, metric, ...)
+// unescaped, so any value not in AllMetricNames() — especially one
+// containing ".." segments — must be rejected before it ever reaches the
+// filesystem layer, exactly like resolution's validTiers allowlist above.
+func TestWindow_RejectsUnknownMetric(t *testing.T) {
+	_ = withWorkspace(t, "node-a")
+	r := &Recorder{}
+
+	for _, metric := range []string{
+		"not_a_real_metric",
+		"../../../../../../etc/passwd",
+		"../node-b/raw/disk_free_bytes",
+		"disk_free_bytes/../../../secrets",
+	} {
+		if _, err := r.Window(metric, time.Now(), tierRaw); err == nil {
+			t.Errorf("metric %q: expected an error, got none", metric)
+		}
+	}
+}
+
+// TestWindow_TraversalMetricNeverReadsPlantedFileOutsideBase is an
+// end-to-end regression for the same defect: a file that a traversal
+// *would* have read, if metric had reached dayFilePath unsanitized, must
+// come back empty-rejected rather than its contents leaking through Window.
+func TestWindow_TraversalMetricNeverReadsPlantedFileOutsideBase(t *testing.T) {
+	root := withWorkspace(t, "node-a")
+
+	// Plant a file outside .cog/observatory/vitals that a successful
+	// traversal (base/node-a/raw/../../../planted/<date>.ndjson) would land
+	// on, containing a row an attacker should never get back.
+	plantedDir := root + "/planted"
+	if err := writeRows(plantedDir, "", "", "", time.Now(), []row{{Ts: time.Now().Format(time.RFC3339Nano), V: 999}}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Recorder{}
+	if _, err := r.Window("../../../planted", time.Now().Add(-time.Hour), tierRaw); err == nil {
+		t.Fatal("expected traversal metric to be rejected before any file access")
+	}
+}
+
 func TestWindow_ReturnsRawPointsSinceFilter(t *testing.T) {
 	root := withWorkspace(t, "node-a")
 	base := vitalsBaseDir(root)
