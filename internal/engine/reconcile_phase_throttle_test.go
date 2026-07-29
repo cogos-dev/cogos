@@ -19,8 +19,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,10 +163,22 @@ func TestReconcileDaemon_ChronicFetchFailureIsThrottled(t *testing.T) {
 		t.Fatalf("test setup: expected several ticks (LoadConfig calls), got %d — increase the test window", ticks)
 	}
 
-	warnCount := 0
-	debugCount := 0
-	for _, line := range strings.Split(buf.String(), "\n") {
-		if !strings.Contains(line, "reconcile-daemon: FetchLive failed") {
+	warnCount, debugCount := countLevelledLines(buf.String(), "reconcile-daemon: FetchLive failed")
+	if warnCount != 1 {
+		t.Errorf("got %d WARN-level 'FetchLive failed' lines across %d ticks, want exactly 1 (first occurrence only) — issue #494's log-noise regression", warnCount, ticks)
+	}
+	if debugCount < int(ticks)-1 {
+		t.Errorf("got %d DEBUG-level 'FetchLive failed' lines, want at least %d (every tick after the first, throttled)", debugCount, ticks-1)
+	}
+}
+
+// countLevelledLines counts how many lines in text contain marker at WARN
+// vs DEBUG level (slog's TextHandler format: "... level=WARN ... msg=\"...\"
+// ..."). Shared by every chronic-failure end-to-end test below so the
+// warn-once-then-debug assertion is written once.
+func countLevelledLines(text, marker string) (warnCount, debugCount int) {
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.Contains(line, marker) {
 			continue
 		}
 		switch {
@@ -173,11 +188,291 @@ func TestReconcileDaemon_ChronicFetchFailureIsThrottled(t *testing.T) {
 			debugCount++
 		}
 	}
+	return warnCount, debugCount
+}
 
+// waitForShutdown polls daemon.State() until it reaches Shutdown (the run()
+// goroutine has fully returned — see the doc comment on
+// ReconcileDaemonShutdown) or fails the test after 2s. Shared by every
+// chronic-failure end-to-end test below; see syncBuffer's doc comment for
+// why this matters (a fixed sleep here previously raced under -race).
+func waitForShutdown(t *testing.T, daemon *ReconcileDaemon) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for daemon.State() != ReconcileDaemonShutdown {
+		select {
+		case <-deadline:
+			t.Fatal("daemon did not reach Shutdown state in time")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// ─── cog-review PR #496 first-pass follow-up: LoadState/BuildState/WriteState ──
+
+// loadCountingNoop is a noopReconcilable-shaped fake that never reports
+// changes (so ApplyPlan/BuildState/WriteState are never reached, and a
+// pre-seeded corrupt state file is never overwritten/fixed) but tracks how
+// many times LoadConfig ran, so tests can confirm several ticks elapsed.
+type loadCountingNoop struct {
+	typeName  string
+	loadCount atomic.Int32
+}
+
+func (r *loadCountingNoop) Type() string { return r.typeName }
+func (r *loadCountingNoop) LoadConfig(_ string) (any, error) {
+	r.loadCount.Add(1)
+	return map[string]any{}, nil
+}
+func (r *loadCountingNoop) FetchLive(_ context.Context, _ any) (any, error) {
+	return map[string]any{}, nil
+}
+func (r *loadCountingNoop) ComputePlan(_ any, _ any, _ *reconcile.State) (*reconcile.Plan, error) {
+	return &reconcile.Plan{
+		ResourceType: r.typeName,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+		Actions: []reconcile.Action{{
+			Action: reconcile.ActionSkip, ResourceType: r.typeName, Name: "test-resource",
+			Details: map[string]any{"reason": "in sync"},
+		}},
+		Summary: reconcile.Summary{Skipped: 1},
+	}, nil
+}
+func (r *loadCountingNoop) ApplyPlan(_ context.Context, _ *reconcile.Plan) ([]reconcile.Result, error) {
+	return nil, nil
+}
+func (r *loadCountingNoop) BuildState(_ any, _ any, _ *reconcile.State) (*reconcile.State, error) {
+	return nil, nil
+}
+func (r *loadCountingNoop) Health() reconcile.ResourceStatus {
+	return reconcile.NewResourceStatus(reconcile.SyncStatusUnknown, reconcile.HealthHealthy)
+}
+
+// TestReconcileDaemon_ChronicLoadStateFailureIsThrottled is the cog-review
+// (PR #496 first pass) follow-up for the LoadState sibling site: a
+// persistently corrupt/unreadable state file fails reconcile.LoadState with
+// the same error on every tick. Must produce exactly one Warn
+// "LoadState failed" line across many ticks, not one per tick.
+func TestReconcileDaemon_ChronicLoadStateFailureIsThrottled(t *testing.T) {
+	reconcile.ResetProviders()
+	defer reconcile.ResetProviders()
+
+	var buf syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	root := t.TempDir()
+	provider := &loadCountingNoop{typeName: "test-chronic-loadstate-failure"}
+	reconcile.UpsertProvider(provider.Type(), provider)
+
+	// Pre-corrupt the state file so LoadState fails identically on every
+	// tick (json.Unmarshal error). This provider's ComputePlan always
+	// reports "no changes" (ActionSkip), so ApplyPlan/BuildState/WriteState
+	// never run and never fix the file.
+	statePath := reconcile.StatePath(root, provider.Type())
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatalf("mkdir state dir: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("{not valid json"), 0o644); err != nil {
+		t.Fatalf("write corrupt state file: %v", err)
+	}
+
+	daemon := newTestDaemon(root, 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	daemon.Start(ctx)
+	<-ctx.Done()
+	cancel()
+	waitForShutdown(t, daemon)
+
+	ticks := provider.loadCount.Load()
+	if ticks < 3 {
+		t.Fatalf("test setup: expected several ticks, got %d — increase the test window", ticks)
+	}
+
+	warnCount, debugCount := countLevelledLines(buf.String(), "reconcile-daemon: LoadState failed")
 	if warnCount != 1 {
-		t.Errorf("got %d WARN-level 'FetchLive failed' lines across %d ticks, want exactly 1 (first occurrence only) — issue #494's log-noise regression", warnCount, ticks)
+		t.Errorf("got %d WARN-level 'LoadState failed' lines across %d ticks, want exactly 1", warnCount, ticks)
 	}
 	if debugCount < int(ticks)-1 {
-		t.Errorf("got %d DEBUG-level 'FetchLive failed' lines, want at least %d (every tick after the first, throttled)", debugCount, ticks-1)
+		t.Errorf("got %d DEBUG-level 'LoadState failed' lines, want at least %d", debugCount, ticks-1)
+	}
+}
+
+// buildStateErrorReconcilable always has a change to apply (so the daemon
+// reaches BuildState every tick) but BuildState always fails identically —
+// exercises warnPhaseFailureThrottled's wiring at the BuildState call site
+// (cog-review, PR #496 first pass).
+type buildStateErrorReconcilable struct {
+	typeName  string
+	loadCount atomic.Int32
+}
+
+func (r *buildStateErrorReconcilable) Type() string { return r.typeName }
+func (r *buildStateErrorReconcilable) LoadConfig(_ string) (any, error) {
+	r.loadCount.Add(1)
+	return map[string]any{}, nil
+}
+func (r *buildStateErrorReconcilable) FetchLive(_ context.Context, _ any) (any, error) {
+	return map[string]any{}, nil
+}
+func (r *buildStateErrorReconcilable) ComputePlan(_ any, _ any, _ *reconcile.State) (*reconcile.Plan, error) {
+	return &reconcile.Plan{
+		ResourceType: r.typeName,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+		Actions: []reconcile.Action{{
+			Action: reconcile.ActionCreate, ResourceType: r.typeName, Name: "test-resource",
+			Details: map[string]any{},
+		}},
+		Summary: reconcile.Summary{Creates: 1},
+	}, nil
+}
+func (r *buildStateErrorReconcilable) ApplyPlan(_ context.Context, plan *reconcile.Plan) ([]reconcile.Result, error) {
+	var results []reconcile.Result
+	for _, a := range plan.Actions {
+		results = append(results, reconcile.Result{Phase: "apply", Action: string(a.Action), Name: a.Name, Status: reconcile.ApplySucceeded})
+	}
+	return results, nil
+}
+func (r *buildStateErrorReconcilable) BuildState(_ any, _ any, _ *reconcile.State) (*reconcile.State, error) {
+	return nil, errors.New("simulated build-state failure")
+}
+func (r *buildStateErrorReconcilable) Health() reconcile.ResourceStatus {
+	return reconcile.NewResourceStatus(reconcile.SyncStatusUnknown, reconcile.HealthHealthy)
+}
+
+// TestReconcileDaemon_ChronicBuildStateFailureIsThrottled is the cog-review
+// (PR #496 first pass) follow-up for the BuildState sibling site.
+func TestReconcileDaemon_ChronicBuildStateFailureIsThrottled(t *testing.T) {
+	reconcile.ResetProviders()
+	defer reconcile.ResetProviders()
+
+	var buf syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	bad := &buildStateErrorReconcilable{typeName: "test-chronic-buildstate-failure"}
+	reconcile.UpsertProvider(bad.Type(), bad)
+
+	daemon := newTestDaemon(t.TempDir(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	daemon.Start(ctx)
+	<-ctx.Done()
+	cancel()
+	waitForShutdown(t, daemon)
+
+	ticks := bad.loadCount.Load()
+	if ticks < 3 {
+		t.Fatalf("test setup: expected several ticks, got %d — increase the test window", ticks)
+	}
+
+	warnCount, debugCount := countLevelledLines(buf.String(), "reconcile-daemon: BuildState failed")
+	if warnCount != 1 {
+		t.Errorf("got %d WARN-level 'BuildState failed' lines across %d ticks, want exactly 1", warnCount, ticks)
+	}
+	if debugCount < int(ticks)-1 {
+		t.Errorf("got %d DEBUG-level 'BuildState failed' lines, want at least %d", debugCount, ticks-1)
+	}
+}
+
+// writeStateOKBuildReconcilable is buildStateErrorReconcilable's mirror:
+// BuildState always SUCCEEDS (returning a valid, non-nil *reconcile.State),
+// so the daemon always reaches WriteState — which the test makes fail
+// identically every tick by blocking its target directory with a file (see
+// TestReconcileDaemon_ChronicWriteStateFailureIsThrottled). Exercises
+// warnPhaseFailureThrottled's wiring at the WriteState call site (cog-review,
+// PR #496 first pass).
+type writeStateOKBuildReconcilable struct {
+	typeName  string
+	loadCount atomic.Int32
+}
+
+func (r *writeStateOKBuildReconcilable) Type() string { return r.typeName }
+func (r *writeStateOKBuildReconcilable) LoadConfig(_ string) (any, error) {
+	r.loadCount.Add(1)
+	return map[string]any{}, nil
+}
+func (r *writeStateOKBuildReconcilable) FetchLive(_ context.Context, _ any) (any, error) {
+	return map[string]any{}, nil
+}
+func (r *writeStateOKBuildReconcilable) ComputePlan(_ any, _ any, _ *reconcile.State) (*reconcile.Plan, error) {
+	return &reconcile.Plan{
+		ResourceType: r.typeName,
+		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+		Actions: []reconcile.Action{{
+			Action: reconcile.ActionCreate, ResourceType: r.typeName, Name: "test-resource",
+			Details: map[string]any{},
+		}},
+		Summary: reconcile.Summary{Creates: 1},
+	}, nil
+}
+func (r *writeStateOKBuildReconcilable) ApplyPlan(_ context.Context, plan *reconcile.Plan) ([]reconcile.Result, error) {
+	var results []reconcile.Result
+	for _, a := range plan.Actions {
+		results = append(results, reconcile.Result{Phase: "apply", Action: string(a.Action), Name: a.Name, Status: reconcile.ApplySucceeded})
+	}
+	return results, nil
+}
+func (r *writeStateOKBuildReconcilable) BuildState(_ any, _ any, _ *reconcile.State) (*reconcile.State, error) {
+	return reconcile.NewState(r.typeName), nil
+}
+func (r *writeStateOKBuildReconcilable) Health() reconcile.ResourceStatus {
+	return reconcile.NewResourceStatus(reconcile.SyncStatusUnknown, reconcile.HealthHealthy)
+}
+
+// TestReconcileDaemon_ChronicWriteStateFailureIsThrottled is the cog-review
+// (PR #496 first pass) follow-up for the WriteState sibling site: the
+// state directory is pre-blocked by a regular file at the exact path
+// WriteState needs to os.MkdirAll, so every WriteState call fails
+// identically ("not a directory").
+func TestReconcileDaemon_ChronicWriteStateFailureIsThrottled(t *testing.T) {
+	reconcile.ResetProviders()
+	defer reconcile.ResetProviders()
+
+	var buf syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	root := t.TempDir()
+	bad := &writeStateOKBuildReconcilable{typeName: "test-chronic-writestate-failure"}
+	reconcile.UpsertProvider(bad.Type(), bad)
+
+	// reconcile.StatePath(root, type) = root/.cog/config/<type>/.state.json.
+	// AcquireStateLock (which runs BEFORE LoadState in every cycle) also
+	// needs root/.cog/config/<type>/ to exist for its sibling .lock file, so
+	// blocking THAT directory would make every cycle fail at the
+	// acquire-state-lock phase instead of ever reaching WriteState. Instead,
+	// make the parent directory a normal directory (lock acquisition
+	// succeeds) but make .state.json ITSELF a directory rather than a file:
+	// LoadState's os.ReadFile then fails (a separate, independently-
+	// throttled "LoadState failed" — expected and harmless here, since
+	// LoadState failures don't abort the cycle), and WriteState's final
+	// os.Rename(tmp, sp) fails every time because you cannot rename a file
+	// onto an existing directory ("file exists" on macOS/Linux).
+	statePath := reconcile.StatePath(root, bad.Type())
+	if err := os.MkdirAll(statePath, 0o755); err != nil {
+		t.Fatalf("mkdir state-path-as-directory: %v", err)
+	}
+
+	daemon := newTestDaemon(root, 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	daemon.Start(ctx)
+	<-ctx.Done()
+	cancel()
+	waitForShutdown(t, daemon)
+
+	ticks := bad.loadCount.Load()
+	if ticks < 3 {
+		t.Fatalf("test setup: expected several ticks, got %d — increase the test window", ticks)
+	}
+
+	warnCount, debugCount := countLevelledLines(buf.String(), "reconcile-daemon: WriteState failed")
+	if warnCount != 1 {
+		t.Errorf("got %d WARN-level 'WriteState failed' lines across %d ticks, want exactly 1", warnCount, ticks)
+	}
+	if debugCount < int(ticks)-1 {
+		t.Errorf("got %d DEBUG-level 'WriteState failed' lines, want at least %d", debugCount, ticks-1)
 	}
 }

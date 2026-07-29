@@ -398,11 +398,19 @@ func (s *siteProvider) applyAction(ctx context.Context, action reconcile.Action)
 		base.Error = "no app_dir in action details"
 		return base
 	}
-	if err := siteBuild(ctx, appDir, action.Name); err != nil {
+	out, err := siteBuild(ctx, appDir, action.Name)
+	if err != nil {
 		base.Status = reconcile.ApplyFailed
 		base.Error = fmt.Sprintf("build: %v", err)
 		return base
 	}
+	// Unlike buildAndHash's drift-check build (demoted to Debug — see its
+	// call site), this is a genuine deploy actually being applied: a rare,
+	// operator-relevant event, not per-cycle noise. Its build output stays
+	// visible at Info by default (cog-review, PR #496 first pass: the
+	// original fix demoted both callers uniformly, which would have hidden
+	// a real deploy's build output too).
+	slog.Info("site: deploy build succeeded", "name", action.Name, "output", string(out))
 	stratName, _ := action.Details["strategy"].(string)
 	strat, err := s.lookupStrategy(stratName)
 	if err != nil {
@@ -504,32 +512,29 @@ func crdByName(crds []siteCRD, name string) (siteCRD, bool) {
 	return siteCRD{}, false
 }
 
-func siteBuild(ctx context.Context, appDir, name string) error {
+// siteBuild runs `bash build.sh` in appDir and returns its combined
+// stdout+stderr output on success. On failure the output is folded into the
+// returned error (unchanged from before issue #494's log-noise fix).
+//
+// Deliberately does NOT log the success-path output itself — see the two
+// call sites below, buildAndHash and (*siteProvider).applyAction, which log
+// it at different levels because they have very different noise profiles:
+// buildAndHash runs on every reconcile cycle (default 30s) for every
+// deployed site purely to hash the result for drift detection (see its doc
+// comment), while applyAction only runs when a create/update action is
+// actually being deployed — a rare, operator-relevant event. A single
+// logging policy inside siteBuild can't serve both correctly (cog-review, PR
+// #496 first pass): demoting to Debug unconditionally would also hide a
+// genuine deploy's build output by default, which was never the noise this
+// issue was about.
+func siteBuild(ctx context.Context, appDir, name string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "bash", "build.sh")
 	cmd.Dir = appDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("build.sh for %s: %w\n%s", name, err, out)
+		return out, fmt.Errorf("build.sh for %s: %w\n%s", name, err, out)
 	}
-	// Issue #494 (unrelated observation): ComputePlan's drift-detection hash
-	// runs this build on every reconcile cycle (default 30s) for every
-	// deployed site, whether or not anything changed — see the doc comment
-	// on ComputePlan's build-and-hash step. Logging the FULL combined
-	// stdout+stderr of `bash build.sh` at every one of those cycles, via the
-	// stdlib log package (which has no level and always writes to
-	// os.Stderr), was the single largest contributor to
-	// ~/.cog/var/logs/serve.log's observed 488 MB — almost entirely
-	// "MallocStackLogging: can't turn off malloc stack logging because it
-	// was not enabled." emitted by the forked build subprocess to its own
-	// stderr and captured verbatim by CombinedOutput. A successful build's
-	// full output is a debugging aid, not routine operational signal, so it
-	// moves to slog.Debug (suppressed by default; opt in with
-	// COG_LOG_DEBUG=1, see log_capture.go) rather than being dropped
-	// outright — the failure path below (fmt.Errorf, still including out)
-	// is unchanged, so a genuine build failure's output is still surfaced at
-	// whatever level the caller logs the returned error.
-	slog.Debug("site: build succeeded", "name", name, "output", string(out))
-	return nil
+	return out, nil
 }
 
 // buildAndHash runs the app's build (the same build.sh path ApplyPlan uses) and
@@ -538,9 +543,25 @@ func siteBuild(ctx context.Context, appDir, name string) error {
 // location for its ../../packages copies, so there is no separate temp build dir
 // to redirect to or clean up; the dist tree is the artifact ApplyPlan deploys.
 func (s *siteProvider) buildAndHash(ctx context.Context, appDir, name string) (string, error) {
-	if err := siteBuild(ctx, appDir, name); err != nil {
+	out, err := siteBuild(ctx, appDir, name)
+	if err != nil {
 		return "", err
 	}
+	// Issue #494 (unrelated observation): this drift-detection hash runs on
+	// every reconcile cycle for every deployed site, whether or not anything
+	// changed. Logging the full combined stdout+stderr of `bash build.sh` on
+	// every one of those cycles, via the stdlib log package (no level,
+	// always writes to os.Stderr), was the single largest contributor to
+	// ~/.cog/var/logs/serve.log's observed 488 MB — almost entirely macOS's
+	// "MallocStackLogging: can't turn off malloc stack logging because it
+	// was not enabled." emitted by the forked build subprocess to its own
+	// stderr and captured verbatim by CombinedOutput. A successful
+	// drift-check build's full output is a debugging aid, not routine
+	// operational signal here, so it moves to slog.Debug (suppressed by
+	// default; opt in with COG_LOG_DEBUG=1, see log_capture.go). This is
+	// distinct from applyAction's real-deploy build below, which stays
+	// visible at Info.
+	slog.Debug("site: drift-check build succeeded", "name", name, "output", string(out))
 	return artifactHash(filepath.Join(appDir, "dist"))
 }
 

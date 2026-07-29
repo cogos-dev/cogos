@@ -683,8 +683,14 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		// corruption or a permission/read fault. Surface it instead of silently
 		// resetting lineage serials, mirroring the WriteState warning below.
 		// Continue with the nil state — providers already handle a nil state.
-		slog.Warn("reconcile-daemon: LoadState failed; continuing with empty state",
-			"provider", providerType, "err", stateErr)
+		//
+		// Throttled like every other phase failure in this function
+		// (cog-review, PR #496 first pass): a persistently corrupted or
+		// unreadable state file fails with the same text on every tick
+		// forever otherwise, reproducing this PR's own log-spam bug class.
+		d.warnPhaseFailureThrottled(providerType, "LoadState", stateErr)
+	} else {
+		d.clearPhaseFailureThrottle(providerType, "LoadState")
 	}
 	stateMs = time.Since(stateStart).Milliseconds()
 
@@ -771,16 +777,25 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	// Steps 6-7: BuildState (pure) + WriteState (atomic tmp+rename), timed
 	// together as the persist phase.
 	writeStart := time.Now()
+	// Both BuildState and WriteState failures are throttled the same way as
+	// every other phase in this function (cog-review, PR #496 first pass:
+	// these two were the remaining unthrottled sibling sites — a workspace
+	// that loses write access to its state directory, or a provider whose
+	// BuildState step is persistently broken, otherwise fails identically
+	// on every tick forever, reproducing this PR's own log-spam bug class).
 	newState, buildErr := provider.BuildState(config, live, state)
-	if buildErr == nil && newState != nil {
-		// Step 7: WriteState — atomic tmp+rename.
-		if writeErr := reconcile.WriteState(d.cfg.WorkspaceRoot, providerType, newState); writeErr != nil {
-			slog.Warn("reconcile-daemon: WriteState failed",
-				"provider", providerType, "err", writeErr)
+	if buildErr != nil {
+		d.warnPhaseFailureThrottled(providerType, "BuildState", buildErr)
+	} else {
+		d.clearPhaseFailureThrottle(providerType, "BuildState")
+		if newState != nil {
+			// Step 7: WriteState — atomic tmp+rename.
+			if writeErr := reconcile.WriteState(d.cfg.WorkspaceRoot, providerType, newState); writeErr != nil {
+				d.warnPhaseFailureThrottled(providerType, "WriteState", writeErr)
+			} else {
+				d.clearPhaseFailureThrottle(providerType, "WriteState")
+			}
 		}
-	} else if buildErr != nil {
-		slog.Warn("reconcile-daemon: BuildState failed",
-			"provider", providerType, "err", buildErr)
 	}
 	writeMs = time.Since(writeStart).Milliseconds()
 
