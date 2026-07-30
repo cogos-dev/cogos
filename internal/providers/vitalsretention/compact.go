@@ -28,10 +28,14 @@ func bucketDuration(tier string) time.Duration {
 	}
 }
 
-// maybeCompact runs a compaction pass for nodeKey if the check interval has
-// elapsed since the last pass. Never returns an error to the caller (the
-// bus-handler dispatch context) — outcomes are recorded via
-// recordCompactResult for Health() to surface instead.
+// maybeCompact hands a compaction pass for nodeKey off to its own goroutine
+// if the check interval has elapsed since the last pass and no compaction is
+// already in flight. It never blocks on compaction I/O — the caller is the
+// bus-handler dispatch context (HandleBusEvent, synchronous inside
+// BusSessionManager.AppendEvent), and per #497 that path must return as soon
+// as the (cheap) sample append is durable, without waiting on compaction's
+// file I/O. Outcomes are recorded via recordCompactResult for Health() to
+// surface instead of returning an error here.
 func (r *Recorder) maybeCompact(base, nodeKey string) {
 	root, err := resolveWorkspaceRoot()
 	if err != nil {
@@ -39,18 +43,59 @@ func (r *Recorder) maybeCompact(base, nodeKey string) {
 	}
 	cfg := loadConfigCached(root)
 
-	r.mu.Lock()
-	due := time.Since(r.lastCompactAt) >= cfg.compactCheckInterval()
-	r.mu.Unlock()
-	if !due {
+	if !r.claimCompactSlot(cfg) {
 		return
 	}
 
-	err = r.compactNode(base, nodeKey, cfg)
-	r.recordCompactResult(err)
-	if err != nil {
-		warnf("vitals-retention: compaction pass failed for node=%s: %v", nodeKey, err)
+	go func() {
+		err := compactHook(r, base, nodeKey, cfg)
+		r.recordCompactResult(err)
+		if err != nil {
+			warnf("vitals-retention: compaction pass failed for node=%s: %v", nodeKey, err)
+		}
+	}()
+}
+
+// claimCompactSlot atomically checks whether a compaction pass is due
+// (interval elapsed) and, if so and none is already in flight, claims the
+// single-flight slot and stamps lastCompactAt immediately — before the pass
+// itself has run. Doing the due-check and the claim inside one critical
+// section closes the check-then-act race on lastCompactAt flagged
+// non-blocking in #493's final review: previously two concurrent callers
+// could both observe "due" before either updated lastCompactAt, since the
+// update only happened after compactNode returned. Now the claim and the
+// stamp are the same atomic step, so at most one caller ever proceeds per
+// interval, and the `compacting` guard additionally covers the case where a
+// single pass runs longer than the check interval itself.
+func (r *Recorder) claimCompactSlot(cfg Config) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.compacting {
+		return false
 	}
+	if time.Since(r.lastCompactAt) < cfg.compactCheckInterval() {
+		return false
+	}
+	r.compacting = true
+	r.lastCompactAt = time.Now()
+	return true
+}
+
+// compactHook performs the actual compaction pass. It is a package-level
+// seam (rather than calling r.compactNode directly) so tests can inject a
+// slow or instrumented compaction without real slow disk I/O — see
+// SetCompactHookForTest.
+var compactHook = func(r *Recorder, base, nodeKey string, cfg Config) error {
+	return r.compactNode(base, nodeKey, cfg)
+}
+
+// SetCompactHookForTest overrides compactHook for the duration of a test.
+// Callers must invoke the returned restore func (typically via t.Cleanup)
+// to avoid leaking the override into other tests.
+func SetCompactHookForTest(f func(r *Recorder, base, nodeKey string, cfg Config) error) (restore func()) {
+	prev := compactHook
+	compactHook = f
+	return func() { compactHook = prev }
 }
 
 // compactNode runs one full compaction pass: raw->5m aging, 5m->1h aging,
@@ -255,6 +300,16 @@ func removeDayFile(base, nodeKey, tier, metric string, day time.Time) error {
 // Repeatedly compacts the single oldest raw day-file across all metrics
 // (oldest first, regardless of RawRetentionHours) until the raw tier's total
 // size is at or under budget, or there is nothing left to compact.
+//
+// today's day-file is never a candidate — see oldestRawDay's doc for why
+// this exemption became load-bearing once compaction moved off the
+// synchronous tick path (#497 fix-review finding): before that change, the
+// ticker's own next append could not run until a prior tick's synchronous
+// compaction fully returned, so this loop could never observe a
+// concurrent appendRow to the same day-file it was about to read-then-
+// delete. Compaction now runs on its own goroutine while the tick path
+// keeps appending, so that race is reachable unless the actively-written
+// day is excluded outright.
 func (r *Recorder) enforceRawBudget(base, nodeKey string, cfg Config) error {
 	budget := cfg.rawBudgetBytes()
 	rawDir := filepath.Join(base, nodeKey, tierRaw)
@@ -266,17 +321,26 @@ func (r *Recorder) enforceRawBudget(base, nodeKey string, cfg Config) error {
 		if size <= budget {
 			return nil
 		}
-		metric, day, ok, err := oldestRawDay(base, nodeKey)
+		// Recomputed each iteration, not snapshotted at entry: a long pass
+		// that crosses UTC midnight must start excluding the NEW actively-
+		// written day immediately, or the exclusion above stops protecting
+		// exactly the file HandleBusEvent is appending to (gate finding on
+		// head 2682919).
+		today := time.Now().UTC().Truncate(24 * time.Hour)
+		metric, day, ok, err := oldestRawDay(base, nodeKey, today)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			// Over budget with nothing left to compact (e.g. a single
-			// metric's one remaining day already exceeds the budget alone).
-			// Nothing more this pass can do; Health() surfaces this via the
-			// caller's error path if downsampling itself is failing, but an
-			// unsatisfiable budget on a small, healthy history is not
-			// itself an error condition worth failing the pass over.
+			// metric's one remaining day already exceeds the budget alone,
+			// or the only remaining raw data is today's actively-written
+			// day-file, which is deliberately never a candidate — see doc
+			// above). Nothing more this pass can do; Health() surfaces this
+			// via the caller's error path if downsampling itself is
+			// failing, but an unsatisfiable budget on a small, healthy
+			// history is not itself an error condition worth failing the
+			// pass over.
 			return nil
 		}
 		if err := downsampleOneDay(base, nodeKey, metric, tierRaw, tier5m, day); err != nil {
@@ -286,8 +350,21 @@ func (r *Recorder) enforceRawBudget(base, nodeKey string, cfg Config) error {
 }
 
 // oldestRawDay scans every metric's raw tier and returns the single
-// earliest (metric, day) pair across all of them.
-func oldestRawDay(base, nodeKey string) (metric string, day time.Time, ok bool, err error) {
+// earliest (metric, day) pair across all of them, excluding excludeDay.
+//
+// excludeDay is always the caller's current UTC day: downsampleOneDay reads
+// a day-file's rows, writes the aggregate, then deletes the raw source
+// (compact.go's downsampleOneDay doc) — read-then-delete with no locking
+// against a concurrent writer. HandleBusEvent's appendRow can land a new
+// row in today's file at any moment now that compaction runs off its own
+// goroutine (see enforceRawBudget's doc), so a raw-budget pass that picked
+// today's file could read it, race a concurrent append, and then delete the
+// file — silently losing the just-appended row with no trace in either the
+// raw source or the 5m aggregate written from the earlier snapshot. Every
+// day strictly before today is safe: HandleBusEvent only ever appends to
+// the day-file matching the event's own timestamp (store.go/appendRow), so
+// a prior day's file is immutable once the day has rolled over.
+func oldestRawDay(base, nodeKey string, excludeDay time.Time) (metric string, day time.Time, ok bool, err error) {
 	metrics, err := listMetrics(base, nodeKey, tierRaw)
 	if err != nil {
 		return "", time.Time{}, false, err
@@ -302,11 +379,14 @@ func oldestRawDay(base, nodeKey string) (metric string, day time.Time, ok bool, 
 		if err != nil {
 			return "", time.Time{}, false, err
 		}
-		if len(days) == 0 {
-			continue
-		}
-		if !found || days[0].Before(bestDay) {
-			bestMetric, bestDay, found = m, days[0], true
+		for _, d := range days {
+			if d.Equal(excludeDay) {
+				continue
+			}
+			if !found || d.Before(bestDay) {
+				bestMetric, bestDay, found = m, d, true
+			}
+			break // days is ascending; the first non-excluded entry is this metric's oldest
 		}
 	}
 	return bestMetric, bestDay, found, nil
