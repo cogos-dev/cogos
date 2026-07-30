@@ -20,6 +20,11 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="$HOME/.cog/bin"
 SHELL_NAME="$(basename "$SHELL")"
 
+# Shared running-daemon guard -- see scripts/lib/refuse-if-running.sh for
+# why this is sourced rather than hand-copied (again).
+# shellcheck source=lib/refuse-if-running.sh
+. "$REPO_DIR/scripts/lib/refuse-if-running.sh"
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -106,6 +111,9 @@ echo ""
 info "Installing to $INSTALL_DIR..."
 
 mkdir -p "$INSTALL_DIR"
+
+# Refuse to clobber a running kernel before writing anything.
+refuse_if_running "$INSTALL_DIR/cogos" || exit 1
 
 # Install cogos binary.
 cp cogos "$INSTALL_DIR/cogos"

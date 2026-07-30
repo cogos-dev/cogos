@@ -88,6 +88,16 @@ jobs:
       - name: Shell hardening gate
         run: ./scripts/check-shell-hardening.sh scripts
 
+      # Install-guard coverage tripwire: fails if a new site writing the
+      # cogos binary into an install path appears without referencing the
+      # shared running-daemon guard (scripts/lib/refuse-if-running.sh /
+      # .ps1). Grep-based heuristic, not a proof -- see the script's own
+      # header for its honest limits. Added alongside the guard's
+      # extraction into one shared implementation; see
+      # cog://mem/working/2026-07-30-self-review-spike/RETRO-486.md.
+      - name: Install guard coverage gate
+        run: ./scripts/check-install-guard-coverage.sh
+
   e2e:
     runs-on: ubuntu-latest
     needs: build
