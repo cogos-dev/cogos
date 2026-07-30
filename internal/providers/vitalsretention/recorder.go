@@ -115,6 +115,12 @@ func (r *Recorder) HandleBusEvent(busID string, block *Block) {
 	}
 	ts = ts.UTC()
 
+	// Record this event's day before appending, so a compaction goroutine
+	// that maybeCompact spawns below (or one already in flight from a prior
+	// tick) sees the exact day this append is about to write to via
+	// currentExcludeDay() — see #500.
+	r.recordEventDay(ts)
+
 	nodeKey := currentNodeKey()
 	metrics := extractMetrics(block.Payload)
 
