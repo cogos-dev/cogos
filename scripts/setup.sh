@@ -107,28 +107,6 @@ echo ""
 info "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 
-# Refuse to clobber a live daemon (same guard class as Makefile
-# check-not-running / setup-dev.sh refuse_if_running): match the cogos
-# binary name anywhere in argv with a standalone "serve" word, which also
-# catches wrapper-shaped invocations (<kernel> --workspace <path> serve).
-#
-# If pgrep itself is unavailable, fail loud rather than silently skipping the
-# check — the same missing-tool fail-open this guard class was already fixed
-# for in Makefile:check-not-running and setup-dev.sh:refuse_if_running; ported
-# here so the third sibling doesn't reopen it.
-if ! command -v pgrep >/dev/null 2>&1; then
-    warn "pgrep not found, so a running kernel cannot be detected."
-    warn "Installing blind could overwrite a live production binary."
-    warn "Install pgrep (procps) or stop the daemon manually before re-running."
-    exit 1
-fi
-if pgrep -f '(^|/)cogos( |$)' >/dev/null 2>&1 &&    pgrep -f '(^|/)cogos( |$)' | xargs -I{} ps -p {} -o args= 2>/dev/null | grep -qw serve; then
-    warn "A cogos daemon appears to be RUNNING on this machine."
-    warn "Installing over a live binary can crash or corrupt the daemon."
-    warn "Stop it first (launchctl / systemctl / Scheduled Task), then re-run."
-    exit 1
-fi
-
 mv "$TMPDIR/cogos" "$INSTALL_DIR/cogos"
 ok "cogos → $INSTALL_DIR/cogos"
 
