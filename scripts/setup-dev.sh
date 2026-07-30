@@ -159,7 +159,19 @@ info "Building cogos from source..."
 
 cd "$REPO_DIR"
 
-VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+# The dev- prefix is load-bearing, not cosmetic -- see the Makefile's VERSION
+# comment for the full rationale. Short version: a bare `git describe` string
+# is valid semver whose suffix parses as a prerelease, and prereleases sort
+# BEFORE their base tag, so a bare describe string reads as OLDER than the
+# release it descends from and self-update's GATE D/F would not treat it as
+# a dev build. Prefixing with dev- makes normVersion() return "" so GATE D
+# fires and self-update stays inert.
+GIT_DESCRIBE=$(git describe --tags --always --dirty 2>/dev/null || true)
+if [ -n "$GIT_DESCRIBE" ]; then
+    VERSION="dev-${GIT_DESCRIBE}"
+else
+    VERSION="dev"
+fi
 BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS="-s -w -X github.com/myrgic/cogos/internal/engine.Version=${VERSION} -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME}"
 
