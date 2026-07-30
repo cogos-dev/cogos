@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/myrgic/cogos/pkg/filelock"
@@ -71,16 +72,65 @@ type BusSessionManager struct {
 	// rename).  Protected by m.mu.
 	lastSeq  map[string]int64
 	lastHash map[string]string
+
+	// registryFileMu single-flights this PROCESS's attempts at the
+	// cross-process registry filelock (RegisterBus's correctness path and
+	// updateRegistrySeqIfNewer's best-effort path). Without it, N concurrent
+	// AppendEvent/RegisterBus callers in the same process each independently
+	// call filelock.Acquire — a real flock(2) syscall, retried on a 50ms
+	// poll — and Go's runtime pins one OS thread per goroutine currently
+	// inside that syscall. Under request-storm concurrency (#505: every HTTP
+	// handler span-emission re-registers and re-appends to bus_traces, see
+	// handler_span.go) that turned into hundreds of concurrently live retry
+	// loops and a monotonically growing thread count — Go never returns
+	// created OS threads to the kernel, so the count only ratchets upward.
+	// Serializing in-process access through this mutex means at most one
+	// goroutine per process is ever inside the real flock(2) retry loop at a
+	// time; every other contender blocks on this mutex instead, which parks
+	// on the Go scheduler and costs no OS thread. Cross-process behavior
+	// (a daemon and a `cogos mcp serve` subprocess sharing a workspace) is
+	// unaffected — the underlying filelock.Acquire calls and their timeouts
+	// are unchanged, just no longer raced against each other from within a
+	// single process.
+	registryFileMu sync.Mutex
+
+	// registeredActive caches busIDs this process has already registered as
+	// "active" in registry.json. RegisterBus is idempotent by contract, but
+	// before this cache every call — regardless of whether state actually
+	// changed — paid the full cross-process lock + load + save cycle.
+	// Callers like handler_span.go call RegisterBus on every single HTTP
+	// request; with the cache, only the first call per busID per process
+	// pays that cost, and every repeat is a m.mu-guarded map lookup. No code
+	// path in this package ever demotes a bus out of "active", so the cache
+	// cannot go stale for the lifetime of this manager. Guarded by m.mu.
+	registeredActive map[string]bool
+
+	// registrySeqSkipCount counts every best-effort seq update skipped —
+	// either because another goroutine already holds registryFileMu, or
+	// because the cross-process filelock itself timed out. Logged at a rate
+	// limit (registrySeqSkipLogEvery) instead of once per skip, so the skip
+	// path itself cannot become a log-volume amplifier under sustained
+	// contention (the original #505 symptom: a continuous storm of
+	// "skipping registry seq update" lines).
+	registrySeqSkipCount atomic.Int64
 }
 
 // NewBusSessionManager constructs a manager rooted at workspaceRoot.
 // Events and registry live under {workspaceRoot}/.cog/.state/buses/.
 func NewBusSessionManager(workspaceRoot string) *BusSessionManager {
 	return &BusSessionManager{
-		workspaceRoot: workspaceRoot,
-		lastSeq:       make(map[string]int64),
-		lastHash:      make(map[string]string),
+		workspaceRoot:    workspaceRoot,
+		lastSeq:          make(map[string]int64),
+		lastHash:         make(map[string]string),
+		registeredActive: make(map[string]bool),
 	}
+}
+
+// RegistrySeqSkipCount reports how many best-effort registry seq updates have
+// been skipped (in-process or cross-process contention) since this manager
+// was constructed. Exposed for tests and diagnostics — see #505.
+func (m *BusSessionManager) RegistrySeqSkipCount() int64 {
+	return m.registrySeqSkipCount.Load()
 }
 
 // WorkspaceRoot returns the workspace path the manager is bound to.
@@ -172,12 +222,31 @@ func (m *BusSessionManager) EnsureBus(busID string) error {
 	return nil
 }
 
-// RegisterBus adds or updates a bus entry in the registry.
+// RegisterBus adds or updates a bus entry in the registry. Idempotent: a
+// repeat call for a busID already known-active IN THIS PROCESS is a cache
+// hit (see registeredActive) and never touches the cross-process lock at
+// all — the fast path for callers like handler_span.go that call this on
+// every request.
 //
-// Lock ordering: registry filelock BEFORE m.mu, never the reverse — acquiring
-// the cross-process lock while holding the in-process mutex would let one
-// contended peer process stall every unrelated bus operation in this process.
+// Lock ordering: registryFileMu (in-process single-flight) BEFORE the
+// registry filelock (cross-process) BEFORE m.mu, never the reverse —
+// acquiring an outer lock while holding an inner one would let one
+// contended peer process/goroutine stall every unrelated bus operation in
+// this process.
 func (m *BusSessionManager) RegisterBus(busID, sessionID, origin string) error {
+	m.mu.Lock()
+	alreadyActive := m.registeredActive[busID]
+	m.mu.Unlock()
+	if alreadyActive {
+		return nil
+	}
+
+	// Single-flight this process's attempts at the cross-process lock (see
+	// registryFileMu doc comment). This path is correctness-critical, so it
+	// blocks for its turn rather than skipping.
+	m.registryFileMu.Lock()
+	defer m.registryFileMu.Unlock()
+
 	lock, err := m.acquireRegistryLock()
 	if err != nil {
 		return fmt.Errorf("acquire registry lock: %w", err)
@@ -185,8 +254,12 @@ func (m *BusSessionManager) RegisterBus(busID, sessionID, origin string) error {
 	defer lock.Release()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.registerBusLocked(busID, sessionID, origin)
+	err = m.registerBusLocked(busID, sessionID, origin)
+	if err == nil {
+		m.registeredActive[busID] = true
+	}
+	m.mu.Unlock()
+	return err
 }
 
 // registryLockTimeout bounds how long a registry writer waits for the
@@ -200,11 +273,14 @@ const registryLockTimeout = 5 * time.Second
 const registrySeqLockTimeout = 500 * time.Millisecond
 
 // acquireRegistryLock takes the cross-process advisory lock guarding the
-// load-modify-save cycle on registry.json. The root-package CLI writer
-// (busSessionManager, reachable from `cog bus send`/`cog infer`) takes the
-// SAME lock, so a running daemon and concurrent CLI invocations serialize
-// instead of last-writer-wins silently dropping each other's entries.
-// Lock ordering: m.mu is always taken before this filelock.
+// load-modify-save cycle on registry.json. Any other process pointed at the
+// same workspace root — notably a `cogos mcp serve` subprocess, which
+// constructs its own independent BusSessionManager (see cli_mcp.go) — takes
+// the SAME lock, so a running daemon and concurrent CLI/MCP invocations
+// serialize instead of last-writer-wins silently dropping each other's
+// entries. Lock ordering: registryFileMu, then m.mu, are always taken
+// outside this filelock by this manager's own callers; a peer process has
+// no equivalent to registryFileMu and simply contends at the OS level.
 func (m *BusSessionManager) acquireRegistryLock() (*filelock.FileLock, error) {
 	if err := os.MkdirAll(m.BusesDir(), 0755); err != nil {
 		return nil, err
@@ -455,25 +531,45 @@ func (m *BusSessionManager) LatestEventHash(busID string) (hash string, seq int6
 	return h, int64(s), nil
 }
 
+// registrySeqSkipLogEvery rate-limits the skip warning below so sustained
+// contention logs a sample instead of one line per AppendEvent — the
+// original #505 symptom was a continuous storm of these exact log lines.
+const registrySeqSkipLogEvery = 100
+
 // updateRegistrySeqIfNewer updates the last event seq/timestamp in the
-// registry. Caller must NOT hold m.mu — this method blocks (briefly) on the
+// registry. Caller must NOT hold m.mu — this method may briefly touch the
 // cross-process registry filelock, and holding the in-process mutex across
 // that wait would let one contended peer stall every unrelated bus operation
 // in this process (the exact hazard this PR fixes elsewhere).
 //
 // Best-effort + monotonic: the seq update is derivable metadata that
-// self-heals on the next append, so on lock contention we skip rather than
-// wait long (registrySeqLockTimeout), and because callers run outside m.mu
-// their updates can arrive out of order — the IfNewer guard makes a stale
-// update a harmless no-op instead of a seq regression.
+// self-heals on the next append, so on ANY contention — in-process
+// (registryFileMu already held by another goroutine, see its doc comment)
+// or cross-process (the filelock itself times out) — this skips immediately
+// rather than joining a retry loop. Because callers run without m.mu their
+// updates can arrive out of order — the IfNewer guard makes a stale update a
+// harmless no-op instead of a seq regression.
+//
+// registryFileMu uses TryLock (not Lock) here deliberately: this is the
+// AppendEvent hot path, potentially called at high frequency (every HTTP
+// handler span, every bus message). Blocking for a turn would still be
+// correct, but skipping outright when another goroutine is already inside
+// the cross-process lock attempt keeps this path from ever queuing, which is
+// what "best-effort" means for metadata that self-heals on the next append.
 func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, ts string) {
+	if !m.registryFileMu.TryLock() {
+		m.recordRegistrySeqSkip(busID, "in-process contention")
+		return
+	}
+	defer m.registryFileMu.Unlock()
+
 	if err := os.MkdirAll(m.BusesDir(), 0755); err != nil {
-		slog.Warn("bus: skipping registry seq update", "err", err, "bus_id", busID)
+		m.recordRegistrySeqSkip(busID, "mkdir: "+err.Error())
 		return
 	}
 	lock, err := filelock.Acquire(m.RegistryPath()+".lock", registrySeqLockTimeout)
 	if err != nil {
-		slog.Warn("bus: skipping registry seq update (lock contended)", "err", err, "bus_id", busID)
+		m.recordRegistrySeqSkip(busID, "cross-process lock contended")
 		return
 	}
 	defer lock.Release()
@@ -492,6 +588,16 @@ func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, ts s
 	}
 	if err := m.saveRegistry(registry); err != nil {
 		slog.Warn("bus: failed to update registry seq", "err", err, "bus_id", busID)
+	}
+}
+
+// recordRegistrySeqSkip increments the skip counter and logs at a rate
+// limit — see registrySeqSkipLogEvery.
+func (m *BusSessionManager) recordRegistrySeqSkip(busID, reason string) {
+	n := m.registrySeqSkipCount.Add(1)
+	if n == 1 || n%registrySeqSkipLogEvery == 0 {
+		slog.Warn("bus: skipping registry seq update (lock contended)",
+			"bus_id", busID, "reason", reason, "skip_count", n)
 	}
 }
 
