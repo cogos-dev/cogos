@@ -280,6 +280,11 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// ACP-client surface: list/browse Claude Code projects+sessions, spawn subprocess.
 	s.registerClaudeCodeRoutes(mux)
 
+	// Diagnostic surface: pprof + expvar under /debug/, loopback-gated
+	// regardless of bind address. See serve_debug.go / #505 — the daemon had
+	// no way to be asked about its own memory when it developed a 36GB leak.
+	s.registerDebugRoutes(mux)
+
 	// Extension HTTP routes (e.g. observatory coverage).
 	if RegisterHTTPExtensions != nil {
 		RegisterHTTPExtensions(s, mux)
