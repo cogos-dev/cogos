@@ -778,7 +778,10 @@ func (p *ledgerProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource,
 		return p.listDirectory(uri, ledgerDir)
 	}
 
-	sessionDir := filepath.Join(ledgerDir, uri.Path)
+	// Sanitize every segment of the caller-supplied path before it becomes
+	// part of a filesystem path (myrgic/cogos#489 round 2 — unauthenticated
+	// path-traversal read via GET /resolve). See pathsafe.go.
+	sessionDir := filepath.Join(ledgerDir, sanitizeRelPath(uri.Path))
 	info, err := os.Stat(sessionDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -855,6 +858,13 @@ func (p *ledgerProjector) Mutate(ctx context.Context, uri *ParsedURI, m *Mutatio
 
 // appendEvent appends an event to the session's event log.
 func (p *ledgerProjector) appendEvent(sessionID string, content []byte) error {
+	// Sanitize the session ID before it becomes a filesystem path component
+	// (myrgic/cogos#489 round 2 — unauthenticated path-traversal write via
+	// POST /mutate). See pathsafe.go. Sanitizing here, before event.SessionID
+	// is set below, keeps the recorded session ID consistent with the
+	// on-disk directory name.
+	sessionID = sanitizePathComponent(sessionID)
+
 	// Parse the event data
 	var event types.Event
 	if err := json.Unmarshal(content, &event); err != nil {
