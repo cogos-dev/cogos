@@ -70,6 +70,10 @@ func runDebugProfileCmd(args []string, defaultWorkspace string, defaultPort int,
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	// debugLoopbackOnly (serve_debug.go) requires this header on every
+	// /debug/ request — see its doc comment for why: it's not a secret, it's
+	// a marker no browser-driven request (img/form/no-cors fetch) can set.
+	req.Header.Set(debugAuthHeader, "1")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

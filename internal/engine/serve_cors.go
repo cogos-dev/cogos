@@ -36,6 +36,19 @@
 // Request whose Origin header is missing (same-origin fetches, curl, the
 // MCP CLI, etc.) are untouched — the middleware only adds headers when an
 // Origin is present or the method is OPTIONS.
+//
+// Exclusion — /debug/* never gets CORS headers, full stop:
+//
+// #505/#507 found that echoing Access-Control-Allow-Origin on the pprof +
+// expvar surface under /debug/ (mounted in serve_debug.go) is itself part of
+// the exposure: a malicious page's cross-origin fetch() is normally blocked
+// by the browser's own same-origin policy on the *response*, but an
+// Allow-Origin header (even "*") is the server explicitly waiving that
+// protection and letting the page read the response body — e.g. a full heap
+// dump. debugLoopbackOnly (serve_debug.go) is /debug/'s own auth layer and
+// deliberately does not want ANY CORS header on its responses, ever,
+// regardless of Origin. So /debug/ requests are excluded from this
+// middleware entirely before any Origin/header logic runs.
 package engine
 
 import (
@@ -60,6 +73,15 @@ func corsMiddleware(next http.Handler) http.Handler {
 	const maxAge = "86400"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// See the file-level "Exclusion" note: /debug/ is authenticated by
+		// debugLoopbackOnly and must never carry an Access-Control-* header,
+		// so it bypasses this middleware's logic entirely — not even the
+		// OPTIONS short-circuit below runs for it.
+		if strings.HasPrefix(r.URL.Path, "/debug/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		origin := r.Header.Get("Origin")
 
 		// Echo loopback origins so credentialed requests can round-trip;
