@@ -768,6 +768,18 @@ func mergeProvidersConfig(base, overlay ProvidersConfig) ProvidersConfig {
 		}
 	}
 	base.Routing = mergeRoutingConfig(base.Routing, overlay.Routing)
+	base.ClaudeOAuth = mergeClaudeOAuthConfig(base.ClaudeOAuth, overlay.ClaudeOAuth)
+	return base
+}
+
+// mergeClaudeOAuthConfig deep-merges overlay onto base. Auto is a pointer
+// with nil-means-unset semantics: an overlay that omits claude_oauth.auto
+// entirely (Auto == nil) must NOT clobber a base value — only an overlay
+// that explicitly sets auto (true or false) overrides the base.
+func mergeClaudeOAuthConfig(base, overlay ClaudeOAuthAutoConfig) ClaudeOAuthAutoConfig {
+	if overlay.Auto != nil {
+		base.Auto = overlay.Auto
+	}
 	return base
 }
 
