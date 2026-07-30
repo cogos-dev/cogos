@@ -840,3 +840,160 @@ func TestProviderForModel_DeterministicTiebreak(t *testing.T) {
 		}
 	}
 }
+
+// ── mergeProvidersConfig ────────────────────────────────────────────────────
+//
+// Regression coverage for the providers.local.yaml overlay merge (PR #509
+// cog-review finding): mergeProvidersConfig must carry every field of
+// ProvidersConfig — Providers, Routing, AND ClaudeOAuth — from overlay onto
+// base. A field silently dropped here means a node-local override in
+// providers.local.yaml is discarded without warning.
+
+func TestMergeProvidersConfig_ClaudeOAuth(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		baseAuto     *bool
+		overlayAuto  *bool
+		wantAuto     *bool
+		wantIsAutoEn bool
+	}{
+		{
+			name:         "base unset, overlay unset -> stays unset (defaults enabled)",
+			baseAuto:     nil,
+			overlayAuto:  nil,
+			wantAuto:     nil,
+			wantIsAutoEn: true,
+		},
+		{
+			name:         "base opts out, overlay omits field entirely -> base opt-out survives",
+			baseAuto:     boolPtr(false),
+			overlayAuto:  nil,
+			wantAuto:     boolPtr(false),
+			wantIsAutoEn: false,
+		},
+		{
+			name:         "base unset, overlay opts out -> overlay opt-out applies",
+			baseAuto:     nil,
+			overlayAuto:  boolPtr(false),
+			wantAuto:     boolPtr(false),
+			wantIsAutoEn: false,
+		},
+		{
+			name:         "base enabled, overlay opts out -> overlay wins",
+			baseAuto:     boolPtr(true),
+			overlayAuto:  boolPtr(false),
+			wantAuto:     boolPtr(false),
+			wantIsAutoEn: false,
+		},
+		{
+			name:         "base opted out, overlay re-enables -> overlay wins",
+			baseAuto:     boolPtr(false),
+			overlayAuto:  boolPtr(true),
+			wantAuto:     boolPtr(true),
+			wantIsAutoEn: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := ProvidersConfig{ClaudeOAuth: ClaudeOAuthAutoConfig{Auto: tc.baseAuto}}
+			overlay := ProvidersConfig{ClaudeOAuth: ClaudeOAuthAutoConfig{Auto: tc.overlayAuto}}
+
+			merged := mergeProvidersConfig(base, overlay)
+
+			if (merged.ClaudeOAuth.Auto == nil) != (tc.wantAuto == nil) {
+				t.Fatalf("ClaudeOAuth.Auto = %v; want %v", merged.ClaudeOAuth.Auto, tc.wantAuto)
+			}
+			if merged.ClaudeOAuth.Auto != nil && tc.wantAuto != nil && *merged.ClaudeOAuth.Auto != *tc.wantAuto {
+				t.Errorf("ClaudeOAuth.Auto = %v; want %v", *merged.ClaudeOAuth.Auto, *tc.wantAuto)
+			}
+			if got := merged.ClaudeOAuth.IsAutoEnabled(); got != tc.wantIsAutoEn {
+				t.Errorf("IsAutoEnabled() = %v; want %v", got, tc.wantIsAutoEn)
+			}
+		})
+	}
+}
+
+// TestMergeProvidersConfig_AllFields is a table test over base/overlay
+// combinations for every field mergeProvidersConfig is supposed to carry
+// (Providers, Routing, ClaudeOAuth), guarding against a future field being
+// added to ProvidersConfig without a matching merge clause.
+func TestMergeProvidersConfig_AllFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Providers: overlay adds new key, overrides existing key, leaves untouched key", func(t *testing.T) {
+		base := ProvidersConfig{
+			Providers: map[string]ProviderConfig{
+				"kept":     {Model: "kept-model"},
+				"override": {Model: "old-model"},
+			},
+		}
+		overlay := ProvidersConfig{
+			Providers: map[string]ProviderConfig{
+				"override": {Model: "new-model"},
+				"added":    {Model: "added-model"},
+			},
+		}
+
+		merged := mergeProvidersConfig(base, overlay)
+
+		if got := merged.Providers["kept"].Model; got != "kept-model" {
+			t.Errorf("Providers[kept].Model = %q; want kept-model", got)
+		}
+		if got := merged.Providers["override"].Model; got != "new-model" {
+			t.Errorf("Providers[override].Model = %q; want new-model", got)
+		}
+		if got := merged.Providers["added"].Model; got != "added-model" {
+			t.Errorf("Providers[added].Model = %q; want added-model", got)
+		}
+	})
+
+	t.Run("Providers: overlay nil map leaves base untouched", func(t *testing.T) {
+		base := ProvidersConfig{Providers: map[string]ProviderConfig{"a": {Model: "a-model"}}}
+		overlay := ProvidersConfig{}
+
+		merged := mergeProvidersConfig(base, overlay)
+
+		if got := merged.Providers["a"].Model; got != "a-model" {
+			t.Errorf("Providers[a].Model = %q; want a-model", got)
+		}
+	})
+
+	t.Run("Routing: overlay non-zero fields override, zero fields preserve base", func(t *testing.T) {
+		base := ProvidersConfig{Routing: RoutingConfig{Default: "base-default", LocalThreshold: 0.5}}
+		overlay := ProvidersConfig{Routing: RoutingConfig{Default: "overlay-default"}}
+
+		merged := mergeProvidersConfig(base, overlay)
+
+		if merged.Routing.Default != "overlay-default" {
+			t.Errorf("Routing.Default = %q; want overlay-default", merged.Routing.Default)
+		}
+		if merged.Routing.LocalThreshold != 0.5 {
+			t.Errorf("Routing.LocalThreshold = %v; want 0.5 (preserved from base)", merged.Routing.LocalThreshold)
+		}
+	})
+
+	t.Run("ClaudeOAuth: overlay omitted entirely preserves base opt-out (the PR #509 regression)", func(t *testing.T) {
+		base := ProvidersConfig{
+			Providers:   map[string]ProviderConfig{"local": {Model: "local-model"}},
+			Routing:     RoutingConfig{Default: "local"},
+			ClaudeOAuth: ClaudeOAuthAutoConfig{Auto: boolPtr(false)},
+		}
+		// overlay mirrors a providers.local.yaml that only sets an unrelated
+		// field and never mentions claude_oauth at all.
+		overlay := ProvidersConfig{
+			Providers: map[string]ProviderConfig{"local": {Endpoint: "http://127.0.0.1:9999"}},
+		}
+
+		merged := mergeProvidersConfig(base, overlay)
+
+		if merged.ClaudeOAuth.Auto == nil || *merged.ClaudeOAuth.Auto != false {
+			t.Fatalf("ClaudeOAuth.Auto = %v; want false (base opt-out must survive an overlay that never mentions claude_oauth)", merged.ClaudeOAuth.Auto)
+		}
+		if merged.ClaudeOAuth.IsAutoEnabled() {
+			t.Error("IsAutoEnabled() = true; want false — operator's opt-out was silently dropped")
+		}
+	})
+}

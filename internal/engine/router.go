@@ -71,6 +71,15 @@ type SimpleRouter struct {
 	stopCh   chan struct{}
 	stopOnce sync.Once
 
+	// tickHooks run alongside probeAll on every availTTL tick (and once
+	// synchronously from Start's initial warm-up). This is the reconcile seam
+	// for discovery-based auto-registration (see maybeAutoRegisterClaudeOAuth):
+	// a node's credentials can appear after boot (first `claude /login` on this
+	// machine), so registration must be re-checked on a running timer, not only
+	// once at BuildRouter time. Guarded by mu like the rest of the router's
+	// mutable state.
+	tickHooks []func()
+
 	// Atomics for lock-free stats.
 	totalRequests atomic.Int64
 	escalations   atomic.Int64
@@ -369,6 +378,35 @@ func (r *SimpleRouter) probeAll(ctx context.Context) {
 	r.avail.Store(&next)
 }
 
+// AddTickHook registers fn to run on every availTTL tick of the background
+// availability maintainer (and once during Start's synchronous warm-up).
+// Used by BuildRouter to wire discovery-based provider auto-registration
+// (see maybeAutoRegisterClaudeOAuth) onto the same timer that already
+// re-probes availability, so a node notices new local credentials without a
+// restart. Hooks run sequentially and must be cheap/non-blocking-ish — they
+// share the tick cadence with probeAll. Safe to call before or after Start.
+func (r *SimpleRouter) AddTickHook(fn func()) {
+	if fn == nil {
+		return
+	}
+	r.mu.Lock()
+	r.tickHooks = append(r.tickHooks, fn)
+	r.mu.Unlock()
+}
+
+// runTickHooks invokes every registered tick hook. Snapshot the slice under
+// the lock, then run hooks lock-free so a hook calling back into the router
+// (e.g. RegisterProvider) cannot deadlock.
+func (r *SimpleRouter) runTickHooks() {
+	r.mu.RLock()
+	hooks := make([]func(), len(r.tickHooks))
+	copy(hooks, r.tickHooks)
+	r.mu.RUnlock()
+	for _, fn := range hooks {
+		fn()
+	}
+}
+
 // Start primes the availability cache synchronously, then maintains it on a
 // ticker until ctx is cancelled or Close is called. Idempotent callers that
 // never invoke Start keep working via available()'s inline-probe fallback.
@@ -377,6 +415,7 @@ func (r *SimpleRouter) Start(ctx context.Context) {
 		r.availTTL = defaultAvailTTL
 	}
 	r.probeAll(ctx) // warm the cache before the first request can read it
+	r.runTickHooks()
 	go func() {
 		t := time.NewTicker(r.availTTL)
 		defer t.Stop()
@@ -388,6 +427,7 @@ func (r *SimpleRouter) Start(ctx context.Context) {
 				return
 			case <-t.C:
 				r.probeAll(ctx)
+				r.runTickHooks()
 			}
 		}
 	}()
@@ -616,6 +656,22 @@ func BuildRouter(cfg *Config, opts ...BuildRouterOption) (Router, error) {
 		autoDiscoverOpenAICompat(router, pcfg)
 	}
 
+	// Discovery-not-declaration: auto-register a node-local claude-oauth
+	// provider from the node's own Claude Code credentials if one isn't
+	// already declared. Checked once here at boot, and re-checked on every
+	// availability-maintainer tick below (see AddTickHook) so a credential
+	// created after boot (the operator's first `claude /login` on this
+	// machine) is picked up without a kernel restart. Skippable alongside
+	// OpenAI-compat auto-discovery so tests stay hermetic (a devbox with a
+	// logged-in `claude` CLI would otherwise non-deterministically register
+	// this provider in unrelated router tests).
+	if !bro.noAutoDiscover {
+		maybeAutoRegisterClaudeOAuth(router, pcfg, bro.procMgr)
+		router.AddTickHook(func() {
+			maybeAutoRegisterClaudeOAuth(router, pcfg, bro.procMgr)
+		})
+	}
+
 	// Start the background availability maintainer when a lifecycle context is
 	// provided (the long-running daemon). Short-lived callers omit it and rely
 	// on available()'s inline-probe fallback.
@@ -641,9 +697,11 @@ func WithProcessManager(pm *ProcessManager) BuildRouterOption {
 }
 
 // WithoutAutoDiscovery disables the live probe of well-known OpenAI-compatible
-// backends (LM Studio :1234, etc.). Production leaves auto-discovery on; tests
-// pass this so router construction is hermetic and does not depend on whatever
-// local LLM servers happen to be running on the host.
+// backends (LM Studio :1234, etc.) AND discovery-based claude-oauth
+// auto-registration (see maybeAutoRegisterClaudeOAuth). Production leaves both
+// on; tests pass this so router construction is hermetic and does not depend
+// on whatever local LLM servers are running, or whatever Claude Code
+// credentials happen to be logged in, on the host.
 func WithoutAutoDiscovery() BuildRouterOption {
 	return func(o *buildRouterOpts) { o.noAutoDiscover = true }
 }
@@ -710,6 +768,18 @@ func mergeProvidersConfig(base, overlay ProvidersConfig) ProvidersConfig {
 		}
 	}
 	base.Routing = mergeRoutingConfig(base.Routing, overlay.Routing)
+	base.ClaudeOAuth = mergeClaudeOAuthConfig(base.ClaudeOAuth, overlay.ClaudeOAuth)
+	return base
+}
+
+// mergeClaudeOAuthConfig deep-merges overlay onto base. Auto is a pointer
+// with nil-means-unset semantics: an overlay that omits claude_oauth.auto
+// entirely (Auto == nil) must NOT clobber a base value — only an overlay
+// that explicitly sets auto (true or false) overrides the base.
+func mergeClaudeOAuthConfig(base, overlay ClaudeOAuthAutoConfig) ClaudeOAuthAutoConfig {
+	if overlay.Auto != nil {
+		base.Auto = overlay.Auto
+	}
 	return base
 }
 

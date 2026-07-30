@@ -478,8 +478,31 @@ type RouterStats struct {
 
 // ProvidersConfig is the top-level configuration from .cog/config/providers.yaml.
 type ProvidersConfig struct {
-	Providers map[string]ProviderConfig `yaml:"providers" json:"providers"`
-	Routing   RoutingConfig             `yaml:"routing" json:"routing"`
+	Providers   map[string]ProviderConfig `yaml:"providers" json:"providers"`
+	Routing     RoutingConfig             `yaml:"routing" json:"routing"`
+	ClaudeOAuth ClaudeOAuthAutoConfig     `yaml:"claude_oauth,omitempty" json:"claude_oauth,omitempty"`
+}
+
+// ClaudeOAuthAutoConfig controls discovery-based auto-registration of the
+// node-local "claude-oauth" provider (see maybeAutoRegisterClaudeOAuth in
+// router.go): every node that already holds Claude Code OAuth credentials
+// (keychain / CLAUDE_CODE_OAUTH_TOKEN / .credentials.json) gets a working
+// claude-oauth provider with no providers.yaml entry and no token paste —
+// discovery, not declaration.
+type ClaudeOAuthAutoConfig struct {
+	// Auto enables automatic discovery-and-registration. Defaults to true: a
+	// nil pointer (the field absent from providers.yaml, or providers.yaml
+	// absent entirely) means enabled. Set explicitly to false to opt out.
+	Auto *bool `yaml:"auto,omitempty" json:"auto,omitempty"`
+}
+
+// IsAutoEnabled reports whether claude-oauth auto-registration is enabled.
+// Absent config (nil) defaults to true.
+func (c ClaudeOAuthAutoConfig) IsAutoEnabled() bool {
+	if c.Auto == nil {
+		return true
+	}
+	return *c.Auto
 }
 
 // ProviderConfig configures a single provider instance.
