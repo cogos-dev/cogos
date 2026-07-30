@@ -49,10 +49,16 @@ pin: v0.16.22   # freeze on an exact tag while developing
 ```
 
 **Version strings.** `VERSION` is derived from `git describe --tags --always
---dirty`, so a local build reports something like `v0.16.22-3-gabc1234-dirty` —
-honest about ancestry, distance from the tag, and uncommitted changes. It sorts
-*after* the tag it descends from, so a dev build is never mistaken for a
-downgrade. Override with `make build VERSION=...` when you need an exact value.
+--dirty`, prefixed with `dev-`, so a local build reports something like
+`dev-v0.16.22-3-gabc1234-dirty` — honest about ancestry, distance from the tag,
+and uncommitted changes. The `dev-` prefix is load-bearing, not cosmetic: a
+bare `git describe` string is valid semver whose suffix parses as a
+*prerelease*, and prereleases sort *before* the release they descend from, so
+without the prefix a dev build reads as a **downgrade** to self-update's
+comparator — the exact clobber this mechanism exists to prevent. Prefixing
+with `dev-` makes it fail semver parsing entirely, which keeps self-update's
+"unknown build" gate active instead. Override with `make build VERSION=...`
+when you need an exact value.
 
 **Bounds.** A dev instance on a scratch workspace has no production corpus, so
 it cannot reproduce corpus-shaped behaviour (large reconcile cycles, lock

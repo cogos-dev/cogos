@@ -29,8 +29,16 @@ SHELL_NAME="$(basename "$SHELL")"
 # process is refused rather than assumed harmless: it may belong to another
 # user (a service account), and guessing wrong overwrites a live production
 # binary. Set ALLOW_RUNNING_INSTALL=1 to override.
+#
+# Detection is two-stage, NOT a `pgrep -f 'cogos serve'` contiguous-substring
+# match: the `cog` wrapper this same script installs always execs the kernel
+# as `<kernel> --workspace <path> serve ...`, putting the workspace flag
+# between "cogos" and "serve" in argv, so a plain substring match never fires
+# for wrapper-started daemons. Instead: (1) pgrep on the binary name only,
+# anchored to a path/word boundary; (2) for each candidate PID, check its full
+# argv for a standalone "serve" word anywhere in it.
 refuse_if_running() {
-    local target="$1" rtarget pid exe
+    local target="$1" rtarget pid exe cmdline is_serve tok
     [ "${ALLOW_RUNNING_INSTALL:-}" = "1" ] && return 0
     [ -e "$target" ] || return 0
     rtarget="$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)/$(basename "$target")"
@@ -44,7 +52,19 @@ refuse_if_running() {
         echo ""
         exit 1
     fi
-    for pid in $(pgrep -f 'cogos serve' 2>/dev/null || true); do
+    for pid in $(pgrep -f '(^|/)cogos( |$)' 2>/dev/null || true); do
+        cmdline=""
+        if [ -r "/proc/$pid/cmdline" ]; then
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        fi
+        if [ -z "$cmdline" ]; then
+            cmdline="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+        fi
+        is_serve=0
+        for tok in $cmdline; do
+            [ "$tok" = "serve" ] && is_serve=1
+        done
+        [ "$is_serve" = "1" ] || continue
         exe=""
         if [ -r "/proc/$pid/exe" ]; then
             exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"

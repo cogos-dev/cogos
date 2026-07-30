@@ -140,6 +140,18 @@ install: build check-not-running
 # /proc/PID/exe or lsof, and guessing wrong overwrites a live production binary.
 # Fail loud, with ALLOW_RUNNING_INSTALL=1 as the documented escape.
 # Both sides are realpath-normalised so a symlinked PREFIX still matches.
+#
+# Detection is two-stage, NOT a `pgrep -f 'cogos serve'` contiguous-substring
+# match: the official `cog` wrapper (scripts/cog) always execs the kernel as
+# `<kernel> --workspace <path> serve ...`, putting the workspace flag between
+# "cogos" and "serve" in argv, so a plain "cogos serve" substring match never
+# fires for wrapper-started daemons — exactly the invisible-daemon case this
+# guard exists to catch. Instead: (1) pgrep on the binary name only, anchored
+# to a path/word boundary so it doesn't match unrelated binaries that merely
+# contain "cogos" as a substring (e.g. cogos-channel-bridge); (2) for each
+# candidate PID, pull its full argv and check for a standalone "serve" word
+# anywhere in it, so the workspace flag (or any other flag) between the binary
+# and the subcommand no longer defeats detection.
 check-not-running:
 	@if [ "$(ALLOW_RUNNING_INSTALL)" = "1" ]; then \
 		echo "  ALLOW_RUNNING_INSTALL=1 — skipping running-daemon check"; \
@@ -158,8 +170,20 @@ check-not-running:
 		echo ""; \
 		exit 1; \
 	fi; \
-	pids=$$(pgrep -f 'cogos serve' 2>/dev/null || true); \
+	pids=$$(pgrep -f '(^|/)cogos( |$$)' 2>/dev/null || true); \
 	for pid in $$pids; do \
+		cmdline=""; \
+		if [ -r "/proc/$$pid/cmdline" ]; then \
+			cmdline=$$(tr '\0' ' ' < "/proc/$$pid/cmdline" 2>/dev/null || true); \
+		fi; \
+		if [ -z "$$cmdline" ]; then \
+			cmdline=$$(ps -o args= -p "$$pid" 2>/dev/null || true); \
+		fi; \
+		is_serve=0; \
+		for tok in $$cmdline; do \
+			if [ "$$tok" = "serve" ]; then is_serve=1; fi; \
+		done; \
+		if [ "$$is_serve" != "1" ]; then continue; fi; \
 		exe=""; \
 		if [ -r "/proc/$$pid/exe" ]; then \
 			exe=$$(readlink -f "/proc/$$pid/exe" 2>/dev/null || true); \
