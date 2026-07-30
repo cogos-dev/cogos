@@ -9,13 +9,17 @@ make build && ./cogos serve --workspace ~/my-project
 
 Or install a pre-built binary:
 
-Refuses to overwrite a running daemon's binary, same guard as `make install` (see `check-not-running` in the `Makefile`):
+Refuses to overwrite a running daemon's binary, using the same two-stage check as `make install`'s `check-not-running` target (binary-name match, then a per-PID argv scan for a standalone `serve` token) — so a `cogos version` or `cogos --help` running elsewhere won't block the install:
 
 ```sh
 # macOS Apple Silicon
 curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
 chmod +x cogos
-pgrep -f '(^|/)cogos( |$)' >/dev/null 2>&1 && { echo "A cogos daemon is running — stop it first, or install to a different path." >&2; exit 1; }
+for pid in $(pgrep -f '(^|/)cogos( |$)' 2>/dev/null); do
+  for tok in $(ps -o args= -p "$pid" 2>/dev/null); do
+    [ "$tok" = "serve" ] && { echo "A cogos daemon is running (pid $pid) — stop it first, or install to a different path." >&2; exit 1; }
+  done
+done
 mv cogos ~/.cog/bin/cogos
 ```
 
@@ -23,7 +27,11 @@ mv cogos ~/.cog/bin/cogos
 # Linux amd64
 curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
 chmod +x cogos
-pgrep -f '(^|/)cogos( |$)' >/dev/null 2>&1 && { echo "A cogos daemon is running — stop it first, or install to a different path." >&2; exit 1; }
+for pid in $(pgrep -f '(^|/)cogos( |$)' 2>/dev/null); do
+  for tok in $(ps -o args= -p "$pid" 2>/dev/null); do
+    [ "$tok" = "serve" ] && { echo "A cogos daemon is running (pid $pid) — stop it first, or install to a different path." >&2; exit 1; }
+  done
+done
 mv cogos ~/.cog/bin/cogos
 ```
 
@@ -31,9 +39,11 @@ mv cogos ~/.cog/bin/cogos
 # Windows amd64 (PowerShell)
 $dest = "$HOME\.cog\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-if (Get-Process cogos -ErrorAction SilentlyContinue) {
-    Write-Error "A cogos daemon is running -- stop it first, or install to a different path."
-    exit 1
+Get-CimInstance Win32_Process -Filter "Name='cogos.exe'" | ForEach-Object {
+    if (($_.CommandLine -split '\s+') -contains 'serve') {
+        Write-Error "A cogos daemon is running (pid $($_.ProcessId)) -- stop it first, or install to a different path."
+        exit 1
+    }
 }
 Invoke-WebRequest -Uri https://github.com/myrgic/cogos/releases/latest/download/cogos-windows-amd64.exe `
     -OutFile "$dest\cogos.exe"
