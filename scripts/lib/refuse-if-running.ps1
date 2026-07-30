@@ -44,6 +44,20 @@
 # When downloaded standalone via Invoke-WebRequest (no local checkout to
 # dot-source from), fetch this file first and dot-source the downloaded
 # copy — see docs/RELEASING.md's Windows install section for the pattern.
+#
+# ---- Known divergence from the bash file (documented, not a fail-open) ----
+# The bash guard has a second stage the PowerShell side does not: it
+# resolves the candidate PID's executable and compares it against $Target,
+# so a `cogos serve` process running a DIFFERENT install is allowed through
+# (see refuse-if-running.sh's rtarget/exe comparison). This file has no
+# equivalent -- it refuses for any cogos.exe process with 'serve' in its
+# command line, regardless of which path that process is executing. That
+# is a precision gap (it can over-refuse an install to an unrelated
+# directory), not a fail-open one -- the unsafe direction this file's
+# contract exists to prevent is under-refusing, and this errs the other
+# way. Left as-is rather than papering over it with an untested path
+# comparison; noted here so the divergence is a documented, chosen gap
+# instead of a silently-discovered one.
 
 function Assert-CogosNotRunning {
     param(
@@ -70,16 +84,25 @@ function Assert-CogosNotRunning {
     }
 
     foreach ($proc in $procs) {
+        # A cogos.exe process whose CommandLine we cannot read (commonly a
+        # process owned by another account/service context, which
+        # Get-CimInstance returns with CommandLine as $null/empty rather
+        # than throwing) is the SAME inconclusive case the bash guard hits
+        # when neither /proc/$pid/cmdline nor `ps -o args=` can be read.
+        # Treating "couldn't read it" as "doesn't contain serve" would be
+        # exactly the fail-open this file's header calls out: refuse
+        # instead of silently moving on to the next process.
+        if ([string]::IsNullOrWhiteSpace($proc.CommandLine)) {
+            throw "REFUSING TO INSTALL: cannot read the command line of PID $($proc.ProcessId), which is running cogos.exe. It may be running with 'serve' in a command line this process lacks permission to see. Refusing rather than guessing. Options: install to a different directory, or set `$env:ALLOW_RUNNING_INSTALL = '1'` to override."
+        }
+
         # Two-stage detection mirrors the bash guard: a name match on
         # cogos.exe is not enough on its own (a bare `cogos.exe version` or
         # `cogos.exe --help` would also match), so also require a
         # standalone "serve" token in the full command line -- this also
         # catches the `cog` wrapper's `cogos.exe --workspace <path> serve`
         # shape, where "serve" is not adjacent to the binary name.
-        $tokens = @()
-        if ($proc.CommandLine) {
-            $tokens = $proc.CommandLine -split '\s+'
-        }
+        $tokens = $proc.CommandLine -split '\s+'
         if ($tokens -contains 'serve') {
             throw "REFUSING TO INSTALL: $Target may be in use -- PID $($proc.ProcessId) is running cogos.exe with 'serve' in its command line. Installing over a running kernel's binary replaces production in place. Options: install to a different directory, stop the daemon first, or set `$env:ALLOW_RUNNING_INSTALL = '1'` to override."
         }

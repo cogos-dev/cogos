@@ -54,7 +54,7 @@
 # direct-execution branch at the bottom opts into `set -u` locally instead.
 
 refuse_if_running() {
-    local target="$1" rtarget pid exe cmdline is_serve tok pids
+    local target="$1" rtarget pid exe cmdline is_serve tok pids pgrep_rc
 
     if [ "${ALLOW_RUNNING_INSTALL:-}" = "1" ]; then
         return 0
@@ -63,7 +63,24 @@ refuse_if_running() {
     # Nothing at the target path yet — nothing to clobber.
     [ -e "$target" ] || return 0
 
-    rtarget="$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)/$(basename "$target")"
+    # Fully resolve the target path itself, not just its parent directory —
+    # if $target is a symlink, comparing an unresolved rtarget against the
+    # exe side's fully-resolved readlink -f result (below) would never
+    # match, and a symlinked install target would sail through the guard
+    # even while a live process executes it via that symlink. `readlink -f`
+    # is the SAME tool and flag used to resolve the exe side, so this stays
+    # in lockstep with that comparison by construction rather than by two
+    # independently-written canonicalizers agreeing by luck. Empty output
+    # means resolution itself failed (a readlink without -f support, or a
+    # broken symlink chain) — that is the inconclusive case, not "nothing
+    # to resolve," so it refuses rather than comparing against "".
+    rtarget="$(readlink -f "$target" 2>/dev/null || true)"
+    if [ -z "$rtarget" ]; then
+        _refuse_if_running_say \
+            "cannot canonicalize the install target path $target." \
+            "readlink -f failed to resolve it (broken symlink chain, or a readlink without -f support on this platform). Refusing rather than comparing against an unresolved path."
+        return 1
+    fi
 
     if ! command -v pgrep >/dev/null 2>&1; then
         _refuse_if_running_say \
@@ -81,7 +98,22 @@ refuse_if_running() {
     # unrelated binary that merely contains "cogos" as a substring (e.g.
     # cogos-channel-bridge); (2) for each candidate PID, pull its full argv
     # and check for a standalone "serve" word anywhere in it.
-    pids="$(pgrep -f '(^|/)cogos( |$)' 2>/dev/null || true)"
+    # pgrep's own exit status distinguishes "ran fine, matched nothing"
+    # (1 — conclusive, safe) from an actual pgrep failure (2 syntax error,
+    # 3+ fatal error, e.g. /proc unreadable in a restricted container).
+    # `|| true` alone would flatten that distinction to an empty $pids in
+    # both cases — the exact "missing pgrep → || true swallows it → empty
+    # pid list" shape RETRO-486 names at Makefile:138, just one layer
+    # deeper (pgrep present but erroring, instead of absent). Status > 1 is
+    # inconclusive and must refuse, not be read as "nothing is running."
+    pids="$(pgrep -f '(^|/)cogos( |$)' 2>/dev/null)"
+    pgrep_rc=$?
+    if [ "$pgrep_rc" -gt 1 ]; then
+        _refuse_if_running_say \
+            "pgrep exited with status $pgrep_rc while searching for a running cogos process." \
+            "Status 1 means 'no match' and is fine; anything higher means pgrep itself failed. Refusing rather than treating that failure as an empty, conclusive result."
+        return 1
+    fi
 
     for pid in $pids; do
         cmdline=""
@@ -90,6 +122,21 @@ refuse_if_running() {
         fi
         if [ -z "$cmdline" ]; then
             cmdline="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+        fi
+
+        # An empty cmdline here means "could not be determined" (neither
+        # /proc nor ps produced anything), NOT "confirmed to have no argv."
+        # pgrep already matched this PID against the cogos name/path
+        # pattern, so it plausibly IS a cogos process; silently `continue`-
+        # ing past it (as this used to do) means "not a serve process" gets
+        # returned for a PID we never actually inspected — the fail-open
+        # this whole file exists to prevent, and the literal RETRO-486
+        # Class B shape: unknown treated as not-running. Refuse instead.
+        if [ -z "$cmdline" ]; then
+            _refuse_if_running_say \
+                "cannot determine the command line of PID $pid, which matched the cogos process pattern." \
+                "It may be running 'cogos serve' against $target. It likely belongs to another user or an unreadable /proc entry. Refusing rather than guessing whether it is a serve process."
+            return 1
         fi
 
         is_serve=0
