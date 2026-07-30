@@ -128,9 +128,71 @@ const claudeCodeVersionFallback = "2.1.74"
 
 // ── Credential JSON shape ─────────────────────────────────────────────────────
 
-// claudeCredentialsFile is the on-disk credential file path.
+// resolveHomeDir returns the user's home directory for goos, checking the
+// same environment variables Go's os.UserHomeDir() checks internally: HOME on
+// macOS/Linux, %USERPROFILE% (falling back to %HOMEDRIVE%+%HOMEPATH%) on
+// Windows. It is expressed as a pure function of goos and an injectable
+// getenv rather than always reading runtime.GOOS/os.Getenv directly so the
+// Windows-shaped discovery path can be unit-tested from a single (non-Windows)
+// test binary — runtime.GOOS is a build-time constant baked into the test
+// binary, so a test cannot make os.UserHomeDir() itself take the Windows
+// branch by setting USERPROFILE at t.Setenv time; this seam makes that branch
+// reachable and table-testable regardless of the host OS running `go test`.
+func resolveHomeDir(goos string, getenv func(string) string) string {
+	if goos == "windows" {
+		if v := getenv("USERPROFILE"); v != "" {
+			return v
+		}
+		if drive, path := getenv("HOMEDRIVE"), getenv("HOMEPATH"); drive != "" && path != "" {
+			return drive + path
+		}
+		return ""
+	}
+	return getenv("HOME")
+}
+
+// claudeConfigDir returns the Claude Code config directory: CLAUDE_CONFIG_DIR
+// when set (the documented Claude Code override — see
+// https://code.claude.com/docs/en/env-vars — it relocates the ENTIRE config
+// directory, including .credentials.json, on every OS), otherwise
+// "<home>/.claude".
+//
+// Home resolution goes through resolveHomeDir(runtime.GOOS, ...), NOT
+// os.Getenv("HOME") directly: HOME is unset on Windows, where Claude Code
+// stores credentials at %USERPROFILE%\.claude\.credentials.json (confirmed
+// against Claude Code's own docs, 2026-07: Windows and Linux both use the
+// file store as their credential source of truth; the macOS keychain is
+// additionally consulted — and takes priority — on darwin only, via
+// claudeCodeCredentialSource.readKeychain). The old os.Getenv("HOME") silently
+// produced the bare relative path "\.claude\.credentials.json" on Windows,
+// which resolves relative to the process's current directory rather than the
+// user's profile — a discovery-breaking bug on every non-macOS node.
+func claudeConfigDir() string {
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
+		return dir
+	}
+	home := resolveHomeDir(runtime.GOOS, os.Getenv)
+	if home == "" {
+		// Last-ditch fallback: os.UserHomeDir() covers OS nuances
+		// resolveHomeDir doesn't special-case; degrade gracefully rather than
+		// join against an empty string.
+		if h, err := os.UserHomeDir(); err == nil && h != "" {
+			home = h
+		}
+	}
+	return filepath.Join(home, ".claude")
+}
+
+// defaultClaudeCredentialsPath returns the on-disk credential file path.
+// Recomputed on every call (not cached in a package var) so it reflects the
+// CURRENT environment: auto-registration re-probes this on every reconcile
+// tick (see maybeAutoRegisterClaudeOAuth), and CLAUDE_CONFIG_DIR / HOME can
+// legitimately differ between that probe and process start (tests also rely
+// on per-case env overrides via t.Setenv taking effect immediately).
 // Source: _write_claude_code_credentials.
-var claudeCredentialsFile = filepath.Join(os.Getenv("HOME"), ".claude", ".credentials.json")
+func defaultClaudeCredentialsPath() string {
+	return filepath.Join(claudeConfigDir(), ".credentials.json")
+}
 
 // claudeAiOauthJSON is the nested structure stored under "claudeAiOauth" in
 // ~/.claude/.credentials.json and in the macOS keychain entry
@@ -195,7 +257,7 @@ type claudeCodeCredentialSource struct {
 }
 
 func newClaudeCodeCredentialSource() *claudeCodeCredentialSource {
-	return &claudeCodeCredentialSource{credPath: claudeCredentialsFile}
+	return &claudeCodeCredentialSource{credPath: defaultClaudeCredentialsPath()}
 }
 
 // Resolve reads the credential from the highest-priority available source.
@@ -308,6 +370,21 @@ func (s *claudeCodeCredentialSource) readCredFile() (OAuthCredential, bool) {
 // read-only but left this write active; making WriteBack a no-op completes the
 // read-only-mirror discipline. The generic CredentialLifecycle WriteBack call
 // is retained for other OAuth sources that legitimately own their own store.
+//
+// Windows/Linux rotation hazard (this is the general case, not just #363):
+// on those platforms ~/.claude/.credentials.json (or
+// %USERPROFILE%\.claude\.credentials.json — see claudeConfigDir) is the
+// AUTHORITATIVE store, not a mirror of a keychain — there is no OS keychain
+// fallback there. If the kernel ever refreshed AND wrote back on those
+// platforms, it would race the live Claude Code client for the single-use
+// refresh token exactly like the keychain case: whichever of {kernel, CC}
+// consumes the refresh_token second gets `invalid_grant`, and whichever
+// writes last wins the file, silently discarding the other's rotation. This
+// WriteBack no-op plus the read-only RefreshFunc (newClaudeCodeReadOnlyRefresh,
+// which never POSTs and instead re-reads the file before delegating to an
+// owner-side actuator) closes that hazard structurally on every OS: the
+// kernel can only ever consume a token Claude Code already wrote, never
+// produce one of its own.
 func (s *claudeCodeCredentialSource) WriteBack(_ OAuthCredential) error {
 	return nil
 }
@@ -437,8 +514,19 @@ func claudeOAuthRefresh(ctx context.Context, refreshToken string) (OAuthCredenti
 // OAuth source) is structurally unreachable for the managed subscription.
 
 // claudeTokenRefreshActuator is the user-space owner-delegating refresh actuator.
-// Source: EXT-010, ~/.hermes/bin/claude-token-refresh.
-var claudeTokenRefreshActuator = filepath.Join(os.Getenv("HOME"), ".hermes", "bin", "claude-token-refresh")
+// Source: EXT-010, ~/.hermes/bin/claude-token-refresh. Uses os.UserHomeDir()
+// (not os.Getenv("HOME"), empty on Windows) for the same reason as
+// claudeConfigDir above; runClaudeTokenRefreshActuator already tolerates a
+// missing binary as a no-op, so a Hermes-less node (most Windows/Linux nodes
+// today) simply skips owner-delegation and falls straight to the
+// still-fresh/still-stale check.
+var claudeTokenRefreshActuator = func() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, ".hermes", "bin", "claude-token-refresh")
+}()
 
 // claudeTokenRefreshActuatorTimeout bounds the actuator subprocess. Matches the
 // Python reference (subprocess.run(..., timeout=45)).

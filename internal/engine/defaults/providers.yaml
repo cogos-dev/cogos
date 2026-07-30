@@ -6,6 +6,20 @@
 # This is the resident gemma-4-26b instance on the Darkstar node.
 # Operators on other nodes should override in providers.local.yaml.
 #
+# ── claude-oauth: discovery, not declaration ─────────────────────────────────
+# You will NOT find a "claude-oauth" entry below. Every node that already has
+# Claude Code credentials (macOS keychain, CLAUDE_CODE_OAUTH_TOKEN env var, or
+# ~/.claude/.credentials.json / %USERPROFILE%\.claude\.credentials.json) gets a
+# working claude-oauth provider automatically — no entry here, no token paste.
+# The kernel re-checks for a newly-created credential on its normal
+# availability-reconcile timer, so logging into Claude Code for the first time
+# on this machine (`claude /login`) is picked up without a kernel restart.
+# To opt out, add:
+#   claude_oauth:
+#     auto: false
+# An explicit "claude-oauth:" entry under `providers:` (any config, any model)
+# always overrides auto-registration — declaration wins over discovery.
+#
 # Additional provider types are first-class but disabled by default:
 #   - vllm           : OpenAI-compatible local server (Linux/CUDA). See
 #                      docs/inference/vllm.md for setup. The kernel
