@@ -9,22 +9,32 @@ make build && ./cogos serve --workspace ~/my-project
 
 Or install a pre-built binary:
 
+Refuses to overwrite a running daemon's binary, same guard as `make install` (see `check-not-running` in the `Makefile`):
+
 ```sh
 # macOS Apple Silicon
 curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
-chmod +x cogos && mv cogos ~/.cog/bin/cogos
+chmod +x cogos
+pgrep -f '(^|/)cogos( |$)' >/dev/null 2>&1 && { echo "A cogos daemon is running — stop it first, or install to a different path." >&2; exit 1; }
+mv cogos ~/.cog/bin/cogos
 ```
 
 ```sh
 # Linux amd64
 curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
-chmod +x cogos && mv cogos ~/.cog/bin/cogos
+chmod +x cogos
+pgrep -f '(^|/)cogos( |$)' >/dev/null 2>&1 && { echo "A cogos daemon is running — stop it first, or install to a different path." >&2; exit 1; }
+mv cogos ~/.cog/bin/cogos
 ```
 
 ```powershell
 # Windows amd64 (PowerShell)
 $dest = "$HOME\.cog\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
+if (Get-Process cogos -ErrorAction SilentlyContinue) {
+    Write-Error "A cogos daemon is running -- stop it first, or install to a different path."
+    exit 1
+}
 Invoke-WebRequest -Uri https://github.com/myrgic/cogos/releases/latest/download/cogos-windows-amd64.exe `
     -OutFile "$dest\cogos.exe"
 Unblock-File "$dest\cogos.exe"
