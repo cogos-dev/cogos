@@ -17,8 +17,87 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-INSTALL_DIR="$HOME/.cog/bin"
+# PREFIX is the install root. Override it to set up a dev environment beside a
+# production node instead of over it:  PREFIX=$HOME/.cog-dev ./scripts/setup-dev.sh
+PREFIX="${PREFIX:-$HOME/.cog}"
+INSTALL_DIR="$PREFIX/bin"
 SHELL_NAME="$(basename "$SHELL")"
+
+# refuse_if_running <target> — refuse to overwrite a binary that a live
+# process is executing. Mirrors the Makefile's check-not-running target; see the
+# comment there for the platform specifics. An unresolvable `cogos serve`
+# process is refused rather than assumed harmless: it may belong to another
+# user (a service account), and guessing wrong overwrites a live production
+# binary. Set ALLOW_RUNNING_INSTALL=1 to override.
+#
+# Detection is two-stage, NOT a `pgrep -f 'cogos serve'` contiguous-substring
+# match: the `cog` wrapper this same script installs always execs the kernel
+# as `<kernel> --workspace <path> serve ...`, putting the workspace flag
+# between "cogos" and "serve" in argv, so a plain substring match never fires
+# for wrapper-started daemons. Instead: (1) pgrep on the binary name only,
+# anchored to a path/word boundary; (2) for each candidate PID, check its full
+# argv for a standalone "serve" word anywhere in it.
+refuse_if_running() {
+    local target="$1" rtarget pid exe cmdline is_serve tok
+    [ "${ALLOW_RUNNING_INSTALL:-}" = "1" ] && return 0
+    [ -e "$target" ] || return 0
+    rtarget="$(cd "$(dirname "$target")" 2>/dev/null && pwd -P)/$(basename "$target")"
+    if ! command -v pgrep >/dev/null 2>&1; then
+        echo ""
+        echo "REFUSING: pgrep not found, so a running kernel cannot be detected."
+        echo "Installing blind could overwrite a live production binary."
+        echo ""
+        echo "  PREFIX=\$HOME/.cog-dev ./scripts/setup-dev.sh   # install beside it"
+        echo "  ALLOW_RUNNING_INSTALL=1 ./scripts/setup-dev.sh # override, if you mean it"
+        echo ""
+        exit 1
+    fi
+    for pid in $(pgrep -f '(^|/)cogos( |$)' 2>/dev/null || true); do
+        cmdline=""
+        if [ -r "/proc/$pid/cmdline" ]; then
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        fi
+        if [ -z "$cmdline" ]; then
+            cmdline="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+        fi
+        is_serve=0
+        for tok in $cmdline; do
+            [ "$tok" = "serve" ] && is_serve=1
+        done
+        [ "$is_serve" = "1" ] || continue
+        exe=""
+        if [ -r "/proc/$pid/exe" ]; then
+            exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+        fi
+        if [ -z "$exe" ] && command -v lsof >/dev/null 2>&1; then
+            exe="$(lsof -p "$pid" -Ffn 2>/dev/null | awk '/^ftxt$/{t=1;next} /^n/{if(t){print substr($0,2);exit}} {t=0}')"
+        fi
+        [ -z "$exe" ] && exe="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+        case "$exe" in /*) ;; *) exe="";; esac
+        if [ -z "$exe" ]; then
+            echo ""
+            echo "REFUSING: cannot determine the executable of PID $pid, which is"
+            echo "running 'cogos serve'. It may be $target."
+            echo "It likely belongs to another user, so /proc and lsof are unreadable."
+            echo "Refusing rather than guessing — a wrong guess overwrites production."
+            echo ""
+            echo "  PREFIX=\$HOME/.cog-dev ./scripts/setup-dev.sh   # install beside it"
+            echo "  ALLOW_RUNNING_INSTALL=1 ./scripts/setup-dev.sh # override, if you mean it"
+            echo ""
+            exit 1
+        fi
+        if [ "$exe" = "$rtarget" ]; then
+            echo ""
+            echo "REFUSING: $target is being executed by PID $pid."
+            echo "Installing over a running kernel's binary replaces production in place."
+            echo ""
+            echo "  PREFIX=\$HOME/.cog-dev ./scripts/setup-dev.sh   # install beside it"
+            echo "  ALLOW_RUNNING_INSTALL=1 ./scripts/setup-dev.sh # override, if you mean it"
+            echo ""
+            exit 1
+        fi
+    done
+}
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -80,7 +159,19 @@ info "Building cogos from source..."
 
 cd "$REPO_DIR"
 
-VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+# The dev- prefix is load-bearing, not cosmetic -- see the Makefile's VERSION
+# comment for the full rationale. Short version: a bare `git describe` string
+# is valid semver whose suffix parses as a prerelease, and prereleases sort
+# BEFORE their base tag, so a bare describe string reads as OLDER than the
+# release it descends from and self-update's GATE D/F would not treat it as
+# a dev build. Prefixing with dev- makes normVersion() return "" so GATE D
+# fires and self-update stays inert.
+GIT_DESCRIBE=$(git describe --tags --always --dirty 2>/dev/null || true)
+if [ -n "$GIT_DESCRIBE" ]; then
+    VERSION="dev-${GIT_DESCRIBE}"
+else
+    VERSION="dev"
+fi
 BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS="-s -w -X github.com/myrgic/cogos/internal/engine.Version=${VERSION} -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME}"
 
@@ -94,6 +185,9 @@ echo ""
 info "Installing to $INSTALL_DIR..."
 
 mkdir -p "$INSTALL_DIR"
+
+# Refuse to clobber a running kernel before writing anything.
+refuse_if_running "$INSTALL_DIR/cogos"
 
 # Install cogos binary.
 cp cogos "$INSTALL_DIR/cogos"
@@ -130,9 +224,9 @@ else
         *)    PROFILE="$HOME/.profile" ;;
     esac
 
-    PATH_LINE='export PATH="$HOME/.cog/bin:$PATH"'
+    PATH_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
 
-    if [ -n "$PROFILE" ] && ! grep -qF '.cog/bin' "$PROFILE" 2>/dev/null; then
+    if [ -n "$PROFILE" ] && ! grep -qF "$INSTALL_DIR" "$PROFILE" 2>/dev/null; then
         echo "" >> "$PROFILE"
         echo "# CogOS" >> "$PROFILE"
         echo "$PATH_LINE" >> "$PROFILE"
