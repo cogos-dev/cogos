@@ -27,6 +27,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // Default truncation caps for the ledger-event preview fields. The sidecar
@@ -154,7 +156,7 @@ func readSidecarMaxTurnIndex(workspaceRoot, sessionID string) int {
 
 // turnSidecarPath returns the sidecar path for a session's turn JSONL.
 func turnSidecarPath(workspaceRoot, sessionID string) string {
-	return filepath.Join(workspaceRoot, ".cog", "run", "turns", sessionID+".jsonl")
+	return filepath.Join(workspaceRoot, ".cog", "run", "turns", pathsafe.SanitizeComponent(sessionID)+".jsonl")
 }
 
 // ReadLastTurn reads the most-recent TurnRecord from the session sidecar.
@@ -248,7 +250,7 @@ func PatchTurnSpeculative(workspaceRoot, sessionID string, turnID string, specTe
 // the ledger event's `sidecar_path` field (stable across absolute-path
 // rewrites by downstream consumers).
 func turnSidecarRelPath(sessionID string) string {
-	return filepath.Join(".cog", "run", "turns", sessionID+".jsonl")
+	return filepath.Join(".cog", "run", "turns", pathsafe.SanitizeComponent(sessionID)+".jsonl")
 }
 
 // extractTextFromToolCalls scans a slice of ToolCallRecords for text-bearing

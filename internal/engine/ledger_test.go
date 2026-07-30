@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // ── Hash tests ─────────────────────────────────────────────────────────────
@@ -352,7 +355,10 @@ func TestCrossSessionChain(t *testing.T) {
 // mustReadAllEvents reads every event from a session ledger.
 func mustReadAllEvents(t *testing.T, root, sessionID string) []EventEnvelope {
 	t.Helper()
-	path := filepath.Join(root, ".cog", "ledger", sessionID, "events.jsonl")
+	// Sanitize to match the on-disk directory AppendEvent actually wrote
+	// (see pathsafe.SanitizeComponent, #489); a no-op for the plain-slug
+	// session IDs every existing caller of this helper uses.
+	path := filepath.Join(root, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID), "events.jsonl")
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatalf("open ledger %s: %v", path, err)
@@ -380,3 +386,133 @@ func mustReadAllEvents(t *testing.T, root, sessionID string) []EventEnvelope {
 
 // Silence "imported and not used" for fmt if the only use is in Errorf (always used).
 var _ = fmt.Sprintf
+
+// ── #489: colon-bearing session keys must not reach the filesystem raw ─────
+
+// TestAppendEventSanitizesColonKey covers the concrete repro from #489: a
+// session key of the "origin:agent" shape (e.g. "http:cog") must round-trip
+// through AppendEvent/GetLastEvent while the on-disk directory name is
+// NTFS-legal. The forward-slash-vs-backslash separator claim itself is
+// covered at the unit level in pkg/pathsafe (SanitizeComponent's output is
+// verified colon-free when stitched into both a "/"-joined and a
+// simulated Windows "\"-joined path); this test proves the real engine
+// call path (AppendEvent → GetLastEvent) actually uses that sanitized form
+// on disk.
+func TestAppendEventSanitizesColonKey(t *testing.T) {
+	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
+	root := t.TempDir()
+
+	sessionID := "http:cog"
+	env := &EventEnvelope{
+		HashedPayload: EventPayload{
+			Type:      "test.event",
+			Timestamp: nowISO(),
+			SessionID: sessionID,
+		},
+		Metadata: EventMetadata{Source: "test"},
+	}
+	if err := AppendEvent(root, sessionID, env); err != nil {
+		t.Fatalf("AppendEvent(%q): %v", sessionID, err)
+	}
+
+	ledgerRoot := filepath.Join(root, ".cog", "ledger")
+	entries, err := os.ReadDir(ledgerRoot)
+	if err != nil {
+		t.Fatalf("read ledger root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ledger root has %d entries, want 1: %+v", len(entries), entries)
+	}
+	if strings.Contains(entries[0].Name(), ":") {
+		t.Fatalf("on-disk session dir %q still contains a colon", entries[0].Name())
+	}
+	want := pathsafe.SanitizeComponent(sessionID)
+	if entries[0].Name() != want {
+		t.Fatalf("on-disk session dir = %q, want %q", entries[0].Name(), want)
+	}
+
+	// GetLastEvent must find the same event back through the raw
+	// (unsanitized) sessionID — callers never have to sanitize themselves.
+	last, err := GetLastEvent(root, sessionID)
+	if err != nil {
+		t.Fatalf("GetLastEvent(%q): %v", sessionID, err)
+	}
+	if last == nil || last.HashedPayload.SessionID != sessionID {
+		t.Fatalf("GetLastEvent round-trip failed: got %+v", last)
+	}
+}
+
+// TestGetLastGlobalEventOwnColonSessionNotTreatedAsPrior guards the
+// GetLastGlobalEvent comparison fixed alongside the path-construction sites:
+// a colon-bearing CURRENT session must not appear to be its own "prior
+// session" just because its on-disk directory name (sanitized) no longer
+// string-matches the raw, unsanitized session key passed in.
+func TestGetLastGlobalEventOwnColonSessionNotTreatedAsPrior(t *testing.T) {
+	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
+	root := t.TempDir()
+
+	current := "http:cog"
+	env := &EventEnvelope{
+		HashedPayload: EventPayload{
+			Type:      "process.start",
+			Timestamp: nowISO(),
+			SessionID: current,
+		},
+		Metadata: EventMetadata{Source: "test"},
+	}
+	if err := AppendEvent(root, current, env); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	// No OTHER session exists yet — GetLastGlobalEvent(current) must not
+	// mistake current's own (sanitized) ledger dir for a prior session.
+	last, err := GetLastGlobalEvent(root, current)
+	if err != nil {
+		t.Fatalf("GetLastGlobalEvent: %v", err)
+	}
+	if last != nil {
+		t.Fatalf("expected nil (no prior session besides current), got %+v", last)
+	}
+}
+
+// TestListLedgerSessionsColonFilter covers the sibling path-construction
+// site in ledger_query.go: filtering by a raw colon-bearing session key must
+// resolve to the same sanitized directory AppendEvent actually wrote.
+func TestListLedgerSessionsColonFilter(t *testing.T) {
+	t.Parallel()
+	t.Cleanup(resetLedgerCacheForTest)
+	root := t.TempDir()
+
+	sessionID := "http:main"
+	env := &EventEnvelope{
+		HashedPayload: EventPayload{
+			Type:      "test.event",
+			Timestamp: nowISO(),
+			SessionID: sessionID,
+		},
+		Metadata: EventMetadata{Source: "test"},
+	}
+	if err := AppendEvent(root, sessionID, env); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	sessions, err := listLedgerSessions(root, sessionID)
+	if err != nil {
+		t.Fatalf("listLedgerSessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("listLedgerSessions(%q) = %v, want exactly 1 match", sessionID, sessions)
+	}
+	want := pathsafe.SanitizeComponent(sessionID)
+	if sessions[0] != want {
+		t.Fatalf("listLedgerSessions(%q) = %q, want %q", sessionID, sessions[0], want)
+	}
+
+	// filepath.Join with the returned ID must resolve to a real file.
+	path := filepath.Join(root, ".cog", "ledger", sessions[0], "events.jsonl")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("resolved session dir does not exist: %v", err)
+	}
+}

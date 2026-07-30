@@ -2,11 +2,14 @@ package engine
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // writeTurnsForTest synthesises n turns in the given session and returns
@@ -224,6 +227,51 @@ func TestQueryIncludeFullHydratesFromSidecar(t *testing.T) {
 	}
 	if res.Turns[0].PromptTruncated {
 		t.Error("hydrated PromptTruncated = true; want false")
+	}
+}
+
+// TestQueryColonSessionID covers the readTurnCompletedEvents sibling
+// path-construction site (#489) end-to-end: a channel-scoped session key
+// containing a colon ("http:cog") must round-trip through RecordTurn
+// (ledger + sidecar) and back out through QueryConversation, with neither
+// on-disk path containing the raw colon.
+func TestQueryColonSessionID(t *testing.T) {
+	p, root, _ := newTestProcessForTurns(t)
+	sessionID := "http:cog"
+
+	turn := &TurnRecord{
+		TurnID:    uuid.NewString(),
+		TurnIndex: NextTurnIndex(root, sessionID),
+		SessionID: sessionID,
+		Prompt:    "hello from a colon-bearing session",
+		Response:  "hi",
+	}
+	if err := p.RecordTurn(turn); err != nil {
+		t.Fatalf("RecordTurn: %v", err)
+	}
+
+	res, err := QueryConversation(root, ConversationQuery{SessionID: sessionID, IncludeFull: true})
+	if err != nil {
+		t.Fatalf("QueryConversation(%q): %v", sessionID, err)
+	}
+	if len(res.Turns) != 1 {
+		t.Fatalf("Turns len = %d; want 1", len(res.Turns))
+	}
+	if res.Turns[0].Prompt != turn.Prompt {
+		t.Errorf("Prompt = %q; want %q", res.Turns[0].Prompt, turn.Prompt)
+	}
+
+	// Neither the ledger dir nor the sidecar file may contain the raw colon.
+	ledgerDir := filepath.Join(root, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID))
+	if _, err := os.Stat(ledgerDir); err != nil {
+		t.Errorf("expected sanitized ledger dir to exist: %v", err)
+	}
+	sidecarPath := turnSidecarPath(root, sessionID)
+	if strings.Contains(filepath.Base(sidecarPath), ":") {
+		t.Errorf("sidecar filename %q still contains a colon", filepath.Base(sidecarPath))
+	}
+	if _, err := os.Stat(sidecarPath); err != nil {
+		t.Errorf("expected sanitized sidecar file to exist: %v", err)
 	}
 }
 

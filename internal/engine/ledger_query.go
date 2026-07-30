@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // ErrSessionNotFound is returned when QueryLedger is scoped to a session that
@@ -287,18 +289,25 @@ func compileEventTypeMatcher(pattern string) (func(string) bool, error) {
 // them. If filter is non-empty, returns just that session (iff its
 // events.jsonl exists). Otherwise returns all non-genesis sessions sorted by
 // events.jsonl mtime descending — "what happened recently" first.
+//
+// filter is a caller-supplied session key (e.g. an HTTP query param) that
+// may contain characters SanitizeComponent rewrites; the returned ID must
+// match the sanitized on-disk directory name — the same form the no-filter
+// branch below returns via e.Name() — so downstream filepath.Join callers
+// (QueryLedger, QueryToolCalls) build the identical path either way.
 func listLedgerSessions(workspaceRoot, filter string) ([]string, error) {
 	base := filepath.Join(workspaceRoot, ".cog", "ledger")
 
 	if filter != "" {
-		eventsPath := filepath.Join(base, filter, "events.jsonl")
+		sanitizedFilter := pathsafe.SanitizeComponent(filter)
+		eventsPath := filepath.Join(base, sanitizedFilter, "events.jsonl")
 		if _, err := os.Stat(eventsPath); err != nil {
 			if os.IsNotExist(err) {
 				return nil, nil
 			}
 			return nil, fmt.Errorf("ledger: stat %s: %w", filter, err)
 		}
-		return []string{filter}, nil
+		return []string{sanitizedFilter}, nil
 	}
 
 	entries, err := os.ReadDir(base)

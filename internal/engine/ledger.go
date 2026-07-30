@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // appendMu serializes concurrent AppendEvent calls to the same session.
@@ -142,7 +144,7 @@ func HashEvent(canonicalBytes []byte, algorithm string) (string, error) {
 func AppendEvent(workspaceRoot, sessionID string, envelope *EventEnvelope) error {
 	appendMu.Lock()
 	defer appendMu.Unlock()
-	ledgerDir := filepath.Join(workspaceRoot, ".cog", "ledger", sessionID)
+	ledgerDir := filepath.Join(workspaceRoot, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID))
 	eventsFile := filepath.Join(ledgerDir, "events.jsonl")
 
 	if err := os.MkdirAll(ledgerDir, 0755); err != nil {
@@ -238,7 +240,7 @@ func setCachedLastEvent(sessionID string, env *EventEnvelope) {
 
 // GetLastEvent returns the last event in a session ledger, or nil if empty.
 func GetLastEvent(workspaceRoot, sessionID string) (*EventEnvelope, error) {
-	eventsFile := filepath.Join(workspaceRoot, ".cog", "ledger", sessionID, "events.jsonl")
+	eventsFile := filepath.Join(workspaceRoot, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID), "events.jsonl")
 
 	f, err := os.Open(eventsFile)
 	if err != nil {
@@ -278,11 +280,17 @@ func GetLastGlobalEvent(workspaceRoot, currentSessionID string) (*EventEnvelope,
 		return nil, err
 	}
 
+	// Directory entries are always the sanitized (on-disk) form of a session
+	// ID; sanitize currentSessionID the same way before comparing so the
+	// current session's own ledger dir isn't mistaken for a "prior session"
+	// when currentSessionID contains characters SanitizeComponent rewrites.
+	currentSanitized := pathsafe.SanitizeComponent(currentSessionID)
+
 	var newestTime int64
 	var newestSession string
 
 	for _, e := range entries {
-		if !e.IsDir() || e.Name() == currentSessionID {
+		if !e.IsDir() || e.Name() == currentSanitized {
 			continue
 		}
 		eventsPath := filepath.Join(ledgerBase, e.Name(), "events.jsonl")

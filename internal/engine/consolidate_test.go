@@ -174,6 +174,45 @@ func TestArchivedSessionsRecordedAfterConsolidation(t *testing.T) {
 	}
 }
 
+// TestArchivedSessionsColonSessionID covers the sibling path-construction
+// site fixed alongside AppendEvent (#489): ArchivedSessions builds the
+// ledger path directly rather than through AppendEvent/GetLastEvent, so it
+// needs its own sanitize call. A colon-bearing session key (the
+// "origin:agent" shape used for channel-scoped sessions, e.g. "http:cog")
+// must resolve correctly.
+func TestArchivedSessionsColonSessionID(t *testing.T) {
+	t.Parallel()
+
+	root := makeWorkspace(t)
+	action := ConsolidationAction{WorkspaceRoot: root, MaxEvents: 40}
+
+	sessionA := "http:cog"
+	sessionB := "http:main"
+	base := mustTime(t, "2026-03-15T08:00:00Z")
+
+	for i := 0; i < 11; i++ {
+		appendFixtureEvent(t, root, sessionA, "thread-a", base.Add(time.Duration(i)*time.Minute), "http", fmt.Sprintf("archive alpha %d", i))
+	}
+	for i := 0; i < 12; i++ {
+		appendFixtureEvent(t, root, sessionB, "thread-b", base.Add(time.Duration(i+20)*time.Minute), "cli", fmt.Sprintf("archive beta %d", i))
+	}
+
+	if _, err := action.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	archived, err := ArchivedSessions(root, sessionA)
+	if err != nil {
+		t.Fatalf("ArchivedSessions(%q): %v", sessionA, err)
+	}
+	if _, ok := archived[sessionA]; !ok {
+		t.Fatalf("archived sessions missing %s", sessionA)
+	}
+	if _, ok := archived[sessionB]; !ok {
+		t.Fatalf("archived sessions missing %s", sessionB)
+	}
+}
+
 func TestHeartbeatTriggersDormantConsolidation(t *testing.T) {
 	t.Parallel()
 
