@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // TestBusSessionAppendAndRead covers the basic seq/hash chain and JSONL
@@ -191,6 +193,177 @@ func TestBusSessionRegistry(t *testing.T) {
 		if _, ok := parsed[0][f]; !ok {
 			t.Errorf("registry.json missing field %q", f)
 		}
+	}
+}
+
+// ── #489 round 2: colon-bearing bus_id must not reach the filesystem raw ───
+//
+// cog-review on PR #504 named this seam directly: bus_id is a caller-supplied
+// free-form string from an HTTP JSON body (POST /v1/bus/open, POST
+// /v1/bus/send), structurally identical to the session keys this PR already
+// sanitizes elsewhere, and it was only guarded by validPathComponent — which
+// blocks traversal/separators but not colons or the other NTFS-illegal
+// characters. These tests mirror TestAppendEventSanitizesColonKey in
+// ledger_test.go and the call-site tests in pkg/pathsafe/pathsafe_test.go.
+
+// TestBusSessionSanitizesColonBusID covers the concrete repro: a bus_id of
+// the "origin:agent" shape (e.g. "http:cog") must round-trip through
+// EnsureBus/AppendEvent/ReadEvents while the on-disk directory name is
+// NTFS-legal.
+func TestBusSessionSanitizesColonBusID(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	busID := "http:cog"
+	if err := mgr.EnsureBus(busID); err != nil {
+		t.Fatalf("EnsureBus(%q): %v", busID, err)
+	}
+
+	busesDir := filepath.Join(root, ".cog", ".state", "buses")
+	entries, err := os.ReadDir(busesDir)
+	if err != nil {
+		t.Fatalf("read buses dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("buses dir has %d entries, want 1: %+v", len(entries), entries)
+	}
+	if strings.Contains(entries[0].Name(), ":") {
+		t.Fatalf("on-disk bus dir %q still contains a colon", entries[0].Name())
+	}
+	want := pathsafe.SanitizeComponent(busID)
+	if entries[0].Name() != want {
+		t.Fatalf("on-disk bus dir = %q, want %q", entries[0].Name(), want)
+	}
+
+	// AppendEvent/ReadEvents must work through the raw (unsanitized) busID —
+	// callers never have to sanitize themselves.
+	if _, err := mgr.AppendEvent(busID, "message", "alice", map[string]interface{}{"content": "hi"}); err != nil {
+		t.Fatalf("AppendEvent(%q): %v", busID, err)
+	}
+	events, err := mgr.ReadEvents(busID)
+	if err != nil {
+		t.Fatalf("ReadEvents(%q): %v", busID, err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1", len(events))
+	}
+	if events[0].BusID != busID {
+		t.Errorf("event.BusID = %q, want raw %q (only the on-disk path is sanitized)", events[0].BusID, busID)
+	}
+}
+
+// TestEventsPathColonBusID_BothSeparators mirrors
+// pkg/pathsafe.TestSanitizeComponent_ColonKey_BothSeparators but at the real
+// engine call site (EventsPath), proving the actual path bus_session.go
+// builds stays colon-free whether treated as a "/"-joined POSIX path or a
+// simulated "\"-joined Windows path.
+func TestEventsPathColonBusID_BothSeparators(t *testing.T) {
+	t.Parallel()
+	mgr := NewBusSessionManager(t.TempDir())
+	busID := "http:cog"
+
+	forwardSlashPath := mgr.EventsPath(busID)
+	if strings.Contains(filepath.Base(filepath.Dir(forwardSlashPath)), ":") {
+		t.Fatalf("forward-slash path %q still has a colon in the bus_id component", forwardSlashPath)
+	}
+
+	// Simulate the Windows form of the same path: a drive-letter colon
+	// ("C:") is legal and expected; sanitizing the bus_id component must not
+	// introduce any OTHER colon.
+	winPath := "C:\\workspace\\.cog\\.state\\buses\\" + pathsafe.SanitizeComponent(busID) + "\\events.jsonl"
+	if n := strings.Count(winPath, ":"); n != 1 {
+		t.Fatalf("simulated Windows path has %d colons, want exactly 1 (the drive letter): %q", n, winPath)
+	}
+}
+
+// TestBusSessionRegistryEndpointSanitizedForColonBusID guards the Endpoint
+// metadata field recorded in registry.json: it must match the actual
+// sanitized on-disk directory EnsureBus created, not the raw caller-supplied
+// bus_id, or the two would silently drift apart for any bus_id containing an
+// NTFS-illegal character.
+func TestBusSessionRegistryEndpointSanitizedForColonBusID(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	busID := "http:cog"
+	if err := mgr.EnsureBus(busID); err != nil {
+		t.Fatalf("EnsureBus: %v", err)
+	}
+	if err := mgr.RegisterBus(busID, "sess1", "test"); err != nil {
+		t.Fatalf("RegisterBus: %v", err)
+	}
+
+	entries := mgr.LoadRegistry()
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+	if strings.Contains(entries[0].Endpoint, ":") {
+		t.Fatalf("registry Endpoint %q still contains a colon", entries[0].Endpoint)
+	}
+	want := filepath.Join(".cog", ".state", "buses", pathsafe.SanitizeComponent(busID))
+	if entries[0].Endpoint != want {
+		t.Fatalf("Endpoint = %q, want %q", entries[0].Endpoint, want)
+	}
+}
+
+// TestAppendEventRotationSanitizesColonBusID covers the size-rotation archive
+// path in AppendEvent — the one busID-to-directory join that did not route
+// through EventsPath before this fix. Before the fix, rotation for a
+// colon-bearing busID would build the archive path under an unsanitized
+// "http:cog" directory instead of the one EnsureBus/EventsPath actually use;
+// this test would fail with "no such file or directory" against that old
+// behavior because it looks for the archive under the SANITIZED bus dir.
+func TestAppendEventRotationSanitizesColonBusID(t *testing.T) {
+	orig := eventsFileMaxBytes
+	eventsFileMaxBytes = 1 // rotate after the very first write
+	t.Cleanup(func() { eventsFileMaxBytes = orig })
+
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "http:cog"
+
+	if _, err := mgr.AppendEvent(busID, "message", "alice", map[string]interface{}{"content": "hi"}); err != nil {
+		t.Fatalf("AppendEvent 1: %v", err)
+	}
+	if _, err := mgr.AppendEvent(busID, "message", "bob", map[string]interface{}{"content": "again"}); err != nil {
+		t.Fatalf("AppendEvent 2: %v", err)
+	}
+
+	busDir := filepath.Join(root, ".cog", ".state", "buses", pathsafe.SanitizeComponent(busID))
+	entries, err := os.ReadDir(busDir)
+	if err != nil {
+		t.Fatalf("read bus dir: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "events.") && strings.HasSuffix(e.Name(), ".jsonl") && e.Name() != "events.jsonl" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no rotated archive file found in sanitized bus dir %s: %+v", busDir, entries)
+	}
+
+	// No sibling raw "http:cog" directory should exist alongside registry
+	// bookkeeping files from an unsanitized join.
+	busesDir := filepath.Join(root, ".cog", ".state", "buses")
+	top, err := os.ReadDir(busesDir)
+	if err != nil {
+		t.Fatalf("read buses dir: %v", err)
+	}
+	dirCount := 0
+	for _, e := range top {
+		if strings.Contains(e.Name(), ":") {
+			t.Fatalf("buses dir entry %q contains a colon: %+v", e.Name(), top)
+		}
+		if e.IsDir() {
+			dirCount++
+		}
+	}
+	if dirCount != 1 {
+		t.Fatalf("buses dir has %d subdirectories, want exactly 1: %+v", dirCount, top)
 	}
 }
 
