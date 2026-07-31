@@ -13,6 +13,20 @@ make build
 
 Requirements: Go 1.25+, macOS or Linux.
 
+### Dev build VERSION strings
+
+`VERSION` is derived from `git describe --tags --always --dirty`, prefixed
+with `dev-`, so a local build reports something like
+`dev-v0.16.22-3-gabc1234-dirty` — honest about ancestry, distance from the tag,
+and uncommitted changes. The `dev-` prefix is load-bearing, not cosmetic: a
+bare `git describe` string is valid semver whose suffix parses as a
+*prerelease*, and prereleases sort *before* the release they descend from, so
+without the prefix a dev build reads as a **downgrade** to self-update's
+comparator — the exact clobber this mechanism exists to prevent. Prefixing
+with `dev-` makes it fail semver parsing entirely, which keeps self-update's
+"unknown build" gate active instead. Override with `make build VERSION=...`
+when you need an exact value.
+
 ## Running tests
 
 ```sh

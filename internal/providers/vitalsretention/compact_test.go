@@ -335,6 +335,91 @@ func TestEnforceRawBudget_NeverCompactsTodaysActivelyWrittenDay(t *testing.T) {
 	}
 }
 
+// TestEnforceRawBudget_ExcludesEventDayNotWallClock is the #500 regression
+// test: excludeDay must be derived from the same time source appendRow keys
+// off (the triggering event's own block.Ts, recorded via recordEventDay)
+// rather than an independent time.Now() read inside enforceRawBudget's loop.
+//
+// #500 describes a narrow desync: maybeCompact's goroutine can run at a
+// wall-clock instant that has drifted past the block.Ts of the event that
+// spawned it (GC pause, scheduler jitter, delayed dispatch across a
+// UTC-midnight boundary), so a time.Now()-derived excludeDay can disagree
+// with the day appendRow actually wrote to for that event, reopening #498's
+// read-then-delete race. This test pins the event's block.Ts to a fixed,
+// hardcoded historical instant far from whenever this test actually
+// executes (rather than "today ± a day" relative to real wall clock), so
+// the failure mode is exercised deterministically on every run instead of
+// only near an actual midnight boundary: against pre-#500 code, which reads
+// time.Now() directly inside the loop, the fixed historical day is never
+// excluded (it is nowhere near real "today"), so the fixture below is
+// wrongly treated as compactable. Against the fix, r.recordEventDay having
+// recorded this exact day as lastEventDay means currentExcludeDay() excludes
+// it regardless of real wall-clock.
+func TestEnforceRawBudget_ExcludesEventDayNotWallClock(t *testing.T) {
+	base := t.TempDir()
+	nodeKey := "node-a"
+	metric := "disk_free_bytes"
+
+	// The triggering event's own block.Ts, as HandleBusEvent would have
+	// parsed it and passed it to recordEventDay — fixed and deliberately
+	// nowhere near real wall-clock "today".
+	eventTs := time.Date(2020, 1, 1, 23, 59, 59, 0, time.UTC)
+	eventDay := eventTs.UTC().Truncate(24 * time.Hour)
+
+	// 30,000 rows lands this single day-file comfortably over a 1MB budget
+	// on its own (same fixture sizing as
+	// TestEnforceRawBudget_NeverCompactsTodaysActivelyWrittenDay above), so
+	// enforceRawBudget's first `size <= budget` check can't short-circuit
+	// before the exclusion logic under test is ever reached.
+	const rowCount = 30000
+	rows := make([]row, 0, rowCount)
+	for i := 0; i < rowCount; i++ {
+		ts := eventDay.Add(time.Duration(i) * time.Second)
+		rows = append(rows, row{Ts: ts.Format(time.RFC3339Nano), V: float64(i)})
+	}
+	if err := writeRows(base, nodeKey, tierRaw, metric, eventDay, rows); err != nil {
+		t.Fatal(err)
+	}
+
+	rawDir := fmt.Sprintf("%s/%s/%s", base, nodeKey, tierRaw)
+	cfg := Config{RawBudgetMB: 1}
+	sizeBefore, err := dirSize(rawDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizeBefore <= cfg.rawBudgetBytes() {
+		t.Fatalf("test fixture too small to exceed the 1MB budget on its own: %d bytes", sizeBefore)
+	}
+
+	r := &Recorder{}
+	r.recordEventDay(eventTs) // simulates HandleBusEvent having processed this event
+
+	if err := r.enforceRawBudget(base, nodeKey, cfg); err != nil {
+		t.Fatalf("enforceRawBudget: %v", err)
+	}
+
+	// The event day's raw file must survive untouched — no 5m sibling
+	// created, no deletion — and the tier must STILL be over budget, proving
+	// enforceRawBudget actually reached (and declined to act on) the event
+	// day rather than returning early for an unrelated reason.
+	if _, err := os.Stat(dayFilePath(base, nodeKey, tierRaw, metric, eventDay)); err != nil {
+		t.Fatalf("event day's raw file must survive enforceRawBudget: %v", err)
+	}
+	if _, err := os.Stat(dayFilePath(base, nodeKey, tier5m, metric, eventDay)); !os.IsNotExist(err) {
+		t.Fatalf("event day's file must not have been downsampled, stat err=%v", err)
+	}
+	sizeAfter, err := dirSize(rawDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizeAfter != sizeBefore {
+		t.Fatalf("raw tier size changed (%d -> %d) even though the only file present is the actively-written event day", sizeBefore, sizeAfter)
+	}
+	if sizeAfter <= cfg.rawBudgetBytes() {
+		t.Fatal("raw tier should still be over budget after enforcement, since the event day was the only (excluded) candidate")
+	}
+}
+
 func TestPruneTier_DeletesOnlyOlderThanCutoff(t *testing.T) {
 	base := t.TempDir()
 	nodeKey := "node-a"

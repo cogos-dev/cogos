@@ -6,11 +6,15 @@
 //   - from_session: recorded correctly; rejection on unregistered session;
 //     rejection on mismatch with payload.from.
 //   - Unknown event type is rejected.
+//   - Payload coercion (issue #492): string-encoded JSON object payloads
+//     from local-model tool calls are parsed and accepted; invalid strings
+//     and non-object JSON (array/scalar) are rejected with a clear error.
 package engine
 
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -387,5 +391,127 @@ func TestToolEmitEvent_FromSession_OmittedKeepsLegacyBehavior(t *testing.T) {
 	}
 	if _, has := resp["from_session"]; has {
 		t.Errorf("from_session should be absent when not provided; got %v", resp["from_session"])
+	}
+}
+
+// ─── payload coercion (issue #492) ───────────────────────────────────────────
+//
+// Local-model tool-call plumbing (LM Studio-served models observed on
+// eclipse's ornith-1.0-35b) stringifies nested object arguments even when
+// shown the object form. These tests exercise the same code path the local
+// harness uses — json.Unmarshal of raw tool-call argument bytes into
+// emitEventInput — rather than constructing emitEventInput literals, since
+// the bug lives in that unmarshal step (see emitEventInput.UnmarshalJSON).
+
+func TestEmitEventInput_PayloadCoercion(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		args        string
+		wantErr     bool
+		wantErrSub  string // substring expected in the error, when wantErr
+		wantPayload map[string]any
+	}{
+		{
+			name:        "object passes through unchanged",
+			args:        `{"type":"attention.boost","payload":{"uri":"cog://mem/x","weight":1.5}}`,
+			wantPayload: map[string]any{"uri": "cog://mem/x", "weight": 1.5},
+		},
+		{
+			name:        "stringified object coerces",
+			args:        `{"type":"attention.boost","payload":"{\"uri\":\"cog://mem/x\",\"weight\":1.5}"}`,
+			wantPayload: map[string]any{"uri": "cog://mem/x", "weight": 1.5},
+		},
+		{
+			name:       "invalid JSON string errors cleanly",
+			args:       `{"type":"attention.boost","payload":"not json at all"}`,
+			wantErr:    true,
+			wantErrSub: "must contain a JSON object",
+		},
+		{
+			name:       "stringified array errors cleanly (non-object JSON, per spec)",
+			args:       `{"type":"attention.boost","payload":"[1,2,3]"}`,
+			wantErr:    true,
+			wantErrSub: "must contain a JSON object",
+		},
+		{
+			name:       "direct JSON array is rejected, not coerced",
+			args:       `{"type":"attention.boost","payload":[1,2,3]}`,
+			wantErr:    true,
+			wantErrSub: "an array",
+		},
+		{
+			name:       "direct JSON scalar is rejected, not coerced",
+			args:       `{"type":"attention.boost","payload":42}`,
+			wantErr:    true,
+			wantErrSub: "a number",
+		},
+		{
+			name:       "direct JSON bool is rejected, not coerced",
+			args:       `{"type":"attention.boost","payload":true}`,
+			wantErr:    true,
+			wantErrSub: "a boolean",
+		},
+		{
+			name:        "payload omitted leaves nil, no error",
+			args:        `{"type":"session.marker"}`,
+			wantPayload: nil,
+		},
+		{
+			name:        "explicit JSON null leaves nil, no error",
+			args:        `{"type":"session.marker","payload":null}`,
+			wantPayload: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var input emitEventInput
+			err := json.Unmarshal([]byte(tc.args), &input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got none (payload=%v)", input.Payload)
+				}
+				if tc.wantErrSub != "" && !strings.Contains(err.Error(), tc.wantErrSub) {
+					t.Errorf("error = %q; want substring %q", err.Error(), tc.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(tc.wantPayload) == 0 && len(input.Payload) == 0 {
+				return // both nil/empty, treat as equal
+			}
+			if !reflect.DeepEqual(input.Payload, tc.wantPayload) {
+				t.Errorf("payload = %#v; want %#v", input.Payload, tc.wantPayload)
+			}
+		})
+	}
+}
+
+// TestToolEmitEvent_StringifiedPayloadEndToEnd reproduces the issue #492
+// repro path in full: raw tool-call argument bytes (payload string-encoded,
+// as a dispatched local model emits it) unmarshal into emitEventInput and
+// the resulting event still emits successfully.
+func TestToolEmitEvent_StringifiedPayloadEndToEnd(t *testing.T) {
+	t.Parallel()
+	server, _ := makeServerWithSessions(t)
+
+	args := `{"type":"insight.captured","payload":"{\"summary\":\"stringified payloads now coerce\",\"tags\":[\"492\"]}"}`
+	var input emitEventInput
+	if err := json.Unmarshal([]byte(args), &input); err != nil {
+		t.Fatalf("unmarshal tool arguments: %v", err)
+	}
+
+	got := callEmitEvent(t, server, input)
+	var resp map[string]any
+	if err := json.Unmarshal([]byte(got), &resp); err != nil {
+		t.Fatalf("expected JSON response; got %q", got)
+	}
+	if emitted, _ := resp["emitted"].(bool); !emitted {
+		t.Errorf("expected emitted=true; got %v", resp)
 	}
 }

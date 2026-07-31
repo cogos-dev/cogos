@@ -47,7 +47,9 @@ func (r *Recorder) maybeCompact(base, nodeKey string) {
 		return
 	}
 
+	r.compactWG.Add(1)
 	go func() {
+		defer r.compactWG.Done()
 		err := compactHook(r, base, nodeKey, cfg)
 		r.recordCompactResult(err)
 		if err != nil {
@@ -322,11 +324,22 @@ func (r *Recorder) enforceRawBudget(base, nodeKey string, cfg Config) error {
 			return nil
 		}
 		// Recomputed each iteration, not snapshotted at entry: a long pass
-		// that crosses UTC midnight must start excluding the NEW actively-
-		// written day immediately, or the exclusion above stops protecting
-		// exactly the file HandleBusEvent is appending to (gate finding on
-		// head 2682919).
-		today := time.Now().UTC().Truncate(24 * time.Hour)
+		// that crosses a day boundary must start excluding the NEW
+		// actively-written day immediately, or the exclusion above stops
+		// protecting exactly the file HandleBusEvent is appending to (gate
+		// finding on head 2682919).
+		//
+		// currentExcludeDay() reads lastEventDay — the UTC day of the most
+		// recent event's own block.Ts — rather than calling time.Now()
+		// here directly (#500): this goroutine may run some time after the
+		// tick that spawned it (maybeCompact's dispatch, GC pause,
+		// scheduler jitter), so an independent wall-clock read at this
+		// exact instant is not guaranteed to agree with the day appendRow
+		// actually wrote to for that tick. Keying off the same time source
+		// appendRow uses removes that gap: today here is always the day
+		// HandleBusEvent has most recently (or is concurrently) writing,
+		// full stop, with no second clock in the loop.
+		today := r.currentExcludeDay()
 		metric, day, ok, err := oldestRawDay(base, nodeKey, today)
 		if err != nil {
 			return err

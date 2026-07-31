@@ -818,6 +818,101 @@ type emitEventInput struct {
 	FromSession string         `json:"from_session,omitempty" jsonschema:"Optional sender session_id. If provided, must be a registered session; recorded as event source. Required for peer.utterance events and must match payload.from."`
 }
 
+// UnmarshalJSON coerces a string-encoded JSON object in the "payload" field
+// into a proper map before the rest of emitEventInput unmarshals normally.
+//
+// Some local-model tool-call plumbing (observed on LM Studio-served models,
+// see issue #492) stringifies nested object arguments even when the tool
+// schema declares an object type — the model's intent is a payload object,
+// but the transport hands it over JSON-encoded twice. Rather than reject
+// those calls outright, attempt a second-pass parse of the string; only
+// error if that second pass also fails to produce a JSON object.
+//
+// This coercion is intentionally narrow: it applies only to the documented
+// "payload" field, and only when it arrives as a JSON string. A payload that
+// arrives as a JSON array, number, bool, or null (whether directly or nested
+// inside the string) is rejected with a clear error — it is never coerced
+// into a map "per the issue's spec" boundary.
+func (e *emitEventInput) UnmarshalJSON(data []byte) error {
+	// Alias to sidestep infinite recursion into this same UnmarshalJSON, and
+	// swap Payload's type to json.RawMessage so we can inspect its raw form
+	// before deciding how to decode it.
+	type alias emitEventInput
+	aux := struct {
+		Payload json.RawMessage `json:"payload,omitempty"`
+		*alias
+	}{
+		alias: (*alias)(e),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	raw := bytes.TrimSpace(aux.Payload)
+	if len(raw) == 0 || string(raw) == "null" {
+		e.Payload = nil
+		return nil
+	}
+
+	payload, err := coerceEmitEventPayload(raw)
+	if err != nil {
+		return err
+	}
+	e.Payload = payload
+	return nil
+}
+
+// coerceEmitEventPayload decodes a raw JSON value into the map[string]any
+// shape emit_event's payload field requires. Object payloads decode
+// directly. String payloads are given one additional parse pass — if the
+// string itself contains a JSON object, that object is used; otherwise the
+// failure is reported clearly. Any other JSON kind (array, number, bool) is
+// rejected outright; it is never coerced.
+func coerceEmitEventPayload(raw []byte) (map[string]any, error) {
+	switch raw[0] {
+	case '{':
+		var obj map[string]any
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, fmt.Errorf("payload: %w", err)
+		}
+		return obj, nil
+	case '"':
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, fmt.Errorf("payload: invalid JSON string: %w", err)
+		}
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" || trimmed[0] != '{' {
+			return nil, fmt.Errorf("payload: string value must contain a JSON object, got %q", s)
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+			return nil, fmt.Errorf("payload: string value is not valid JSON: %w", err)
+		}
+		return obj, nil
+	default:
+		return nil, fmt.Errorf("payload: must be a JSON object (or a JSON-encoded string of one), got %s", describeJSONKind(raw))
+	}
+}
+
+// describeJSONKind gives a short human-readable name for the JSON value kind
+// starting at raw, for use in error messages.
+func describeJSONKind(raw []byte) string {
+	switch raw[0] {
+	case '[':
+		return "an array"
+	case 't', 'f':
+		return "a boolean"
+	case 'n':
+		return "null"
+	default:
+		if raw[0] == '-' || (raw[0] >= '0' && raw[0] <= '9') {
+			return "a number"
+		}
+		return "an unrecognized value"
+	}
+}
+
 type readLedgerInput struct {
 	SessionID      string `json:"session_id,omitempty" jsonschema:"Filter to a single session; empty reads across all non-genesis sessions"`
 	EventType      string `json:"event_type,omitempty" jsonschema:"Exact event type, or a prefix wildcard like 'attention.*'"`

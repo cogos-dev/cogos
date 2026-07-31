@@ -141,6 +141,27 @@ type Recorder struct {
 	// happen atomically in the same critical section instead of a
 	// check-then-later-set split across the compaction pass.
 	compacting bool
+
+	// lastEventDay is the UTC day of block.Ts for the most recent event
+	// HandleBusEvent has processed — the exact day appendRow last wrote
+	// into (recorded by recordEventDay). enforceRawBudget's excludeDay
+	// (compact.go) reads this via currentExcludeDay instead of calling
+	// time.Now() itself — see #500: maybeCompact's goroutine computing
+	// excludeDay from wall-clock at its own (possibly delayed) run time
+	// could disagree with the day appendRow actually wrote to, narrowly
+	// reopening the read-then-delete race #498 closed. Keying off the same
+	// time source appendRow uses removes that independent clock read
+	// entirely, for any recorder that has processed at least one event.
+	lastEventDay time.Time
+
+	// compactWG counts in-flight compaction goroutines spawned by
+	// maybeCompact (Add(1) before the `go func`, Done() via defer inside
+	// it). Production code never waits on it — per #497 the bus-handler
+	// dispatch path must return without blocking on compaction I/O — but
+	// tests that exercise the real (non-stubbed) compactHook need a way to
+	// join the goroutine before their t.TempDir() cleanup fires; see
+	// waitForCompactionIdle in compact_async_test.go and #515.
+	compactWG sync.WaitGroup
 }
 
 // globalRecorder is the process-wide recorder instance. A package-level
@@ -240,6 +261,35 @@ func (r *Recorder) recordCompactResult(err error) {
 	r.lastCompactErr = err
 	r.lastCompactAt = time.Now()
 	r.compacting = false
+}
+
+// recordEventDay records the UTC day of ts — block.Ts, already parsed and
+// UTC-normalized by HandleBusEvent — as lastEventDay. Called once per event,
+// before that event's row is appended, so a concurrently-running compaction
+// goroutine's currentExcludeDay() call sees the day this call is about to
+// write to (or has just written to) rather than an independently-read wall
+// clock. See #500 and lastEventDay's doc.
+func (r *Recorder) recordEventDay(ts time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastEventDay = ts.UTC().Truncate(24 * time.Hour)
+}
+
+// currentExcludeDay returns the day enforceRawBudget must never treat as a
+// compaction candidate: the UTC day of the most recent event this recorder
+// has actually processed (lastEventDay, set by recordEventDay) — the same
+// time source appendRow keys off, per #500. Falls back to wall-clock
+// time.Now() when no event has been recorded yet (a bare Recorder used
+// directly, e.g. in tests or a standalone CLI invocation that never went
+// through HandleBusEvent), which matches this package's pre-#500 behavior
+// for those callers.
+func (r *Recorder) currentExcludeDay() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.lastEventDay.IsZero() {
+		return r.lastEventDay
+	}
+	return time.Now().UTC().Truncate(24 * time.Hour)
 }
 
 // --- providerAdapter: pkg/substrate/reconcile.Reconcilable wiring -------
