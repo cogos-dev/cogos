@@ -47,6 +47,7 @@ package pathsafe
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -108,6 +109,47 @@ func SanitizeComponent(raw string) string {
 	}
 
 	return out
+}
+
+// SanitizeRelPath sanitizes a caller-supplied, possibly multi-segment
+// relative path (e.g. a cog: URI path component such as
+// "<session-id>/events.jsonl") by running SanitizeComponent over each
+// "/"-separated segment independently and rejoining the result with
+// filepath.Join.
+//
+// This is what actually makes it safe to join a caller-supplied path onto a
+// base directory: every segment becomes traversal-safe on its own (a ".."
+// segment becomes ".%2E", never a parent-directory reference — see
+// SanitizeComponent's doc comment), so the joined result can never resolve
+// outside the base directory regardless of how filepath.Join's own lexical
+// Clean() would otherwise have collapsed it. Empty segments (from a doubled
+// "/") are dropped.
+//
+// myrgic/cogos#489 round 5: added here — the canonical package — because
+// internal/engine/uri.go's resolveProjection (the single chokepoint every
+// cog: projection in the root module resolves through: mem, adr, role,
+// skill, agent, spec, status, ledger, kernel, canonical, conf, ontology,
+// work, handoff, artifact, docs, hooks) rejected literal ".." substrings and
+// absolute paths, but never escaped NTFS-illegal characters — so a
+// colon-bearing path component (the exact #489 shape, e.g. a ledger
+// session ID "http:cog") reached filepath.Join raw. The sdk module has an
+// intentionally-duplicated private copy of this same function
+// (sdk/pathsafe.go's sanitizeRelPath, predating this one) because it cannot
+// import this package (separate go.mod, see that file's doc comment); keep
+// the two in sync if either changes.
+func SanitizeRelPath(relPath string) string {
+	if relPath == "" {
+		return relPath
+	}
+	segments := strings.Split(relPath, "/")
+	clean := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		clean = append(clean, SanitizeComponent(seg))
+	}
+	return filepath.Join(clean...)
 }
 
 // isIllegalPathByte reports whether c is illegal in a Windows/NTFS path

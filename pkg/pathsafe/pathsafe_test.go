@@ -1,6 +1,7 @@
 package pathsafe
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -139,5 +140,54 @@ func TestSanitizeComponent_OrdinaryKeysUnchanged(t *testing.T) {
 		if got := SanitizeComponent(in); got != in {
 			t.Errorf("SanitizeComponent(%q) = %q, want unchanged", in, got)
 		}
+	}
+}
+
+// ── SanitizeRelPath ──────────────────────────────────────────────────────────
+// Added round 5 (myrgic/cogos#489): promoted from the sdk module's private
+// sanitizeRelPath to this canonical package because internal/engine/uri.go's
+// resolveProjection needed the same multi-segment sanitization and cannot
+// import sdk (wrong dependency direction).
+
+func TestSanitizeRelPath_ColonSegment(t *testing.T) {
+	got := SanitizeRelPath("http:cog")
+	if strings.Contains(got, ":") {
+		t.Errorf("SanitizeRelPath(\"http:cog\") = %q, still contains ':'", got)
+	}
+}
+
+func TestSanitizeRelPath_TraversalDefused(t *testing.T) {
+	base := t.TempDir()
+	ledgerDir := filepath.Join(base, "ledger")
+
+	joined := filepath.Join(ledgerDir, SanitizeRelPath("../../../../etc/passwd"))
+	rel, err := filepath.Rel(ledgerDir, joined)
+	if err != nil {
+		t.Fatalf("filepath.Rel: %v", err)
+	}
+	if strings.HasPrefix(rel, "..") {
+		t.Fatalf("SanitizeRelPath allowed escape: joined=%q is outside base %q (rel=%q)", joined, ledgerDir, rel)
+	}
+}
+
+func TestSanitizeRelPath_PreservesLegitimateMultiSegmentPaths(t *testing.T) {
+	got := SanitizeRelPath("semantic/insights/eigenform")
+	want := filepath.Join("semantic", "insights", "eigenform")
+	if got != want {
+		t.Errorf("SanitizeRelPath(%q) = %q, want %q", "semantic/insights/eigenform", got, want)
+	}
+}
+
+func TestSanitizeRelPath_EmptyUnchanged(t *testing.T) {
+	if got := SanitizeRelPath(""); got != "" {
+		t.Errorf("SanitizeRelPath(\"\") = %q, want empty string preserved", got)
+	}
+}
+
+func TestSanitizeRelPath_DropsEmptySegments(t *testing.T) {
+	got := SanitizeRelPath("a//b")
+	want := filepath.Join("a", "b")
+	if got != want {
+		t.Errorf("SanitizeRelPath(%q) = %q, want %q (doubled '/' should collapse)", "a//b", got, want)
 	}
 }

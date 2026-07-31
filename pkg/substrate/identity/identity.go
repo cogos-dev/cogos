@@ -251,11 +251,15 @@ func CRDDir(root string) string {
 
 // LoadCRD loads a single identity CRD by subject slug.
 // Looks for {root}/.cog/config/identities/{sub}.yaml.
+//
+// sub is sanitized (myrgic/cogos#489 round 5) before it reaches the
+// filesystem — see pathsafe.go for why this was the least-guarded seam in
+// the whole issue (no traversal check at all, unlike every sibling site).
 func LoadCRD(root, sub string) (*CRD, error) {
 	if sub == "" {
 		return nil, errors.New("load identity CRD: empty subject")
 	}
-	path := filepath.Join(crdDir(root), sub+".yaml")
+	path := filepath.Join(crdDir(root), sanitizeSubjectComponent(sub)+".yaml")
 	return loadCRDFile(path)
 }
 
