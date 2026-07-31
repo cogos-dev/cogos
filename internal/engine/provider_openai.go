@@ -40,6 +40,24 @@ const (
 	openaiCompatDefaultMaxToks  = 4096
 )
 
+// apiV0ModelsProbeTimeout caps how much of ListModelsWithContext's incoming
+// per-provider budget (modelsPerProviderTimeout, defined in serve_compat.go —
+// 2s in production) the speculative LM Studio /api/v0/models probe may spend
+// before ListModelsWithContext gives up on it and falls back to the plain
+// /v1/models listing. Deliberately a fraction (1/4) of the whole budget, not
+// an unrelated absolute constant, so the two stay proportional if
+// modelsPerProviderTimeout is ever retuned.
+//
+// Sized this way (PR #519 review): a real LM Studio backend answers
+// /api/v0/models in single-digit milliseconds locally / low tens of ms over
+// LAN, so this cap essentially never fires for the case it exists to serve.
+// It exists to bound the OTHER case: a non-LM-Studio OpenAI-compat server
+// (vLLM, llama.cpp, text-generation-webui) that is slow to 404 — without this
+// cap that server's fallback /v1/models call would inherit whatever sliver of
+// the shared ctx the slow 404 left behind, silently dropping the provider
+// from /v1/models on a timeout the pre-#518 code never had.
+const apiV0ModelsProbeTimeout = modelsPerProviderTimeout / 4
+
 // OpenAICompatProvider implements Provider against any OpenAI-compatible server.
 type OpenAICompatProvider struct {
 	name           string
@@ -272,9 +290,30 @@ func (p *OpenAICompatProvider) ListModels(ctx context.Context) ([]string, error)
 // /v1/models listing (via listModels) so the provider still contributes ids
 // to the /v1/models menu — just without context metadata — rather than being
 // skipped entirely by the caller's graceful-degradation path.
+//
+// Budget split (PR #519 review): liveModelEntries hands this whole method a
+// single bounded ctx (modelsPerProviderTimeout, 2s in production) meant to
+// cover ONE real upstream call — that was the pre-#518 contract, and it must
+// hold for every OpenAI-compat provider, not just LM Studio ones. The
+// speculative /api/v0/models probe is capped at its own short sub-deadline
+// (apiV0ModelsProbeTimeout) derived from ctx rather than being handed the
+// whole thing, so a slow-to-404 non-LM-Studio backend (vLLM, llama.cpp,
+// text-generation-webui — precisely who the fallback exists for) can't eat
+// most of the budget before the fallback even starts. The fallback call then
+// runs against the ORIGINAL ctx (not the probe's sub-context), so it is
+// guaranteed at least ctx's remaining time minus the probe's capped slice —
+// comfortably most of the original budget — matching what a provider with no
+// ModelContextLister at all still gets via plain ListModels.
 func (p *OpenAICompatProvider) ListModelsWithContext(ctx context.Context) ([]ModelListing, error) {
-	rows, err := p.probeAPIv0Models(ctx)
+	probeCtx, cancel := context.WithTimeout(ctx, apiV0ModelsProbeTimeout)
+	rows, err := p.probeAPIv0Models(probeCtx)
+	cancel()
 	if err != nil {
+		// Deliberately re-use the ORIGINAL ctx here, not probeCtx: probeCtx's
+		// own deadline already elapsed (that's how we got here on a timeout) or
+		// is about to be canceled, so passing it to listModels would carry the
+		// probe's exhausted budget into the fallback instead of restoring
+		// ctx's own remaining time.
 		ids, lerr := p.listModels(ctx)
 		if lerr != nil {
 			return nil, lerr
