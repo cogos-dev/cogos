@@ -250,6 +250,81 @@ func (p *OpenAICompatProvider) ListModels(ctx context.Context) ([]string, error)
 	return p.listModels(ctx)
 }
 
+// ListModelsWithContext enumerates model ids together with each model's
+// context window by probing LM Studio's native GET /api/v0/models — the same
+// endpoint and row shape (lmsModelRow / lmsModelsResponse, defined in
+// provider_lms_model_state.go) that LMSModelStateProvider already uses for its
+// read-only health probe. Reusing that shape rather than re-parsing a second
+// way to talk to LM Studio is deliberate (#518).
+//
+// Context precedence: prefer the LOADED context (loaded_context_length) over
+// the checkpoint's theoretical max (max_context_length) — a model loaded at
+// 32K on a 256K-capable checkpoint must advertise 32K, matching what the
+// backend will actually accept. max_context_length is used only as a
+// fallback when the model isn't currently reported loaded. A row with
+// neither field yields ContextLength 0 (unknown), which modelEntryFor and the
+// /v1/models JSON encoding (`omitempty`) both treat as "omit" — never a
+// guessed default (#518: a wrong number is worse than no number here).
+//
+// /api/v0/models is LM Studio-specific; any other OpenAI-compat server
+// (vLLM, llama.cpp, text-generation-webui) will 404 or otherwise fail this
+// probe. On that failure this method falls back to the plain id-only
+// /v1/models listing (via listModels) so the provider still contributes ids
+// to the /v1/models menu — just without context metadata — rather than being
+// skipped entirely by the caller's graceful-degradation path.
+func (p *OpenAICompatProvider) ListModelsWithContext(ctx context.Context) ([]ModelListing, error) {
+	rows, err := p.probeAPIv0Models(ctx)
+	if err != nil {
+		ids, lerr := p.listModels(ctx)
+		if lerr != nil {
+			return nil, lerr
+		}
+		listings := make([]ModelListing, 0, len(ids))
+		for _, id := range ids {
+			listings = append(listings, ModelListing{ID: id})
+		}
+		return listings, nil
+	}
+	listings := make([]ModelListing, 0, len(rows))
+	for _, r := range rows {
+		ctxLen := 0
+		switch {
+		case r.LoadedContextLength != nil && *r.LoadedContextLength > 0:
+			ctxLen = *r.LoadedContextLength
+		case r.MaxContextLength > 0:
+			ctxLen = r.MaxContextLength
+		}
+		listings = append(listings, ModelListing{ID: r.ID, ContextLength: ctxLen})
+	}
+	return listings, nil
+}
+
+// probeAPIv0Models performs the read-only GET /api/v0/models request against
+// LM Studio's native REST surface (see LMSModelStateProvider.probeModels for
+// the sibling implementation this deliberately mirrors). Returns an error with
+// no fallback of its own — ListModelsWithContext decides whether to fall back
+// to the id-only /v1/models listing.
+func (p *OpenAICompatProvider) probeAPIv0Models(ctx context.Context) ([]lmsModelRow, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/api/v0/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	p.setHeaders(req)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openai-compat: /api/v0/models status %d", resp.StatusCode)
+	}
+	var out lmsModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
 // listModels fetches the model list from /v1/models.
 func (p *OpenAICompatProvider) listModels(ctx context.Context) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/v1/models", nil)
