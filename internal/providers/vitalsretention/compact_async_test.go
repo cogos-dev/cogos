@@ -7,6 +7,37 @@ import (
 	"time"
 )
 
+// waitForCompactionIdle blocks until every compaction goroutine maybeCompact
+// has spawned for r has finished (r.compactWG reaches zero), or fails the
+// test after a bounded timeout.
+//
+// Call it via t.Cleanup, registered AFTER the test's t.TempDir() call (e.g.
+// after withWorkspace, which calls t.TempDir() first thing) — t.Cleanup
+// funcs run LIFO, so a cleanup registered later runs BEFORE one registered
+// earlier. That ordering joins any real (non-stubbed) compaction goroutine
+// HandleBusEvent triggered before t.TempDir()'s own registered cleanup
+// (os.RemoveAll) tears down the directory that goroutine may still be
+// writing into. Same shape and rationale as #481's fix in
+// internal/conversations/index_multiwriter_test.go — see #515.
+//
+// Tests that install SetCompactHookForTest and already join the hook
+// themselves (compact_async_test.go's other two tests) don't need this: it's
+// only for tests that let HandleBusEvent run the real, filesystem-touching
+// compactHook.
+func waitForCompactionIdle(t *testing.T, r *Recorder) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		r.compactWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for in-flight compaction goroutine to finish")
+	}
+}
+
 // TestMaybeCompact_ConcurrentCallsTriggerAtMostOneCompaction is the #497
 // regression test: a burst of concurrent HandleBusEvent calls must claim the
 // single-flight compaction slot at most once, closing the check-then-act
