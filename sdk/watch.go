@@ -380,6 +380,18 @@ func parseWatchPattern(pattern string) (*watchPattern, error) {
 		}
 	}
 
+	// Reject '..' path-traversal segments at parse time, mirroring
+	// ParseURI's check in uri.go (myrgic/cogos#489 round 2/4) — defense in
+	// depth alongside resolveWatchPaths' own sanitizeRelPath call. Split on
+	// both '/' and '\' for the same reason uri.go's check does: a
+	// backslash-only segment contains no '/' and would otherwise sail
+	// through as one opaque, non-".." token.
+	for _, seg := range strings.FieldsFunc(wp.path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return nil, InvalidURIError(pattern, "path segment '..' is not allowed")
+		}
+	}
+
 	return wp, nil
 }
 
@@ -392,7 +404,14 @@ func (k *Kernel) resolveWatchPaths(pattern *watchPattern) ([]string, map[string]
 	case "memory", "mem":
 		basePath := k.MemoryDir()
 		if pattern.path != "" {
-			basePath = filepath.Join(basePath, pattern.path)
+			// Sanitized (myrgic/cogos#489 round 5 — a cog-review finding
+			// against round 4's own PR) before joining: an unauthenticated
+			// GET /ws/watch?uri=cog:mem/../../../../ reaches here via
+			// Kernel.WatchURI with no traversal or NTFS-illegal-character
+			// guard, the same class this file's sibling projectors in
+			// cogos.go/thread.go were fixed for one round earlier. See
+			// pathsafe.go.
+			basePath = filepath.Join(basePath, sanitizeRelPath(pattern.path))
 		}
 		baseURI := "cog:mem"
 		if pattern.path != "" {
@@ -421,7 +440,8 @@ func (k *Kernel) resolveWatchPaths(pattern *watchPattern) ([]string, map[string]
 	case "ledger":
 		basePath := filepath.Join(k.CogDir(), "ledger")
 		if pattern.path != "" {
-			basePath = filepath.Join(basePath, pattern.path)
+			// See the sanitization note on the "memory"/"mem" case above.
+			basePath = filepath.Join(basePath, sanitizeRelPath(pattern.path))
 		}
 		paths = append(paths, basePath)
 		mapping[basePath] = "cog:ledger"

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 const defaultConsolidationEventLimit = 100
@@ -355,7 +356,7 @@ func appendArchivedSessionsEvent(workspaceRoot string, sessions map[string]struc
 
 func ArchivedSessions(workspaceRoot, sessionID string) (map[string]struct{}, error) {
 	archived := make(map[string]struct{})
-	path := filepath.Join(workspaceRoot, ".cog", "ledger", sessionID, "events.jsonl")
+	path := filepath.Join(workspaceRoot, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID), "events.jsonl")
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {

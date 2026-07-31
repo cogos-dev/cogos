@@ -13,9 +13,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // TestBusSendAndReadEvents hits POST /v1/bus/send followed by GET
@@ -83,11 +87,11 @@ func TestBusSendAndReadEvents(t *testing.T) {
 	// must be present with the correct value + type.
 	// Reference fixture: /tmp/phase3-fixture-after-send.json.
 	wantFields := map[string]interface{}{
-		"v":       float64(2),
-		"bus_id":  "phase3-test",
-		"seq":     float64(1),
-		"from":    "phase3-test",
-		"type":    "message",
+		"v":      float64(2),
+		"bus_id": "phase3-test",
+		"seq":    float64(1),
+		"from":   "phase3-test",
+		"type":   "message",
 	}
 	for k, wantv := range wantFields {
 		got, ok := events[0][k]
@@ -478,10 +482,10 @@ func TestSessionsListAndDetail(t *testing.T) {
 	// Individual TAA context detail is still available via /{id}/context.
 	// Seed the TAA store for a separate session.
 	server.sessions.Record(&SessionContextState{
-		SessionID:    "sess-taa-xyz",
-		Profile:      "agent_harness",
-		TurnNumber:   1,
-		IrisPressure: 0.25,
+		SessionID:     "sess-taa-xyz",
+		Profile:       "agent_harness",
+		TurnNumber:    1,
+		IrisPressure:  0.25,
 		LastRequestAt: time.Now(),
 	})
 
@@ -713,6 +717,56 @@ func TestConsumerRegistryAckAndList(t *testing.T) {
 	}
 	if reg.Remove("c1") {
 		t.Error("Remove twice should return false")
+	}
+}
+
+// TestConsumerRegistryPersistSanitizesColonBusID covers the sibling
+// path-construction seam cog-review flagged alongside bus_id (myrgic/cogos
+// PR #504 round 2, "unverified notes"): persistLocked builds
+// {bus_id}.cursors.jsonl the same unsanitized way EventsPath used to build
+// {bus_id}/events.jsonl. GetOrCreate/Ack aren't wired to any HTTP/MCP route
+// today (only List/Remove are, and neither persists), so this guards against
+// a future caller reintroducing the defect, mirroring the bus_session.go
+// tests above.
+func TestConsumerRegistryPersistSanitizesColonBusID(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	reg := NewConsumerRegistry(root)
+
+	busID := "http:cog"
+	reg.GetOrCreate(busID, "c1")
+	if _, err := reg.Ack(busID, "c1", 1); err != nil {
+		t.Fatalf("Ack(%q): %v", busID, err)
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read cursor dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("cursor dir has %d entries, want 1: %+v", len(entries), entries)
+	}
+	if strings.Contains(entries[0].Name(), ":") {
+		t.Fatalf("on-disk cursor file %q still contains a colon", entries[0].Name())
+	}
+	want := pathsafe.SanitizeComponent(busID) + ".cursors.jsonl"
+	if entries[0].Name() != want {
+		t.Fatalf("cursor file = %q, want %q", entries[0].Name(), want)
+	}
+
+	// LoadFromDisk must be able to read the file back without error (the
+	// busID it recovers from the filename is the sanitized form — a known,
+	// documented asymmetry with the raw busID used as the live in-memory map
+	// key, acceptable because this path is not currently reachable from any
+	// wired-up route).
+	reg2 := NewConsumerRegistry(root)
+	if err := reg2.LoadFromDisk(); err != nil {
+		t.Fatalf("LoadFromDisk: %v", err)
+	}
+	sanitizedBusID := filepath.Base(want[:len(want)-len(".cursors.jsonl")])
+	loaded := reg2.List(sanitizedBusID)
+	if len(loaded) != 1 {
+		t.Fatalf("List(%q) after LoadFromDisk = %d entries, want 1", sanitizedBusID, len(loaded))
 	}
 }
 

@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // === EVENT ENVELOPE ===
@@ -185,7 +187,7 @@ func HashEvent(canonicalBytes []byte, algorithm string) (string, error) {
 //
 // The ledger is stored at <workspaceRoot>/.cog/ledger/<sessionID>/events.jsonl.
 func AppendEvent(workspaceRoot, sessionID string, envelope *EventEnvelope) error {
-	ledgerDir := filepath.Join(workspaceRoot, ".cog", "ledger", sessionID)
+	ledgerDir := filepath.Join(workspaceRoot, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID))
 	eventsFile := filepath.Join(ledgerDir, "events.jsonl")
 
 	// Ensure ledger directory exists
@@ -253,7 +255,7 @@ func AppendEvent(workspaceRoot, sessionID string, envelope *EventEnvelope) error
 
 // GetLastEvent retrieves the last event from a session ledger.
 func GetLastEvent(workspaceRoot, sessionID string) (*EventEnvelope, error) {
-	eventsFile := filepath.Join(workspaceRoot, ".cog", "ledger", sessionID, "events.jsonl")
+	eventsFile := filepath.Join(workspaceRoot, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID), "events.jsonl")
 
 	f, err := os.Open(eventsFile)
 	if err != nil {
@@ -344,7 +346,7 @@ func scanForGenesisAlgorithm(r io.Reader) (string, bool) {
 // VerifyLedger verifies the hash chain integrity for a session ledger.
 // Returns error if any hash is invalid or chain is broken.
 func VerifyLedger(workspaceRoot, sessionID string) error {
-	eventsFile := filepath.Join(workspaceRoot, ".cog", "ledger", sessionID, "events.jsonl")
+	eventsFile := filepath.Join(workspaceRoot, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID), "events.jsonl")
 
 	f, err := os.Open(eventsFile)
 	if err != nil {

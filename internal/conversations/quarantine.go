@@ -28,6 +28,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // QuarantineDir is the default subdirectory under the workspace for quarantine
@@ -223,18 +225,22 @@ func loadQuarantineKeys(path string) map[string]struct{} {
 	return keys
 }
 
-// sanitizeSourceName replaces characters that are not safe in directory names.
-// Only forward-slashes and null bytes are replaced; other characters are kept
-// as-is since source names are typically simple identifiers.
+// sanitizeSourceName makes an ingest-record-supplied source name safe to use
+// as a single quarantine directory-name component.
+//
+// This used to hand-roll its own escaping (only '/' and NUL), which was
+// narrower than pkg/pathsafe.SanitizeComponent used everywhere else in this
+// codebase for the same problem (myrgic/cogos#489 round 4): it left NTFS's
+// other illegal characters (notably ':') unescaped, so a WriteRecord call
+// with source "http:cog" — reachable from ingest_parser.go's quarantine
+// branches for unknown-schema/missing-fields records — created the exact
+// colon-bearing directory name #489 targets. It also left a bare ".."
+// source name unescaped, which combined with the historical '/'-only
+// replacement here (".." contains no '/') let filepath.Join(quarantineDir,
+// "..") resolve one level above the intended quarantine root. Delegating to
+// pathsafe.SanitizeComponent closes both: it escapes the full NTFS-illegal
+// set including ':', and its trailing-dot rule turns ".." into the
+// non-traversing literal ".%2E" (see pathsafe.go for why).
 func sanitizeSourceName(name string) string {
-	out := make([]byte, 0, len(name))
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if c == '/' || c == 0 {
-			out = append(out, '_')
-		} else {
-			out = append(out, c)
-		}
-	}
-	return string(out)
+	return pathsafe.SanitizeComponent(name)
 }

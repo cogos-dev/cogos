@@ -266,7 +266,11 @@ func (p *memoryProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource,
 		return p.listSectors(uri)
 	}
 
-	memPath := filepath.Join(p.kernel.MemoryDir(), uri.Path)
+	// Sanitize every segment of the caller-supplied path before it becomes
+	// part of a filesystem path (myrgic/cogos#489 round 4 — same class as
+	// ledgerProjector's round-2 fix, applied here to close the sibling gap).
+	// See pathsafe.go.
+	memPath := filepath.Join(p.kernel.MemoryDir(), sanitizeRelPath(uri.Path))
 
 	info, err := os.Stat(memPath)
 	if err != nil {
@@ -376,7 +380,8 @@ func (p *memoryProjector) Mutate(ctx context.Context, uri *ParsedURI, m *Mutatio
 
 // setMemory creates or replaces a cogdoc.
 func (p *memoryProjector) setMemory(uri *ParsedURI, content []byte, metadata map[string]any) error {
-	memPath := filepath.Join(p.kernel.MemoryDir(), uri.Path)
+	// See the sanitization note on Resolve above (myrgic/cogos#489 round 4).
+	memPath := filepath.Join(p.kernel.MemoryDir(), sanitizeRelPath(uri.Path))
 
 	// Determine final path (add extension if needed)
 	if filepath.Ext(memPath) == "" {
@@ -439,7 +444,8 @@ func (p *memoryProjector) validateCogdocContent(content []byte) error {
 
 // deleteMemory removes a cogdoc.
 func (p *memoryProjector) deleteMemory(uri *ParsedURI) error {
-	memPath := filepath.Join(p.kernel.MemoryDir(), uri.Path)
+	// See the sanitization note on Resolve above (myrgic/cogos#489 round 4).
+	memPath := filepath.Join(p.kernel.MemoryDir(), sanitizeRelPath(uri.Path))
 
 	// Try exact path first
 	if _, err := os.Stat(memPath); err == nil {
@@ -493,12 +499,14 @@ func (p *adrProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource, er
 		return p.listADRs(uri, adrDir)
 	}
 
-	// Resolve specific ADR using glob pattern (e.g., "004" -> "004-*.md")
-	pattern := filepath.Join(adrDir, uri.Path+"-*.md")
+	// Resolve specific ADR using glob pattern (e.g., "004" -> "004-*.md").
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	safePath := sanitizeRelPath(uri.Path)
+	pattern := filepath.Join(adrDir, safePath+"-*.md")
 	matches, err := filepath.Glob(pattern)
 	if err != nil || len(matches) == 0 {
 		// Try exact match
-		exactPath := filepath.Join(adrDir, uri.Path+".md")
+		exactPath := filepath.Join(adrDir, safePath+".md")
 		if content, err := os.ReadFile(exactPath); err == nil {
 			resource := NewResource(uri.Raw, content)
 			resource.ContentType = ContentTypeMarkdown
@@ -556,7 +564,8 @@ func (p *specProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource, e
 		return p.listDirectory(uri, specDir)
 	}
 
-	specPath := filepath.Join(specDir, uri.Path+".cog.md")
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	specPath := filepath.Join(specDir, sanitizeRelPath(uri.Path)+".cog.md")
 	content, err := os.ReadFile(specPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -607,7 +616,8 @@ func (p *statusProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource,
 		return p.listDirectory(uri, statusDir)
 	}
 
-	statusPath := filepath.Join(statusDir, uri.Path+".json")
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	statusPath := filepath.Join(statusDir, sanitizeRelPath(uri.Path)+".json")
 	content, err := os.ReadFile(statusPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -684,8 +694,11 @@ func (p *handoffProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource
 		return p.listDirectory(uri, handoffDir)
 	}
 
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	safePath := sanitizeRelPath(uri.Path)
+
 	// Try glob pattern first
-	pattern := filepath.Join(handoffDir, uri.Path+"*.md")
+	pattern := filepath.Join(handoffDir, safePath+"*.md")
 	matches, err := filepath.Glob(pattern)
 	if err == nil && len(matches) > 0 {
 		content, err := os.ReadFile(matches[0])
@@ -698,7 +711,7 @@ func (p *handoffProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource
 	}
 
 	// Try exact path
-	exactPath := filepath.Join(handoffDir, uri.Path+".md")
+	exactPath := filepath.Join(handoffDir, safePath+".md")
 	content, err := os.ReadFile(exactPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -746,7 +759,12 @@ func (p *crystalProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource
 		return nil, InvalidURIError(uri.Raw, "crystal namespace requires a session ID path")
 	}
 
-	crystalPath := filepath.Join(p.kernel.CogDir(), "ledger", uri.Path, "crystal.json")
+	// Sanitize every segment of the caller-supplied path before it becomes
+	// part of a filesystem path (myrgic/cogos#489 round 4 — crystalProjector
+	// is the sibling of ledgerProjector's round-2 fix a few lines below,
+	// joining into the same .cog/ledger/<id>/ tree but left unsanitized
+	// until now). See pathsafe.go.
+	crystalPath := filepath.Join(p.kernel.CogDir(), "ledger", sanitizeRelPath(uri.Path), "crystal.json")
 	content, err := os.ReadFile(crystalPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -778,7 +796,10 @@ func (p *ledgerProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource,
 		return p.listDirectory(uri, ledgerDir)
 	}
 
-	sessionDir := filepath.Join(ledgerDir, uri.Path)
+	// Sanitize every segment of the caller-supplied path before it becomes
+	// part of a filesystem path (myrgic/cogos#489 round 2 — unauthenticated
+	// path-traversal read via GET /resolve). See pathsafe.go.
+	sessionDir := filepath.Join(ledgerDir, sanitizeRelPath(uri.Path))
 	info, err := os.Stat(sessionDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -855,6 +876,13 @@ func (p *ledgerProjector) Mutate(ctx context.Context, uri *ParsedURI, m *Mutatio
 
 // appendEvent appends an event to the session's event log.
 func (p *ledgerProjector) appendEvent(sessionID string, content []byte) error {
+	// Sanitize the session ID before it becomes a filesystem path component
+	// (myrgic/cogos#489 round 2 — unauthenticated path-traversal write via
+	// POST /mutate). See pathsafe.go. Sanitizing here, before event.SessionID
+	// is set below, keeps the recorded session ID consistent with the
+	// on-disk directory name.
+	sessionID = sanitizePathComponent(sessionID)
+
 	// Parse the event data
 	var event types.Event
 	if err := json.Unmarshal(content, &event); err != nil {
@@ -896,7 +924,8 @@ func (p *roleProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource, e
 		return p.listDirectory(uri, roleDir)
 	}
 
-	rolePath := filepath.Join(roleDir, uri.Path)
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	rolePath := filepath.Join(roleDir, sanitizeRelPath(uri.Path))
 	info, err := os.Stat(rolePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -955,7 +984,8 @@ func (p *skillProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource, 
 		return p.listDirectory(uri, skillDir)
 	}
 
-	skillPath := filepath.Join(skillDir, uri.Path)
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	skillPath := filepath.Join(skillDir, sanitizeRelPath(uri.Path))
 	info, err := os.Stat(skillPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1014,7 +1044,8 @@ func (p *agentProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource, 
 		return p.listDirectory(uri, agentDir)
 	}
 
-	agentPath := filepath.Join(agentDir, uri.Path)
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	agentPath := filepath.Join(agentDir, sanitizeRelPath(uri.Path))
 	info, err := os.Stat(agentPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1078,7 +1109,12 @@ func (p *kernelProjector) Resolve(_ context.Context, uri *ParsedURI) (*Resource,
 		return NewJSONResource(uri.Raw, info)
 	}
 
-	kernelPath := filepath.Join(p.kernel.CogDir(), uri.Path)
+	// Sanitized (myrgic/cogos#489 round 4) before joining — see pathsafe.go.
+	// This is the widest-open of the sibling gaps: kernelProjector joins
+	// straight onto CogDir() with no glob suffix and no extension
+	// constraint, so an unsanitized uri.Path here would have been a
+	// read-anything-under-.cog/ primitive.
+	kernelPath := filepath.Join(p.kernel.CogDir(), sanitizeRelPath(uri.Path))
 	content, err := os.ReadFile(kernelPath)
 	if err != nil {
 		if os.IsNotExist(err) {

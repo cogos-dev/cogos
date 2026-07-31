@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,6 +60,19 @@ func TestParseWatchPattern(t *testing.T) {
 		{
 			name:    "unknown namespace",
 			pattern: "cog://unknown/*",
+			wantErr: true,
+		},
+		// myrgic/cogos#489 round 5: parseWatchPattern must reject '..'
+		// segments the same way sdk/uri.go's ParseURI does, mirroring the
+		// defense-in-depth layering used everywhere else in this module.
+		{
+			name:    "traversal segment forward slash",
+			pattern: "cog://ledger/../../../../etc",
+			wantErr: true,
+		},
+		{
+			name:    "traversal segment backslash-only",
+			pattern: `cog://ledger/..\..\..\etc`,
 			wantErr: true,
 		},
 	}
@@ -263,6 +277,69 @@ func TestKernel_WatchURI_NotConnected(t *testing.T) {
 	_, err = kernel.WatchURI(context.Background(), "cog://mem/*")
 	if err == nil {
 		t.Error("expected error for closed kernel")
+	}
+}
+
+// TestResolveWatchPathsSanitizesNTFSIllegalChars regression-tests
+// myrgic/cogos#489 round 5: resolveWatchPaths joined pattern.path into a
+// filesystem path with no NTFS-illegal-character sanitization (and no
+// traversal guard at all — parseWatchPattern never rejected '..' segments
+// the way sdk/uri.go's ParseURI did), the same class of bug this module's
+// sibling projectors (memoryProjector, ledgerProjector, ...) were fixed for
+// one round earlier. Constructs the ParsedURI-equivalent (*watchPattern)
+// directly to exercise resolveWatchPaths in isolation, mirroring
+// pathtraversal_test.go's approach for the resource projectors.
+func TestResolveWatchPathsSanitizesNTFSIllegalChars(t *testing.T) {
+	kernel := newTestKernel(t)
+
+	cases := []struct {
+		name      string
+		namespace string
+	}{
+		{"memory", "mem"},
+		{"ledger", "ledger"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pattern := &watchPattern{namespace: tc.namespace, path: "http:cog", raw: "cog://" + tc.namespace + "/http:cog"}
+			paths, _, err := kernel.resolveWatchPaths(pattern)
+			if err != nil {
+				t.Fatalf("resolveWatchPaths: %v", err)
+			}
+			for _, p := range paths {
+				if strings.Contains(p, "http:cog") {
+					t.Errorf("resolveWatchPaths(%q) returned path %q still containing the raw colon-bearing component — NTFS-illegal, myrgic/cogos#489", tc.namespace, p)
+				}
+				if !strings.Contains(p, "http%3Acog") {
+					t.Errorf("resolveWatchPaths(%q) returned path %q missing expected sanitized form", tc.namespace, p)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveWatchPathsRejectsTraversal regression-tests the same round-5
+// finding for the traversal shape: an unauthenticated
+// GET /ws/watch?uri=cog:mem/../../../../ reaches resolveWatchPaths via
+// Kernel.WatchURI with the raw '..' segments intact before this fix,
+// registering a filesystem watch outside the workspace root.
+func TestResolveWatchPathsRejectsTraversal(t *testing.T) {
+	kernel := newTestKernel(t)
+
+	pattern := &watchPattern{namespace: "mem", path: "../../../../secret", raw: "cog://mem/../../../../secret"}
+	paths, _, err := kernel.resolveWatchPaths(pattern)
+	if err != nil {
+		t.Fatalf("resolveWatchPaths: %v", err)
+	}
+	for _, p := range paths {
+		rel, relErr := filepath.Rel(kernel.MemoryDir(), p)
+		if relErr != nil {
+			t.Fatalf("filepath.Rel: %v", relErr)
+		}
+		if strings.HasPrefix(rel, "..") {
+			t.Fatalf("resolveWatchPaths allowed escape: path=%q is outside MemoryDir %q (rel=%q)", p, kernel.MemoryDir(), rel)
+		}
 	}
 }
 

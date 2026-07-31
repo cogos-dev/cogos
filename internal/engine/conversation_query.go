@@ -20,6 +20,8 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // ConversationQuery parameterises a read over the turn history.
@@ -160,7 +162,7 @@ func QueryConversation(workspaceRoot string, q ConversationQuery) (*Conversation
 // readTurnCompletedEvents scans the session ledger for all turn.completed
 // events. Ignores other event types. Safe on a missing ledger file.
 func readTurnCompletedEvents(workspaceRoot, sessionID string) ([]EventEnvelope, error) {
-	path := filepath.Join(workspaceRoot, ".cog", "ledger", sessionID, "events.jsonl")
+	path := filepath.Join(workspaceRoot, ".cog", "ledger", pathsafe.SanitizeComponent(sessionID), "events.jsonl")
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
