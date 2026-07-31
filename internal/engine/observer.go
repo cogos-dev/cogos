@@ -123,7 +123,22 @@ func (m *TrajectoryModel) Update(attended []string, fieldScores map[string]float
 	// Compute prediction error: Jaccard distance between last prediction and
 	// actually attended paths. On the very first cycle lastPrediction is empty,
 	// so we get 0 if attendance is also empty, or 1 if attendance is non-empty.
-	predErr := jaccardDistance(m.lastPrediction, attendedSet)
+	//
+	// Guard (#428): an empty attendedSet means no attention signal arrived
+	// this cycle at all — e.g. no external attention-signal producer is
+	// wired up (the .cog/run/attention.jsonl consumer has nothing to read).
+	// That is an absence of measurement, not evidence of a maximal
+	// prediction miss. Falling through to jaccardDistance's documented
+	// empty-vs-nonempty case would report a false predErr=1.0 every single
+	// cycle from the moment lastPrediction is first populated onward — and
+	// that value is what actually gets recorded (ledger, consolidation
+	// CogDoc, observer.surprise event), not just logged and discarded. Only
+	// compute a real distance when there is attendance evidence to compare
+	// against; otherwise there is nothing to be surprised about.
+	var predErr float64
+	if len(attendedSet) > 0 {
+		predErr = jaccardDistance(m.lastPrediction, attendedSet)
+	}
 
 	// Decay all existing momentum entries.
 	for path := range m.momentum {
