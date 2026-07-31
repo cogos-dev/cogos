@@ -100,6 +100,60 @@ func TestParseURIStillAcceptsLegitimatePaths(t *testing.T) {
 	}
 }
 
+// TestParseURIRejectsBackslashTraversalSegments regression-tests
+// myrgic/cogos#489 round 4: the original '..'-segment check split only on
+// '/', so a raw path like "..\\..\\etc\\passwd" — containing no '/' at all —
+// was treated as one opaque segment that never equals "..", and sailed
+// through unrejected. On a Windows peer, filepath.Join then interprets the
+// embedded backslashes as real separators and the traversal succeeds where
+// this check was supposed to have caught it.
+func TestParseURIRejectsBackslashTraversalSegments(t *testing.T) {
+	tests := []string{
+		// Backslash-only traversal: no '/' anywhere, so the pre-fix
+		// strings.Split(path, "/") check saw one non-".." segment.
+		`cog:ledger/..\..\..\..\etc\passwd`,
+		`cog://ledger/..\..\..\..\etc\passwd`,
+		// Mixed separators: '..' isolated only by a backslash on one side.
+		`cog:ledger/subdir\..\..\etc\passwd`,
+		// A single backslash-bounded '..' segment is enough on its own.
+		`cog:ledger\..`,
+	}
+
+	for _, uri := range tests {
+		parsed, err := ParseURI(uri)
+		if err == nil {
+			t.Errorf("ParseURI(%q) = %+v, nil; want an error rejecting the backslash-bounded '..' segment", uri, parsed)
+		}
+	}
+}
+
+// TestParseURIStillAcceptsBackslashInOrdinaryNames guards the backslash fix
+// against being overly strict: a literal backslash that is NOT forming a
+// '..' segment (e.g. inside an otherwise-ordinary identifier) must still
+// parse — rejection is scoped to the traversal shape, not to the byte.
+func TestParseURIStillAcceptsBackslashInOrdinaryNames(t *testing.T) {
+	tests := []struct {
+		uri  string
+		path string
+	}{
+		// "a..b" split on '\' is one segment "a..b", not "..".
+		{`cog:ledger/a..b`, "a..b"},
+		// A backslash-bearing but non-".." segment.
+		{`cog:ledger/weird\name`, `weird\name`},
+	}
+
+	for _, tt := range tests {
+		parsed, err := ParseURI(tt.uri)
+		if err != nil {
+			t.Errorf("ParseURI(%q) unexpected error: %v", tt.uri, err)
+			continue
+		}
+		if parsed.Path != tt.path {
+			t.Errorf("ParseURI(%q).Path = %q, want %q", tt.uri, parsed.Path, tt.path)
+		}
+	}
+}
+
 // --- Layer 2: sanitizePathComponent / sanitizeRelPath at the join sites ---
 
 func TestSanitizePathComponentNeutralizesTraversal(t *testing.T) {
@@ -263,6 +317,120 @@ func TestLedgerProjectorDirectMutateRejectsTraversal(t *testing.T) {
 	confined := filepath.Join(kernel.CogDir(), "ledger", ".%2E", "events.jsonl")
 	if _, statErr := os.Stat(confined); statErr != nil {
 		t.Fatalf("expected sanitized write at %q, got stat error: %v", confined, statErr)
+	}
+}
+
+// ─── Round 4: whole-class coverage — every OTHER *Projector had the same gap ───
+//
+// The round-2/3 fixes above sanitized ledgerProjector alone. A full sweep
+// (myrgic/cogos#489 round 4) found ten more built-in projectors joining
+// uri.Path into a filesystem path with zero sanitization: memoryProjector,
+// adrProjector, specProjector, statusProjector, handoffProjector,
+// crystalProjector, roleProjector, skillProjector, agentProjector, and
+// kernelProjector (cogos.go) — plus threadProjector (thread.go), reachable
+// via POST /mutate as an unauthenticated arbitrary-directory create-and-
+// append rather than just a read. Each is exercised here the same way as
+// TestLedgerProjectorDirectResolveRejectsTraversal: a hand-built ParsedURI
+// bypassing ParseURI's own '..'-segment rejection, so the assertion is
+// specifically about the per-projector sanitizeRelPath call, not the
+// upstream defense-in-depth layer.
+
+// projectorTraversalCase describes one sibling projector's escape shape.
+type projectorTraversalCase struct {
+	namespace string
+	// secretRelPath is where a secret marker file is planted, relative to
+	// kernel.Root(), chosen to match what the *unsanitized* join would have
+	// produced for the traversalPath below (mirroring the existing ledger
+	// test's approach: same '..' depth, same target file name shape).
+	secretRelPath string
+	traversalPath string
+}
+
+func TestSiblingProjectorsRejectPathTraversal(t *testing.T) {
+	// Pop counts are exact, not padded, because the assertion depends on the
+	// planted secret and the (would-be) resolved path landing on the SAME
+	// file: pop one too few or too many and the pre-fix code would have
+	// escaped to a directory this test never plants anything in, making the
+	// "no leak" assertion pass for the wrong reason on both old and new
+	// code. Each base dir's depth below kernel.Root():
+	//   mem/adr/spec/status/role/skill/agent: root/.cog/X or root/.claude/X (2)
+	//   crystal: root/.cog/ledger, but uri.Path becomes crystal.json's own
+	//     parent dir, so 2 pops from ledgerDir lands exactly at root
+	//   handoff: root/projects/cog_lab_package/handoffs (3)
+	//   kernel: root/.cog itself, the base IS CogDir() (1)
+	cases := []projectorTraversalCase{
+		{"mem", "secret", "../../secret"},
+		{"crystal", "crystal.json", "../.."},
+		{"adr", "secret.md", "../../secret"},
+		{"spec", "secret.cog.md", "../../secret"},
+		{"status", "secret.json", "../../secret"},
+		{"handoff", "secret.md", "../../../secret"},
+		{"role", "secret.txt", "../../secret.txt"},
+		{"skill", "secret.txt", "../../secret.txt"},
+		{"agent", "secret.txt", "../../secret.txt"},
+		{"kernel", "secret.txt", "../secret.txt"},
+	}
+
+	const marker = "outside-the-sandbox-marker"
+
+	for _, tc := range cases {
+		t.Run(tc.namespace, func(t *testing.T) {
+			kernel := newTestKernel(t)
+
+			secretPath := filepath.Join(kernel.Root(), tc.secretRelPath)
+			if err := os.WriteFile(secretPath, []byte(marker), 0o644); err != nil {
+				t.Fatalf("plant secret at %q: %v", secretPath, err)
+			}
+
+			proj, ok := kernel.projectors[tc.namespace]
+			if !ok {
+				t.Fatalf("%s projector not registered", tc.namespace)
+			}
+
+			uri := &ParsedURI{
+				Namespace: tc.namespace,
+				Path:      tc.traversalPath,
+				Raw:       "cog:" + tc.namespace + "/" + tc.traversalPath,
+			}
+
+			resource, err := proj.Resolve(context.Background(), uri)
+			if resource != nil && strings.Contains(string(resource.Content), marker) {
+				t.Fatalf("%sProjector.Resolve leaked the planted secret via a hand-built ParsedURI (path=%q): %q",
+					tc.namespace, tc.traversalPath, resource.Content)
+			}
+			_ = err // not-found is expected but not asserted strictly per-namespace shape
+		})
+	}
+}
+
+// TestThreadProjectorMutateRejectsPathTraversal targets threadProjector
+// specifically: before the fix, threadPath/threadMetaPath joined a raw
+// caller-supplied thread ID straight into a filesystem path, and
+// appendMessage (via fs.AppendLine) MkdirAll's the parent directory — an
+// unauthenticated POST /mutate on an arbitrary cog:thread/<id> was an
+// arbitrary-directory create-and-append, not just an NTFS portability gap.
+func TestThreadProjectorMutateRejectsPathTraversal(t *testing.T) {
+	kernel := newTestKernel(t)
+
+	proj, ok := kernel.projectors["thread"]
+	if !ok {
+		t.Fatal("thread projector not registered")
+	}
+
+	evilDir := filepath.Join(kernel.Root(), "evil-thread-dir")
+	uri := &ParsedURI{
+		Namespace: "thread",
+		Path:      "../../../../evil-thread-dir",
+		Raw:       "cog:thread/../../../../evil-thread-dir",
+	}
+	mutation := NewAppendMutation([]byte(`{"role":"user","content":"hi"}`))
+
+	if err := proj.Mutate(context.Background(), uri, mutation); err != nil {
+		t.Fatalf("threadProjector.Mutate unexpected error: %v", err)
+	}
+
+	if _, statErr := os.Stat(evilDir); statErr == nil {
+		t.Fatalf("threadProjector.Mutate created a directory outside the threads tree at %q", evilDir)
 	}
 }
 
