@@ -153,6 +153,15 @@ type Recorder struct {
 	// time source appendRow uses removes that independent clock read
 	// entirely, for any recorder that has processed at least one event.
 	lastEventDay time.Time
+
+	// compactWG counts in-flight compaction goroutines spawned by
+	// maybeCompact (Add(1) before the `go func`, Done() via defer inside
+	// it). Production code never waits on it — per #497 the bus-handler
+	// dispatch path must return without blocking on compaction I/O — but
+	// tests that exercise the real (non-stubbed) compactHook need a way to
+	// join the goroutine before their t.TempDir() cleanup fires; see
+	// waitForCompactionIdle in compact_async_test.go and #515.
+	compactWG sync.WaitGroup
 }
 
 // globalRecorder is the process-wide recorder instance. A package-level
