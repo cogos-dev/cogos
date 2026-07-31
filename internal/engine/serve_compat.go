@@ -138,14 +138,22 @@ type compatModelPermission struct {
 
 // compatModel is a single entry in the /v1/models list. `tier` and
 // `description` are cogos extensions ignored by standard OpenAI clients.
+//
+// ContextLength is `omitempty` deliberately (#518): most entries (intent
+// aliases, static frontier/eclipse ids, and live ids from a provider with no
+// comparable upstream field) have no known context window. Emitting 0 or a
+// guessed default there would be worse than omitting the field — a client
+// that sees no field can fall back to its own default; one that sees a wrong
+// number cannot tell the difference from a real answer.
 type compatModel struct {
-	ID          string                  `json:"id"`
-	Object      string                  `json:"object"`
-	Created     int64                   `json:"created"`
-	OwnedBy     string                  `json:"owned_by"`
-	Permission  []compatModelPermission `json:"permission"`
-	Tier        string                  `json:"tier,omitempty"`
-	Description string                  `json:"description,omitempty"`
+	ID            string                  `json:"id"`
+	Object        string                  `json:"object"`
+	Created       int64                   `json:"created"`
+	OwnedBy       string                  `json:"owned_by"`
+	Permission    []compatModelPermission `json:"permission"`
+	Tier          string                  `json:"tier,omitempty"`
+	Description   string                  `json:"description,omitempty"`
+	ContextLength int                     `json:"context_length,omitempty"`
 }
 
 type compatModelsResponse struct {
@@ -248,7 +256,11 @@ func modelsCacheFor(router Router) *modelsCacheEntry {
 //     "<provider>/<model>" ids (owned_by "cogos:<provider>"). Embedding models
 //     are tagged (description "embedding"), never dropped. A provider whose probe
 //     errors or times out is skipped — the endpoint never 500s and never blocks
-//     beyond the per-provider budget.
+//     beyond the per-provider budget. A provider that additionally implements
+//     ModelContextLister (currently OpenAICompatProvider against an LM
+//     Studio backend, via its native GET /api/v0/models) contributes a
+//     `context_length` on each entry — the LOADED context, never the
+//     checkpoint's theoretical max, and omitted entirely when unknown (#518).
 //
 // The composed list is deduped by final id and served from a ~45s TTL cache so
 // concurrent callers don't stampede every backend.
@@ -362,21 +374,30 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	return data
 }
 
-// liveModelEntries walks the router's providers, probing each ModelLister with a
-// bounded per-provider timeout, concurrently, and returns the composed live
-// entries. A provider whose probe errors or times out is skipped (slog.Debug):
-// the endpoint never fails and never blocks beyond modelsPerProviderTimeout.
-// Order is deterministic (by provider Name(), which RangeProviders guarantees),
-// so the caller's first-occurrence dedupe is stable.
+// liveModelEntries walks the router's providers, probing each ModelLister (or
+// the richer ModelContextLister, #518) with a bounded per-provider timeout,
+// concurrently, and returns the composed live entries. A provider whose probe
+// errors or times out is skipped (slog.Debug): the endpoint never fails and
+// never blocks beyond modelsPerProviderTimeout. Order is deterministic (by
+// provider Name(), which RangeProviders guarantees), so the caller's
+// first-occurrence dedupe is stable.
 func liveModelEntries(ctx context.Context, router Router, now int64) []compatModel {
 	if router == nil {
 		return nil
 	}
 
-	// Snapshot the ModelLister providers in Name() order.
+	// Snapshot the ModelLister/ModelContextLister providers in Name() order.
+	// Every concrete provider today (OpenAICompatProvider) that implements
+	// ModelContextLister also implements plain ModelLister, but the check
+	// accepts either so a future provider implementing only the richer
+	// interface isn't silently excluded from the menu.
 	var listers []Provider
 	router.RangeProviders(func(p Provider) {
 		if _, ok := p.(ModelLister); ok {
+			listers = append(listers, p)
+			return
+		}
+		if _, ok := p.(ModelContextLister); ok {
 			listers = append(listers, p)
 		}
 	})
@@ -394,19 +415,19 @@ func liveModelEntries(ctx context.Context, router Router, now int64) []compatMod
 			defer wg.Done()
 			pctx, cancel := context.WithTimeout(ctx, modelsPerProviderTimeout)
 			defer cancel()
-			ids, err := p.(ModelLister).ListModels(pctx)
+			listings, err := listModelsForProvider(pctx, p)
 			if err != nil {
 				slog.Debug("compat: /v1/models: provider enumeration skipped",
 					"provider", p.Name(), "err", err)
 				return
 			}
-			entries := make([]compatModel, 0, len(ids))
+			entries := make([]compatModel, 0, len(listings))
 			frontier := isFrontierProvider(p)
-			for _, id := range ids {
-				if id == "" {
+			for _, listing := range listings {
+				if listing.ID == "" {
 					continue
 				}
-				entries = append(entries, modelEntryFor(p, id, frontier, now))
+				entries = append(entries, modelEntryFor(p, listing, frontier, now))
 			}
 			mu.Lock()
 			results[i] = entries
@@ -420,6 +441,26 @@ func liveModelEntries(ctx context.Context, router Router, now int64) []compatMod
 		out = append(out, entries...)
 	}
 	return out
+}
+
+// listModelsForProvider returns model listings for p, preferring the richer
+// ModelContextLister (context_length included, #518) when the provider
+// implements it, and falling back to the plain ModelLister (ids only,
+// ContextLength left at 0/unknown) otherwise. The caller (liveModelEntries)
+// has already confirmed p implements at least ModelLister before calling this.
+func listModelsForProvider(ctx context.Context, p Provider) ([]ModelListing, error) {
+	if cl, ok := p.(ModelContextLister); ok {
+		return cl.ListModelsWithContext(ctx)
+	}
+	ids, err := p.(ModelLister).ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	listings := make([]ModelListing, 0, len(ids))
+	for _, id := range ids {
+		listings = append(listings, ModelListing{ID: id})
+	}
+	return listings, nil
 }
 
 // isFrontierProvider reports whether p is an Anthropic/Claude frontier provider,
@@ -463,24 +504,35 @@ func isEmbeddingModelID(id string) bool {
 // today, so this is defensive) falls back to composite emission — which always
 // admits via the ProviderForName prefix guard — rather than becoming an
 // advertise-then-reject bare id.
-func modelEntryFor(p Provider, id string, frontier bool, now int64) compatModel {
+//
+// listing.ContextLength (#518) is carried onto the entry only when > 0 — see
+// compatModel's doc comment for why 0/absent must stay omitted rather than
+// becoming a wire 0.
+func modelEntryFor(p Provider, listing ModelListing, frontier bool, now int64) compatModel {
+	id := listing.ID
 	desc := ""
 	if isEmbeddingModelID(id) {
 		desc = "embedding"
 	}
+	var m compatModel
 	if frontier && strings.HasPrefix(id, "claude-") {
-		return mkCompatModel(id, "anthropic", "frontier-managed", desc, now)
+		m = mkCompatModel(id, "anthropic", "frontier-managed", desc, now)
+	} else {
+		name := p.Name()
+		composite := name + "/" + id
+		tier := "frontier-managed"
+		switch {
+		case strings.Contains(strings.ToLower(name), "eclipse"):
+			tier = "lan-local"
+		case p.Capabilities().IsLocal:
+			tier = "local-sovereign"
+		}
+		m = mkCompatModel(composite, "cogos:"+name, tier, desc, now)
 	}
-	name := p.Name()
-	composite := name + "/" + id
-	tier := "frontier-managed"
-	switch {
-	case strings.Contains(strings.ToLower(name), "eclipse"):
-		tier = "lan-local"
-	case p.Capabilities().IsLocal:
-		tier = "local-sovereign"
+	if listing.ContextLength > 0 {
+		m.ContextLength = listing.ContextLength
 	}
-	return mkCompatModel(composite, "cogos:"+name, tier, desc, now)
+	return m
 }
 
 // eclipseModelServed reports whether some registered provider actually serves

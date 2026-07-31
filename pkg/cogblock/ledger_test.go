@@ -578,3 +578,44 @@ func TestCanonFormRFC8785V1_ConstantValue(t *testing.T) {
 		t.Errorf("CanonFormRFC8785V1 = %q; want %q", CanonFormRFC8785V1, "rfc8785-v1")
 	}
 }
+
+// TestAppendEvent_SanitizesColonSessionID covers myrgic/cogos#489 for this
+// package's own AppendEvent/GetLastEvent/VerifyLedger — a sibling copy of
+// the engine's ledger with the identical path-construction seam. A
+// colon-bearing session key (the "origin:agent" shape used for
+// channel-scoped sessions, e.g. "http:cog") must produce an NTFS-legal
+// directory name and still round-trip correctly.
+func TestAppendEvent_SanitizesColonSessionID(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionID := "http:cog"
+
+	event := NewEventEnvelope("test.event", sessionID)
+	event.WithData("message", "hello")
+	if err := AppendEvent(tmpDir, sessionID, event); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	ledgerRoot := filepath.Join(tmpDir, ".cog", "ledger")
+	entries, err := os.ReadDir(ledgerRoot)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("ledger root has %d entries, want 1: %+v", len(entries), entries)
+	}
+	if strings.Contains(entries[0].Name(), ":") {
+		t.Fatalf("on-disk session dir %q still contains a colon", entries[0].Name())
+	}
+
+	last, err := GetLastEvent(tmpDir, sessionID)
+	if err != nil {
+		t.Fatalf("GetLastEvent: %v", err)
+	}
+	if last == nil || last.HashedPayload.SessionID != sessionID {
+		t.Fatalf("GetLastEvent round-trip failed: got %+v", last)
+	}
+
+	if err := VerifyLedger(tmpDir, sessionID); err != nil {
+		t.Fatalf("VerifyLedger: %v", err)
+	}
+}

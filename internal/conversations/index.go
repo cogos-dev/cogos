@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/myrgic/cogos/pkg/filelock"
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // metaLockTimeout bounds how long UpsertSession/DeleteSession wait to acquire
@@ -824,10 +825,16 @@ func sha256Hex(b []byte) string {
 
 // turnsFilename derives a safe flat filename from sessionID. Composite keys
 // for normalized ingest sessions take the form "<source>/<session_id>"; the
-// "/" is replaced with "__" so the file stays in projDir without creating
-// subdirectories.
+// "/" is replaced with "__" first (preserving the existing on-disk naming
+// convention for that common case) so the file stays in projDir without
+// creating subdirectories. The result then goes through
+// pathsafe.SanitizeComponent to escape anything else NTFS forbids (a colon
+// in a source or session id, control characters, ...) — see myrgic/cogos#489.
+// Plain slugs/UUIDs (the overwhelming majority of session IDs) round-trip
+// unchanged through both steps.
 func turnsFilename(sessionID string) string {
-	return strings.ReplaceAll(sessionID, "/", "__") + ".json"
+	flat := strings.ReplaceAll(sessionID, "/", "__")
+	return pathsafe.SanitizeComponent(flat) + ".json"
 }
 
 func (idx *Index) turnsPath(sessionID string) string {

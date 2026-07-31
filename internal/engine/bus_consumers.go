@@ -6,8 +6,9 @@
 // decoupled.
 //
 // Persistence layout:
-//   {workspace}/.cog/run/bus/{bus_id}.cursors.jsonl   — append-only log, last
-//                                                       entry per consumer wins
+//
+//	{workspace}/.cog/run/bus/{bus_id}.cursors.jsonl   — append-only log, last
+//	                                                    entry per consumer wins
 package engine
 
 import (
@@ -19,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // ConsumerCursor tracks a consumer's position in a bus event stream.
@@ -140,6 +143,17 @@ func (cr *ConsumerRegistry) Remove(consumerID string) bool {
 
 // persistLocked writes a cursor snapshot to the cursors.jsonl file.
 // Caller must hold cr.mu.
+//
+// busID is sanitized via pathsafe.SanitizeComponent before it becomes part
+// of the filename: it is the same caller-supplied, structurally-unsafe
+// identifier bus_session.go's EventsPath now sanitizes for the identical
+// reason (myrgic/cogos#489 round 2 — cog-review flagged this as the same
+// bug-class pattern, unverified-reachable at review time). GetOrCreate/Ack,
+// the only callers that reach here, are not currently wired to any
+// HTTP/MCP route (only List/Remove are, from serve_bus.go, and neither
+// takes the persist-to-disk path), so this is a preventative fix rather
+// than a live-exploit closure — but it means a future caller can't
+// reintroduce the defect this file's sibling was written to fix.
 func (cr *ConsumerRegistry) persistLocked(busID string, cursor *ConsumerCursor) {
 	if cr.dataDir == "" {
 		return
@@ -148,7 +162,7 @@ func (cr *ConsumerRegistry) persistLocked(busID string, cursor *ConsumerCursor) 
 		slog.Warn("bus-cursor: mkdir failed", "dir", cr.dataDir, "err", err)
 		return
 	}
-	path := filepath.Join(cr.dataDir, busID+".cursors.jsonl")
+	path := filepath.Join(cr.dataDir, pathsafe.SanitizeComponent(busID)+".cursors.jsonl")
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		slog.Warn("bus-cursor: open cursor file failed", "path", path, "err", err)

@@ -154,10 +154,79 @@ func TestQuarantineWriter_SourceNameSanitization(t *testing.T) {
 		t.Fatalf("WriteRecord: %v", err)
 	}
 
-	// Should create "src_sub" not "src/sub" (which would create a nested dir).
-	path := filepath.Join(qDir, "src_sub", "quarantine.jsonl")
+	// Should create "src%2Fsub" (percent-escaped by pkg/pathsafe.SanitizeComponent),
+	// not "src/sub" — which would create a nested directory instead of one
+	// component — and not any lossy substitution that could collide two
+	// distinct sources onto the same on-disk name.
+	path := filepath.Join(qDir, "src%2Fsub", "quarantine.jsonl")
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Errorf("sanitized path %s not found: %v", path, statErr)
+	}
+
+	// Must NOT have created a nested "src/sub/quarantine.jsonl" — that would
+	// mean the '/' reached the filesystem as a real separator.
+	nested := filepath.Join(qDir, "src", "sub", "quarantine.jsonl")
+	if _, statErr := os.Stat(nested); statErr == nil {
+		t.Errorf("source name's '/' was not sanitized: found nested path %s", nested)
+	}
+}
+
+// TestQuarantineWriter_SourceNameNTFSIllegalChars regression-tests
+// myrgic/cogos#489 round 4: sanitizeSourceName used to only replace '/' and
+// NUL, so a colon-bearing source (the exact shape #489 was filed against)
+// reached the filesystem raw and would break on any Windows/NTFS peer.
+func TestQuarantineWriter_SourceNameNTFSIllegalChars(t *testing.T) {
+	qDir := t.TempDir()
+	qw := NewQuarantineWriter(qDir)
+
+	original := json.RawMessage(`{"schema":"cogos.observatory.conversations/v0.1","source":"http:cog","session_id":"s1","role":"user","timestamp":"2026-06-10T00:00:00Z","text":"x"}`)
+	prov := QuarantineProvenance{Reason: QuarantineReasonUnmappedComponent, Component: "session.turn"}
+
+	if err := qw.WriteRecord("http:cog", original, prov); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+
+	rawColonPath := filepath.Join(qDir, "http:cog", "quarantine.jsonl")
+	if _, statErr := os.Stat(rawColonPath); statErr == nil {
+		t.Errorf("colon reached the filesystem raw at %s — NTFS-illegal, myrgic/cogos#489", rawColonPath)
+	}
+
+	entries, err := os.ReadDir(qDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || strings.Contains(entries[0].Name(), ":") {
+		t.Errorf("expected exactly one colon-free quarantine subdirectory, got %v", entries)
+	}
+}
+
+// TestQuarantineWriter_SourceNameTraversal regression-tests myrgic/cogos#489
+// round 4: a bare ".." source name (no '/', so the pre-fix sanitizer left it
+// untouched) let filepath.Join(quarantineDir, "..") resolve one level above
+// the intended quarantine root.
+func TestQuarantineWriter_SourceNameTraversal(t *testing.T) {
+	qDir := t.TempDir()
+	qw := NewQuarantineWriter(qDir)
+
+	original := json.RawMessage(`{"schema":"cogos.observatory.conversations/v0.1","source":"..","session_id":"s1","role":"user","timestamp":"2026-06-10T00:00:00Z","text":"x"}`)
+	prov := QuarantineProvenance{Reason: QuarantineReasonUnmappedComponent, Component: "session.turn"}
+
+	if err := qw.WriteRecord("..", original, prov); err != nil {
+		t.Fatalf("WriteRecord: %v", err)
+	}
+
+	// The escaped record must land INSIDE qDir, never in qDir's parent.
+	parentEscape := filepath.Join(filepath.Dir(qDir), "quarantine.jsonl")
+	if _, statErr := os.Stat(parentEscape); statErr == nil {
+		t.Errorf("source \"..\" escaped the quarantine root: found %s", parentEscape)
+	}
+
+	entries, err := os.ReadDir(qDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("expected exactly one quarantine subdirectory under qDir, got %v", entries)
 	}
 }
 

@@ -168,6 +168,29 @@ func ParseURI(rawURI string) (*ParsedURI, error) {
 	// Path is everything after the namespace
 	path := strings.TrimPrefix(parsed.Path, "/")
 
+	// Reject '..' path-traversal segments at parse time. This is defense in
+	// depth alongside the per-projector sanitization in pathsafe.go
+	// (myrgic/cogos#489 round 2): url.Parse has already percent-decoded
+	// parsed.Path, so this also catches the %2e%2e-encoded form of the same
+	// attack, and it protects every projector uniformly rather than relying
+	// on each one to sanitize its own filesystem joins.
+	//
+	// Split on BOTH '/' and '\' (myrgic/cogos#489 round 4): a raw path like
+	// "..\\..\\etc" contains no '/', so splitting on '/' alone treats it as
+	// one opaque segment ("..\..\etc") that never equals ".." and sails
+	// through this check — filepath.Join on Windows then interprets the
+	// embedded backslashes as real separators and the traversal succeeds
+	// there even though it was rejected in intent everywhere else. Every
+	// projector below additionally runs its own per-segment sanitization
+	// (pathsafe.go), which independently escapes backslashes inside a
+	// component; this check is the first, URI-level layer and should reject
+	// the same set that layer would otherwise have to clean up after.
+	for _, seg := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return nil, InvalidURIError(rawURI, "path segment '..' is not allowed")
+		}
+	}
+
 	return &ParsedURI{
 		Namespace: namespace,
 		Path:      path,

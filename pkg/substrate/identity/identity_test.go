@@ -161,6 +161,99 @@ spec:
 	}
 }
 
+// TestLoadCRD_RejectsPathTraversal regression-tests myrgic/cogos#489 round
+// 5: LoadCRD joined the caller-supplied subject slug into a filesystem path
+// with NO sanitization at all — not even a '..' check, unlike every sibling
+// seam this issue touched. The subject reaches here from cog_register_session
+// MCP tool's in.Subject field via resolveBoundIdentity/resolveIdentityExpression
+// on every inference request (internal/engine), so this was reachable
+// end-to-end, not just in isolation.
+func TestLoadCRD_RejectsPathTraversal(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".cog", "config", "identities")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a SYNTACTICALLY VALID CRD outside the identities directory,
+	// matching what the unsanitized join would have targeted — not just an
+	// arbitrary marker string. A marker string would make this test pass
+	// vacuously even without the fix: the pre-fix code DOES traverse and
+	// read the file, it just then fails YAML/schema validation on the
+	// marker text, which looks identical (err != nil) to a legitimate
+	// not-found rejection. Only a parseable, valid CRD at the escape target
+	// distinguishes "traversed and successfully loaded" from "correctly
+	// rejected as not-found".
+	secretPath := filepath.Join(root, "secret.yaml")
+	validCRD := `apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: escaped-identity
+spec:
+  iss: attacker
+  sub: escaped-identity
+  type: agent
+  expressions:
+    - aud: workspace:cog
+      display_name: Escaped
+      role: substrate-guardian
+`
+	if err := os.WriteFile(secretPath, []byte(validCRD), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// identities dir is {root}/.cog/config/identities — 3 pops reaches root.
+	crd, err := identity.LoadCRD(root, "../../../secret")
+	if err == nil {
+		t.Fatalf("LoadCRD allowed traversal: successfully loaded %+v from outside the identities directory", crd)
+	}
+}
+
+// TestLoadCRD_SanitizesNTFSIllegalChars regression-tests the NTFS-portability
+// half of the same finding: a colon-bearing subject (the #489 repro shape)
+// must not reach the filesystem raw.
+func TestLoadCRD_SanitizesNTFSIllegalChars(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".cog", "config", "identities")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// LoadCRD should look for the sanitized (percent-escaped) filename, not
+	// the raw colon-bearing one.
+	sanitizedPath := filepath.Join(dir, "http%3Acog.yaml")
+	yamlBody := `apiVersion: cog.os/v1alpha1
+kind: Identity
+metadata:
+  name: http-cog
+spec:
+  iss: myrgic
+  sub: cog
+  type: agent
+  expressions:
+    - aud: workspace:cog
+      display_name: HTTP Cog
+      role: substrate-guardian
+`
+	if err := os.WriteFile(sanitizedPath, []byte(yamlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	crd, err := identity.LoadCRD(root, "http:cog")
+	if err != nil {
+		t.Fatalf("LoadCRD(%q): %v", "http:cog", err)
+	}
+	if crd.Metadata.Name != "http-cog" {
+		t.Errorf("loaded wrong CRD: %+v", crd)
+	}
+
+	// The raw colon-bearing path must never have been the one read from.
+	rawPath := filepath.Join(dir, "http:cog.yaml")
+	if _, statErr := os.Stat(rawPath); statErr == nil {
+		t.Errorf("a file at the raw colon-bearing path %q exists, which would mask this test", rawPath)
+	}
+}
+
 func TestExpressionFor_ExactMatch(t *testing.T) {
 	spec := &identity.CRDSpec{
 		Expressions: []identity.Expression{

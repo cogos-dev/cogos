@@ -34,6 +34,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/myrgic/cogos/pkg/pathsafe"
 	"gopkg.in/yaml.v3"
 )
 
@@ -85,10 +86,14 @@ type MCPServer struct {
 
 	// toolDefs is the cached snapshot of MCP tools as kernel-side
 	// [ToolDefinition] values, suitable for direct injection onto a
-	// [CompletionRequest.Tools] slice. Populated once at construction by
-	// snapshotToolDefinitions (which does an in-process ListTools); read
-	// by handleChat when the kernel-agent path needs to advertise its own
-	// tools. Frozen after construction returns — read-only afterwards.
+	// [CompletionRequest.Tools] slice. Populated at construction by
+	// snapshotToolDefinitions (which does an in-process ListTools) and
+	// re-populated by ApplyExtensions once extension tools (conversations,
+	// eval) are registered — read by handleChat when the kernel-agent path
+	// needs to advertise its own tools, and by IsInternalTool/CallTool to
+	// decide whether a tool call executes in-process. Read-only after
+	// ApplyExtensions returns (or after construction, for servers that never
+	// call ApplyExtensions, e.g. extension-free tests).
 	// See mcp_tool_defs.go and myrgic/cogos#89.
 	toolDefs []ToolDefinition
 
@@ -2032,12 +2037,22 @@ func (m *MCPServer) toolIngest(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 
 	// Generate filename: {source}-{date}-{slug}.cog.md
+	//
+	// input.Source is a caller-supplied cog_ingest MCP tool argument, never
+	// validated against the IngestSource enum before this point (that
+	// switch has no default/rejection case), and embedded here without
+	// sanitization (myrgic/cogos#489 round 4 — same class as the ingest
+	// pipeline's quarantine.go sibling). A source of "http:cog" produced
+	// the on-disk filename "http:cog-<date>-<slug>.cog.md", the same
+	// NTFS-illegal colon #489 targets. containedJoin below (via
+	// WriteCogDoc) already defeats a "/"-bearing source used for
+	// directory-escape, so this is a portability, not an escape, fix.
 	date := time.Now().UTC().Format("2006-01-02")
 	slug := slugify(result.Title)
 	if slug == "" {
 		slug = "untitled"
 	}
-	filename := fmt.Sprintf("%s-%s-%s.cog.md", input.Source, date, slug)
+	filename := fmt.Sprintf("%s-%s-%s.cog.md", pathsafe.SanitizeComponent(input.Source), date, slug)
 	memPath := filepath.Join("semantic", "inbox", subdir, filename)
 
 	// Write the CogDoc.

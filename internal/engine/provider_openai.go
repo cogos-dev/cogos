@@ -40,6 +40,24 @@ const (
 	openaiCompatDefaultMaxToks  = 4096
 )
 
+// apiV0ModelsProbeTimeout caps how much of ListModelsWithContext's incoming
+// per-provider budget (modelsPerProviderTimeout, defined in serve_compat.go —
+// 2s in production) the speculative LM Studio /api/v0/models probe may spend
+// before ListModelsWithContext gives up on it and falls back to the plain
+// /v1/models listing. Deliberately a fraction (1/4) of the whole budget, not
+// an unrelated absolute constant, so the two stay proportional if
+// modelsPerProviderTimeout is ever retuned.
+//
+// Sized this way (PR #519 review): a real LM Studio backend answers
+// /api/v0/models in single-digit milliseconds locally / low tens of ms over
+// LAN, so this cap essentially never fires for the case it exists to serve.
+// It exists to bound the OTHER case: a non-LM-Studio OpenAI-compat server
+// (vLLM, llama.cpp, text-generation-webui) that is slow to 404 — without this
+// cap that server's fallback /v1/models call would inherit whatever sliver of
+// the shared ctx the slow 404 left behind, silently dropping the provider
+// from /v1/models on a timeout the pre-#518 code never had.
+const apiV0ModelsProbeTimeout = modelsPerProviderTimeout / 4
+
 // OpenAICompatProvider implements Provider against any OpenAI-compatible server.
 type OpenAICompatProvider struct {
 	name           string
@@ -248,6 +266,102 @@ func (p *OpenAICompatProvider) effectiveModel(req *CompletionRequest) string {
 // by the /v1/models composition handler.
 func (p *OpenAICompatProvider) ListModels(ctx context.Context) ([]string, error) {
 	return p.listModels(ctx)
+}
+
+// ListModelsWithContext enumerates model ids together with each model's
+// context window by probing LM Studio's native GET /api/v0/models — the same
+// endpoint and row shape (lmsModelRow / lmsModelsResponse, defined in
+// provider_lms_model_state.go) that LMSModelStateProvider already uses for its
+// read-only health probe. Reusing that shape rather than re-parsing a second
+// way to talk to LM Studio is deliberate (#518).
+//
+// Context precedence: prefer the LOADED context (loaded_context_length) over
+// the checkpoint's theoretical max (max_context_length) — a model loaded at
+// 32K on a 256K-capable checkpoint must advertise 32K, matching what the
+// backend will actually accept. max_context_length is used only as a
+// fallback when the model isn't currently reported loaded. A row with
+// neither field yields ContextLength 0 (unknown), which modelEntryFor and the
+// /v1/models JSON encoding (`omitempty`) both treat as "omit" — never a
+// guessed default (#518: a wrong number is worse than no number here).
+//
+// /api/v0/models is LM Studio-specific; any other OpenAI-compat server
+// (vLLM, llama.cpp, text-generation-webui) will 404 or otherwise fail this
+// probe. On that failure this method falls back to the plain id-only
+// /v1/models listing (via listModels) so the provider still contributes ids
+// to the /v1/models menu — just without context metadata — rather than being
+// skipped entirely by the caller's graceful-degradation path.
+//
+// Budget split (PR #519 review): liveModelEntries hands this whole method a
+// single bounded ctx (modelsPerProviderTimeout, 2s in production) meant to
+// cover ONE real upstream call — that was the pre-#518 contract, and it must
+// hold for every OpenAI-compat provider, not just LM Studio ones. The
+// speculative /api/v0/models probe is capped at its own short sub-deadline
+// (apiV0ModelsProbeTimeout) derived from ctx rather than being handed the
+// whole thing, so a slow-to-404 non-LM-Studio backend (vLLM, llama.cpp,
+// text-generation-webui — precisely who the fallback exists for) can't eat
+// most of the budget before the fallback even starts. The fallback call then
+// runs against the ORIGINAL ctx (not the probe's sub-context), so it is
+// guaranteed at least ctx's remaining time minus the probe's capped slice —
+// comfortably most of the original budget — matching what a provider with no
+// ModelContextLister at all still gets via plain ListModels.
+func (p *OpenAICompatProvider) ListModelsWithContext(ctx context.Context) ([]ModelListing, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, apiV0ModelsProbeTimeout)
+	rows, err := p.probeAPIv0Models(probeCtx)
+	cancel()
+	if err != nil {
+		// Deliberately re-use the ORIGINAL ctx here, not probeCtx: probeCtx's
+		// own deadline already elapsed (that's how we got here on a timeout) or
+		// is about to be canceled, so passing it to listModels would carry the
+		// probe's exhausted budget into the fallback instead of restoring
+		// ctx's own remaining time.
+		ids, lerr := p.listModels(ctx)
+		if lerr != nil {
+			return nil, lerr
+		}
+		listings := make([]ModelListing, 0, len(ids))
+		for _, id := range ids {
+			listings = append(listings, ModelListing{ID: id})
+		}
+		return listings, nil
+	}
+	listings := make([]ModelListing, 0, len(rows))
+	for _, r := range rows {
+		ctxLen := 0
+		switch {
+		case r.LoadedContextLength != nil && *r.LoadedContextLength > 0:
+			ctxLen = *r.LoadedContextLength
+		case r.MaxContextLength > 0:
+			ctxLen = r.MaxContextLength
+		}
+		listings = append(listings, ModelListing{ID: r.ID, ContextLength: ctxLen})
+	}
+	return listings, nil
+}
+
+// probeAPIv0Models performs the read-only GET /api/v0/models request against
+// LM Studio's native REST surface (see LMSModelStateProvider.probeModels for
+// the sibling implementation this deliberately mirrors). Returns an error with
+// no fallback of its own — ListModelsWithContext decides whether to fall back
+// to the id-only /v1/models listing.
+func (p *OpenAICompatProvider) probeAPIv0Models(ctx context.Context) ([]lmsModelRow, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+"/api/v0/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	p.setHeaders(req)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openai-compat: /api/v0/models status %d", resp.StatusCode)
+	}
+	var out lmsModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
 }
 
 // listModels fetches the model list from /v1/models.

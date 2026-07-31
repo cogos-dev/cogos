@@ -286,6 +286,61 @@ func TestResolveURIGlobNoMatch(t *testing.T) {
 	}
 }
 
+// TestResolveURISanitizesNTFSIllegalChars regression-tests myrgic/cogos#489
+// round 5: resolveProjection rejected literal ".." and absolute paths but
+// never escaped NTFS-illegal characters, so a colon-bearing uriPath (the
+// exact #489 repro shape — a ledger session ID like "http:cog") reached
+// filepath.Join with the raw colon intact via every one of the "direct",
+// "directory", and "glob" branches.
+func TestResolveURISanitizesNTFSIllegalChars(t *testing.T) {
+	t.Parallel()
+	root := "/workspace"
+
+	cases := []struct {
+		name    string
+		uri     string
+		wantNot string // substring that must NOT appear in the resolved path
+	}{
+		{"ledger directory pattern", "cog://ledger/http:cog", "http:cog"},
+		{"mem direct pattern", "cog://mem/http:cog.cog.md", "http:cog.cog.md"},
+		{"role directory pattern", "cog://role/http:cog", "http:cog"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			res, err := ResolveURI(root, tc.uri)
+			if err != nil {
+				t.Fatalf("ResolveURI(%q): %v", tc.uri, err)
+			}
+			if strings.Contains(res.Path, tc.wantNot) {
+				t.Errorf("ResolveURI(%q).Path = %q still contains the raw colon-bearing component %q — NTFS-illegal, myrgic/cogos#489",
+					tc.uri, res.Path, tc.wantNot)
+			}
+			// pkg/pathsafe.SanitizeComponent percent-escapes ':' as "%3A".
+			if !strings.Contains(res.Path, "%3A") {
+				t.Errorf("ResolveURI(%q).Path = %q missing expected sanitized form containing %q", tc.uri, res.Path, "%3A")
+			}
+		})
+	}
+}
+
+// TestResolveURIStillWorksForOrdinaryPaths guards the sanitization fix
+// against being overly strict: ordinary multi-segment, extension-bearing
+// paths must resolve exactly as before.
+func TestResolveURIStillWorksForOrdinaryPaths(t *testing.T) {
+	t.Parallel()
+	root := "/workspace"
+	res, err := ResolveURI(root, "cog://mem/semantic/insights/foo.cog.md")
+	if err != nil {
+		t.Fatalf("ResolveURI: %v", err)
+	}
+	want := root + "/.cog/mem/semantic/insights/foo.cog.md"
+	if filepath.ToSlash(res.Path) != want {
+		t.Errorf("Path = %q; want %q", res.Path, want)
+	}
+}
+
 // ── cogURIPattern ─────────────────────────────────────────────────────────────
 
 func TestCogURIPatternDoesNotMatchHTTPS(t *testing.T) {

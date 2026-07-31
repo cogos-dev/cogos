@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -240,7 +241,20 @@ func (m *AgentSyncModel) sendRequest(peerID bep.DeviceID, filename string, entry
 func (m *AgentSyncModel) HandleRequest(req *bep.Request) *bep.Response {
 	resp := &bep.Response{ID: req.ID}
 
-	if !bep.IsAgentCRDFile(req.Name) {
+	// bep.IsAgentCRDFile only checks the ".agent.yaml" suffix — it is not a
+	// path guard. bep_receiver.go's ReceiveAgentCRD/RemoveAgentCRD (the
+	// write/delete siblings of this read path, driven by the peer-supplied
+	// filenames in Index/IndexUpdate messages) additionally reject any
+	// name containing a path separator or that isn't its own base name;
+	// this read path was missing that same guard (myrgic/cogos#489 round
+	// 4 — a caller-supplied identifier, here a BEP peer's requested
+	// filename, reaching filepath.Join unsanitized). Without it, a peer
+	// requesting Name: "../../../../some/where/x.agent.yaml" would have
+	// this node serve back the contents of any file ending in
+	// ".agent.yaml" reachable by lexical traversal from watchDir.
+	if !bep.IsAgentCRDFile(req.Name) ||
+		strings.ContainsAny(req.Name, `/\`) ||
+		req.Name != filepath.Base(req.Name) {
 		resp.Code = bep.ErrorCodeInvalidFile
 		return resp
 	}

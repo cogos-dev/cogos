@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/myrgic/cogos/pkg/filelock"
+	"github.com/myrgic/cogos/pkg/pathsafe"
 	"github.com/myrgic/cogos/pkg/substrate/cogfield"
 )
 
@@ -168,9 +169,17 @@ func (m *BusSessionManager) RegistryPath() string {
 	return filepath.Join(m.BusesDir(), "registry.json")
 }
 
-// EventsPath returns the path to a bus's events JSONL file.
+// EventsPath returns the path to a bus's events JSONL file. busID is
+// sanitized via pathsafe.SanitizeComponent before joining: bus_id is a
+// caller-supplied free-form string (POST /v1/bus/open, POST /v1/bus/send)
+// that is structurally identical to a session key — the same whole-class
+// defect this file's package fixes for session keys (myrgic/cogos#489)
+// applies here, since validPathComponent alone permits colons and other
+// NTFS-illegal characters through. All internal readers/writers of the
+// events file route through this method, so sanitizing here is the single
+// seam that makes EnsureBus, AppendEvent, getLastEvent, and ReadEvents safe.
 func (m *BusSessionManager) EventsPath(busID string) string {
-	return filepath.Join(m.BusesDir(), busID, "events.jsonl")
+	return filepath.Join(m.BusesDir(), pathsafe.SanitizeComponent(busID), "events.jsonl")
 }
 
 // computeBusBlockHash computes the V2 content-addressed hash for a bus block.
@@ -203,15 +212,22 @@ func computeBusBlockHash(block *BusBlock) string {
 
 // EnsureBus creates the bus directory + events.jsonl if they don't exist.
 // Safe to call multiple times.
+//
+// validPathComponent rejects the degenerate cases (empty, ".", "..",
+// embedded separators/NUL) with a clear "invalid bus_id" error up front —
+// those are inputs with no sane on-disk representation, not ones we want to
+// silently escape. Everything validPathComponent accepts still needs
+// NTFS-illegal-character escaping (colons, etc.), which EventsPath now
+// applies via pathsafe.SanitizeComponent — see that method's doc comment.
 func (m *BusSessionManager) EnsureBus(busID string) error {
 	if !validPathComponent(busID) {
 		return fmt.Errorf("invalid bus_id %q", busID)
 	}
-	busDir := filepath.Join(m.BusesDir(), busID)
+	eventsFile := m.EventsPath(busID)
+	busDir := filepath.Dir(eventsFile)
 	if err := os.MkdirAll(busDir, 0755); err != nil {
 		return fmt.Errorf("create bus dir: %w", err)
 	}
-	eventsFile := filepath.Join(busDir, "events.jsonl")
 	if _, err := os.Stat(eventsFile); os.IsNotExist(err) {
 		f, err := os.Create(eventsFile)
 		if err != nil {
@@ -307,7 +323,10 @@ func (m *BusSessionManager) registerBusLocked(busID, sessionID, origin string) e
 		State:        "active",
 		Participants: []string{fmt.Sprintf("%s:session:%s", origin, sessionID), "kernel:cogos"},
 		Transport:    "file",
-		Endpoint:     filepath.Join(".cog", ".state", "buses", busID),
+		// Sanitized to match the actual on-disk directory name (see
+		// EventsPath) — an unsanitized Endpoint here would record metadata
+		// that doesn't match where EnsureBus actually wrote the bus.
+		Endpoint:     filepath.Join(".cog", ".state", "buses", pathsafe.SanitizeComponent(busID)),
 		CreatedAt:    now,
 		LastEventSeq: 0,
 		LastEventAt:  now,
@@ -437,7 +456,7 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	// matching root's archiveBus which resets LastEventSeq/EventCount to 0).
 	if fi, statErr := os.Stat(eventsFile); statErr == nil && fi.Size() >= eventsFileMaxBytes {
 		ts := time.Now().UTC().Format("2006-01-02T150405Z")
-		archivePath := filepath.Join(m.BusesDir(), busID, "events."+ts+".jsonl")
+		archivePath := filepath.Join(m.BusesDir(), pathsafe.SanitizeComponent(busID), "events."+ts+".jsonl")
 		if renameErr := os.Rename(eventsFile, archivePath); renameErr == nil {
 			// Create a fresh empty events.jsonl for subsequent appends. Only
 			// reset the seq/hash cache once the new file actually exists — if

@@ -436,13 +436,24 @@ func (p *threadProjector) threadsDir() string {
 }
 
 // threadPath returns the path to a thread's JSONL file.
+//
+// id is caller-supplied (the URI path segment after cog:thread/, or a
+// generated "thread-<unixnano>" ID) and is sanitized here — the single
+// chokepoint every one of threadPath's callers (loadThread, appendMessage,
+// setThread, patchThread) goes through — before becoming a filesystem path
+// component (myrgic/cogos#489 round 4). Before this fix, appendMessage
+// reached fs.AppendLine, which MkdirAll's the parent directory: an
+// unauthenticated POST /mutate on cog:thread/<id> was an arbitrary
+// directory create-and-append under threadsDir(), not just an NTFS
+// portability gap. See pathsafe.go.
 func (p *threadProjector) threadPath(id string) string {
-	return filepath.Join(p.threadsDir(), id, "thread.jsonl")
+	return filepath.Join(p.threadsDir(), sanitizeRelPath(id), "thread.jsonl")
 }
 
 // threadMetaPath returns the path to a thread's metadata file.
+// See the sanitization note on threadPath above.
 func (p *threadProjector) threadMetaPath(id string) string {
-	return filepath.Join(p.threadsDir(), id, "meta.json")
+	return filepath.Join(p.threadsDir(), sanitizeRelPath(id), "meta.json")
 }
 
 // activeThreadPath returns the path to the active thread marker file.

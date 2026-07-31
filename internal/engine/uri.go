@@ -25,6 +25,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/myrgic/cogos/pkg/pathsafe"
 )
 
 // resolveURIContext is the context passed to URIRegistry.Resolve when
@@ -271,6 +273,19 @@ func resolveProjection(workspaceRoot string, proj *Projection, uriPath string) (
 	if strings.Contains(uriPath, "..") || filepath.IsAbs(uriPath) {
 		return "", fmt.Errorf("cog uri path %q: traversal not permitted", uriPath)
 	}
+
+	// Sanitize NTFS-illegal characters per segment (myrgic/cogos#489 round
+	// 5). The ".." / absolute-path check above stops traversal, but did
+	// nothing about a colon or other NTFS-illegal byte reaching the
+	// filesystem raw — this is the single chokepoint every cog: projection
+	// in this module resolves through (mem, adr, role, skill, agent, spec,
+	// status, ledger, kernel, canonical, conf, ontology, work, handoff,
+	// artifact, docs, hooks), so a session-ID-shaped uriPath (e.g.
+	// "cog:ledger/http:cog") reached filepath.Join with the raw colon
+	// intact via any of the three branches below. pathsafe.SanitizeRelPath
+	// is idempotent and a no-op on already-safe input (plain slugs/UUIDs),
+	// so this does not change resolution for any existing well-formed URI.
+	uriPath = pathsafe.SanitizeRelPath(uriPath)
 
 	// Compute base directory.
 	var base string
