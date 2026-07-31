@@ -56,6 +56,29 @@ type ModelLister interface {
 	ListModels(ctx context.Context) ([]string, error)
 }
 
+// ModelListing is one upstream-enumerated model plus whatever context-window
+// metadata the provider was able to obtain for it. ContextLength is 0 when the
+// upstream has no comparable field (most OpenAI-compat servers only expose bare
+// ids via /v1/models) — callers must treat 0 as "unknown", never as a real
+// window, and omit it from any client-facing representation rather than
+// guessing a default (#518: a wrong number is worse than no number here).
+type ModelListing struct {
+	ID            string
+	ContextLength int
+}
+
+// ModelContextLister is implemented by providers that can enumerate model ids
+// together with each model's context window (e.g. LM Studio's native
+// GET /api/v0/models, which — unlike the OpenAI-standard /v1/models — exposes
+// loaded_context_length / max_context_length per model). handleModels prefers
+// this over plain ModelLister so context_length can be propagated to
+// /v1/models (#518) without changing the ModelLister contract that
+// OllamaProvider and ClaudeOAuthProvider already satisfy with no comparable
+// per-model window to report.
+type ModelContextLister interface {
+	ListModelsWithContext(ctx context.Context) ([]ModelListing, error)
+}
+
 // CancelSafeCompleter is implemented by providers whose Complete() cannot
 // reliably propagate ctx-cancellation to the server (#432). Such providers
 // expose CompleteCancelSafe, which routes the request through their

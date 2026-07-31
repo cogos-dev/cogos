@@ -18,8 +18,12 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // listerStub is a StubProvider that also implements ModelLister, so it is
@@ -424,5 +428,286 @@ func TestComposeModelsList_CancelledCallerDoesNotPoisonCache(t *testing.T) {
 		if !second[want] {
 			t.Errorf("cache poisoned by cancelled caller: %q missing after healthy rebuild; got %v", want, second)
 		}
+	}
+}
+
+// ── #518: context_length propagation ────────────────────────────────────────
+
+// contextListerStub is a StubProvider that implements ModelContextLister
+// (rather than plain ModelLister) so /v1/models composition exercises the
+// context_length-carrying path (#518). listings are returned verbatim by
+// ListModelsWithContext; listErr, when set, makes it fail (graceful-skip path).
+type contextListerStub struct {
+	*StubProvider
+	listings []ModelListing
+	listErr  error
+}
+
+func newContextListerStub(name string, isLocal bool, listings ...ModelListing) *contextListerStub {
+	sp := NewStubProvider(name, "resp")
+	sp.capabilities.IsLocal = isLocal
+	return &contextListerStub{StubProvider: sp, listings: listings}
+}
+
+func (l *contextListerStub) ListModelsWithContext(ctx context.Context) ([]ModelListing, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if l.listErr != nil {
+		return nil, l.listErr
+	}
+	return l.listings, nil
+}
+
+// TestHandleModels_ContextLengthPropagated verifies the core #518 fix: a
+// provider that reports a per-model context window via ModelContextLister has
+// that window surfaced as `context_length` on the composed /v1/models entry.
+func TestHandleModels_ContextLengthPropagated(t *testing.T) {
+	t.Parallel()
+
+	lister := newContextListerStub("lmstudio-eclipse", true,
+		ModelListing{ID: "ornith-1.0-35b", ContextLength: 32768},
+	)
+	router := NewSimpleRouter(RoutingConfig{Default: "lmstudio-eclipse"})
+	router.RegisterProvider(lister)
+
+	srv := freshModelsServer(t, router)
+	resp := fetchModels(t, srv)
+	byID := modelIDSet(resp)
+
+	m, ok := byID["lmstudio-eclipse/ornith-1.0-35b"]
+	if !ok {
+		t.Fatalf("composite id missing; got %v", modelIDKeys(byID))
+	}
+	if m.ContextLength != 32768 {
+		t.Errorf("ContextLength = %d; want 32768", m.ContextLength)
+	}
+}
+
+// TestHandleModels_ContextLengthAbsentIsOmitted verifies the design
+// constraint from #518: a model with no known context window must have the
+// `context_length` JSON key OMITTED entirely, never emitted as 0 or a guessed
+// default — a client that sees no field can fall back sanely; one that sees a
+// wrong number cannot tell it apart from a real answer.
+func TestHandleModels_ContextLengthAbsentIsOmitted(t *testing.T) {
+	t.Parallel()
+
+	// A plain ModelLister (no context metadata available at all) alongside a
+	// ModelContextLister entry that itself reports an unknown (0) window —
+	// both must omit the field on the wire.
+	plain := newListerStub("lmstudio-darkstar", true, "gemma-4-26b")
+	unknownCtx := newContextListerStub("some-vllm", true,
+		ModelListing{ID: "mystery-model", ContextLength: 0},
+	)
+	router := NewSimpleRouter(RoutingConfig{Default: "lmstudio-darkstar"})
+	router.RegisterProvider(plain)
+	router.RegisterProvider(unknownCtx)
+
+	srv := freshModelsServer(t, router)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	srv.handleModels(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("handleModels: status = %d; want 200", w.Code)
+	}
+
+	// Decode into a generic map so a present-but-zero key is distinguishable
+	// from an absent key (unlike decoding into a typed struct field).
+	var raw struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&raw); err != nil {
+		t.Fatalf("decode /v1/models: %v", err)
+	}
+	for _, entry := range raw.Data {
+		id, _ := entry["id"].(string)
+		if id != "lmstudio-darkstar/gemma-4-26b" && id != "some-vllm/mystery-model" {
+			continue
+		}
+		if _, present := entry["context_length"]; present {
+			t.Errorf("entry %q: context_length key present in JSON with no known window; want omitted entirely; entry=%+v", id, entry)
+		}
+	}
+}
+
+// TestOpenAICompatListModelsWithContext_PrefersLoadedOverMax verifies the
+// #518 design constraint at the provider layer: when LM Studio's
+// /api/v0/models reports both a loaded_context_length and a larger
+// max_context_length, ListModelsWithContext must report the LOADED value —
+// advertising the checkpoint's theoretical max when a smaller context is
+// actually loaded is exactly the bug #518 exists to fix.
+func TestOpenAICompatListModelsWithContext_PrefersLoadedOverMax(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v0/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{
+					"id":                    "ornith-1.0-35b",
+					"state":                 "loaded",
+					"loaded_context_length": 32768,
+					"max_context_length":    262144,
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "ornith-1.0-35b")
+	listings, err := p.ListModelsWithContext(context.Background())
+	if err != nil {
+		t.Fatalf("ListModelsWithContext: %v", err)
+	}
+	if len(listings) != 1 {
+		t.Fatalf("listings = %v; want 1 entry", listings)
+	}
+	if listings[0].ContextLength != 32768 {
+		t.Errorf("ContextLength = %d; want 32768 (loaded, not the 262144 max)", listings[0].ContextLength)
+	}
+}
+
+// TestOpenAICompatListModelsWithContext_FallsBackToMaxWhenNotLoaded verifies
+// the fallback half: a model reported by /api/v0/models with no
+// loaded_context_length (not currently loaded) still yields a usable —
+// though approximate — context_length from max_context_length, rather than
+// silently dropping the field.
+func TestOpenAICompatListModelsWithContext_FallsBackToMaxWhenNotLoaded(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{
+					"id":                 "gemma-4-26b",
+					"state":              "not-loaded",
+					"max_context_length": 131072,
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "gemma-4-26b")
+	listings, err := p.ListModelsWithContext(context.Background())
+	if err != nil {
+		t.Fatalf("ListModelsWithContext: %v", err)
+	}
+	if len(listings) != 1 || listings[0].ContextLength != 131072 {
+		t.Fatalf("listings = %v; want 1 entry with ContextLength 131072", listings)
+	}
+}
+
+// TestOpenAICompatListModelsWithContext_FallsBackToPlainListingOnNonLMStudio
+// verifies graceful degradation against a non-LM-Studio OpenAI-compat server
+// (vLLM, llama.cpp): /api/v0/models 404s, so ListModelsWithContext must fall
+// back to the standard /v1/models id-only listing rather than erroring the
+// provider out of the /v1/models menu entirely.
+func TestOpenAICompatListModelsWithContext_FallsBackToPlainListingOnNonLMStudio(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v0/models":
+			http.NotFound(w, r)
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(openaiModelsResponseJSON("llama-3-8b"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "llama-3-8b")
+	listings, err := p.ListModelsWithContext(context.Background())
+	if err != nil {
+		t.Fatalf("ListModelsWithContext: %v", err)
+	}
+	if len(listings) != 1 || listings[0].ID != "llama-3-8b" {
+		t.Fatalf("listings = %v; want 1 entry with id llama-3-8b", listings)
+	}
+	if listings[0].ContextLength != 0 {
+		t.Errorf("ContextLength = %d; want 0 (unknown — non-LM-Studio server has no comparable field)", listings[0].ContextLength)
+	}
+}
+
+// TestOpenAICompatListModelsWithContext_SlowProbeDoesNotStarveFallback is the
+// #519 review regression: liveModelEntries hands ListModelsWithContext a
+// single bounded ctx meant to cover ONE real upstream call (the pre-#518
+// contract every OpenAI-compat provider relied on). Before the budget-split
+// fix, the /api/v0/models probe and its /v1/models fallback shared that same
+// ctx, so a non-LM-Studio backend that is merely SLOW to 404 (a loaded proxy,
+// a remote host — exactly who the fallback exists to serve) could burn most
+// of the budget on the failed probe alone, leaving the real fallback call too
+// little time to complete and silently dropping the provider from /v1/models
+// (logged at slog.Debug, where nobody looks).
+//
+// This test reproduces exactly that shape with a ctx budget generous enough
+// to complete a NORMAL fallback call, but too tight to survive a slow probe
+// PLUS the fallback both drawing from the same pool:
+//   - total ctx budget:            1200ms
+//   - /api/v0/models (the probe):  sleeps 1000ms, then 404s
+//   - /v1/models (the fallback):   sleeps 500ms, then succeeds
+//
+// Pre-fix: the probe alone consumes ~1000ms of the shared 1200ms ctx, leaving
+// ~200ms for a fallback call that needs 500ms — it times out and
+// ListModelsWithContext returns an error, exactly the "silently vanishes"
+// failure the review flagged. Post-fix: the probe is capped at its own
+// apiV0ModelsProbeTimeout sub-budget (modelsPerProviderTimeout/4 = 500ms in
+// production), so it is canceled well before its fake 1000ms sleep completes;
+// the fallback then runs against the ORIGINAL ctx, which still has the
+// majority of the 1200ms left — comfortably more than the 500ms it needs.
+func TestOpenAICompatListModelsWithContext_SlowProbeDoesNotStarveFallback(t *testing.T) {
+	t.Parallel()
+
+	const (
+		totalBudget  = 1200 * time.Millisecond
+		probeDelay   = 1000 * time.Millisecond
+		fallbackWait = 500 * time.Millisecond
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v0/models":
+			// Simulate a non-LM-Studio server that is slow to answer 404 (a
+			// loaded proxy, a remote/off-LAN host) rather than an instant one.
+			select {
+			case <-time.After(probeDelay):
+			case <-r.Context().Done():
+				return
+			}
+			http.NotFound(w, r)
+		case "/v1/models":
+			select {
+			case <-time.After(fallbackWait):
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(openaiModelsResponseJSON("llama-3-8b"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestOpenAIProvider(t, srv.URL, "llama-3-8b")
+
+	ctx, cancel := context.WithTimeout(context.Background(), totalBudget)
+	defer cancel()
+
+	listings, err := p.ListModelsWithContext(ctx)
+	if err != nil {
+		t.Fatalf("ListModelsWithContext: %v; the slow probe starved the fallback's share of the shared %s budget (probe delay %s, fallback needs %s)",
+			err, totalBudget, probeDelay, fallbackWait)
+	}
+	if len(listings) != 1 || listings[0].ID != "llama-3-8b" {
+		t.Fatalf("listings = %v; want 1 entry with id llama-3-8b", listings)
 	}
 }
