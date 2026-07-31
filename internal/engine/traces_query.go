@@ -105,7 +105,7 @@ type sourceSpec struct {
 
 // sourceSpecs is the §3.4 normalization table materialized.
 //
-// Empirical verification (2026-04-21) against /Users/slowbro/cog-workspace/.cog/run:
+// Empirical verification (2026-04-21) against a live workspace's .cog/run:
 //   - attention.jsonl:         occurred_at (RFC3339 Z), no session_id, no level
 //   - proprioceptive.jsonl:    timestamp (RFC3339 Z), no session_id, event as pseudo-level
 //   - internal-requests.jsonl: timestamp is FLOAT UNIX SECONDS (drift from spec's

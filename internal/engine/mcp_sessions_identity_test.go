@@ -105,7 +105,7 @@ func TestHarnessBinding_WithSubject(t *testing.T) {
 		"session_id": "test-agent-001",
 		"workspace":  "/tmp/ws",
 		"role":       "agent",
-		"subject":    "chaz",
+		"subject":    "test-subject",
 	})
 	if ok, _ := result["ok"].(bool); !ok {
 		t.Fatalf("expected ok=true, got %v", result)
@@ -113,8 +113,8 @@ func TestHarnessBinding_WithSubject(t *testing.T) {
 	if created, _ := result["binding_created"].(bool); !created {
 		t.Errorf("expected binding_created=true in response, got %v", result)
 	}
-	if subj, _ := result["binding_subject"].(string); subj != "chaz" {
-		t.Errorf("expected binding_subject=chaz, got %q", subj)
+	if subj, _ := result["binding_subject"].(string); subj != "test-subject" {
+		t.Errorf("expected binding_subject=test-subject, got %q", subj)
 	}
 
 	// Verify the binding is retrievable via the backend.
@@ -122,8 +122,8 @@ func TestHarnessBinding_WithSubject(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ResolveHarnessBinding to find the binding")
 	}
-	if binding.Spec.Subject != "chaz" {
-		t.Errorf("expected subject=chaz, got %q", binding.Spec.Subject)
+	if binding.Spec.Subject != "test-subject" {
+		t.Errorf("expected subject=test-subject, got %q", binding.Spec.Subject)
 	}
 	if binding.Spec.SessionID != "test-agent-001" {
 		t.Errorf("expected session_id=test-agent-001, got %q", binding.Spec.SessionID)
@@ -172,7 +172,7 @@ func TestHarnessBinding_ExistingCallerUnchanged(t *testing.T) {
 		"workspace":  "/tmp/ws",
 		"role":       "coordinator",
 		"model":      "claude-opus-4",
-		"hostname":   "darkstar",
+		"hostname":   "test-host",
 	})
 	if ok, _ := result["ok"].(bool); !ok {
 		t.Fatalf("backward-compat failure: existing caller got ok=false, result=%v", result)
@@ -236,7 +236,7 @@ func TestHarnessBinding_BackendNil(t *testing.T) {
 		"session_id": "test-nobackend-001",
 		"workspace":  "/tmp/ws",
 		"role":       "agent",
-		"subject":    "slowbro",
+		"subject":    "test-subject",
 	})
 	if ok, _ := result["ok"].(bool); !ok {
 		t.Fatalf("expected ok=true even with nil backend, got %v", result)

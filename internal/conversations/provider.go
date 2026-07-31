@@ -930,13 +930,21 @@ func defaultOntologyDir(root string) string {
 }
 
 // defaultSourceDirs returns the default JSONL source directories to scan.
-// Prefers ~/.claude/projects/-Users-slowbro; falls back gracefully.
+//
+// Claude Code names a session store's per-directory bucket after the
+// project directory's path with each separator replaced by a hyphen (e.g.
+// /home/alice -> -home-alice), under ~/.claude/projects/. A session whose
+// cwd was $HOME — the common case for a "home" or dashboard-style session —
+// lands in the bucket for the home directory's own slug, so that's checked
+// first; the unfiltered ~/.claude/projects/ directory (every project's
+// sessions) is the general fallback.
 func defaultSourceDirs() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil
 	}
-	candidate := filepath.Join(home, ".claude", "projects", "-Users-slowbro")
+	homeSlug := strings.ReplaceAll(home, string(filepath.Separator), "-")
+	candidate := filepath.Join(home, ".claude", "projects", homeSlug)
 	if _, err := os.Stat(candidate); err == nil {
 		return []string{candidate}
 	}

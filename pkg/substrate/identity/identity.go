@@ -213,7 +213,7 @@ type Expression struct {
 	// WorkspaceRoot is the canonical cog:// URI home for this identity
 	// in this audience context. Location-independent; path projection
 	// is resolved by the WorkspaceBinding reconciler (Wave 6c).
-	// Example: "cog://workspaces/cog", "cog://workspaces/chaz"
+	// Example: "cog://workspaces/cog", "cog://workspaces/example-user"
 	WorkspaceRoot string `yaml:"workspace_root,omitempty"`
 	// Claims is an OIDC-style free-form claim bag. The reconciler preserves
 	// unknown claims verbatim — future tooling can read them without the

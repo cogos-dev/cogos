@@ -174,7 +174,7 @@ func IsUserScopedPath(p string) bool {
 // Examples:
 //
 //	"agents/exec/users/alice/notes.md" → "alice"
-//	"users/erin/drafts.md"            → "erin"
+//	"users/bob/drafts.md"             → "bob"
 //	"agents/exec/shared/policies.md"  → "" (not user-scoped)
 func ExtractUserFromPath(p string) string {
 	// Look for "/users/" or leading "users/"

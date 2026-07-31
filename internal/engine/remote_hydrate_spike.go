@@ -8,7 +8,7 @@
 // This is SPIKE code: a standalone client driving the REAL, already-shipped
 // block-sync HTTP API (serve_blocks.go) and the REAL BlobStore (blobstore.go).
 // Nothing here changes the kernel; it composes existing primitives to prove the
-// reconcile loop Chaz described:
+// reconcile loop the operator described:
 //
 //	Eclipse (authoritative) holds the model. Darkstar caches blocks by content
 //	hash, holds a pointer not the authority, and on reconnect/drift pulls only

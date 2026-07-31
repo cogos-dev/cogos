@@ -15,10 +15,15 @@
 # Each directory is scanned non-recursively for *.jsonl files whose names
 # are UUIDs (the Claude Code session ID format).
 #
-# Supports ~ expansion for the home directory.
-# Default: ["~/.claude/projects/-Users-slowbro"] when that directory exists.
+# Supports ~ expansion for the home directory. Below is illustrative; the
+# actual default (when this file or the field is absent) is computed by
+# defaultSourceDirs() in internal/conversations/provider.go, which derives
+# the home directory's own Claude Code project-bucket slug rather than any
+# fixed value.
+# Default: ["~/.claude/projects/<home-dir-slug>"] when that directory exists,
+# else ["~/.claude/projects"].
 source_dirs:
-  - ~/.claude/projects/-Users-slowbro
+  - ~/.claude/projects/example-project-slug
 
 # include_patterns: glob patterns for files to index within each source_dir.
 # Default: ["*.jsonl"]
@@ -46,4 +51,4 @@ max_sessions_to_index: 0
 # default_identity: tag applied to sessions from this config when no
 # identity can be extracted from the JSONL records themselves.
 # Default: "" (no tag)
-default_identity: "slowbro"
+default_identity: "example-operator"

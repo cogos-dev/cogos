@@ -163,7 +163,7 @@ type WorkspaceBindingCRD struct {
 
 // WorkspaceBindingSpec declares the subject → workspace-URI → access triple.
 type WorkspaceBindingSpec struct {
-	// Subject is the identity sub-slug (e.g. "cog", "chaz").
+	// Subject is the identity sub-slug (e.g. "cog", "example-user").
 	Subject string `yaml:"subject"`
 	// WorkspaceURI is the cog:// address of the workspace (e.g. "cog://workspaces/cog").
 	WorkspaceURI string `yaml:"workspace_uri"`
@@ -197,7 +197,7 @@ type HarnessBindingCRD struct {
 type HarnessBindingSpec struct {
 	// SessionID is the session identifier from the session-register event.
 	SessionID string `yaml:"session_id"`
-	// Subject is the identity sub-slug being bound (e.g. "chaz", "cog").
+	// Subject is the identity sub-slug being bound (e.g. "example-user", "cog").
 	Subject string `yaml:"subject"`
 	// Type distinguishes the user identity ("user") from the agent identity
 	// ("agent") in a dual-identity agentic harness session.

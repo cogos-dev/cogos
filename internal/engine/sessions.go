@@ -71,7 +71,7 @@ const (
 // is why the pattern is written as "token-hyphenable-hyphenable" rather than
 // "exactly three tokens."
 //
-// Example: slowbro-laptop-cogos-gap-closure → passes.
+// Example: node-a-laptop-cogos-gap-closure → passes.
 //
 //	alpha-beta-gamma                 → passes (exactly 3 tokens).
 //	a-b                              → REJECTED (only 2 tokens).

@@ -1,7 +1,12 @@
 // provider_anthropic_normalizer_poisoned_test.go — poisoned-session replay test.
 //
-// Replays /Users/slowbro/.claude/jobs/c7596ecb/tmp/poisoned_session.json
-// (73 messages, session 20260530_113602) at truncation lengths [12,20,40,60,73].
+// Replays a captured 73-message poisoned session (session 20260530_113602) at
+// truncation lengths [12,20,40,60,73]. The fixture is a real session capture
+// used to reproduce a normalizer regression and is intentionally NOT checked
+// into this public repo (it contains real conversational content, not
+// synthetic data) — set COGOS_POISONED_SESSION_FIXTURE to its path locally to
+// exercise this test; it skips cleanly when unset or the path doesn't exist,
+// same as every other run of this suite including CI.
 // For each length:
 //   1. Convert the raw JSON to []ProviderMessage.
 //   2. Call buildAnthropicRequest to produce an anthropicRequest (exercises normalizer).
@@ -41,7 +46,10 @@ type rawPoisonedMessage struct {
 // truncation lengths and asserts that buildAnthropicRequest (via the normalizer)
 // produces a checker-clean output.
 func TestPoisonedSessionReplay(t *testing.T) {
-	const sessionPath = "/Users/slowbro/.claude/jobs/c7596ecb/tmp/poisoned_session.json"
+	sessionPath := os.Getenv("COGOS_POISONED_SESSION_FIXTURE")
+	if sessionPath == "" {
+		t.Skip("COGOS_POISONED_SESSION_FIXTURE not set — skipping (see file header)")
+	}
 
 	data, err := os.ReadFile(sessionPath)
 	if err != nil {

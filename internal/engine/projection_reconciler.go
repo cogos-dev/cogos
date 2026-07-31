@@ -745,7 +745,7 @@ func generatePedagogicalDescent(nodes []LineageNode) string {
 	tierNames := map[int]string{
 		1: "Tier 1: Established Science (citable antecedents)",
 		2: "Tier 2: Structural Parallels (well-grounded; not peer-reviewed as stated)",
-		3: "Tier 3: Working Hypotheses (Chaz-developed; requires validation)",
+		3: "Tier 3: Working Hypotheses (operator-developed; requires validation)",
 		4: "Tier 4: Speculative / Universal Claims (requires explicit demotion before publication)",
 	}
 

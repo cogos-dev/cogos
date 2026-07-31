@@ -22,8 +22,8 @@ import (
 //   - "ambient": always-on mic, VAD-gated attention, continuous diarization.
 //     The pipeline is mic → VAD → diarize → ecapa_match → STT → attribute →
 //     mention_detect → emit. Cog stays silent unless mentioned or there is
-//     "appropriate silence." This is the multi-human-attendee mode (e.g. Chaz
-//     + Erin with a hot mic where Cog listens and chimes in when addressed).
+//     "appropriate silence." This is the multi-human-attendee mode (e.g. two people
+//     sharing a hot mic where Cog listens and chimes in when addressed).
 //
 // Pipeline overrides the ordered stage list derived from Mode. When empty,
 // the channel runtime uses DEFAULT_PIPELINES[Mode]. Each entry is a stage

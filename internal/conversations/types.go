@@ -3,7 +3,7 @@
 // substrate state.
 //
 // The observatory projects operator session JSONLs from
-// ~/.claude/projects/-Users-slowbro/*.jsonl (and any additional configured
+// ~/.claude/projects/<home-dir-slug>/*.jsonl (and any additional configured
 // directories) into a queryable index. After projection, the substrate can
 // answer queries like "what did the operator say about harness attestation in
 // May 2026?" via the cog_search_conversations MCP tool instead of walking
@@ -158,7 +158,8 @@ type IndexEntry struct {
 type ObservatoryConfig struct {
 	// SourceDirs is the list of JSONL source directories to scan for
 	// Claude Code session files (UUID-named .jsonl).
-	// Defaults to ["~/.claude/projects/-Users-slowbro"].
+	// Defaults to ["~/.claude/projects/<home-dir-slug>"] (see
+	// defaultSourceDirs in provider.go).
 	SourceDirs []string `yaml:"source_dirs" json:"source_dirs,omitempty"`
 
 	// IngestDirs is the list of normalized ingest root directories. Each

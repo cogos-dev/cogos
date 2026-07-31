@@ -27,9 +27,27 @@ import (
 // Test fixtures
 // ---------------------------------------------------------------------------
 
-const realExperimentCogdocPath = "/Users/slowbro/workspaces/cog/.cog/mem/semantic/architecture/tournament/experiments/exp-001-anti-pattern-placement.cog.md"
-const realBusEventsPath = "/Users/slowbro/workspaces/cog/.cog/.state/buses/bus_tournament/events.jsonl"
-const realWorkspaceRoot = "/Users/slowbro/workspaces/cog"
+// realWorkspaceRoot resolves the local COGOS_WORKSPACE substrate checkout
+// used by the two opt-in integration tests below (same convention as
+// pkg/cogdoc_review's TestT09_RegressionADR052_WorkflowAsDAG): the
+// COGOS_WORKSPACE env var if set, else $HOME/workspaces/cog. Neither test
+// requires this to exist — each skips cleanly when its fixture is absent —
+// so CI and contributors without a local substrate checkout are unaffected.
+func realWorkspaceRoot() string {
+	if ws := os.Getenv("COGOS_WORKSPACE"); ws != "" {
+		return ws
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "workspaces", "cog")
+}
+
+func realExperimentCogdocPath() string {
+	return filepath.Join(realWorkspaceRoot(), ".cog", "mem", "semantic", "architecture", "tournament", "experiments", "exp-001-anti-pattern-placement.cog.md")
+}
+
+func realBusEventsPath() string {
+	return filepath.Join(realWorkspaceRoot(), ".cog", ".state", "buses", "bus_tournament", "events.jsonl")
+}
 
 // stubDispatcher is a no-op AgentDispatcher for tests.
 type stubDispatcher struct {
@@ -121,12 +139,13 @@ func busEventFromTrialRecord(tr TrialRecord) BusEvent {
 // ---------------------------------------------------------------------------
 
 func TestLoadConfig_RealExperiment(t *testing.T) {
-	if _, err := os.Stat(realExperimentCogdocPath); os.IsNotExist(err) {
-		t.Skipf("real experiment cogdoc not found at %s", realExperimentCogdocPath)
+	cogdocPath := realExperimentCogdocPath()
+	if _, err := os.Stat(cogdocPath); os.IsNotExist(err) {
+		t.Skipf("real experiment cogdoc not found at %s", cogdocPath)
 	}
 
 	p := buildTestProvider(nil, nil, nil)
-	cfgAny, err := p.LoadConfig(realWorkspaceRoot)
+	cfgAny, err := p.LoadConfig(realWorkspaceRoot())
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -195,11 +214,12 @@ func TestLoadConfig_EmptyDir(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFetchLive_RealBusEvents(t *testing.T) {
-	if _, err := os.Stat(realBusEventsPath); os.IsNotExist(err) {
-		t.Skipf("real bus events not found at %s", realBusEventsPath)
+	busEventsPath := realBusEventsPath()
+	if _, err := os.Stat(busEventsPath); os.IsNotExist(err) {
+		t.Skipf("real bus events not found at %s", busEventsPath)
 	}
 
-	reader := NewFileBusReader(realBusEventsPath)
+	reader := NewFileBusReader(busEventsPath)
 	p := buildTestProvider(nil, nil, reader)
 	// Also need root for LoadConfig
 	_ = p.root
