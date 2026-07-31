@@ -622,17 +622,37 @@ func TestReadsNotBlockedByPeerHoldingCrossProcessLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("peer filelock.Acquire: %v", err)
 	}
-	defer peerLock.Release()
 
 	// A concurrent UpsertSession for the SAME sessionID will now block
 	// waiting for peerLock, up to metaLockTimeout (5s). It runs in the
-	// background; this test does not wait for it to finish.
+	// background — this test's assertions do not wait for it — but the test
+	// as a whole must not return until it has, because t.TempDir()'s
+	// registered cleanup (os.RemoveAll(dir)) races this goroutine's
+	// filesystem writes otherwise: releasing peerLock unblocks the write,
+	// which can still be in flight (or not yet started) when RemoveAll
+	// begins tearing down dir underneath it (issue #481, ~33% flake).
+	//
+	// t.Cleanup here is registered after t.TempDir()'s own cleanup (dir was
+	// obtained above), so cleanups run LIFO: this one — release the peer
+	// lock, then block until the writer goroutine actually exits — runs to
+	// completion before t.TempDir()'s RemoveAll ever starts, instead of
+	// racing it.
+	writerDone := make(chan struct{})
 	go func() {
+		defer close(writerDone)
 		_ = idx.UpsertSession(
 			SessionMeta{SessionID: sessionID, TurnCount: 1, FirstTurnAt: now, LastTurnAt: now},
 			[]Turn{{UUID: sessionID, SessionID: sessionID, TurnIndex: 0, Role: "user", Timestamp: now, Text: "contended write"}},
 		)
 	}()
+	t.Cleanup(func() {
+		peerLock.Release()
+		select {
+		case <-writerDone:
+		case <-time.After(metaLockTimeout + 2*time.Second):
+			t.Error("contended UpsertSession goroutine did not exit after peer lock release — would have raced t.TempDir() cleanup")
+		}
+	})
 
 	// Give the goroutine above a moment to actually reach and block on
 	// filelock.Acquire before asserting reads are unaffected.
