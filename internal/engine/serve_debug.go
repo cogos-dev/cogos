@@ -18,10 +18,25 @@
 //	GET /debug/pprof/threadcreate     — OS-thread-creation profile
 //	GET /debug/vars                   — expvar counters
 //
-// `go tool pprof http://127.0.0.1:6931/debug/pprof/heap` reads any of the
-// profile endpoints directly. `cogos debug heap` / `cogos debug goroutines`
-// (cli_debug.go) wrap the fetch-and-save step into one command for an
-// operator or seat capturing evidence without a Go toolchain handy.
+// None of these endpoints is reachable by a bare `go tool pprof <url>` or
+// `curl <url>` call: debugLoopbackOnly (below) requires the X-Cogos-Debug
+// header on every /debug/ request, and neither client sends it by default —
+// a request without it 403s before reaching any pprof/expvar handler. Reach
+// the surface one of two ways instead:
+//
+//	cogos debug heap [--out FILE]        — fetches /debug/pprof/heap with
+//	cogos debug goroutines [--out FILE]  — the required header set, saves
+//	                                        the raw profile to disk, and
+//	                                        prints the `go tool pprof <file>`
+//	                                        invocation to run against that
+//	                                        saved file (cli_debug.go)
+//	curl -H "X-Cogos-Debug: 1" http://127.0.0.1:6931/debug/pprof/heap
+//	                                      — the same fetch by hand, for any
+//	                                        endpoint above, without the CLI
+//	                                        wrapper
+//
+// The header's value is never checked and is not a secret — see "Security"
+// below for exactly what it does and does not defend against.
 //
 // Note: the mutex and block profiles are zero-rate by default (matches
 // net/http/pprof's own upstream behavior — it never calls
