@@ -85,10 +85,14 @@ type MCPServer struct {
 
 	// toolDefs is the cached snapshot of MCP tools as kernel-side
 	// [ToolDefinition] values, suitable for direct injection onto a
-	// [CompletionRequest.Tools] slice. Populated once at construction by
-	// snapshotToolDefinitions (which does an in-process ListTools); read
-	// by handleChat when the kernel-agent path needs to advertise its own
-	// tools. Frozen after construction returns — read-only afterwards.
+	// [CompletionRequest.Tools] slice. Populated at construction by
+	// snapshotToolDefinitions (which does an in-process ListTools) and
+	// re-populated by ApplyExtensions once extension tools (conversations,
+	// eval) are registered — read by handleChat when the kernel-agent path
+	// needs to advertise its own tools, and by IsInternalTool/CallTool to
+	// decide whether a tool call executes in-process. Read-only after
+	// ApplyExtensions returns (or after construction, for servers that never
+	// call ApplyExtensions, e.g. extension-free tests).
 	// See mcp_tool_defs.go and myrgic/cogos#89.
 	toolDefs []ToolDefinition
 

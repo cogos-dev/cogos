@@ -41,6 +41,34 @@ var SetProvidersWorkspace func(workspaceRoot string)
 // Nil means no extensions are registered.
 var RegisterMCPExtensions func(srv *MCPServer)
 
+// ApplyExtensions is the single shared post-construction step every MCPServer
+// entrypoint MUST run before serving traffic, regardless of transport. It:
+//
+//  1. Calls RegisterMCPExtensions (if set) so the conversations/eval tool
+//     families register on this server instance.
+//  2. Re-runs backfillEagerSchemas, because extension hooks add EAGER tools
+//     via TrackTool *after* the constructor's initial backfill ran, leaving
+//     their inferred InputSchemas nil in toolMeta.
+//  3. Re-snapshots toolDefs, because it too is first populated at
+//     construction time — before extensions exist — and both
+//     IsInternalTool/CallTool (in-process tool execution) and the
+//     kernel-agent chat auto-advertise path key off it.
+//
+// This exists because myrgic/cogos#422 found the stdio entrypoint
+// (runMCPServeEngine in cli_mcp.go) constructed an MCPServer and skipped this
+// step entirely, silently exposing 14 of 21 tools over stdio while the HTTP
+// entrypoint (registerMCPRoutes in serve_mcp.go) exposed all 21. Routing both
+// transports through one method — instead of each re-implementing the same
+// two-call sequence — is the fix: a future third entrypoint gets this for
+// free, and there is no second list to fall out of sync.
+func (m *MCPServer) ApplyExtensions() {
+	if RegisterMCPExtensions != nil {
+		RegisterMCPExtensions(m)
+	}
+	m.backfillEagerSchemas()
+	m.toolDefs = snapshotToolDefinitions(m.server)
+}
+
 // WireHarnessBackend is called once during Boot after NewServer, to wire the
 // RBAC harness-binding layer into the server so cog_register_session can
 // create HarnessBindingCRDs for sessions that supply a "subject" field.

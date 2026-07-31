@@ -1,32 +1,33 @@
 // cli_mcp.go — `cogos mcp serve` subcommand: run the engine MCPServer on stdio.
 //
-// Phase 2 of Track 5 (per Agent I2's revised dead-code plan): this engine
-// implementation exists alongside the root-package `cmdMCP` (mcp.go). The
-// root-linked `cogos` binary still dispatches to its own path today. Once
-// Phase 4 flips the Makefile default build target to cmd/cogos/, `cogos mcp
-// serve` will naturally route through here.
+// Historical note: this implementation once existed alongside a root-package
+// `cmdMCP` (mcp.go) with its own hand-rolled JSON-RPC loop and a 4-tool
+// catalogue. That root package (and its serveServer type) was fully removed
+// by the ADR-121 consolidation (myrgic/cogos#464, commit 6fcdd2a); cmd/cogos/
+// has been the sole binary and build target since. Any comment or comparison
+// referencing "root" describes deleted code, not a live alternate path.
 //
-// Byte-compat and feature diff vs root:
+// Transport: stdio, newline-delimited JSON-RPC 2.0, via the upstream
+// modelcontextprotocol/go-sdk StdioTransport (server.RunStdio below).
 //
-//   - Transport: both use stdio with newline-delimited JSON-RPC 2.0.
-//     Root implements the JSON-RPC loop by hand (mcp.go:515 Run); engine
-//     uses the upstream modelcontextprotocol/go-sdk StdioTransport which
-//     speaks the same wire format.
+// Tool catalogue parity (myrgic/cogos#422): the HTTP transport
+// (registerMCPRoutes in serve_mcp.go) and this stdio entrypoint must expose
+// the identical tool surface. Both build an MCPServer via NewMCPServer /
+// NewMCPServerWithAgentController and then MUST call ApplyExtensions
+// (providers_register.go) before serving — that single call registers the
+// conversations/eval extension families and refreshes the derived
+// schema/toolDefs caches. Before #422's fix this entrypoint skipped that
+// call entirely, exposing 14 of the full 21 tools; see newStdioMCPServer.
 //
-//   - Tool catalogue: root's cmdMCP registers the 4 kernel-native tools
-//     (memory_search / memory_read / memory_write / coherence_check) plus
-//     the bridge-mode external-tool loader. Engine's MCPServer registers
-//     the FULL engine tool catalogue (20+ tools including ledger, traces,
-//     config, agent-state, kernel-slog, tool-calls, conversation, event-
-//     bus) via registerTools in mcp_server.go.
-//
-//     This is a strict super-set; every root tool has an engine equivalent.
-//     When the Phase 4 Makefile switch lands, `cogos mcp serve` users get
-//     the richer surface without any additional work.
-//
-//   - Bridge mode: root's --bridge flag (OpenClaw gateway) is not mirrored
-//     in Phase 2. It is scoped for a follow-up if/when needed; bridge mode
-//     is not used by the kernel-native workflow.
+// Known gap, not fixed here: root's old --bridge flag (OpenClaw gateway
+// proxy) has no equivalent here — passing --bridge to this subcommand fails
+// flag parsing rather than proxying external tools. Confirmed currently
+// unreachable from any live caller: harness.GenerateMCPConfig (the only code
+// that spawns `cogos mcp serve --bridge`) requires a non-empty
+// InferenceRequest.OpenClawURL, and no production code path sets that field
+// (the OpenClaw integration is archived — myrgic/openclaw-plugin). Tracked
+// as a documented, currently-dormant gap rather than fixed in #422's scope,
+// which is transport tool-set parity, not OpenClaw proxying.
 //
 // Lifecycle:
 //
@@ -82,6 +83,46 @@ func runMCPCmdWithIO(args []string, defaultWorkspace string, stderr io.Writer) i
 	}
 }
 
+// newStdioMCPServer builds the MCPServer used by `cogos mcp serve`: session
+// backends wired the same way the HTTP daemon wires them (serve_mcp.go's
+// registerMCPRoutes), plus the shared ApplyExtensions step so stdio exposes
+// the identical tool surface as HTTP (myrgic/cogos#422 — stdio previously
+// skipped this, exposing 14 of 21 tools). Split out from runMCPServeEngine so
+// tests can exercise construction + registration over an in-memory transport
+// without binding to a real stdio pipe.
+func newStdioMCPServer(cfg *Config, nucleus *Nucleus, process *Process) *MCPServer {
+	server := NewMCPServer(cfg, nucleus, process)
+
+	// Wire session-management backends so cog_register_session /
+	// cog_list_sessions / cog_offer_handoff / cog_list_handoffs / etc. work
+	// over stdio (same registries the HTTP path uses, just no live Server).
+	//
+	// forkRegistry mirrors serve.go's wiring (SetForkRegistry) so
+	// cog_fork_session over stdio also gets a live lineage index — without
+	// this, the stdio MCP path silently skipped fork-registry updates
+	// entirely (m.forkRegistry stayed nil; see the nil-safe check in
+	// mcp_fork_session.go). ReplaySessionRegistry's session.fork case and
+	// ReplayForkRegistry both read the durable session.fork bus events so a
+	// restart of this process reconstructs prior forks instead of starting
+	// blank.
+	busSessions := NewBusSessionManager(cfg.WorkspaceRoot)
+	sessionRegistry := NewSessionRegistry()
+	handoffRegistry := NewHandoffRegistry()
+	forkRegistry := NewForkRegistry()
+	_ = ReplaySessionRegistry(busSessions, sessionRegistry)
+	_ = ReplayHandoffRegistry(busSessions, handoffRegistry)
+	_ = ReplayForkRegistry(busSessions, forkRegistry)
+	server.SetSessionsBackend(busSessions, sessionRegistry, handoffRegistry)
+	server.SetForkRegistry(forkRegistry)
+
+	// Apply any extension hooks registered by workspace-root wiring (e.g.
+	// cmd/cogos/providers_wire.go's init() chaining eval + conversations onto
+	// RegisterMCPExtensions) so stdio's tools/list matches HTTP's.
+	server.ApplyExtensions()
+
+	return server
+}
+
 // runMCPServeEngine parses `cogos mcp serve` flags and hands the mcp.Server
 // off to StdioTransport. Intentionally does NOT call os.Exit so tests can
 // assert on the returned code. On any initialization failure a short error
@@ -124,29 +165,7 @@ func runMCPServeEngine(args []string, defaultWorkspace string, stderr io.Writer)
 	}
 
 	process := NewProcess(cfg, nucleus)
-	server := NewMCPServer(cfg, nucleus, process)
-
-	// Wire session-management backends so cog_register_session /
-	// cog_list_sessions / cog_offer_handoff / cog_list_handoffs / etc. work
-	// over stdio (same registries the HTTP path uses, just no live Server).
-	//
-	// forkRegistry mirrors serve.go's wiring (SetForkRegistry) so
-	// cog_fork_session over stdio also gets a live lineage index — without
-	// this, the stdio MCP path silently skipped fork-registry updates
-	// entirely (m.forkRegistry stayed nil; see the nil-safe check in
-	// mcp_fork_session.go). ReplaySessionRegistry's session.fork case and
-	// ReplayForkRegistry both read the durable session.fork bus events so a
-	// restart of this process reconstructs prior forks instead of starting
-	// blank.
-	busSessions := NewBusSessionManager(cfg.WorkspaceRoot)
-	sessionRegistry := NewSessionRegistry()
-	handoffRegistry := NewHandoffRegistry()
-	forkRegistry := NewForkRegistry()
-	_ = ReplaySessionRegistry(busSessions, sessionRegistry)
-	_ = ReplayHandoffRegistry(busSessions, handoffRegistry)
-	_ = ReplayForkRegistry(busSessions, forkRegistry)
-	server.SetSessionsBackend(busSessions, sessionRegistry, handoffRegistry)
-	server.SetForkRegistry(forkRegistry)
+	server := newStdioMCPServer(cfg, nucleus, process)
 
 	// Wire a signal-aware context so shells (or hosts like Claude Desktop)
 	// that send SIGINT/SIGTERM on shutdown get a clean exit.
