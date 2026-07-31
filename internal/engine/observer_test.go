@@ -204,6 +204,44 @@ func TestTrajectoryModelStatsAccumulate(t *testing.T) {
 	}
 }
 
+// TestTrajectoryModelNoAttentionSignalIsNotSurprise pins the #428 regression:
+// once a prediction is populated from field scores, an attendedSet that is
+// structurally empty every cycle (no attention-signal producer wired, e.g.
+// nothing ever POSTs to /v1/attention) must NOT degrade into a permanent
+// PredictionError=1.0 "total miss." Absence of attention data is absence of
+// evidence, not evidence of divergence.
+func TestTrajectoryModelNoAttentionSignalIsNotSurprise(t *testing.T) {
+	t.Parallel()
+	m := NewTrajectoryModel()
+	field := map[string]float64{"/a": 0.8, "/b": 0.6}
+
+	// Cycle 1: empty attendance, but this populates lastPrediction from
+	// fieldScores for the next cycle.
+	first := m.Update(nil, field)
+	if first.PredictionError != 0.0 {
+		t.Fatalf("cycle 1 error = %.4f; want 0.0", first.PredictionError)
+	}
+	if len(first.Prediction) == 0 {
+		t.Fatal("cycle 1 prediction is empty; test needs a populated prediction to reproduce #428")
+	}
+
+	// Cycles 2-5: lastPrediction is now non-empty, attendance stays
+	// structurally empty (the unwired-producer scenario from #428). Before
+	// the fix this fell through to jaccardDistance's empty-vs-nonempty case
+	// and returned a false 1.0 every cycle.
+	for i := 0; i < 4; i++ {
+		u := m.Update(nil, field)
+		if u.PredictionError != 0.0 {
+			t.Errorf("cycle %d error = %.4f; want 0.0 (no attention signal is not a total miss)", i+2, u.PredictionError)
+		}
+	}
+
+	_, meanErr := m.Stats()
+	if meanErr != 0.0 {
+		t.Errorf("mean error = %.4f; want 0.0 — should not be poisoned by unmeasured cycles", meanErr)
+	}
+}
+
 func TestTrajectoryModelPredictionErrorInRange(t *testing.T) {
 	t.Parallel()
 	m := NewTrajectoryModel()
