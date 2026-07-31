@@ -174,3 +174,92 @@ func toolNames(ts []*mcp.Tool) []string {
 	}
 	return out
 }
+
+// TestNewStdioMCPServer_AppliesExtensions is the regression test for
+// myrgic/cogos#422: the stdio entrypoint (newStdioMCPServer, used by
+// runMCPServeEngine) must call ApplyExtensions so any tool registered via the
+// RegisterMCPExtensions hook — the mechanism cmd/cogos/providers_wire.go uses
+// to chain in the conversations/eval tool families — appears in stdio's
+// tools/list, exactly as it already does for the HTTP transport
+// (registerMCPRoutes in serve_mcp.go). Before the fix, newStdioMCPServer's
+// predecessor code never called RegisterMCPExtensions at all, so a fake
+// extension registered here would be invisible over stdio while still
+// showing up if the same MCPServer were wired the HTTP way.
+func TestNewStdioMCPServer_AppliesExtensions(t *testing.T) {
+	// Not parallel: mutates the package-level RegisterMCPExtensions hook.
+	prev := RegisterMCPExtensions
+	t.Cleanup(func() { RegisterMCPExtensions = prev })
+
+	const markerTool = "test_extension_marker_tool"
+	RegisterMCPExtensions = func(srv *MCPServer) {
+		mcp.AddTool(srv.Server(), &mcp.Tool{
+			Name:        markerTool,
+			Description: "marker tool standing in for a real extension (conversations/eval) for #422 regression coverage",
+		}, func(ctx context.Context, req *mcp.CallToolRequest, input struct{}) (*mcp.CallToolResult, any, error) {
+			return &mcp.CallToolResult{}, nil, nil
+		})
+	}
+
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	nucleus := makeNucleus("Cog", "tester")
+	process := NewProcess(cfg, nucleus)
+
+	// This is the exact call runMCPServeEngine makes; testing it directly
+	// (rather than round-tripping through flag parsing + real stdio) lets us
+	// use the in-memory transport pair like the round-trip test above does.
+	server := newStdioMCPServer(cfg, nucleus, process)
+
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = runServerOnTransport(ctx, server, serverTransport)
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
+	}
+	defer func() {
+		_ = session.Close()
+		cancel()
+		wg.Wait()
+	}()
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("session.ListTools: %v", err)
+	}
+	found := false
+	for _, tool := range tools.Tools {
+		if tool.Name == markerTool {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("stdio tools/list missing extension tool %q registered via RegisterMCPExtensions; "+
+			"got %d tools: %v — ApplyExtensions was not run", markerTool, len(tools.Tools), toolNames(tools.Tools))
+	}
+
+	// ToolDefinitions() (the snapshot IsInternalTool/CallTool and the
+	// kernel-agent chat auto-advertise path key off) must also see it —
+	// ApplyExtensions refreshes this snapshot, not just tools/list.
+	defs := server.ToolDefinitions()
+	defFound := false
+	for _, d := range defs {
+		if d.Name == markerTool {
+			defFound = true
+			break
+		}
+	}
+	if !defFound {
+		t.Errorf("ToolDefinitions() missing extension tool %q; toolDefs snapshot was not refreshed by ApplyExtensions", markerTool)
+	}
+}
