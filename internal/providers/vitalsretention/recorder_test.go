@@ -55,7 +55,16 @@ func TestHandleBusEvent_AppendsRawRows(t *testing.T) {
 	root := withWorkspace(t, "node-a")
 
 	r := &Recorder{}
-	ts := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	t.Cleanup(func() { waitForCompactionIdle(t, r) })
+	// Anchored to now rather than a fixed calendar date: this test's
+	// HandleBusEvent call runs the real, unstubbed compactHook (maybeCompact
+	// always claims the slot on a fresh Recorder's first call), and a fixed
+	// historical date eventually ages past defaultRawRetentionHours (48h),
+	// putting it in-scope for ageTier to downsample away — racing this
+	// test's own read of the row below. "Now" is always inside the window
+	// (in fact it's today, excluded from aging entirely), so this can never
+	// go stale — see #515.
+	ts := time.Now().UTC()
 	r.HandleBusEvent(ProprioBusID, snapshotBlock(ts, 123456, 789, 3, 1, 0, 5))
 
 	base := vitalsBaseDir(root)
@@ -112,8 +121,20 @@ func TestHandleBusEvent_RotatesAcrossMetricDays(t *testing.T) {
 	base := vitalsBaseDir(root)
 
 	r := &Recorder{}
-	day1 := time.Date(2026, 7, 28, 23, 59, 0, 0, time.UTC)
-	day2 := time.Date(2026, 7, 29, 0, 1, 0, 0, time.UTC)
+	t.Cleanup(func() { waitForCompactionIdle(t, r) })
+	// day1/day2 are anchored to "today" rather than a fixed calendar date
+	// for the same reason as TestHandleBusEvent_AppendsRawRows above: this
+	// test's real, unstubbed compactHook ages any raw day strictly older
+	// than defaultRawRetentionHours (48h) — a hardcoded historical pair
+	// eventually crosses that line and races this test's own read of day1
+	// below (#515). "Yesterday 23:59" is always < 48h old and "today 00:01"
+	// is always excluded outright as the actively-written day, so this
+	// stays correct on every run regardless of when it executes, while
+	// still exercising the actual thing under test: rotation across a real
+	// day boundary.
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	day1 := today.Add(-1 * time.Minute)
+	day2 := today.Add(1 * time.Minute)
 
 	r.HandleBusEvent(ProprioBusID, snapshotBlock(day1, 100, 1, 1, 0, 0, 0))
 	r.HandleBusEvent(ProprioBusID, snapshotBlock(day2, 200, 2, 1, 0, 0, 0))
@@ -139,7 +160,11 @@ func TestHandleBusEvent_MultipleTicksAppendSameDayFile(t *testing.T) {
 	base := vitalsBaseDir(root)
 
 	r := &Recorder{}
-	ts := time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC)
+	t.Cleanup(func() { waitForCompactionIdle(t, r) })
+	// Anchored to today, not a fixed calendar date — see
+	// TestHandleBusEvent_AppendsRawRows above (#515): "today" is always
+	// excluded from this test's own real compaction pass outright.
+	ts := time.Now().UTC().Truncate(24 * time.Hour).Add(10 * time.Hour)
 	for i := 0; i < 3; i++ {
 		r.HandleBusEvent(ProprioBusID, snapshotBlock(ts.Add(time.Duration(i)*time.Minute), float64(100+i), 1, 1, 0, 0, 0))
 	}
@@ -164,6 +189,7 @@ func TestEnsureVitalsGitignore_WrittenOnce(t *testing.T) {
 	base := vitalsBaseDir(root)
 
 	r := &Recorder{}
+	t.Cleanup(func() { waitForCompactionIdle(t, r) })
 	ts := time.Now().UTC()
 	r.HandleBusEvent(ProprioBusID, snapshotBlock(ts, 1, 1, 1, 0, 0, 0))
 
@@ -226,6 +252,7 @@ func TestHealth_DegradedAfterAppendFailure(t *testing.T) {
 	base := vitalsBaseDir(root)
 
 	r := &Recorder{}
+	t.Cleanup(func() { waitForCompactionIdle(t, r) })
 	r.HandleBusEvent(ProprioBusID, snapshotBlock(time.Now(), 1, 1, 1, 0, 0, 0))
 	if h := r.Health(); h.Health != "Healthy" {
 		t.Fatalf("expected Healthy after a clean write, got %+v", h)

@@ -47,7 +47,9 @@ func (r *Recorder) maybeCompact(base, nodeKey string) {
 		return
 	}
 
+	r.compactWG.Add(1)
 	go func() {
+		defer r.compactWG.Done()
 		err := compactHook(r, base, nodeKey, cfg)
 		r.recordCompactResult(err)
 		if err != nil {
