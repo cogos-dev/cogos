@@ -21,7 +21,7 @@ your terminal:
   curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o /tmp/cogos-refuse-if-running.sh
   . /tmp/cogos-refuse-if-running.sh
   mkdir -p ~/.cog/bin
-  refuse_if_running ~/.cog/bin/cogos
+  refuse_if_running ~/.cog/bin/cogos || exit 1
   curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
   chmod +x cogos && mv cogos ~/.cog/bin/cogos
 )
@@ -34,7 +34,7 @@ your terminal:
   curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o /tmp/cogos-refuse-if-running.sh
   . /tmp/cogos-refuse-if-running.sh
   mkdir -p ~/.cog/bin
-  refuse_if_running ~/.cog/bin/cogos
+  refuse_if_running ~/.cog/bin/cogos || exit 1
   curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
   chmod +x cogos && mv cogos ~/.cog/bin/cogos
 )

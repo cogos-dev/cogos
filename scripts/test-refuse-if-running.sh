@@ -274,6 +274,48 @@ sleep 0.2
 expect_refused "symlinked install target executed via the symlink" "$WORKDIR/symlink-dir/cogos" \
     "is being executed by PID"
 
+# --- Scenario 11 (README install-snippet regression): a BARE call -- one
+# with no `|| exit 1` suffix -- made from a caller that has `set -e` in
+# effect must still run the guard to completion on the no-daemon path.
+#
+# Every scenario above invokes refuse_if_running in an errexit-SUPPRESSED
+# context (an `if` condition, or the left side of `&&`/`||`), which is
+# exactly why this suite was 10/10 green while both README install blocks
+# were silently broken: they call the guard bare inside `( set -eu; ... )`,
+# and pgrep's exit 1 on "no match" -- the common success path -- tripped the
+# caller's errexit from inside the function body, killing the whole install
+# subshell before curl/chmod/mv ever ran, with no output at all.
+#
+# pgrep is stubbed to a deterministic "no match" (exit 1) rather than
+# relying on no cogos daemon happening to run on the test machine, so this
+# exercises the failing path on any host -- including a dev laptop with a
+# live kernel, where an unstubbed pgrep returns 0 and hides the bug. ---
+(
+    STUBDIR="$WORKDIR/stub-pgrep-nomatch"
+    build_restricted_path "$STUBDIR" pgrep
+    cat >"$STUBDIR/pgrep" <<'STUB'
+#!/bin/sh
+exit 1
+STUB
+    chmod +x "$STUBDIR/pgrep"
+    export PATH="$STUBDIR"
+    # Mirrors the README block's shape exactly: set -eu, source, bare call,
+    # then the lines that would perform the install.
+    out="$(
+        set -eu
+        # shellcheck source=lib/refuse-if-running.sh
+        . "$REPO_ROOT/scripts/lib/refuse-if-running.sh"
+        refuse_if_running "$WORKDIR/idle-target"
+        echo "INSTALL-WOULD-PROCEED"
+    )" && rc=0 || rc=$?
+    if [ "${rc:-0}" -eq 0 ] && printf '%s' "$out" | grep -qF "INSTALL-WOULD-PROCEED"; then
+        echo "  PASS  bare call under caller's set -e, no daemon running (guard completed, as expected)"
+        exit 0
+    fi
+    echo "  FAIL  bare call under caller's set -e, no daemon running (expected the guard to complete and allow; got rc=${rc:-0}, output: '${out}')"
+    exit 1
+) && pass=$((pass + 1)) || fail=$((fail + 1))
+
 echo ""
 echo "== $pass passed, $fail failed =="
 [ "$fail" -eq 0 ]

@@ -40,6 +40,15 @@
 # subshell — sourcing a function into `make` doesn't carry across lines):
 #   scripts/lib/refuse-if-running.sh "$(INSTALL_TARGET)"
 #
+# Curl-pipe install snippets (README.md), which fetch this file and source it
+# inside a `( set -eu; ... )` subshell so a refusal exits the install rather
+# than the user's interactive terminal — same `|| exit 1` as the sourced form:
+#   refuse_if_running ~/.cog/bin/cogos || exit 1
+# Keep the `|| exit 1`. The function is written so that omitting it can no
+# longer kill the caller mid-guard (see the pgrep_rc capture below), but under
+# `set -e` a bare call still ends the caller with the guard's own status and no
+# chance to add context, and it silently diverges from every other call site.
+#
 # Returns/exits 0 if it is safe to proceed, 1 if refused (message already
 # printed to stderr). Never removes or moves anything itself — detection
 # only. The caller still performs the actual install.
@@ -106,8 +115,23 @@ refuse_if_running() {
     # pid list" shape RETRO-486 names at Makefile:138, just one layer
     # deeper (pgrep present but erroring, instead of absent). Status > 1 is
     # inconclusive and must refuse, not be read as "nothing is running."
-    pids="$(pgrep -f '(^|/)cogos( |$)' 2>/dev/null)"
-    pgrep_rc=$?
+    # `|| pgrep_rc=$?` rather than a bare assignment followed by reading `$?`:
+    # pgrep exits 1 on the NORMAL, overwhelmingly-common "no cogos daemon is
+    # running" path, and a command-substitution assignment carries that
+    # non-zero status as its own. Under a caller that has `set -e` in effect,
+    # a BARE `refuse_if_running ...` call therefore aborts the caller right
+    # here -- inside the function, before pgrep_rc is even read, before any
+    # refuse/allow decision is made, and before the caller's install lines run
+    # -- silently and with no output. Bash only suppresses errexit inside a
+    # function body when the call site is on the non-final side of an `&&`/`||`
+    # list or is an if/while condition, so the documented `|| exit 1` usage
+    # above masked this for every in-repo caller while the README's bare
+    # snippets hit it every time. Capturing the status without ever letting the
+    # assignment be the failing command means the guard cannot be killed
+    # mid-flight by a caller that omits that suffix. Pinned by the "bare call
+    # under set -e" scenario in scripts/test-refuse-if-running.sh.
+    pgrep_rc=0
+    pids="$(pgrep -f '(^|/)cogos( |$)' 2>/dev/null)" || pgrep_rc=$?
     if [ "$pgrep_rc" -gt 1 ]; then
         _refuse_if_running_say \
             "pgrep exited with status $pgrep_rc while searching for a running cogos process." \
