@@ -74,12 +74,20 @@ This is a one-time prompt per binary. Code signing will remove this step in a fu
 
 ### Install to PATH
 
-The recommended location for per-user installs is `%LOCALAPPDATA%\cogos\`, which does not require admin privileges:
+The recommended location for per-user installs is `%LOCALAPPDATA%\cogos\`, which does not require admin privileges. This refuses to overwrite a binary a running `cogos.exe` daemon is executing, using the shared guard at `scripts/lib/refuse-if-running.ps1` (the same one `make install`'s bash counterpart uses on macOS/Linux — see that file's header for why Windows has its own implementation rather than sharing the bash one) — fetched here rather than inlined so this doc can't drift from the canonical check the way the bash copies once did (see `cog://mem/working/2026-07-30-self-review-spike/RETRO-486.md`):
 
 ```powershell
-# Create the install directory and move the binary
+# Create the install directory
 $InstallDir = "$env:LOCALAPPDATA\cogos"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+# Refuse to overwrite a running daemon's binary (throws, doesn't `exit` --
+# safe to paste into an interactive session; see refuse-if-running.ps1)
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.ps1 -OutFile "$env:TEMP\refuse-if-running.ps1"
+. "$env:TEMP\refuse-if-running.ps1"
+Assert-CogosNotRunning -Target "$InstallDir\cogos.exe"
+
+# Move the binary
 Move-Item -Force .\cogos.exe "$InstallDir\cogos.exe"
 
 # Add to the User PATH (persists across sessions; no admin needed)
@@ -88,6 +96,8 @@ if ($UserPath -notlike "*$InstallDir*") {
     [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
 }
 ```
+
+Set `$env:ALLOW_RUNNING_INSTALL = '1'` to override, if you mean it (e.g. a deliberate in-place upgrade you'll restart the daemon after).
 
 Open a **new** PowerShell window so the updated PATH is picked up.
 

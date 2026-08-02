@@ -86,6 +86,50 @@ info "Downloading $BINARY_NAME..."
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
+# ── Load the shared running-daemon guard ─────────────────────────────────────
+# This script supports two invocations (see the header): a local checkout
+# (`./scripts/setup.sh`) and `curl -fsSL .../setup.sh | sh`, which has no
+# local checkout to source a sibling file from. Prefer the local copy when
+# one exists; otherwise fetch the SAME guard from the release ref this
+# script is itself installing, so the check travels with the version being
+# installed. See scripts/lib/refuse-if-running.sh for the guard itself and
+# why it is sourced here rather than hand-copied (again -- this script used
+# to carry its own inline copy; see RETRO-486.md for why that kept
+# diverging from its siblings).
+#
+# $0 rather than BASH_SOURCE: this script is documented to run under `sh`
+# via a pipe, where BASH_SOURCE is unset/unsupported; checking whether $0
+# resolves to a real file on disk works under both sh and bash and
+# correctly reports "no local checkout" when piped (in that mode $0 is not
+# a path to this file).
+SCRIPT_DIR=""
+if [ -f "$0" ] && [ "$(basename "$0")" = "setup.sh" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/lib/refuse-if-running.sh" ]; then
+    # shellcheck source=lib/refuse-if-running.sh
+    . "$SCRIPT_DIR/lib/refuse-if-running.sh"
+elif curl -fsSL -o "$TMPDIR/refuse-if-running.sh" \
+        "https://raw.githubusercontent.com/$REPO/$VERSION/scripts/lib/refuse-if-running.sh" 2>/dev/null; then
+    # shellcheck source=lib/refuse-if-running.sh
+    . "$TMPDIR/refuse-if-running.sh"
+else
+    # Could not obtain the guard by either path. Per the guard's own
+    # fail-closed contract, "could not verify" is not "safe" -- refuse
+    # rather than install blind unless the caller explicitly overrides.
+    refuse_if_running() {
+        if [ "${ALLOW_RUNNING_INSTALL:-}" = "1" ]; then
+            return 0
+        fi
+        warn "Could not load the running-daemon safety check (network issue,"
+        warn "or $VERSION predates it). Refusing rather than installing blind."
+        warn "Re-run with ALLOW_RUNNING_INSTALL=1 to override, only if you"
+        warn "know nothing is running."
+        return 1
+    }
+fi
+
 if ! curl -fsSL -o "$TMPDIR/cogos" "$DOWNLOAD_URL"; then
     fail "Download failed. Check that $VERSION has a release for $PLATFORM"
 fi
@@ -106,6 +150,9 @@ echo ""
 # Install.
 info "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
+
+# Refuse to clobber a running kernel before writing anything.
+refuse_if_running "$INSTALL_DIR/cogos" || exit 1
 
 mv "$TMPDIR/cogos" "$INSTALL_DIR/cogos"
 ok "cogos → $INSTALL_DIR/cogos"

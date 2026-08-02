@@ -7,29 +7,58 @@ make build && ./cogos serve --workspace ~/my-project
 # http://localhost:6931/health
 ```
 
-Or install a pre-built binary:
+Or install a pre-built binary. Each block below refuses to overwrite a
+binary a running `cogos` daemon is executing — it fetches the same shared
+guard `make install` uses (`scripts/lib/refuse-if-running.sh` /
+`scripts/lib/refuse-if-running.ps1`) rather than inlining its own copy, and
+runs in a subshell/script block so a refusal exits only the install, not
+your terminal:
 
 ```sh
 # macOS Apple Silicon
-curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
-chmod +x cogos && mv cogos ~/.cog/bin/cogos
+(
+  set -eu
+  guard="$(mktemp)"; trap 'rm -f "$guard"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o "$guard"
+  . "$guard"
+  mkdir -p ~/.cog/bin
+  refuse_if_running ~/.cog/bin/cogos || exit 1
+  curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
+  chmod +x cogos && mv cogos ~/.cog/bin/cogos
+)
 ```
 
 ```sh
 # Linux amd64
-curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
-chmod +x cogos && mv cogos ~/.cog/bin/cogos
+(
+  set -eu
+  guard="$(mktemp)"; trap 'rm -f "$guard"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o "$guard"
+  . "$guard"
+  mkdir -p ~/.cog/bin
+  refuse_if_running ~/.cog/bin/cogos || exit 1
+  curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
+  chmod +x cogos && mv cogos ~/.cog/bin/cogos
+)
 ```
 
 ```powershell
 # Windows amd64 (PowerShell)
 $dest = "$HOME\.cog\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.ps1 -OutFile "$env:TEMP\refuse-if-running.ps1"
+. "$env:TEMP\refuse-if-running.ps1"
+Assert-CogosNotRunning -Target "$dest\cogos.exe"
 Invoke-WebRequest -Uri https://github.com/myrgic/cogos/releases/latest/download/cogos-windows-amd64.exe `
     -OutFile "$dest\cogos.exe"
 Unblock-File "$dest\cogos.exe"
 # Add $dest to your PATH if it isn't already
 ```
+
+Set `ALLOW_RUNNING_INSTALL=1` (bash) / `$env:ALLOW_RUNNING_INSTALL = '1'`
+(PowerShell) to override, if you mean it. See
+`scripts/lib/refuse-if-running.sh` for what the guard checks and why it
+fails closed rather than assuming "not running" when it can't tell.
 
 Other architectures (linux/arm64, darwin/amd64 for Intel Macs) are available on the [Releases page](https://github.com/myrgic/cogos/releases/latest).
 

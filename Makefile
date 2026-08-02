@@ -56,7 +56,7 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64 windows-amd64 windows-arm64
 
-.PHONY: all build clean test test-coverage test-integration bench install image run e2e e2e-local $(PLATFORMS) $(BINARY)
+.PHONY: all build clean test test-coverage test-integration bench install check-not-running test-install-guard image run e2e e2e-local $(PLATFORMS) $(BINARY)
 
 # Default: build for current platform
 build: $(BINARY)
@@ -95,8 +95,23 @@ windows-arm64:
 INSTALL_DIR := $(HOME)/.cog/bin
 INSTALL_TARGET := $(INSTALL_DIR)/cogos
 
-# Install to ~/.cog/bin/cogos (atomic: build, verify, checksum, move)
-install: build
+# Refuse to clobber a binary a live cogos daemon is executing. Delegates to
+# the ONE shared implementation at scripts/lib/refuse-if-running.sh -- see
+# that file's header for why this is not (again) a hand-copied check.
+# Set ALLOW_RUNNING_INSTALL=1 to override.
+check-not-running:
+	@scripts/lib/refuse-if-running.sh "$(INSTALL_TARGET)"
+
+# Functional regression suite for the guard above. Also wired into CI's lint
+# job; this target is the local entry point so the suite is discoverable
+# without reading ci.yml.
+test-install-guard:
+	@scripts/test-refuse-if-running.sh
+
+# Install to ~/.cog/bin/cogos (atomic: build, verify, checksum, move).
+# check-not-running runs first so the backup/cp/mv below never fire against
+# a binary a running kernel is executing.
+install: build check-not-running
 	@echo "=== Installing to $(INSTALL_TARGET) ==="
 	@./$(BINARY) version > /dev/null 2>&1 || (echo "ERROR: built binary fails version check" && exit 1)
 	@mkdir -p "$(INSTALL_DIR)"
