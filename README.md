@@ -18,8 +18,9 @@ your terminal:
 # macOS Apple Silicon
 (
   set -eu
-  curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o /tmp/cogos-refuse-if-running.sh
-  . /tmp/cogos-refuse-if-running.sh
+  guard="$(mktemp)"; trap 'rm -f "$guard"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o "$guard"
+  . "$guard"
   mkdir -p ~/.cog/bin
   refuse_if_running ~/.cog/bin/cogos || exit 1
   curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-darwin-arm64 -o cogos
@@ -31,8 +32,9 @@ your terminal:
 # Linux amd64
 (
   set -eu
-  curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o /tmp/cogos-refuse-if-running.sh
-  . /tmp/cogos-refuse-if-running.sh
+  guard="$(mktemp)"; trap 'rm -f "$guard"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/myrgic/cogos/main/scripts/lib/refuse-if-running.sh -o "$guard"
+  . "$guard"
   mkdir -p ~/.cog/bin
   refuse_if_running ~/.cog/bin/cogos || exit 1
   curl -L https://github.com/myrgic/cogos/releases/latest/download/cogos-linux-amd64 -o cogos
