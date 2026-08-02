@@ -19,9 +19,13 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,6 +82,31 @@ type ReconcileDaemonConfig struct {
 	// Convergence tunes the per-provider anomaly thresholds (cost-over-budget
 	// and persistent-degraded). Zero values fall back to sensible defaults.
 	Convergence ConvergenceConfig
+
+	// RetryMaxSkipTicks caps the per-provider retry skip window after
+	// consecutive failed cycles. Default 32 (~16 min at the 30s PollInterval).
+	//
+	// Before this existed the daemon retried every registered provider on the
+	// fixed PollInterval forever, healthy or permanently broken alike: a
+	// provider whose ApplyPlan could not possibly succeed (missing actuator
+	// binary) burned ~2,880 identical retries a day.
+	RetryMaxSkipTicks int
+
+	// RetryJitter is the fraction of the nominal skip window randomized away
+	// in each direction. Zero selects the 0.25 default; pass a negative value
+	// to disable jitter (tests that assert exact skip windows).
+	RetryJitter float64
+
+	// QuarantineAfter is the count of consecutive failed cycles after which
+	// the daemon stops ACTUATING a provider. Default 12; negative disables
+	// quarantine entirely.
+	//
+	// With exponential skip, 12 consecutive failures is ~255 ticks — roughly
+	// two hours of real elapsed time, not six minutes. That threshold means
+	// "this is not transient", which is the property that makes quarantine
+	// safe: an overnight LM Studio outage backs off to 16-minute retries and
+	// self-heals, while a missing actuator script quarantines.
+	QuarantineAfter int
 }
 
 func (c *ReconcileDaemonConfig) withDefaults() ReconcileDaemonConfig {
@@ -91,7 +120,29 @@ func (c *ReconcileDaemonConfig) withDefaults() ReconcileDaemonConfig {
 	if cfg.ShutdownGracePeriod <= 0 {
 		cfg.ShutdownGracePeriod = 5 * time.Second
 	}
+	if cfg.RetryMaxSkipTicks <= 0 {
+		cfg.RetryMaxSkipTicks = 32
+	}
+	if cfg.RetryJitter == 0 {
+		cfg.RetryJitter = 0.25
+	} else if cfg.RetryJitter < 0 {
+		cfg.RetryJitter = 0
+	}
+	if cfg.QuarantineAfter == 0 {
+		cfg.QuarantineAfter = 12
+	}
 	return cfg
+}
+
+// quarantineRecord is the state captured when the daemon stops actuating a
+// provider. Fingerprint is the provider's config fingerprint at the moment
+// quarantine began: when a later cycle sees a DIFFERENT fingerprint, the
+// operator has changed the config that was failing, and quarantine lifts
+// automatically (see reviewQuarantine).
+type quarantineRecord struct {
+	Since       time.Time
+	Failures    int
+	Fingerprint string
 }
 
 // ReconcileDaemon is the daemon-resident goroutine that drives the full
@@ -147,20 +198,44 @@ type ReconcileDaemon struct {
 	// consulted for control flow.
 	lastPhaseErrMu sync.Mutex
 	lastPhaseErr   map[string]string
+
+	// tickSeq is the daemon's monotonic tick counter, the clock the backoff
+	// skip windows are measured in. Atomic because runProviders' concurrent
+	// path (MaxConcurrent > 1) reads it from worker goroutines while runTick
+	// advances it.
+	tickSeq atomic.Int64
+
+	// backoff widens the retry cadence for a provider whose cycles keep
+	// failing. Instance-scoped: the autonomic self-heal ticker holds its own,
+	// and the two schedulers tick at different intervals over overlapping
+	// provider names, so sharing state would corrupt both.
+	backoff *failureBackoff
+
+	// quarantined records providers the daemon has stopped ACTUATING.
+	// configFingerprints holds each provider's most recent config fingerprint,
+	// the signal used to lift quarantine automatically once the operator
+	// changes whatever was broken.
+	quarantineMu       sync.Mutex
+	quarantined        map[string]quarantineRecord
+	configFingerprints map[string]string
 }
 
 // NewReconcileDaemon creates a ReconcileDaemon with the given config.
 // Call Start(ctx) to begin the loop.
 func NewReconcileDaemon(cfg ReconcileDaemonConfig) *ReconcileDaemon {
+	resolved := cfg.withDefaults()
 	return &ReconcileDaemon{
-		cfg:           cfg.withDefaults(),
-		state:         ReconcileDaemonStarting,
-		triggered:     make(map[string]struct{}),
-		triggerCh:     make(chan struct{}, 1),
-		health:        newConvergenceTracker(cfg.Convergence),
-		cycleSerials:  make(map[string]*atomic.Int64),
-		lastSummaries: make(map[string]reconcile.Summary),
-		lastPhaseErr:  make(map[string]string),
+		cfg:                resolved,
+		state:              ReconcileDaemonStarting,
+		triggered:          make(map[string]struct{}),
+		triggerCh:          make(chan struct{}, 1),
+		health:             newConvergenceTracker(cfg.Convergence),
+		cycleSerials:       make(map[string]*atomic.Int64),
+		lastSummaries:      make(map[string]reconcile.Summary),
+		lastPhaseErr:       make(map[string]string),
+		backoff:            newFailureBackoff(resolved.RetryMaxSkipTicks, resolved.RetryJitter),
+		quarantined:        make(map[string]quarantineRecord),
+		configFingerprints: make(map[string]string),
 	}
 }
 
@@ -250,6 +325,205 @@ func (d *ReconcileDaemon) clearActionFailureThrottle(providerType, action, name 
 	d.lastPhaseErrMu.Lock()
 	delete(d.lastPhaseErr, key)
 	d.lastPhaseErrMu.Unlock()
+}
+
+// cycleOutcomeChanged reports whether providerType's cycle-outcome fingerprint
+// differs from the last recorded one, updating the record.
+//
+// PR #496 threw the Warn-once/Debug-repeat net over every FAILURE site in
+// runOneCycle — phases, per-action results — but the cycle-complete SUMMARY
+// line, which escalates from Info to Warn whenever apply_failed > 0, sat
+// outside that net. A provider stuck on a permanently-failing action
+// therefore re-emitted it at Warn every 30s forever: 1,185 lines in a single
+// day for one provider, 90.6% of all daemon WARNs. Empirically the throttle
+// on its sibling worked exactly as designed over the same window — the
+// detailed "action failed" line for that provider logged once, total — which
+// is what makes the summary line's omission visible as an oversight rather
+// than a policy.
+//
+// Fingerprinting on the outcome SHAPE rather than merely on "has failed
+// before" keeps the level decision honest: a first failure, a change in the
+// failure's shape, and a recovery are all still Warn. Only a byte-identical
+// repeat of an already-reported outcome drops to Debug.
+//
+// Shares lastPhaseErr with a "|cycle|" key suffix. The three key spaces are
+// disjoint by construction: phase keys are providerType+"|"+phase and phase
+// names contain no "|", action keys are providerType+"|action|"+..., and
+// "cycle" is not a phase name.
+func (d *ReconcileDaemon) cycleOutcomeChanged(providerType, fingerprint string) bool {
+	key := providerType + "|cycle|"
+	d.lastPhaseErrMu.Lock()
+	prev, seen := d.lastPhaseErr[key]
+	changed := !seen || prev != fingerprint
+	d.lastPhaseErr[key] = fingerprint
+	d.lastPhaseErrMu.Unlock()
+	return changed
+}
+
+// clearCycleOutcomeThrottle forgets providerType's cached cycle outcome, so a
+// recurrence after a period of health is reported as the fresh event it is
+// rather than as a continuation of the old streak. Called from runOneCycle's
+// outcome defer on EVERY successful exit — including the "provider in sync"
+// early return, which is the path a recovered provider actually takes.
+func (d *ReconcileDaemon) clearCycleOutcomeThrottle(providerType string) {
+	key := providerType + "|cycle|"
+	d.lastPhaseErrMu.Lock()
+	delete(d.lastPhaseErr, key)
+	d.lastPhaseErrMu.Unlock()
+}
+
+// forgetProviderThrottles drops every throttle key belonging to providerType,
+// called when the provider is no longer in the registry so the map does not
+// grow without bound across a long-lived process.
+func (d *ReconcileDaemon) forgetProviderThrottles(providerType string) {
+	prefix := providerType + "|"
+	d.lastPhaseErrMu.Lock()
+	for k := range d.lastPhaseErr {
+		if strings.HasPrefix(k, prefix) {
+			delete(d.lastPhaseErr, k)
+		}
+	}
+	d.lastPhaseErrMu.Unlock()
+}
+
+// ─── Retry backoff and quarantine ────────────────────────────────────────────
+
+// configFingerprint reduces a provider's loaded config to a short stable
+// string. Used only to notice that the operator CHANGED something, so a cheap
+// structural hash is sufficient and a marshal failure is not an error —
+// falling back to the Go-syntax rendering still changes when the config does.
+func configFingerprint(config any) string {
+	if config == nil {
+		return "nil"
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		data = []byte(fmt.Sprintf("%#v", config))
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:8])
+}
+
+// noteCycleFailure records a failed cycle: widen the retry window and, past
+// the configured threshold, stop actuating the provider entirely.
+func (d *ReconcileDaemon) noteCycleFailure(providerType string) {
+	tick := int(d.tickSeq.Load())
+	fails, skip := d.backoff.RecordFailure(providerType, tick)
+
+	if d.cfg.QuarantineAfter <= 0 || fails < d.cfg.QuarantineAfter {
+		return
+	}
+
+	d.quarantineMu.Lock()
+	if _, already := d.quarantined[providerType]; already {
+		d.quarantineMu.Unlock()
+		return
+	}
+	d.quarantined[providerType] = quarantineRecord{
+		Since:       time.Now(),
+		Failures:    fails,
+		Fingerprint: d.configFingerprints[providerType],
+	}
+	d.quarantineMu.Unlock()
+
+	// Exactly one WARN, carrying the recovery path. From here the standing
+	// condition lives in the pull surface (GET /v1/reconcile/convergence) and
+	// in the still-open anomaly episode, not in repeated push.
+	slog.Warn("reconcile-daemon: provider quarantined, actuation stopped",
+		"provider", providerType,
+		"consecutive_failures", fails,
+		"skip_ticks", skip,
+		"recovery", quarantineRecoveryHint(providerType),
+	)
+}
+
+// quarantineRecoveryHint is the operator-facing string carried on the
+// quarantine WARN and the convergence snapshot.
+func quarantineRecoveryHint(providerType string) string {
+	return "fix the underlying fault; quarantine lifts automatically when the provider's config changes or its next observation is in sync, " +
+		"or resume immediately with `cogos reconcile " + providerType + "`; a kernel restart clears all quarantines"
+}
+
+// noteCycleSuccess clears a provider's failure streak and lifts quarantine.
+//
+// Reachable for a quarantined provider because quarantine stops ACTUATION,
+// not observation: the read-only prefix still runs, so a condition that
+// resolves on its own (the model gets loaded by hand, the peer comes back)
+// produces an in-sync cycle, which lands here and lifts quarantine without
+// operator involvement.
+func (d *ReconcileDaemon) noteCycleSuccess(providerType string) {
+	if n, recovered := d.backoff.RecordSuccess(providerType); recovered {
+		slog.Info("reconcile-daemon: provider recovered, retry cadence restored",
+			"provider", providerType, "was_fail_count", n)
+	}
+	d.liftQuarantine(providerType, "provider reconciled successfully")
+}
+
+// liftQuarantine removes providerType from quarantine, logging once if it was
+// in fact quarantined.
+func (d *ReconcileDaemon) liftQuarantine(providerType, why string) {
+	d.quarantineMu.Lock()
+	rec, was := d.quarantined[providerType]
+	delete(d.quarantined, providerType)
+	d.quarantineMu.Unlock()
+	if !was {
+		return
+	}
+	slog.Warn("reconcile-daemon: provider quarantine lifted, actuation resumed",
+		"provider", providerType,
+		"reason", why,
+		"quarantined_for", time.Since(rec.Since).Round(time.Second).String(),
+	)
+}
+
+// reviewQuarantine records providerType's current config fingerprint and lifts
+// quarantine if it differs from the fingerprint captured when quarantine began.
+//
+// This is what makes a terminal state safe rather than a trap. The dominant
+// chronic-failure shape in this daemon is "not configured yet" rather than a
+// transient fault (see warnPhaseFailureThrottled's note: discord with no bot
+// token). Without this, such a provider would quarantine after ~2h, the
+// operator would add the missing token, and nothing would ever retry it —
+// strictly worse than today, where it simply starts working on the next tick.
+// LoadConfig has already run and is read-only, so noticing the change costs
+// one hash.
+func (d *ReconcileDaemon) reviewQuarantine(providerType, fingerprint string) {
+	d.quarantineMu.Lock()
+	d.configFingerprints[providerType] = fingerprint
+	rec, quarantined := d.quarantined[providerType]
+	d.quarantineMu.Unlock()
+
+	if !quarantined || rec.Fingerprint == fingerprint {
+		return
+	}
+	d.liftQuarantine(providerType, "config changed since quarantine")
+	d.backoff.RecordSuccess(providerType)
+}
+
+// isQuarantined reports whether the daemon has stopped actuating providerType.
+func (d *ReconcileDaemon) isQuarantined(providerType string) bool {
+	d.quarantineMu.Lock()
+	defer d.quarantineMu.Unlock()
+	_, ok := d.quarantined[providerType]
+	return ok
+}
+
+// Resume clears providerType's quarantine and retry backoff and queues an
+// immediate cycle. This is the OPERATOR entrance (CLI / HTTP): an explicit
+// "try now" that overrides the daemon's own pacing.
+//
+// Deliberately separate from Trigger. Trigger is wired to fsnotify projection
+// watchers (see boot.go), which fire on file events the reconcilers themselves
+// can cause; if Trigger reset the backoff, a batch of corpus writes would
+// un-quarantine and restore the busy-loop this exists to stop. Machine
+// triggers honour backoff; only operator intent overrides it.
+func (d *ReconcileDaemon) Resume(providerType string) {
+	if !d.hasProvider(providerType) {
+		return
+	}
+	d.liftQuarantine(providerType, "operator resume")
+	d.backoff.RecordSuccess(providerType)
+	d.Trigger(providerType)
 }
 
 // LastCycleSerial returns the current monotonic cycle-completion counter for
@@ -370,15 +644,49 @@ func (d *ReconcileDaemon) LastCoherence() (cB float64, perProvider []ProviderCoh
 // snapshot (cost-over-budget / persistent-degraded). It is the queryable surface
 // for operators and agents, and a test oracle: assert on observed runtime
 // behaviour after running the daemon, not just on code paths.
+// It merges the tracker's episode state with the daemon's own quarantine and
+// failure-streak state, so one read answers "what is wrong, since when, how
+// many distinct times, and is the daemon still trying" without grepping logs.
 func (d *ReconcileDaemon) ProviderConvergence() []ProviderConvergence {
-	return d.health.Snapshot()
+	snap := d.health.Snapshot()
+
+	d.quarantineMu.Lock()
+	quarantined := make(map[string]quarantineRecord, len(d.quarantined))
+	for pt, rec := range d.quarantined {
+		quarantined[pt] = rec
+	}
+	d.quarantineMu.Unlock()
+
+	for i := range snap {
+		pt := snap[i].Provider
+		snap[i].ConsecutiveFailures = d.backoff.Failures(pt)
+		if rec, ok := quarantined[pt]; ok {
+			snap[i].Quarantined = true
+			snap[i].QuarantinedSince = rec.Since.UTC().Format(time.RFC3339)
+			snap[i].Recovery = quarantineRecoveryHint(pt)
+		}
+	}
+	return snap
 }
 
-// observeConvergence feeds one completed cycle's cost and a fresh Health() read
-// (for the degraded axis) to the anomaly tracker.
+// observeConvergence feeds one completed cycle's cost, a fresh Health() read
+// (for the degraded axis) and the provider's quarantine state to the anomaly
+// tracker.
+//
+// Quarantine is fed in as its own anomaly axis on purpose. The condition that
+// motivated this work reports Health()==Suspended, not Degraded, so the
+// degraded axis never sees it and it contributes nothing to the anomaly
+// counter — meaning the ~1,100 daily WARNs this change deletes were the only
+// live indication it was broken. Raising quarantine as a counted, clearable
+// episode is what turns removing the noise into keeping the signal rather
+// than losing it.
 func (d *ReconcileDaemon) observeConvergence(providerType string, provider reconcile.Reconcilable, cycleMs, fetchMs int64) {
-	degraded := provider.Health().Health == reconcile.HealthDegraded
-	d.health.Observe(providerType, cycleMs, fetchMs, degraded)
+	d.health.Observe(providerType, convObservation{
+		CycleMs:     cycleMs,
+		FetchMs:     fetchMs,
+		Degraded:    provider.Health().Health == reconcile.HealthDegraded,
+		Quarantined: d.isQuarantined(providerType),
+	})
 }
 
 // State returns the current lifecycle state of the daemon.
@@ -530,9 +838,27 @@ func (d *ReconcileDaemon) runTick(ctx context.Context) {
 		return
 	}
 
-	slog.Debug("reconcile-daemon: tick", "provider_count", len(providers))
+	// Advance the backoff clock and drop providers still inside a skip window.
+	// A provider that has never failed is always ready, so the healthy path is
+	// untouched.
+	tick := int(d.tickSeq.Add(1))
+	eligible := make([]string, 0, len(providers))
+	for _, pt := range providers {
+		if !d.backoff.Ready(pt, tick) {
+			continue
+		}
+		eligible = append(eligible, pt)
+	}
 
-	errCount := d.runProviders(ctx, providers)
+	slog.Debug("reconcile-daemon: tick",
+		"provider_count", len(providers),
+		"eligible_count", len(eligible),
+	)
+	if len(eligible) == 0 {
+		return
+	}
+
+	errCount := d.runProviders(ctx, eligible)
 
 	d.mu.Lock()
 	if errCount > 0 {
@@ -555,9 +881,22 @@ func (d *ReconcileDaemon) runTriggered(ctx context.Context) {
 		return
 	}
 
+	// Machine triggers honour backoff. These come from fsnotify projection
+	// watchers (boot.go), which fire on file events that the projection
+	// reconcilers themselves can produce; letting them bypass the skip window
+	// would hand every watcher a backoff-defeat lever and restore the
+	// busy-loop. Operator intent goes through Resume, which clears the window
+	// first.
+	tick := int(d.tickSeq.Load())
 	types := make([]string, 0, len(queued))
 	for t := range queued {
+		if !d.backoff.Ready(t, tick) {
+			continue
+		}
 		types = append(types, t)
+	}
+	if len(types) == 0 {
+		return
 	}
 	slog.Debug("reconcile-daemon: triggered", "providers", types)
 	d.runProviders(ctx, types)
@@ -641,6 +980,27 @@ func (d *ReconcileDaemon) runProviders(ctx context.Context, providerTypes []stri
 // Panics are recovered and returned as errors to preserve error isolation.
 // Conforms to ADR-092 §4 Reconcilable contract order.
 func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) (retErr error) {
+	// Retry-cadence accounting. Registered FIRST so it runs LAST (defers are
+	// LIFO), i.e. after the panic-recover defer below has settled retErr — a
+	// panicking provider must count as a failure, not a success.
+	//
+	// recordOutcome is cleared on the one path that is neither: a quarantined
+	// provider's observe-only cycle, where the daemon deliberately did not
+	// attempt the work and so has learned nothing about whether it would
+	// succeed.
+	recordOutcome := true
+	defer func() {
+		if !recordOutcome {
+			return
+		}
+		if retErr != nil {
+			d.noteCycleFailure(providerType)
+			return
+		}
+		d.noteCycleSuccess(providerType)
+		d.clearCycleOutcomeThrottle(providerType)
+	}()
+
 	// Recover from panics so one misbehaving provider can't take down the loop.
 	defer func() {
 		if r := recover(); r != nil {
@@ -670,6 +1030,14 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	provider, err := d.getProvider(providerType)
 	if err != nil {
 		slog.Warn("reconcile-daemon: provider not found", "provider", providerType, "err", err)
+		// The provider has left the registry: drop its throttle and backoff
+		// keys rather than leaving them to accumulate for the process
+		// lifetime, and do not count this against a retry streak it can no
+		// longer work off.
+		recordOutcome = false
+		d.forgetProviderThrottles(providerType)
+		d.backoff.Forget(providerType)
+		d.liftQuarantine(providerType, "provider left the registry")
 		return err
 	}
 
@@ -689,6 +1057,13 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		return fmt.Errorf("LoadConfig %s: %w", providerType, err)
 	}
 	d.clearPhaseFailureThrottle(providerType, "LoadConfig")
+
+	// Fingerprint the freshly-loaded config and lift quarantine if the
+	// operator has changed it since the provider was quarantined. Done here,
+	// immediately after LoadConfig, so it also covers providers that fail in a
+	// LATER phase (FetchLive against an unreachable peer) — those never reach
+	// the actuation gate below, but their config can still be fixed.
+	d.reviewQuarantine(providerType, configFingerprint(config))
 
 	// Step 2: FetchLive — read-only observation of world state.
 	fetchStart := time.Now()
@@ -797,6 +1172,41 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		return nil
 	}
 
+	// Actuation gate. A quarantined provider still runs everything above this
+	// line — LoadConfig, FetchLive, ComputePlan, and the convergence
+	// observation below — and stops only at ApplyPlan.
+	//
+	// "Stop actuating" rather than "stop looking" is what keeps the terminal
+	// state honest. Skipping the whole cycle would freeze the anomaly tracker
+	// for that provider, so the episode could never clear and the counter
+	// would pin at 1 reporting a condition that may have resolved hours ago —
+	// an always-on stale alarm, which is the same disease as the always-firing
+	// one this change exists to cure. Keeping the read-only prefix alive
+	// preserves drift detection, health observation, and episode-clearing by
+	// construction.
+	if d.isQuarantined(providerType) {
+		dur := time.Since(start)
+		span.SetAttributes(attribute.Int64("cycle.duration_ms", dur.Milliseconds()))
+		span.SetAttributes(phaseAttrs()...)
+		span.SetAttributes(attribute.Bool("cycle.quarantined", true))
+
+		// Neither success nor failure: the work was not attempted. Hold the
+		// retry window at full depth so observation continues at the widened
+		// cadence instead of every tick.
+		recordOutcome = false
+		d.backoff.Hold(providerType, int(d.tickSeq.Load()))
+		d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs)
+
+		slog.Debug("reconcile-daemon: drift observed but provider quarantined",
+			"provider", providerType,
+			"creates", plan.Summary.Creates,
+			"updates", plan.Summary.Updates,
+			"deletes", plan.Summary.Deletes,
+			"duration_ms", dur.Milliseconds(),
+		)
+		return nil
+	}
+
 	// Step 5: ApplyPlan — idempotent per ADR-092 §3.
 	applyStart := time.Now()
 	results, err := provider.ApplyPlan(spanCtx, plan)
@@ -859,9 +1269,20 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 	span.SetAttributes(attribute.Int64("cycle.duration_ms", dur.Milliseconds()))
 	span.SetAttributes(phaseAttrs()...)
 
+	// Level decision for the cycle summary. Warn on a new or changed failure
+	// outcome, Debug on a byte-identical repeat of one already reported. The
+	// message and fields below are unchanged — only which level they go out
+	// at. See cycleOutcomeChanged.
 	logLevel := slog.LevelInfo
 	if applyFailed > 0 {
-		logLevel = slog.LevelWarn
+		fingerprint := fmt.Sprintf("c=%d,u=%d,d=%d,s=%d,f=%d",
+			plan.Summary.Creates, plan.Summary.Updates, plan.Summary.Deletes,
+			plan.Summary.Skipped, applyFailed)
+		if d.cycleOutcomeChanged(providerType, fingerprint) {
+			logLevel = slog.LevelWarn
+		} else {
+			logLevel = slog.LevelDebug
+		}
 	}
 	slog.Log(ctx, logLevel, "reconcile-daemon: cycle complete",
 		"provider", providerType,
