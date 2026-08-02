@@ -115,23 +115,23 @@ The kernel has three internal layers:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Membrane          HTTP API · MCP Server · Provider Router   │
+│  API Layer         HTTP API · MCP Server · Provider Router   │
 │                    Event Broker (SSE) · Config API           │
 ├──────────────────────────────────────────────────────────────┤
 │  Workspace         Context Engine · Memory · Ledger          │
 │                    Salience Scorer · Blob Store · Traces     │
 │                    Conversation Sidecars · Kernel Slog       │
 ├──────────────────────────────────────────────────────────────┤
-│  Nucleus           Process Loop · Identity · State FSM       │
+│  Process Core      Process Loop · Identity · State FSM       │
 │                    Agent Harness · CogBus · Tool-call Gate   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Membrane** is the API surface. Serves OpenAI and Anthropic-compatible chat endpoints, the always-on MCP Streamable HTTP server, the Anthropic Messages API proxy, the event broker with SSE streaming, and the config mutation API. Routes inference requests to local or cloud providers. Binds to `127.0.0.1:6931` by default; `--bind` or `bind_addr` in YAML relaxes CORS when set to a non-loopback interface.
+**API Layer** is the kernel's HTTP and MCP surface. Serves OpenAI and Anthropic-compatible chat endpoints, the always-on MCP Streamable HTTP server, the Anthropic Messages API proxy, the event broker with SSE streaming, and the config mutation API. Routes inference requests to local or cloud providers. Binds to `127.0.0.1:6931` by default; `--bind` or `bind_addr` in YAML relaxes CORS when set to a non-loopback interface.
 
 **Workspace** is where state lives. The context engine scores documents and arranges them into stability zones optimized for KV cache reuse. The ledger is append-only and hash-chained. Traces capture attention, proprioceptive state, and internal request metabolites. Conversation sidecars persist full turn text. Memory persists across sessions.
 
-**Nucleus** is the process loop. Runs continuously through four states (Active, Receptive, Consolidating, Dormant). Manages identity, consolidation, workspace lifecycle, the homeostatic agent harness, the tool-call hallucination gate, and emits to the kernel slog (stderr tee plus `.cog/run/kernel.log.jsonl`).
+**Process Core** is the kernel's control loop. Runs continuously through four states (Active, Receptive, Consolidating, Dormant). Manages identity, consolidation, workspace lifecycle, the homeostatic agent harness, the tool-call hallucination gate, and emits to the kernel slog (stderr tee plus `.cog/run/kernel.log.jsonl`).
 
 ---
 
@@ -147,7 +147,7 @@ The context engine:
 
 | Zone | Contents | Behavior |
 |------|----------|----------|
-| 0: Nucleus | Identity, system config | Always present, never evicted |
+| 0: Core | Identity, system config | Always present, never evicted |
 | 1: Knowledge | Workspace docs, indexed memory | Shifts slowly, high cache hit rate |
 | 2: History | Conversation turns | Scored by relevance, evictable |
 | 3: Current | The current message | Always present |
@@ -166,7 +166,6 @@ The model sees a pre-focused window instead of everything-or-nothing. Zone order
 - **Foveated context assembly.** A live `UserPromptSubmit` hook fires on every prompt. Documents are ranked and arranged into stability zones optimized for KV cache reuse.
 - **Workspace memory.** Hierarchical memory with salience scoring and temporal attention. Your workspace remembers across sessions, models, and tools. Switch from Claude Code to Cursor and back. Same memory, same context.
 - **Conversation persistence.** `turn.completed` ledger events plus a per-session sidecar at `.cog/run/turns/<sessionID>.jsonl` preserve full prompt and response text.
-- **Foveated decomposition pipeline.** `cog decompose` processes any input through the kernel into four tiers: Tier 0 (one-sentence), Tier 1 (paragraph), Tier 2 (full CogDoc with sections and embeddings), Tier 3 (raw, gated). Includes an interactive workbench TUI (`--workbench`), embedding co-generation, content-addressed CogDoc storage, and bus event emission.
 
 ### Inference and routing
 
@@ -181,8 +180,7 @@ The model sees a pre-focused window instead of everything-or-nothing. Zone order
 
 ### Coordination
 
-- **Reconcilers.** A generic plan/apply control loop (in `pkg/reconcile`) runs registered providers: agent, component, discord, eval, mcp-tools, service, and cogdoc-review. Each provider implements `Reconcilable` (seven methods: Type, LoadConfig, FetchLive, ComputePlan, ApplyPlan, BuildState, Health). The orchestrator handles plan, apply, drift detection, topological ordering (Kahn's sort), and three-axis status (Sync, Health, Operation) for all providers.
-- **Cogdoc Review Reconciler.** Layer A deterministic prior-art gate for cogdoc authoring: deduplication check before any LLM write, with LLM-generated abstract synthesis for the observatory ingest path.
+- **Reconcilers.** A generic plan/apply control loop (in `pkg/reconcile`) runs 27 registered providers: 11 core kernel functions (agent, discord, eval, identity, mcp-tools, openclaw-agents, openclaw-cron, openclaw-gateway, pin, self-update, service), 8 workspace and integration providers (component, conversations, site, margin-bridge, lms-model-state, mlx-inference, vitals-retention, and one worktree reconciler per managed repo), and 8 corpus-observatory reconcilers (projection-compiler plus 7 lineage-projection kinds). Run `cogos reconcile --help` for the current live list. Each provider implements `Reconcilable` (seven methods: Type, LoadConfig, FetchLive, ComputePlan, ApplyPlan, BuildState, Health). The orchestrator handles plan, apply, drift detection, topological ordering (Kahn's sort), and three-axis status (Sync, Health, Operation) for all providers.
 - **Kernel-native session management.** `SessionRegistry` + `HandoffRegistry` with atomic-claim semantics: first-wins enforced at the bus boundary, not just in the in-memory cache. Bus stays ground truth; the registries are derived views rebuilt from seq-sorted replay on startup.
 - **Native agent harness.** A homeostatic assessment loop runs as a goroutine inside the kernel. Calls a local model via Ollama with six kernel-native tools. Adaptive interval (5m-30m) based on assessment urgency, with panic recovery.
 - **MCP Streamable HTTP.** Full MCP transport at `POST /mcp` with JSON-RPC 2.0, session management, and 30-minute expiry. Always-on (no build tag). 54 tools spanning observability, agent control, config, memory, sessions, handoffs, voice, and conversation search.
@@ -351,7 +349,6 @@ Ships with adapters for Anthropic, Ollama, Claude Code, Codex, and vLLM (PagedAt
 ```sh
 cog serve               # Start the daemon (--bind <addr> to expose beyond loopback)
 cog claude              # Launch Claude Code with ANTHROPIC_BASE_URL set to the kernel
-cog decompose ...       # Run the 4-tier foveated decomposition pipeline
 cog emit ...            # Write an event through the engine (no more silent drops)
 cog bus watch|tail|list # Read the event bus
 cog bus send ...        # Write to the bus. Direct JSONL by default; --http for SSE broadcast
@@ -495,7 +492,6 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 - Anthropic Messages API proxy with streaming SSE
 - Native Go agent harness with adaptive interval and 6 kernel tools
 - Embedded web dashboard with agent status, cycle history, and decomposition panel
-- Foveated decomposition pipeline (`cog decompose`) with 4-tier output, workbench TUI, embeddings, and bus events
 - Library extraction: 8 packages in pkg/ (ADR-100; pkg/substrate added)
 - Content-addressed blob store
 - Git-derived salience scoring
@@ -545,7 +541,7 @@ Per-release summaries: the [Releases page](https://github.com/myrgic/cogos/relea
 - [Writing a Provider](docs/writing-a-provider.md): How to add a new inference provider
 - [MCP Specification](docs/MCP-SPEC.md): MCP server contract
 - [Provider Specification](docs/PROVIDER-SPEC.md): Provider interface contract
-- [Architecture Diagrams](docs/architecture-diagram-source.md): Cell model, topology views
+- [Architecture Diagrams](docs/architecture-diagram-source.md): Kernel layer diagrams, topology views
 - [Cognitive GitOps](docs/architecture/cognitive-gitops.md): Substrate-coordinated repo model
 - [E2E Test Plan](docs/E2E-TEST-PLAN.md): End-to-end test strategy
 
