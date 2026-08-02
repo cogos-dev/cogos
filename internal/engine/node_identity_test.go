@@ -369,8 +369,8 @@ func TestResolveNodeID_AdoptionSourceIsDeterministic(t *testing.T) {
 // COG_NODE_ID is the operator escape hatch and the clean way to provision a
 // child. COGOS_NODE_ID is a DIFFERENT, pre-existing variable owned by the
 // presence hooks, where it holds `$(hostname -s)` — honoring it here would let
-// exporting COGOS_NODE_ID=darkstar silently rewrite SourceIdentity on every
-// emitted block to the string "darkstar".
+// exporting COGOS_NODE_ID=node-a silently rewrite SourceIdentity on every
+// emitted block to the string "node-a".
 func TestResolveNodeID_EnvPin(t *testing.T) {
 	const legacy = "3e264177-983d-4c2c-8775-72dd6d6813d7"
 	pin := uuid.NewString()
@@ -390,10 +390,10 @@ func TestResolveNodeID_EnvPin(t *testing.T) {
 		home := t.TempDir()
 		establishNodeTier(t, home, true)
 		useHome(t, home)
-		t.Setenv(nodeIDEnvVar, "darkstar")
+		t.Setenv(nodeIDEnvVar, "node-a")
 
 		got := resolveNodeID(nodeIdentWorkspace(t, legacy))
-		if got == "darkstar" {
+		if got == "node-a" {
 			t.Fatal("a malformed COG_NODE_ID became the node identity")
 		}
 		if got != legacy {
@@ -405,10 +405,10 @@ func TestResolveNodeID_EnvPin(t *testing.T) {
 		home := t.TempDir()
 		establishNodeTier(t, home, true)
 		useHome(t, home)
-		t.Setenv("COGOS_NODE_ID", "darkstar")
+		t.Setenv("COGOS_NODE_ID", "node-a")
 
 		got := resolveNodeID(nodeIdentWorkspace(t, legacy))
-		if got == "darkstar" {
+		if got == "node-a" {
 			t.Fatal("the hooks' COGOS_NODE_ID (a hostname) was used as the kernel node id")
 		}
 		if got != legacy {

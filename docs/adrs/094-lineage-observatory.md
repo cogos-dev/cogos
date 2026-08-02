@@ -71,7 +71,7 @@ with three new frontmatter fields:
 |------|---------|--------------------------|
 | 1 | Established science; published, peer-reviewed | Yes — directly |
 | 2 | Structural parallel; well-grounded but not peer-reviewed as stated | Yes — with framing |
-| 3 | Working hypothesis; Chaz-developed claim needing validation | Only with demotion template |
+| 3 | Working hypothesis; operator-developed claim needing validation | Only with demotion template |
 | 4 | Universal/cosmological claim; speculative scope | Requires explicit disclaimer |
 
 ### §3 — ProjectionReconciler as substrate primitive

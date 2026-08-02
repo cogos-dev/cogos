@@ -198,7 +198,7 @@ Same three operations at every level: fork, merge, die.
     ┃       │                    │                                 ┃
     ┃  ┌────▼──────────────┐  ┌──▼───────────────────┐            ┃
     ┃  │ Workspace: "home" │  │ Workspace: "work"    │            ┃
-    ┃  │ Identity: Chaz    │  │ Identity: Team-Infra  │            ┃
+    ┃  │ Identity: Owner   │  │ Identity: Team-Infra  │            ┃
     ┃  │ Memory: personal  │  │ Memory: work docs     │            ┃
     ┃  │ Ledger: ██████    │  │ Ledger: ██████        │            ┃
     ┃  └───────────────────┘  └──────────────────────┘            ┃

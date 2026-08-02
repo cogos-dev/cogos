@@ -96,6 +96,20 @@ def _state_path() -> Path:
     return Path.home() / ".claude" / "state" / "proprioception" / "post-turn.json"
 
 
+def _home_project_dir() -> Path:
+    """Return this machine's Claude Code project bucket for $HOME.
+
+    Claude Code names each project bucket after the project directory's path
+    with every separator replaced by a hyphen (/home/alice -> -home-alice),
+    under ~/.claude/projects/. Deriving the slug from Path.home() keeps this
+    correct for any operator; hardcoding one developer's slug silently turned
+    every collector below into a no-op for everyone else (the directory simply
+    never existed, and the is_dir() guards returned the empty result).
+    """
+    home = Path.home()
+    return home / ".claude" / "projects" / str(home).replace(os.sep, "-")
+
+
 # ---------- Field collectors (each individually bounded) -------------------
 
 
@@ -167,7 +181,7 @@ def _gh_recent_merges(repo: str, hours: int = 24) -> int | None:
 
 def _memory_recent_writes(window_seconds: int = 3600) -> dict[str, Any]:
     """Count and find latest mtime under user memory dir within window."""
-    base = Path.home() / ".claude" / "projects" / "-Users-slowbro" / "memory"
+    base = _home_project_dir() / "memory"
     info: dict[str, Any] = {"recent_writes_count": 0, "last_write_iso": None}
     try:
         if not base.is_dir():
@@ -204,7 +218,7 @@ def _observatory_unindexed_bytes() -> int | None:
     substrate-side Observatory reconciler can replace this with a real
     indexed-through-watermark when it lands (cogos#300).
     """
-    base = Path.home() / ".claude" / "projects" / "-Users-slowbro"
+    base = _home_project_dir()
     try:
         if not base.is_dir():
             return None

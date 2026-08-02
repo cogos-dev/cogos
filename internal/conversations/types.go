@@ -71,7 +71,7 @@ type SessionMeta struct {
 	// SourceSize records the source file size at index time (drift detection).
 	SourceSize int64 `json:"source_size"`
 
-	// Identity is the operator identity extracted from the JSONL (e.g. "slowbro").
+	// Identity is the operator identity extracted from the JSONL (e.g. "example-user").
 	// Populated from userType/sessionId/cwd fields present in the records.
 	Identity string `json:"identity,omitempty"`
 

@@ -251,7 +251,7 @@ implementation begins.
 #### Primitive 1: Conversations Observatory
 
 **What it is:** A Reconcilable that ingests the session JSONLs from
-`~/.claude/projects/-Users-slowbro/*.jsonl` (and analogous locations on other nodes),
+`~/.claude/projects/<project-slug>/*.jsonl` (and analogous locations on other nodes),
 projects them as cogblocks/events on the substrate bus, and exposes them as queryable
 records via `cog_search_conversations` and related MCP tools.
 
