@@ -48,7 +48,7 @@ relations: {}
   id: hermes-statedb.v1
   version: 1.0.0
   sources:
-    - hermes-darkstar
+    - hermes-node-a
     - hermes-cog
   ontology: "cogos.conversations@^1"
 rules:
@@ -125,7 +125,7 @@ func TestCoverageCache_SkipServesFromCacheWithoutReparse(t *testing.T) {
 	writeHermesOntologyDir(t, ontDir)
 
 	// 4 user + 3 assistant (intended) + 2 tool (degenerate) = 9 mapped, 2 degenerate.
-	source := "hermes-darkstar"
+	source := "hermes-node-a"
 	ts := "2026-06-10T00:00:00Z"
 	var lines []string
 	for i := 1; i <= 4; i++ {
@@ -226,7 +226,7 @@ func TestCoverageCache_RemovedSourceIsPruned(t *testing.T) {
 	ontDir := filepath.Join(root, ".cog", "observatory", "ontology")
 	writeHermesOntologyDir(t, ontDir)
 
-	source := "hermes-darkstar"
+	source := "hermes-node-a"
 	ts := "2026-06-10T00:00:00Z"
 	var lines []string
 	for i := 1; i <= 3; i++ {

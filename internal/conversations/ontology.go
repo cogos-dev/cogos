@@ -241,7 +241,7 @@ type LoadedOntology struct {
 
 	// L2 maps source-id → mapping document. Source-id matches the observer
 	// source declaration in ingest records (e.g. "claude-code-jsonl",
-	// "hermes-darkstar", "hermes-cog").
+	// "hermes-node-a", "hermes-cog").
 	L2 map[string]*MappingDoc
 
 	// MappedComponents is the union of L1 component names that any loaded
@@ -279,7 +279,7 @@ func ParseMappingDoc(data []byte) (*MappingDoc, error) {
 //
 // Source routing for L2: a mapping doc that declares mapping.source is keyed
 // under that source id; a mapping doc with mapping.sources (list) is keyed
-// under each. The hermes-statedb mapping declares sources: [hermes-darkstar,
+// under each. The hermes-statedb mapping declares sources: [hermes-node-a,
 // hermes-cog], so both sources share the same mapping doc.
 func LoadOntologyDir(ontologyDir string) (*LoadedOntology, error) {
 	if _, err := os.Stat(ontologyDir); os.IsNotExist(err) {

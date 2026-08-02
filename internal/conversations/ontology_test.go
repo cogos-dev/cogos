@@ -234,7 +234,7 @@ rules:
   id: hermes-statedb.v1
   version: 1.0.0
   sources:
-    - hermes-darkstar
+    - hermes-node-a
     - hermes-cog
   ontology: "cogos.conversations@^1"
 rules:
@@ -264,12 +264,12 @@ func TestLoadOntologyDir_LoadsL1AndL2(t *testing.T) {
 		t.Errorf("OntologyRef: want cogos.conversations@1.0.0, got %q", lo.OntologyRef)
 	}
 
-	// L2 should have 3 source entries: claude-code-jsonl, hermes-darkstar, hermes-cog
+	// L2 should have 3 source entries: claude-code-jsonl, hermes-node-a, hermes-cog
 	if _, ok := lo.L2["claude-code-jsonl"]; !ok {
 		t.Error("expected claude-code-jsonl in L2")
 	}
-	if _, ok := lo.L2["hermes-darkstar"]; !ok {
-		t.Error("expected hermes-darkstar in L2")
+	if _, ok := lo.L2["hermes-node-a"]; !ok {
+		t.Error("expected hermes-node-a in L2")
 	}
 	if _, ok := lo.L2["hermes-cog"]; !ok {
 		t.Error("expected hermes-cog in L2")

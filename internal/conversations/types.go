@@ -217,7 +217,7 @@ type sourceFileInfo struct {
 // and ApplyPlan re-parses every file of the source to rebuild its sessions.
 type ingestSourceInfo struct {
 	// Source is the observer-declared source id (directory name, e.g.
-	// "hermes-darkstar").
+	// "hermes-node-a").
 	Source string
 
 	// Dir is the absolute path of the source directory.

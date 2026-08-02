@@ -150,14 +150,14 @@ func TestToolEmitEvent_PeerUtteranceValid(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
 	registerTestSession(t, registry, "opus-cog-node-a")
-	registerTestSession(t, registry, "gemma-cog-eclipse")
+	registerTestSession(t, registry, "gemma-cog-node-b")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
 		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse",
+			"to":      "gemma-cog-node-b",
 			"content": "What is the eigenform?",
 			"turn":    float64(1),
 		},
@@ -181,14 +181,14 @@ func TestToolEmitEvent_PeerUtterance_MissingFromSession(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
 	registerTestSession(t, registry, "opus-cog-node-a")
-	registerTestSession(t, registry, "gemma-cog-eclipse")
+	registerTestSession(t, registry, "gemma-cog-node-b")
 
 	input := emitEventInput{
 		Type: "peer.utterance",
 		// FromSession intentionally omitted
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse",
+			"to":      "gemma-cog-node-b",
 			"content": "Hello",
 			"turn":    float64(1),
 		},
@@ -203,14 +203,14 @@ func TestToolEmitEvent_PeerUtterance_UnregisteredFrom(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
 	// Register only the "to" session; "from" is not registered.
-	registerTestSession(t, registry, "gemma-cog-eclipse")
+	registerTestSession(t, registry, "gemma-cog-node-b")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
 		FromSession: "opus-cog-node-a", // not registered
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse",
+			"to":      "gemma-cog-node-b",
 			"content": "Hello",
 			"turn":    float64(1),
 		},
@@ -232,7 +232,7 @@ func TestToolEmitEvent_PeerUtterance_UnregisteredTo(t *testing.T) {
 		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse", // not registered
+			"to":      "gemma-cog-node-b", // not registered
 			"content": "Hello",
 			"turn":    float64(1),
 		},
@@ -247,7 +247,7 @@ func TestToolEmitEvent_PeerUtterance_FromSessionMismatch(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
 	registerTestSession(t, registry, "opus-cog-node-a")
-	registerTestSession(t, registry, "gemma-cog-eclipse")
+	registerTestSession(t, registry, "gemma-cog-node-b")
 	registerTestSession(t, registry, "haiku-cog-aux")
 
 	input := emitEventInput{
@@ -255,7 +255,7 @@ func TestToolEmitEvent_PeerUtterance_FromSessionMismatch(t *testing.T) {
 		FromSession: "haiku-cog-aux", // differs from payload.from
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse",
+			"to":      "gemma-cog-node-b",
 			"content": "Hello",
 			"turn":    float64(1),
 		},
@@ -270,14 +270,14 @@ func TestToolEmitEvent_PeerUtterance_EmptyContent(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
 	registerTestSession(t, registry, "opus-cog-node-a")
-	registerTestSession(t, registry, "gemma-cog-eclipse")
+	registerTestSession(t, registry, "gemma-cog-node-b")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
 		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse",
+			"to":      "gemma-cog-node-b",
 			"content": "", // empty
 			"turn":    float64(1),
 		},
@@ -292,14 +292,14 @@ func TestToolEmitEvent_PeerUtterance_MissingTurn(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
 	registerTestSession(t, registry, "opus-cog-node-a")
-	registerTestSession(t, registry, "gemma-cog-eclipse")
+	registerTestSession(t, registry, "gemma-cog-node-b")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
 		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse",
+			"to":      "gemma-cog-node-b",
 			"content": "Hello",
 			// turn missing
 		},
@@ -314,14 +314,14 @@ func TestToolEmitEvent_PeerUtterance_NonPositiveTurn(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
 	registerTestSession(t, registry, "opus-cog-node-a")
-	registerTestSession(t, registry, "gemma-cog-eclipse")
+	registerTestSession(t, registry, "gemma-cog-node-b")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
 		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
 			"from":    "opus-cog-node-a",
-			"to":      "gemma-cog-eclipse",
+			"to":      "gemma-cog-node-b",
 			"content": "Hello",
 			"turn":    float64(0), // invalid: must be >= 1
 		},
