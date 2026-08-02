@@ -6,9 +6,16 @@
 // spawned by the reconcile provider's ApplyPlan (or invoked manually). The
 // running daemon never reaches this code in-process. The full sequence:
 //
-//	lock → cleanup orphans → resolve → download → verify(sha256) → verify(version)
+//	lock → cleanup orphans → resolve → fetch checksums → verify(signature)
+//	     → download → verify(sha256) → verify(version)
 //	     → backup(copy) → atomic swap(rename) → kickstart → health poll
 //	     → on failure: rollback(restore .bak) → kickstart → re-poll → loud log
+//
+// verify(signature) is GATE L0 (cli_selfupdate_provenance.go). It proves
+// checksums.txt came from this repository's release workflow before any digest
+// is read out of it; verify(sha256) then proves the downloaded binary matches
+// the digest in that now-trusted file. Neither step is sufficient alone — the
+// checksum proves integrity, the signature proves provenance.
 //
 // Every destructive step has an all-or-nothing recovery. The .bak file is the
 // rollback point; the running binary is never left absent (backup is a COPY, so
@@ -34,6 +41,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/myrgic/cogos/internal/providers/selfupdate"
 )
 
 // kernelLaunchdLabel is the launchd job label for the CogOS kernel.
@@ -59,6 +68,19 @@ type selfUpdater struct {
 	force  bool
 	manual bool
 
+	// requireSig is the provenance posture ("enforce" | "warn" | "off"), read
+	// from <workspace>/.cog/config/self-update.yaml. See gateProvenance.
+	requireSig string
+	// identityRepo is the repository whose CI identity a signature must be
+	// bound to. It is the COMPILE-TIME canonical repo unless the operator set
+	// signature_repo, and is never derived from repo above — see
+	// verifyProvenance for why that separation is load-bearing.
+	identityRepo string
+	// allowUnsigned is the manual-path escape hatch for a release published
+	// before signing existed. It covers ONLY a missing signature, never an
+	// invalid one, and is never set on the automatic path.
+	allowUnsigned bool
+
 	// Seams (defaulted in newSelfUpdater; overridden in tests).
 	binDir         string                                               // directory holding the cogos binary
 	runDirOverride string                                               // when set, runDir() returns this (tests; avoids touching real ~/.cog/run)
@@ -67,8 +89,11 @@ type selfUpdater struct {
 	rollbackPoll   func(deadline time.Duration, expectTag string) error // re-poll after rollback
 	download       func(ctx context.Context, url, dst string) error     // fetch url → dst
 	fetchText      func(ctx context.Context, url string) (string, error)
-	smokeTest      func(binPath string) (version string, err error) // run `<bin> version`
-	logf           func(format string, args ...any)
+	// fetchOptional fetches an asset that may legitimately not exist (the
+	// signature and certificate on pre-signing releases): found=false on 404.
+	fetchOptional func(ctx context.Context, url string) (body string, found bool, err error)
+	smokeTest     func(binPath string) (version string, err error) // run `<bin> version`
+	logf          func(format string, args ...any)
 }
 
 // resolveAssetURLsFn is the network release-resolution seam, overridable in
@@ -78,22 +103,36 @@ var resolveAssetURLsFn = resolveAssetURLs
 // newSelfUpdater builds a selfUpdater with production seams.
 func newSelfUpdater(p selfUpdateApplyParams) *selfUpdater {
 	u := &selfUpdater{
-		repo:   p.Repo,
-		toTag:  p.ToTag,
-		root:   p.Workspace,
-		port:   p.Port,
-		force:  p.Force,
-		manual: p.Manual,
-		binDir: cogBinDir(),
+		repo:          p.Repo,
+		toTag:         p.ToTag,
+		root:          p.Workspace,
+		port:          p.Port,
+		force:         p.Force,
+		manual:        p.Manual,
+		allowUnsigned: p.AllowUnsigned,
+		binDir:        cogBinDir(),
 	}
 	if u.port == 0 {
 		u.port = 6931
 	}
+	// The detached updater is spawned with only --to/--repo/--port/--workspace,
+	// so it re-reads the provenance posture from the workspace config rather
+	// than having it passed on the command line. That keeps self-update.yaml
+	// the single source of truth and means an operator who tightens the setting
+	// gets it applied on the very next update, with no restart.
+	//
+	// An empty workspace resolves to enforce WITHOUT touching the filesystem;
+	// see SignatureSettingsFor. Otherwise the config path would be relative and
+	// resolve against this process's working directory.
+	sig := selfupdate.SignatureSettingsFor(p.Workspace)
+	u.requireSig = sig.Mode
+	u.identityRepo = sig.IdentityRepo
 	u.kickstart = u.kickstartKernel
 	u.healthPoll = u.pollHealth
 	u.rollbackPoll = u.healthPollExpect
 	u.download = downloadFile
 	u.fetchText = fetchText
+	u.fetchOptional = fetchOptionalText
 	u.smokeTest = smokeTestVersion
 	u.logf = func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "self-update: "+format+"\n", args...)
@@ -164,7 +203,26 @@ func (u *selfUpdater) runApply(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("download checksums: %w", err)
 	}
-	wantSum, ok := checksumFor(target.AssetName, sums)
+
+	// GATE L0 — PROVENANCE. Verify the Sigstore signature over checksums.txt
+	// BEFORE any digest is read out of it.
+	//
+	// The ordering is the security property, not an implementation detail.
+	// checksums.txt is fetched over the same unauthenticated channel as the
+	// binary, so an attacker who substitutes both produces a pair that matches
+	// by construction — GATE L below would pass happily. Only the signature
+	// distinguishes them, and only if it is checked first: the write-ahead
+	// immediately after this records the expected digest into kernel.toml, so
+	// verifying later would mean the ledger had already been written from
+	// unverified text.
+	//
+	// trustedSums, not sums, is what the digest is parsed from.
+	trustedSums, err := u.gateProvenance(ctx, target, sums)
+	if err != nil {
+		return fmt.Errorf("provenance verify: %w (running binary untouched)", err)
+	}
+
+	wantSum, ok := checksumFor(target.AssetName, trustedSums)
 	if !ok {
 		return fmt.Errorf("no checksum entry for %s in release checksums.txt", target.AssetName)
 	}
@@ -639,9 +697,11 @@ func resolveAssetURLs(ctx context.Context, repo, tag string) (*assetURLs, error)
 		return nil, err
 	}
 	return &assetURLs{
-		AssetName:   rt.AssetName,
-		AssetURL:    rt.AssetURL,
-		ChecksumURL: rt.ChecksumURL,
+		AssetName:      rt.AssetName,
+		AssetURL:       rt.AssetURL,
+		ChecksumURL:    rt.ChecksumURL,
+		SignatureURL:   rt.SignatureURL,
+		CertificateURL: rt.CertificateURL,
 	}, nil
 }
 
@@ -649,6 +709,10 @@ type assetURLs struct {
 	AssetName   string
 	AssetURL    string
 	ChecksumURL string
+	// SignatureURL / CertificateURL locate the Sigstore material GATE L0
+	// verifies checksums.txt against.
+	SignatureURL   string
+	CertificateURL string
 }
 
 // copyFileMode copies src to dst with the given mode. The copy is atomic: it

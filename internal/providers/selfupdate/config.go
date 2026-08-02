@@ -34,7 +34,106 @@ type SelfUpdateConfig struct {
 	CheckIntervalStr string        `yaml:"check_interval"` // raw "1h"/"30m"; parsed into CheckInterval
 	CheckInterval    time.Duration `yaml:"-"`              // never serialized; derived from CheckIntervalStr
 
+	// RequireSignature selects the provenance posture: "enforce" | "warn" | "off".
+	// See the SignaturePolicy constants for semantics and the migration rationale.
+	RequireSignature string `yaml:"require_signature"`
+
+	// SignatureRepo overrides the repository identity a release signature must
+	// be bound to. It defaults to the COMPILE-TIME defaultRepo, deliberately
+	// NOT to Repo above.
+	//
+	// WHY THESE ARE TWO SETTINGS AND NOT ONE.
+	//
+	// Repo names where the update is DOWNLOADED FROM. If the identity pin were
+	// derived from it, then anyone who can write this file could point both at
+	// their own fork, sign their own checksums.txt with their own perfectly
+	// genuine keyless Fulcio certificate, and the updater would verify it and
+	// log "provenance OK". That is strictly worse than no verification at all:
+	// `off` at least prints a warning, whereas a self-referential pin prints an
+	// affirmative green light over an attacker's binary.
+	//
+	// So the trust anchor is fixed in the binary and the download source is
+	// not. Retargeting where bytes come from is a config change; retargeting
+	// whose signature is acceptable requires saying so separately and explicitly
+	// — and even then it is logged loudly on every cycle.
+	SignatureRepo string `yaml:"signature_repo"`
+
+	// signatureKeyPresent records whether require_signature appeared in the file
+	// at all, which is what distinguishes "operator chose warn" from "pre-existing
+	// config written before this key existed". Never serialized.
+	signatureKeyPresent bool `yaml:"-"`
+
 	root string `yaml:"-"` // workspace root this config was loaded from; never serialized
+}
+
+// SignaturePolicy values for require_signature.
+//
+// MIGRATION — why the absent-key default is warn, not enforce.
+//
+// The task of this setting is to fail closed: an update whose provenance cannot
+// be proven must not be applied. But flipping straight to enforce on upgrade is
+// a live risk to a node running with auto_apply:true, because several
+// legitimate conditions produce an unverifiable-but-honest update:
+//
+//   - Releases published before provenance.FirstSignedRelease carry no
+//     signature at all. A node pinned to such a tag would stop updating.
+//   - A pipeline hiccup that drops the signing step would silently freeze the
+//     whole fleet's update path with no prior signal.
+//   - A missed Sigstore root rotation would do the same (see roots.go).
+//
+// None of those is an attack, and none should be discovered by an operator
+// noticing months later that their node never updated. So the rollout is
+// staged, and the stage is inferred from the config file rather than announced:
+//
+//	Stage 1 (this change) — key ABSENT in an existing config → SignatureWarn.
+//	  Verification runs on every update and the result is logged loudly, but a
+//	  failure does not block the swap. This buys real telemetry from the live
+//	  fleet at zero brick risk, and every cycle emits the deprecation notice
+//	  below so the flip cannot arrive unannounced.
+//	Stage 2 (next minor) — absent key flips to SignatureEnforce by changing
+//	  defaultRequireSignature to SignatureEnforce, a one-line, one-test change.
+//	  By then Stage 1's warnings have surfaced any release that would break.
+//
+// An operator who wants the end state today simply writes
+// `require_signature: enforce`, which is the documented recommendation. An
+// explicit `warn` or `off` is honoured and is NOT treated as unset, so a
+// deliberate choice never silently changes under the operator.
+const (
+	// SignatureEnforce fails closed: an update whose signature is absent,
+	// unverifiable, or bound to the wrong identity is refused and the running
+	// binary is left untouched.
+	SignatureEnforce = "enforce"
+
+	// SignatureWarn verifies and logs but does not block. Transitional.
+	SignatureWarn = "warn"
+
+	// SignatureOff skips verification entirely. Escape hatch for a wedged
+	// channel (missed root rotation, broken pipeline). Logs on every cycle so
+	// it cannot be set once and forgotten.
+	SignatureOff = "off"
+)
+
+// defaultRequireSignature is the posture applied when require_signature is
+// absent from an existing config file. Stage 2 of the migration flips this
+// single constant to SignatureEnforce.
+const defaultRequireSignature = SignatureWarn
+
+// SignatureModeUnset reports whether the operator has expressed a choice. The
+// provider uses this to emit the one-time-per-cycle migration notice.
+func (c *SelfUpdateConfig) SignatureModeUnset() bool { return !c.signatureKeyPresent }
+
+// DefaultRepo returns the compile-time canonical release repository. It is the
+// trust anchor for signature identity; see SignatureRepo.
+func DefaultRepo() string { return defaultRepo }
+
+// IdentityRepo returns the repository whose CI identity a release signature
+// must be bound to: the explicit signature_repo when set, otherwise the
+// compile-time default. Never c.Repo — see SignatureRepo for why.
+func (c *SelfUpdateConfig) IdentityRepo() string {
+	if c.SignatureRepo != "" {
+		return c.SignatureRepo
+	}
+	return defaultRepo
 }
 
 // Root returns the workspace root this config was loaded from (empty when the
@@ -51,11 +150,16 @@ const (
 // no auto-apply, 1h check interval. Used when no config file is present.
 func defaultConfig() *SelfUpdateConfig {
 	return &SelfUpdateConfig{
-		Enabled:       false,
-		Channel:       channelStable,
-		AutoApply:     false,
-		Repo:          defaultRepo,
-		CheckInterval: defaultCheckInterval,
+		Enabled:   false,
+		Channel:   channelStable,
+		AutoApply: false,
+		Repo:      defaultRepo,
+		// A config created fresh (no file on disk) has no legacy to protect, so
+		// it gets the end-state posture immediately. Only an EXISTING file that
+		// predates the key is granted the transitional warn default, in
+		// loadSelfUpdateConfig below.
+		RequireSignature: SignatureEnforce,
+		CheckInterval:    defaultCheckInterval,
 	}
 }
 
@@ -70,6 +174,19 @@ func selfUpdateConfigPath(root string) string {
 //   - read / parse error    → nil, err              (surfaces as a reconcile WARN)
 //   - success               → parsed config with defaults filled and validated
 func loadSelfUpdateConfig(root string) (*SelfUpdateConfig, error) {
+	// A RELATIVE root would make the config path resolve against the process's
+	// current working directory, so `cogos self-update` run from any writable
+	// directory would read THAT directory's .cog/config/self-update.yaml — and
+	// honour a `require_signature: off` planted there. The self-update path had
+	// no config read at all before provenance verification was added, so this
+	// guard closes surface that this change itself introduced.
+	//
+	// An empty root keeps its existing meaning (no workspace → the disabled
+	// default, no traffic, no swap); anything else must be absolute.
+	if root != "" && !filepath.IsAbs(root) {
+		return nil, fmt.Errorf("self-update: workspace root %q is not absolute; refusing to resolve config against the working directory", root)
+	}
+
 	path := selfUpdateConfigPath(root)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -85,6 +202,9 @@ func loadSelfUpdateConfig(root string) (*SelfUpdateConfig, error) {
 	cfg.root = root
 	// Reset duration so an explicit (or missing) check_interval is honoured by parse().
 	cfg.CheckInterval = 0
+	// Reset the posture so an ABSENT require_signature key is distinguishable
+	// from an explicit one after unmarshalling (see SignaturePolicy migration).
+	cfg.RequireSignature = ""
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("self-update: parsing %s: %w", path, err)
 	}
@@ -94,6 +214,18 @@ func loadSelfUpdateConfig(root string) (*SelfUpdateConfig, error) {
 	}
 	if cfg.Repo == "" {
 		cfg.Repo = defaultRepo
+	}
+	// Provenance posture: an existing file that predates the key gets the
+	// transitional default; an explicit value is always honoured verbatim.
+	cfg.signatureKeyPresent = cfg.RequireSignature != ""
+	if !cfg.signatureKeyPresent {
+		cfg.RequireSignature = defaultRequireSignature
+	}
+	switch cfg.RequireSignature {
+	case SignatureEnforce, SignatureWarn, SignatureOff:
+	default:
+		return nil, fmt.Errorf("self-update: %s: unknown require_signature %q (want enforce|warn|off)",
+			path, cfg.RequireSignature)
 	}
 	if err := cfg.parse(); err != nil {
 		return nil, fmt.Errorf("self-update: %s: %w", path, err)

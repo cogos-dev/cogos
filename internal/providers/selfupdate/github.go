@@ -38,6 +38,16 @@ type resolvedRelease struct {
 	AssetURL    string // download URL for cogos-<goos>-<goarch>
 	AssetName   string // "cogos-darwin-arm64"
 	ChecksumURL string // download URL for checksums.txt
+
+	// SignatureURL / CertificateURL locate the Sigstore keyless signature over
+	// checksums.txt and the Fulcio certificate that signed it. The release job
+	// uploads both alongside checksums.txt on every signed release
+	// (.github/workflows/release.yml, "Sign checksums.txt (Sigstore keyless)").
+	// Releases published before provenance.FirstSignedRelease have neither; the
+	// updater treats a 404 on these as "unsigned release" rather than as a
+	// verification failure.
+	SignatureURL   string // <base>/checksums.txt.sig
+	CertificateURL string // <base>/checksums.txt.pem
 }
 
 // cacheKey distinguishes cached results by the inputs that affect resolution.
@@ -146,11 +156,13 @@ func (r *ReleaseResolver) fetch(ctx context.Context, cfg *SelfUpdateConfig) (*re
 	assetName := AssetName()
 	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", cfg.Repo, rel.TagName)
 	return &resolvedRelease{
-		Tag:         rel.TagName,
-		Prerelease:  rel.Prerelease,
-		AssetName:   assetName,
-		AssetURL:    base + "/" + assetName,
-		ChecksumURL: base + "/checksums.txt",
+		Tag:            rel.TagName,
+		Prerelease:     rel.Prerelease,
+		AssetName:      assetName,
+		AssetURL:       base + "/" + assetName,
+		ChecksumURL:    base + "/checksums.txt",
+		SignatureURL:   base + "/checksums.txt.sig",
+		CertificateURL: base + "/checksums.txt.pem",
 	}, nil
 }
 
