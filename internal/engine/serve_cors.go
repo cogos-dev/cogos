@@ -37,7 +37,7 @@
 // MCP CLI, etc.) are untouched — the middleware only adds headers when an
 // Origin is present or the method is OPTIONS.
 //
-// Exclusion — /debug/* never gets CORS headers, full stop:
+// Exclusion — debug surfaces never get CORS headers, full stop:
 //
 // #505/#507 found that echoing Access-Control-Allow-Origin on the pprof +
 // expvar surface under /debug/ (mounted in serve_debug.go) is itself part of
@@ -49,6 +49,32 @@
 // deliberately does not want ANY CORS header on its responses, ever,
 // regardless of Origin. So /debug/ requests are excluded from this
 // middleware entirely before any Origin/header logic runs.
+//
+// #507's review then caught that the same read primitive applied unchanged to
+// the pre-existing /v1/debug/ endpoints (serve.go, handlers in debug.go):
+// /v1/debug/last returns a DebugSnapshot carrying the extracted query text of
+// the most recent chat request plus the filesystem paths of every injected
+// cogdoc, and /v1/debug/context returns the live context window. With the
+// star fallback above, any cross-origin page could read both bodies with a
+// plain simple GET — no preflight, no header tricks. Protecting a heap dump
+// four layers deep while leaving arguably more sensitive conversation content
+// open to the identical attack was an inconsistency, not a deliberate scope
+// choice, so isDebugPath below covers that prefix too.
+//
+// Why the /v1/debug/ endpoints get the CORS exclusion but NOT
+// debugLoopbackOnly: unlike /debug/pprof, they have real browser consumers —
+// the kernel serves its own dashboard at GET / and canvas at GET /canvas
+// (serve.go), and both fetch /v1/debug/last and /v1/debug/context with
+// `const API = window.location.origin`. Those are SAME-origin requests: the
+// browser's same-origin policy lets the page read the response without any
+// Access-Control-Allow-Origin header, so dropping CORS headers here costs
+// those UIs nothing while fully closing the cross-origin read. Applying
+// debugLoopbackOnly instead would break them outright — every dashboard fetch
+// carries a Referer, which that guard rejects by design. Triggering these
+// endpoints cross-origin without being able to read the response is harmless
+// (they are side-effect-free reads of an in-memory snapshot), which is why the
+// no-cors/img vector debugLoopbackOnly exists to stop on /debug/pprof/profile
+// — a 30s CPU burn — has no analogue here.
 package engine
 
 import (
@@ -73,11 +99,10 @@ func corsMiddleware(next http.Handler) http.Handler {
 	const maxAge = "86400"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// See the file-level "Exclusion" note: /debug/ is authenticated by
-		// debugLoopbackOnly and must never carry an Access-Control-* header,
-		// so it bypasses this middleware's logic entirely — not even the
-		// OPTIONS short-circuit below runs for it.
-		if strings.HasPrefix(r.URL.Path, "/debug/") {
+		// See the file-level "Exclusion" note: debug surfaces must never carry
+		// an Access-Control-* header, so they bypass this middleware's logic
+		// entirely — not even the OPTIONS short-circuit below runs for them.
+		if isDebugPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -121,6 +146,27 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isDebugPath reports whether a request path belongs to one of the kernel's
+// debug surfaces, which are excluded from CORS entirely (see the file-level
+// "Exclusion" note for why each one is here):
+//
+//	/debug/     — pprof + expvar (serve_debug.go), also behind debugLoopbackOnly
+//	/v1/debug/  — pipeline snapshot + context window (debug.go), same-origin
+//	              dashboard/canvas consumers only
+//
+// The bare, slashless forms are matched too so a future /v1/debug index route
+// cannot quietly land back inside the CORS middleware. Anything that is merely
+// prefixed by these strings without a path separator (e.g. /v1/debugger) is
+// NOT matched — that would be a different route with different exposure.
+func isDebugPath(path string) bool {
+	for _, p := range []string{"/debug", "/v1/debug"} {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // originAllowValue returns the value to place in Access-Control-Allow-Origin

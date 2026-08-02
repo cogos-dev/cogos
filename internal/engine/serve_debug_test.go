@@ -347,3 +347,104 @@ func TestDebugRoutes_NoAccessControlHeadersEver(t *testing.T) {
 		t.Errorf("Access-Control-Allow-Methods = %q; want empty on a /debug/ OPTIONS response", got)
 	}
 }
+
+// ── /v1/debug/* CORS exclusion (#507 review round 3) ─────────────────────
+
+// TestIsDebugPath covers the prefix matcher that decides which paths bypass
+// corsMiddleware. The negative cases matter as much as the positive ones: a
+// bare strings.HasPrefix("/debug") would also swallow unrelated future routes
+// like /debugger or /v1/debugging, silently dropping their CORS headers.
+func TestIsDebugPath(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/debug", true},
+		{"/debug/", true},
+		{"/debug/pprof/heap", true},
+		{"/debug/vars", true},
+		{"/v1/debug", true},
+		{"/v1/debug/", true},
+		{"/v1/debug/last", true},
+		{"/v1/debug/context", true},
+		{"/v1/chat/completions", false},
+		{"/v1/models", false},
+		{"/", false},
+		{"/debugger", false},
+		{"/v1/debugging", false},
+		{"/v1/debugger/last", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isDebugPath(tc.path); got != tc.want {
+			t.Errorf("isDebugPath(%q) = %v; want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestV1DebugRoutes_NoAccessControlHeadersEver is the sibling of
+// TestDebugRoutes_NoAccessControlHeadersEver, for the pre-existing
+// /v1/debug/ endpoints. /v1/debug/last returns the extracted query text of
+// the last chat request plus injected cogdoc paths; before this change
+// corsMiddleware's non-loopback "*" fallback let any cross-origin page read
+// that body with a plain simple GET (no preflight, since it's a simple
+// request). The exclusion removes the header the browser needs to permit
+// that read.
+func TestV1DebugRoutes_NoAccessControlHeadersEver(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+
+	for _, path := range []string{"/v1/debug/last", "/v1/debug/context"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "127.0.0.1:9999"
+		req.Header.Set("Origin", "http://evil.example.com")
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("%s: Access-Control-Allow-Origin = %q; want empty so a cross-origin page cannot read the body", path, got)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Errorf("%s: Access-Control-Allow-Credentials = %q; want empty", path, got)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Methods"); got != "" {
+			t.Errorf("%s: Access-Control-Allow-Methods = %q; want empty", path, got)
+		}
+	}
+}
+
+// TestV1DebugRoutes_SameOriginConsumersStillReachHandler pins the deliberate
+// asymmetry with /debug/pprof: /v1/debug/ gets the CORS exclusion but NOT
+// debugLoopbackOnly, because the kernel's own dashboard (GET /) and canvas
+// (GET /canvas) fetch these routes same-origin with `API =
+// window.location.origin`. A same-origin browser fetch sends a Referer and no
+// custom header — exactly the shape debugLoopbackOnly rejects — so applying
+// that guard here would 403 the dashboard. The handler must still be reached.
+func TestV1DebugRoutes_SameOriginConsumersStillReachHandler(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+
+	for _, path := range []string{"/v1/debug/last", "/v1/debug/context"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "127.0.0.1:9999"
+		// What a same-origin dashboard fetch actually looks like: a Referer,
+		// no Origin, and no X-Cogos-Debug header.
+		req.Header.Set("Referer", "http://127.0.0.1:6931/")
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+
+		// The test server has served no chat request, so the handler answers
+		// 404 "no requests yet". The point is that it is the *handler*
+		// answering, not debugLoopbackOnly's 403.
+		if w.Code == http.StatusForbidden {
+			t.Errorf("%s: got 403 — debugLoopbackOnly must not gate /v1/debug/, it would break the same-origin dashboard", path)
+		}
+		if w.Code != http.StatusOK && w.Code != http.StatusNotFound {
+			t.Errorf("%s: status = %d; want 200 or 404 from the handler", path, w.Code)
+		}
+		if !strings.Contains(w.Header().Get("Content-Type"), "application/json") {
+			t.Errorf("%s: Content-Type = %q; want the handler's JSON response", path, w.Header().Get("Content-Type"))
+		}
+	}
+}
