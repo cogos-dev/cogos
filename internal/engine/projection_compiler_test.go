@@ -391,8 +391,8 @@ func TestAcceptance_A5_SingleBlockModification(t *testing.T) {
 
 	// Modify a single block's content: swap a substring inside Quote 3's
 	// blockquote. The marker is a verbatim phrase from the fixture.
-	const marker = "This also means that the wave is initiated by the highest-energy distinction"
-	const replacement = "MODIFIED: the wave is initiated by the highest-energy distinction"
+	const marker = "This sentence is the fixture's designated mutation target"
+	const replacement = "MODIFIED: this sentence is the fixture's designated mutation target"
 	if !strings.Contains(string(originalData), marker) {
 		t.Fatalf("test marker %q not in fixture; update marker", marker)
 	}

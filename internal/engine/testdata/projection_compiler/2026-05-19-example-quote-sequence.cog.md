@@ -43,7 +43,7 @@ Second boundary; anchor `#quote-2`.
 
 ## Quote 3 — The load-bearing marker sentence
 
-> This also means that the wave is initiated by the highest-energy distinction and all other layers are necessarily topologically lower unless the level of local energy gradient is positive.
+> This sentence is the fixture's designated mutation target, and exactly one acceptance test rewrites a substring of it to prove that editing a single quote produces a single Update.
 
 This sentence is the fixture's mutation marker: the single-block-modification
 acceptance test swaps a substring inside it to prove that editing one quote
