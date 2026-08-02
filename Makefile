@@ -56,7 +56,7 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64 windows-amd64 windows-arm64
 
-.PHONY: all build clean test test-coverage test-integration bench install check-not-running image run e2e e2e-local $(PLATFORMS) $(BINARY)
+.PHONY: all build clean test test-coverage test-integration bench install check-not-running test-install-guard image run e2e e2e-local $(PLATFORMS) $(BINARY)
 
 # Default: build for current platform
 build: $(BINARY)
@@ -101,6 +101,12 @@ INSTALL_TARGET := $(INSTALL_DIR)/cogos
 # Set ALLOW_RUNNING_INSTALL=1 to override.
 check-not-running:
 	@scripts/lib/refuse-if-running.sh "$(INSTALL_TARGET)"
+
+# Functional regression suite for the guard above. Also wired into CI's lint
+# job; this target is the local entry point so the suite is discoverable
+# without reading ci.yml.
+test-install-guard:
+	@scripts/test-refuse-if-running.sh
 
 # Install to ~/.cog/bin/cogos (atomic: build, verify, checksum, move).
 # check-not-running runs first so the backup/cp/mv below never fire against

@@ -64,6 +64,28 @@ build_restricted_path() {
     done
 }
 
+# wait_for_guard_visible PID
+# Blocks until PID is visible to the SAME pgrep pattern the guard itself
+# uses, or ~5s elapses. Replaces a fixed `sleep 0.2` after each background
+# spawn: 0.2s is plenty on an idle laptop, but on a loaded CI runner the
+# child can be forked-but-not-yet-visible in the process table when the
+# assertion runs. The guard would then correctly see nothing running and
+# allow the install, turning an expect_refused scenario into a spurious
+# failure (or, worse, an expect_allowed scenario into a pass for the wrong
+# reason). Polling the real predicate removes the race instead of widening
+# the sleep and hoping.
+wait_for_guard_visible() {
+    local pid="$1" i=0
+    while [ "$i" -lt 100 ]; do
+        if pgrep -f '(^|/)cogos( |$)' 2>/dev/null | grep -qx "$pid"; then
+            return 0
+        fi
+        sleep 0.05
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # expect_allowed NAME TARGET
 # Asserts refuse_if_running returns 0 (safe to proceed).
 expect_allowed() {
@@ -156,8 +178,9 @@ expect_allowed "existing idle target" "$WORKDIR/idle-target"
 
 # --- Scenario 3: ALLOW_RUNNING_INSTALL=1 -> always allowed ---
 "$WORKDIR/bin/cogos" serve >/dev/null 2>&1 &
-BG_PIDS+=("$!"); disown "$!" 2>/dev/null || true
-sleep 0.2
+serve_pid=$!
+BG_PIDS+=("$serve_pid"); disown "$serve_pid" 2>/dev/null || true
+wait_for_guard_visible "$serve_pid" || echo "  WARN  pid $serve_pid never became visible to pgrep; next assertions may be unreliable"
 ALLOW_RUNNING_INSTALL=1
 export ALLOW_RUNNING_INSTALL
 expect_allowed "ALLOW_RUNNING_INSTALL=1 override" "$WORKDIR/bin/cogos"
@@ -169,14 +192,16 @@ expect_refused "target executed by a serve process" "$WORKDIR/bin/cogos" \
 
 # --- Scenario 5: a serve process running, but NOT executing this target -> allowed ---
 "$WORKDIR/decoy/cogos" serve >/dev/null 2>&1 &
-BG_PIDS+=("$!"); disown "$!" 2>/dev/null || true
-sleep 0.2
+decoy_pid=$!
+BG_PIDS+=("$decoy_pid"); disown "$decoy_pid" 2>/dev/null || true
+wait_for_guard_visible "$decoy_pid" || echo "  WARN  pid $decoy_pid never became visible to pgrep; next assertion may be unreliable"
 expect_allowed "serve process running a different target" "$WORKDIR/decoy/cogos-not-this-one"
 
 # --- Scenario 6: process executing the target WITHOUT 'serve' in argv -> allowed ---
 "$WORKDIR/noserve/cogos" version >/dev/null 2>&1 &
-BG_PIDS+=("$!"); disown "$!" 2>/dev/null || true
-sleep 0.2
+noserve_pid=$!
+BG_PIDS+=("$noserve_pid"); disown "$noserve_pid" 2>/dev/null || true
+wait_for_guard_visible "$noserve_pid" || echo "  WARN  pid $noserve_pid never became visible to pgrep; next assertion may be unreliable"
 expect_allowed "process executing target without 'serve' in argv" "$WORKDIR/noserve/cogos"
 
 # --- Scenario 7: pgrep missing from PATH -> refused ---
@@ -269,8 +294,9 @@ STUB
 mkdir -p "$WORKDIR/symlink-dir"
 ln -sf "$WORKDIR/real/cogos-binary" "$WORKDIR/symlink-dir/cogos"
 "$WORKDIR/symlink-dir/cogos" serve >/dev/null 2>&1 &
-BG_PIDS+=("$!"); disown "$!" 2>/dev/null || true
-sleep 0.2
+symlink_pid=$!
+BG_PIDS+=("$symlink_pid"); disown "$symlink_pid" 2>/dev/null || true
+wait_for_guard_visible "$symlink_pid" || echo "  WARN  pid $symlink_pid never became visible to pgrep; next assertion may be unreliable"
 expect_refused "symlinked install target executed via the symlink" "$WORKDIR/symlink-dir/cogos" \
     "is being executed by PID"
 

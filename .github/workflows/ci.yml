@@ -98,6 +98,18 @@ jobs:
       - name: Install guard coverage gate
         run: ./scripts/check-install-guard-coverage.sh
 
+      # Functional regression suite for the guard's actual detection logic.
+      # The two gates above are static: neither ever EXECUTES
+      # refuse_if_running, so a fail-open regression inside it (reverting the
+      # pgrep-exit-status capture, the symlink canonicalization, the
+      # unreadable-cmdline refusal) would sail through a fully green CI and
+      # ship to every caller that sources this one shared file. This step is
+      # what makes those scenarios load-bearing rather than decorative.
+      # Needs the Go toolchain (already set up above) to build the stand-in
+      # binary the suite execs; it SKIPs cleanly if go is unavailable.
+      - name: Install guard regression suite
+        run: ./scripts/test-refuse-if-running.sh
+
   e2e:
     runs-on: ubuntu-latest
     needs: build
