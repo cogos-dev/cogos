@@ -9,7 +9,6 @@
 #   make test     - Run tests
 #   make clean    - Remove build artifacts
 #   make install  - Install to ~/.cog/bin/cogos
-#   make push     - Build + push to OCI layout (triggers kernel auto-reload)
 #   make image    - Build production OCI image
 #   make e2e      - Run e2e test in a container
 #   make e2e-local - Run e2e test locally
@@ -57,7 +56,7 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64 windows-amd64 windows-arm64
 
-.PHONY: all build clean test test-coverage test-integration bench install push image run e2e e2e-local $(PLATFORMS) $(BINARY)
+.PHONY: all build clean test test-coverage test-integration bench install image run e2e e2e-local $(PLATFORMS) $(BINARY)
 
 # Default: build for current platform
 build: $(BINARY)
@@ -111,11 +110,6 @@ install: build
 	@NEW_SHA=$$(shasum -a 256 "$(INSTALL_TARGET)" | cut -d' ' -f1); \
 		echo "  Installed cogos $(VERSION) ($(GOOS)/$(GOARCH))"; \
 		echo "  SHA-256: $$NEW_SHA"
-
-# Push to OCI layout — running kernel auto-reloads
-push: build
-	@echo "=== Pushing to OCI layout ==="
-	@./$(BINARY) oci push ./$(BINARY)
 
 # Run tests
 test: build
