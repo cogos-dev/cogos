@@ -125,6 +125,38 @@ When Layer 2 retirement is attempted, the migration procedure is:
 
 ---
 
+## Conflict log (recorded, unresolved)
+
+Added alongside the change that made node identity machine-scoped
+(`internal/engine/node_identity.go`). Recorded here rather than resolved,
+because resolving it is an operator decision, not an implementation detail.
+
+- **ADR-065 §7 vs. RFC-033.** ADR-065 §7 places daemon runtime state at
+  workspace-scoped `.cog/run/daemon/state.yaml` (implemented verbatim in
+  `internal/engine/daemon_lifecycle.go`). RFC-033 says node-runtime state is
+  machine-local and must not live in the shared workspace `.cog/`. Both are
+  live. The node-identity change moved **identity only** and deliberately left
+  daemon state exactly where ADR-065 put it.
+- **ADR-065 §9 is what makes the bug reachable.** "Recursive Nesting" blesses a
+  CogOS kernel running inside a container managed by another CogOS kernel as a
+  first-class pattern. Combined with the `-v WorkspaceRoot:WorkspaceRoot` bind
+  mount, that is precisely how a child kernel came to read the host's
+  workspace-scoped `node_id` and clone its identity. ADR-065 predates RFC-033
+  and says nothing about identity separation; that silence was the gap.
+- **Which machine tier owns node state — `~/.cog/` or RFC-033's `~/.cogos/`?**
+  Unsettled. Identity currently lands in `~/.cog/node/`, adjacent to the tier
+  that already works (`~/.cog/etc` certs, `~/.cog/node/global.yaml`). When
+  RFC-033 settles it, this is a one-line change to `defaultNodeIdentityDir`,
+  and `COG_NODE_DIR` is already the migration seam.
+- **This ADR's Layer 3 is partially revived.** `~/.cog/node/identity.yaml`
+  remains orphaned — no Go code reads it. The new resolver does not write to it
+  and does not depend on it.
+
+Scoping authority for the change itself is RFC-036's 2026-07-29 operator ruling
+("node = hardware, workspace = the overlay"), not this ADR.
+
+---
+
 ## References
 
 - Three-layer identity model (L1/L2/L3) — (internal reference omitted)

@@ -9,9 +9,15 @@ import (
 	"testing"
 )
 
+// NOT t.Parallel: these tests point $HOME at a t.TempDir, and $HOME is process-
+// global. Combining t.Parallel with a global os.Setenv("HOME", …) leaked the
+// fake home to every concurrently-running test — which stayed invisible only
+// while nothing else resolved paths from $HOME. Node identity is now machine-
+// anchored (see node_identity.go), so a concurrent test that boots a Process
+// would materialize <tmp>/.cog/node inside this test's TempDir and break its
+// cleanup. t.Setenv is the correct primitive and refuses to run under
+// t.Parallel, which is exactly the constraint being honored here.
 func TestAddCogBinToPathWritesRCLine(t *testing.T) {
-	t.Parallel()
-
 	// Use a temp home with a pre-existing .bashrc so detectShellRC finds it.
 	tmp := t.TempDir()
 	bashrc := filepath.Join(tmp, ".bashrc")
@@ -19,14 +25,8 @@ func TestAddCogBinToPathWritesRCLine(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	origHome := os.Getenv("HOME")
-	origShell := os.Getenv("SHELL")
-	t.Cleanup(func() {
-		os.Setenv("HOME", origHome)
-		os.Setenv("SHELL", origShell)
-	})
-	os.Setenv("HOME", tmp)
-	os.Setenv("SHELL", "/bin/bash")
+	t.Setenv("HOME", tmp)
+	t.Setenv("SHELL", "/bin/bash")
 
 	if err := addCogBinToPath(); err != nil {
 		t.Fatalf("addCogBinToPath: %v", err)
@@ -42,8 +42,6 @@ func TestAddCogBinToPathWritesRCLine(t *testing.T) {
 }
 
 func TestAddCogBinToPathIdempotent(t *testing.T) {
-	t.Parallel()
-
 	tmp := t.TempDir()
 	binDir := filepath.Join(tmp, ".cog", "bin")
 	bashrc := filepath.Join(tmp, ".bashrc")
@@ -53,14 +51,8 @@ func TestAddCogBinToPathIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	origHome := os.Getenv("HOME")
-	origShell := os.Getenv("SHELL")
-	t.Cleanup(func() {
-		os.Setenv("HOME", origHome)
-		os.Setenv("SHELL", origShell)
-	})
-	os.Setenv("HOME", tmp)
-	os.Setenv("SHELL", "/bin/bash")
+	t.Setenv("HOME", tmp)
+	t.Setenv("SHELL", "/bin/bash")
 
 	if err := addCogBinToPath(); err != nil {
 		t.Fatalf("addCogBinToPath (second call): %v", err)
@@ -79,14 +71,8 @@ func TestAddCogBinToPathIdempotent(t *testing.T) {
 
 func TestDetectShellRCZsh(t *testing.T) {
 	tmp := t.TempDir()
-	orig := os.Getenv("HOME")
-	origShell := os.Getenv("SHELL")
-	t.Cleanup(func() {
-		os.Setenv("HOME", orig)
-		os.Setenv("SHELL", origShell)
-	})
-	os.Setenv("HOME", tmp)
-	os.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("HOME", tmp)
+	t.Setenv("SHELL", "/bin/zsh")
 	rc := detectShellRC()
 	if !strings.HasSuffix(rc, ".zshrc") {
 		t.Errorf("expected .zshrc; got %s", rc)
