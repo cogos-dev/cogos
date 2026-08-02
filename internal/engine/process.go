@@ -238,7 +238,7 @@ func NewProcess(cfg *Config, nucleus *Nucleus) *Process {
 		cfg:       cfg,
 		sessionID: uuid.New().String(),
 		startedAt: now,
-		NodeID:    loadOrCreateNodeID(cfg),
+		NodeID:    resolveNodeID(cfg),
 		TrustState: TrustState{
 			LocalScore:           1.0,
 			CoherenceFingerprint: "sha256:" + sha256Hex("coherence:unknown"),
@@ -1022,62 +1022,14 @@ func (p *Process) EmitEvent(eventType string, data map[string]interface{}, sourc
 	return nil
 }
 
-func loadOrCreateNodeID(cfg *Config) string {
-	if cfg == nil {
-		return uuid.NewString()
-	}
-	runDir := filepath.Join(cfg.CogDir, "run")
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
-		return uuid.NewString()
-	}
-	path := filepath.Join(runDir, "node_id")
-	// An already-persisted id is authoritative and never rewritten — it is
-	// referenced in the ledger, the manifest, and process attribution, so
-	// changing it would sever that history. Anchoring applies to MINTING only.
-	if data, err := os.ReadFile(path); err == nil {
-		if id := strings.TrimSpace(string(data)); id != "" {
-			return id
-		}
-	}
-	// Mint. Prefer the kernel's own BEP device identity so process.NodeID and
-	// the peer identity it presents on the wire are the SAME value (RFC-036,
-	// "sealed device identity" — collapses two identity primitives into one).
-	// Reads the cert file directly, so it is independent of whether the BEP
-	// engine is enabled/running (cluster.enabled may be false at this point in
-	// boot).
-	//
-	// ORDERING: NewProcess runs at boot.go:246, long before the cluster/BEP
-	// block (boot.go:432, branching on cluster.enabled at boot.go:445/516),
-	// and `bep-cert gen` is a manual CLI step that Boot never invokes. So on
-	// the realistic operator path — boot with
-	// cluster.enabled=false (the default), opt into clustering later — no cert
-	// exists at mint time and, because an existing id is never rewritten, the
-	// anchor would never activate for that node. Reading the cert alone is
-	// therefore not sufficient: we MINT the device identity here if it is
-	// absent, so that the node's first-ever id is device-anchored regardless of
-	// when (or whether) clustering is later enabled.
-	//
-	// This does not weaken dark-by-default: dark-by-default is a statement about
-	// network behavior (no listener, no goroutines, no port bind), and that is
-	// unchanged. Creating the local keypair is a filesystem-only act, the same
-	// class as minting the UUID it replaces.
-	id := bepAnchoredNodeID()
-	if id == "" {
-		if err := ensureBEPDeviceIdentity(); err == nil {
-			id = bepAnchoredNodeID()
-		} else {
-			slog.Debug("nodeid: could not mint BEP device identity; using UUID",
-				"err", fmt.Sprintf("%v", err))
-		}
-	}
-	if id == "" {
-		id = uuid.NewString()
-	}
-	if err := os.WriteFile(path, []byte(id+"\n"), 0o644); err != nil {
-		return id
-	}
-	return id
-}
+// Node-id RESOLUTION (which id this kernel uses, and where it is cached) lives
+// in node_identity.go — see resolveNodeID. It is machine-scoped: caching the id
+// under the workspace, as this file used to, let a containerized child kernel
+// read the host's file through the `-v WorkspaceRoot:WorkspaceRoot` bind mount
+// and adopt the host's identity.
+//
+// What remains here is node-id MINTING, unchanged: the cert-anchoring chain
+// from cogos#474 (RFC-036). resolveNodeID calls into it via mintNodeID.
 
 // nodeIDCertDir resolves the BEP cert dir used for node-id anchoring. It is a
 // package var solely so tests can point it at a t.TempDir() and stay hermetic;

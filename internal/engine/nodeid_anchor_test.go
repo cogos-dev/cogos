@@ -37,10 +37,27 @@ func useTempCertDir(t *testing.T) string {
 	return dir
 }
 
+// useTempNodeDir points machine-local node-id storage at an isolated dir so no
+// test reads or writes the real ~/.cog/node.
+//
+// The returned path deliberately does NOT exist yet: its existence is one of the
+// two migration-gate probes (machineHasPriorNodeTier), so pre-creating it would
+// wedge the gate open in every test. A test that wants to simulate an
+// established machine creates it explicitly, or generates a cert.
+func useTempNodeDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "node")
+	prev := nodeIDDir
+	nodeIDDir = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { nodeIDDir = prev })
+	return dir
+}
+
 // A freshly-minted node id equals the formatted BEP DeviceID when a cert is
 // already on disk in the cert dir.
 func TestNodeID_AnchoredToDeviceIDOnMint(t *testing.T) {
 	certDir := useTempCertDir(t)
+	useTempNodeDir(t)
 	if err := bep.GenerateBEPCert(certDir); err != nil {
 		t.Fatalf("generate cert: %v", err)
 	}
@@ -51,7 +68,7 @@ func TestNodeID_AnchoredToDeviceIDOnMint(t *testing.T) {
 	}
 
 	cfg := writeNodeIDCfg(t)
-	got := loadOrCreateNodeID(cfg)
+	got := resolveNodeID(cfg)
 	if got != want {
 		t.Fatalf("minted node id = %q, want device-anchored %q", got, want)
 	}
@@ -59,7 +76,7 @@ func TestNodeID_AnchoredToDeviceIDOnMint(t *testing.T) {
 		t.Fatalf("minted node id %q is not a parseable device id: %v", got, err)
 	}
 	// Persisted, and identical on a second load.
-	if again := loadOrCreateNodeID(cfg); again != got {
+	if again := resolveNodeID(cfg); again != got {
 		t.Fatalf("node id not stable across loads: %q then %q", got, again)
 	}
 }
@@ -71,11 +88,12 @@ func TestNodeID_AnchoredToDeviceIDOnMint(t *testing.T) {
 // for any node that opts into clustering later, since ids are never rewritten.
 func TestNodeID_MintsDeviceIdentityWhenNoCertExists(t *testing.T) {
 	certDir := useTempCertDir(t)
+	useTempNodeDir(t)
 	if fileExists(filepath.Join(certDir, "bep-cert.pem")) {
 		t.Fatal("precondition: cert dir should start empty")
 	}
 
-	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+	got := resolveNodeID(writeNodeIDCfg(t))
 
 	if !fileExists(filepath.Join(certDir, "bep-cert.pem")) {
 		t.Fatal("expected a BEP cert to be minted when none existed")
@@ -92,10 +110,14 @@ func TestNodeID_MintsDeviceIdentityWhenNoCertExists(t *testing.T) {
 	}
 }
 
-// An already-persisted node id is authoritative and never rewritten, even to
-// the (different) device-anchored value.
+// An already-established node id is authoritative and never rewritten, even to
+// the (different) device-anchored value. Since node identity became machine-
+// scoped this is the UPGRADE path: the machine is established (a cert is on
+// disk, so the migration gate is open), the only id it has ever had lives in the
+// workspace, and it must survive the move to machine-local storage untouched.
 func TestNodeID_ExistingNeverRewritten(t *testing.T) {
 	certDir := useTempCertDir(t)
+	useTempNodeDir(t)
 	if err := bep.GenerateBEPCert(certDir); err != nil {
 		t.Fatalf("generate cert: %v", err)
 	}
@@ -109,7 +131,7 @@ func TestNodeID_ExistingNeverRewritten(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(runDir, "node_id"), []byte(legacy+"\n"), 0o644); err != nil {
 		t.Fatalf("seed node_id: %v", err)
 	}
-	if got := loadOrCreateNodeID(cfg); got != legacy {
+	if got := resolveNodeID(cfg); got != legacy {
 		t.Fatalf("existing node id was changed: got %q, want preserved %q", got, legacy)
 	}
 }
@@ -125,8 +147,9 @@ func TestNodeID_FallsBackToUUIDWhenIdentityUnavailable(t *testing.T) {
 	prev := nodeIDCertDir
 	nodeIDCertDir = func() string { return filepath.Join(blocked, "etc") }
 	t.Cleanup(func() { nodeIDCertDir = prev })
+	useTempNodeDir(t)
 
-	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+	got := resolveNodeID(writeNodeIDCfg(t))
 	if got == "" {
 		t.Fatal("expected a UUID fallback, got empty node id")
 	}
@@ -153,6 +176,8 @@ func TestBepAnchoredNodeID_EmptyWithoutCert(t *testing.T) {
 func TestNodeID_RecoversFromCertWithoutKey(t *testing.T) {
 	certDir := useTempCertDir(t)
 
+	useTempNodeDir(t)
+
 	// Seed the exact broken state the review flagged: a cert with no
 	// matching key, as GenerateBEPCert could previously leave behind if it
 	// died after writing the cert but before the key.
@@ -163,7 +188,7 @@ func TestNodeID_RecoversFromCertWithoutKey(t *testing.T) {
 		t.Fatal("precondition: no key should exist yet")
 	}
 
-	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+	got := resolveNodeID(writeNodeIDCfg(t))
 
 	if !fileExists(filepath.Join(certDir, "bep-cert.pem")) {
 		t.Fatal("expected a regenerated cert after recovery")
@@ -187,6 +212,8 @@ func TestNodeID_RecoversFromCertWithoutKey(t *testing.T) {
 func TestNodeID_RecoversFromKeyWithoutCert(t *testing.T) {
 	certDir := useTempCertDir(t)
 
+	useTempNodeDir(t)
+
 	if err := os.WriteFile(filepath.Join(certDir, "bep-key.pem"), []byte("not a real key\n"), 0o600); err != nil {
 		t.Fatalf("seed orphaned key: %v", err)
 	}
@@ -194,7 +221,7 @@ func TestNodeID_RecoversFromKeyWithoutCert(t *testing.T) {
 		t.Fatal("precondition: no cert should exist yet")
 	}
 
-	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+	got := resolveNodeID(writeNodeIDCfg(t))
 
 	if !fileExists(filepath.Join(certDir, "bep-cert.pem")) || !fileExists(filepath.Join(certDir, "bep-key.pem")) {
 		t.Fatal("expected a full regenerated pair after recovery")
@@ -214,6 +241,8 @@ func TestNodeID_RecoversFromKeyWithoutCert(t *testing.T) {
 // silent permanent UUID fallback.
 func TestNodeID_RecoversFromCorruptOrMismatchedPair(t *testing.T) {
 	certDir := useTempCertDir(t)
+
+	useTempNodeDir(t)
 
 	// Seed a mismatched-but-well-formed pair: a genuine cert from one
 	// identity paired with a genuine key from a different one. Both files
@@ -259,7 +288,7 @@ func TestNodeID_RecoversFromCorruptOrMismatchedPair(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prevLogger) })
 
-	got := loadOrCreateNodeID(writeNodeIDCfg(t))
+	got := resolveNodeID(writeNodeIDCfg(t))
 
 	slog.SetDefault(prevLogger)
 	logOut := logBuf.String()
