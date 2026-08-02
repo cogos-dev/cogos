@@ -342,7 +342,7 @@ func TestBuildRouter_ClaudeOAuthAutoRegistration_AtBoot(t *testing.T) {
 // itself (independent of claude-oauth specifics): a hook registered before
 // Start runs once during the synchronous warm-up, and again once the ticker
 // fires, which is the mechanism the reconcile-loop re-check (gap 2 of the
-// Eclipse auto-register ruling) depends on to notice a credential created
+// peer-node auto-register ruling) depends on to notice a credential created
 // after boot without a kernel restart.
 func TestSimpleRouter_TickHooksRunOnEveryTick(t *testing.T) {
 	t.Parallel()

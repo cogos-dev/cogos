@@ -11,8 +11,8 @@ import (
 //
 // RFC-036 §11.1 settles the LAYERING question: host vitals are physical
 // facts about the machine, so S2 keys files on L1 (constellation NodeID)
-// under the shared L2 workspace — that's what lets Eclipse's pulse
-// BEP-sync to Darkstar and a fleet view fall out of the file layout. What
+// under the shared L2 workspace — that's what lets one node's pulse
+// BEP-sync to another and a fleet view fall out of the file layout. What
 // is NOT settled is the concrete *value*: the kernel's node_id storage
 // location and field name disagree today (Seam B, cogos PR #474), pending
 // the operator's ruling. Per the RFC's 2026-07-29 acceptance note ("implement

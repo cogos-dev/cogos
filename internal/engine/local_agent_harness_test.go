@@ -1324,7 +1324,7 @@ func TestDispatchToHarness_ExplicitProvider_RequestedModelWinsOverConfigDefault(
 	}))
 	defer srv.Close()
 
-	// Provider config hardcodes a model, mirroring the Darkstar
+	// Provider config hardcodes a model, mirroring the local-node
 	// providers.local.yaml gemma content-hash id from the issue.
 	writeTestFile(t, filepath.Join(root, ".cog", "config", "providers.yaml"), `providers:
   lmstudio-darkstar:

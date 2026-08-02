@@ -175,7 +175,7 @@ func newConductorOverStreams(peerInput io.Writer, peerOutput io.Reader, sink *ca
 	return c
 }
 
-const testIss = "cog://identity/conductor/darkstar"
+const testIss = "cog://identity/conductor/node-a"
 const testSub = "cog://identity/cell/hermes-1"
 
 func testIdentity() contract.Identity {

@@ -81,7 +81,7 @@ func buildModelManifest(dir, modelID string) (ModelManifest, error) {
 }
 
 // normalizeNodeURL prepends http:// when the node has no scheme (e.g. a bare
-// host:port like "eclipse:6931").
+// host:port like "node-a:6931").
 func normalizeNodeURL(node string) string {
 	if !strings.Contains(node, "://") {
 		return "http://" + node

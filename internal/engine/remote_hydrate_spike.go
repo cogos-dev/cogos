@@ -10,7 +10,7 @@
 // Nothing here changes the kernel; it composes existing primitives to prove the
 // reconcile loop the operator described:
 //
-//	Eclipse (authoritative) holds the model. Darkstar caches blocks by content
+//	Node A (authoritative) holds the model. Node B caches blocks by content
 //	hash, holds a pointer not the authority, and on reconnect/drift pulls only
 //	the delta. Self-reconcile falls out of content addressing.
 //
@@ -78,8 +78,8 @@ var inFlight sync.Map
 // only the blocks the local store is missing from a remote node, then verifying
 // integrity. This is the cross-node cache leg.
 //
-//	bs        — the LOCAL blob store (Darkstar's cache)
-//	remoteURL — base URL of the authoritative node's daemon (Eclipse), e.g. http://192.168.10.191:6931
+//	bs        — the LOCAL blob store (node B's cache)
+//	remoteURL — base URL of the authoritative node's daemon (node A), e.g. http://192.0.2.10:6931
 //	shards    — the model manifest (what the model dir should contain)
 //
 // Reconcile semantics: only locally-missing hashes are pulled. Re-running after
@@ -243,7 +243,7 @@ func MaterializeModelDir(bs *BlobStore, destDir string, shards []ModelShard, wri
 }
 
 // RemoteManifest fetches the remote node's full blob manifest. Useful for the
-// "what does Eclipse have" discovery step. Composes the existing
+// "what does the remote node have" discovery step. Composes the existing
 // GET /v1/blocks/manifest endpoint.
 func RemoteManifest(remoteURL string, client *http.Client) ([]BlobEntry, error) {
 	if client == nil {

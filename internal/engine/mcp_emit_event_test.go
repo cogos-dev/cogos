@@ -149,14 +149,14 @@ func TestToolEmitEvent_EmptyTypeRejected(t *testing.T) {
 func TestToolEmitEvent_PeerUtteranceValid(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 	registerTestSession(t, registry, "gemma-cog-eclipse")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
-		FromSession: "opus-cog-darkstar",
+		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse",
 			"content": "What is the eigenform?",
 			"turn":    float64(1),
@@ -170,8 +170,8 @@ func TestToolEmitEvent_PeerUtteranceValid(t *testing.T) {
 	if emitted, _ := resp["emitted"].(bool); !emitted {
 		t.Errorf("expected emitted=true; got %v", resp)
 	}
-	if resp["from_session"] != "opus-cog-darkstar" {
-		t.Errorf("from_session = %v; want opus-cog-darkstar", resp["from_session"])
+	if resp["from_session"] != "opus-cog-node-a" {
+		t.Errorf("from_session = %v; want opus-cog-node-a", resp["from_session"])
 	}
 }
 
@@ -180,14 +180,14 @@ func TestToolEmitEvent_PeerUtteranceValid(t *testing.T) {
 func TestToolEmitEvent_PeerUtterance_MissingFromSession(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 	registerTestSession(t, registry, "gemma-cog-eclipse")
 
 	input := emitEventInput{
 		Type: "peer.utterance",
 		// FromSession intentionally omitted
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse",
 			"content": "Hello",
 			"turn":    float64(1),
@@ -207,9 +207,9 @@ func TestToolEmitEvent_PeerUtterance_UnregisteredFrom(t *testing.T) {
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
-		FromSession: "opus-cog-darkstar", // not registered
+		FromSession: "opus-cog-node-a", // not registered
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse",
 			"content": "Hello",
 			"turn":    float64(1),
@@ -224,14 +224,14 @@ func TestToolEmitEvent_PeerUtterance_UnregisteredFrom(t *testing.T) {
 func TestToolEmitEvent_PeerUtterance_UnregisteredTo(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 	// "to" session not registered
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
-		FromSession: "opus-cog-darkstar",
+		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse", // not registered
 			"content": "Hello",
 			"turn":    float64(1),
@@ -246,7 +246,7 @@ func TestToolEmitEvent_PeerUtterance_UnregisteredTo(t *testing.T) {
 func TestToolEmitEvent_PeerUtterance_FromSessionMismatch(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 	registerTestSession(t, registry, "gemma-cog-eclipse")
 	registerTestSession(t, registry, "haiku-cog-aux")
 
@@ -254,7 +254,7 @@ func TestToolEmitEvent_PeerUtterance_FromSessionMismatch(t *testing.T) {
 		Type:        "peer.utterance",
 		FromSession: "haiku-cog-aux", // differs from payload.from
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse",
 			"content": "Hello",
 			"turn":    float64(1),
@@ -269,14 +269,14 @@ func TestToolEmitEvent_PeerUtterance_FromSessionMismatch(t *testing.T) {
 func TestToolEmitEvent_PeerUtterance_EmptyContent(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 	registerTestSession(t, registry, "gemma-cog-eclipse")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
-		FromSession: "opus-cog-darkstar",
+		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse",
 			"content": "", // empty
 			"turn":    float64(1),
@@ -291,14 +291,14 @@ func TestToolEmitEvent_PeerUtterance_EmptyContent(t *testing.T) {
 func TestToolEmitEvent_PeerUtterance_MissingTurn(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 	registerTestSession(t, registry, "gemma-cog-eclipse")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
-		FromSession: "opus-cog-darkstar",
+		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse",
 			"content": "Hello",
 			// turn missing
@@ -313,14 +313,14 @@ func TestToolEmitEvent_PeerUtterance_MissingTurn(t *testing.T) {
 func TestToolEmitEvent_PeerUtterance_NonPositiveTurn(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 	registerTestSession(t, registry, "gemma-cog-eclipse")
 
 	input := emitEventInput{
 		Type:        "peer.utterance",
-		FromSession: "opus-cog-darkstar",
+		FromSession: "opus-cog-node-a",
 		Payload: map[string]any{
-			"from":    "opus-cog-darkstar",
+			"from":    "opus-cog-node-a",
 			"to":      "gemma-cog-eclipse",
 			"content": "Hello",
 			"turn":    float64(0), // invalid: must be >= 1
@@ -337,11 +337,11 @@ func TestToolEmitEvent_PeerUtterance_NonPositiveTurn(t *testing.T) {
 func TestToolEmitEvent_FromSession_RecordedOnInsightCaptured(t *testing.T) {
 	t.Parallel()
 	server, registry := makeServerWithSessions(t)
-	registerTestSession(t, registry, "opus-cog-darkstar")
+	registerTestSession(t, registry, "opus-cog-node-a")
 
 	input := emitEventInput{
 		Type:        "insight.captured",
-		FromSession: "opus-cog-darkstar",
+		FromSession: "opus-cog-node-a",
 		Payload:     map[string]any{"summary": "binding event is the smallest unit of maintenance"},
 	}
 	got := callEmitEvent(t, server, input)
@@ -349,8 +349,8 @@ func TestToolEmitEvent_FromSession_RecordedOnInsightCaptured(t *testing.T) {
 	if err := json.Unmarshal([]byte(got), &resp); err != nil {
 		t.Fatalf("expected JSON response; got %q", got)
 	}
-	if resp["from_session"] != "opus-cog-darkstar" {
-		t.Errorf("from_session = %v; want opus-cog-darkstar", resp["from_session"])
+	if resp["from_session"] != "opus-cog-node-a" {
+		t.Errorf("from_session = %v; want opus-cog-node-a", resp["from_session"])
 	}
 	if emitted, _ := resp["emitted"].(bool); !emitted {
 		t.Errorf("emitted = %v; want true", resp["emitted"])
@@ -364,7 +364,7 @@ func TestToolEmitEvent_FromSession_UnregisteredSessionRejected(t *testing.T) {
 
 	input := emitEventInput{
 		Type:        "session.marker",
-		FromSession: "opus-cog-darkstar", // not registered
+		FromSession: "opus-cog-node-a", // not registered
 		Payload:     map[string]any{"label": "checkpoint"},
 	}
 	got := callEmitEvent(t, server, input)
@@ -397,7 +397,7 @@ func TestToolEmitEvent_FromSession_OmittedKeepsLegacyBehavior(t *testing.T) {
 // ─── payload coercion (issue #492) ───────────────────────────────────────────
 //
 // Local-model tool-call plumbing (LM Studio-served models observed on
-// eclipse's ornith-1.0-35b) stringifies nested object arguments even when
+// a peer node's ornith-1.0-35b) stringifies nested object arguments even when
 // shown the object form. These tests exercise the same code path the local
 // harness uses — json.Unmarshal of raw tool-call argument bytes into
 // emitEventInput — rather than constructing emitEventInput literals, since

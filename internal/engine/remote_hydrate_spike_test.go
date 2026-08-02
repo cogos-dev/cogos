@@ -2,7 +2,7 @@
 // block cache cross-node hydrate, against the REAL block-sync HTTP server and
 // two REAL BlobStores. SPIKE (spike-model-weight-block-cache).
 //
-// Scenario: store A = Eclipse (authoritative librarian), store B = Darkstar
+// Scenario: store A = node A (authoritative librarian), store B = node B
 // (non-authoritative cache). We stand A up behind the real registerBlockRoutes
 // handler via httptest, then RemoteHydrate a multi-shard "model" into B and
 // assert byte-identical materialization, integrity, cache-hit-on-rerun, and
@@ -52,7 +52,7 @@ func makeModel(t *testing.T, authoritative *BlobStore) (modelDir string, shards 
 }
 
 func TestRemoteHydrate_ModelWeightCache_EndToEnd(t *testing.T) {
-	// --- Eclipse side: authoritative store A behind the REAL HTTP handler ---
+	// --- Node A side: authoritative store A behind the REAL HTTP handler ---
 	handlerA, procA := newBlobsTestServer(t)
 	storeA := procA.BlobStore()
 	srcDir, shards := makeModel(t, storeA)
@@ -60,7 +60,7 @@ func TestRemoteHydrate_ModelWeightCache_EndToEnd(t *testing.T) {
 	srv := httptest.NewServer(handlerA)
 	defer srv.Close()
 
-	// --- Darkstar side: empty cache store B ---
+	// --- Node B side: empty cache store B ---
 	rootB := t.TempDir()
 	storeB := NewBlobStore(rootB)
 	if err := storeB.Init(); err != nil {
@@ -115,7 +115,7 @@ func TestRemoteHydrate_ModelWeightCache_EndToEnd(t *testing.T) {
 	}
 	t.Logf("WARM: %d cache hits, %d bytes transferred (free)", rep2.AlreadyLocal, rep2.BytesPulled)
 
-	// --- Drift reconcile: Eclipse updates one shard. New content → new hash →
+	// --- Drift reconcile: node A updates one shard. New content → new hash →
 	//     manifest entry changes. B should re-pull ONLY that one shard. ---
 	updated := make([]byte, 512*1024)
 	for i := range updated {
