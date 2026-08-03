@@ -3,11 +3,22 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// realHomeAtLoad captures the process's actual $HOME before any test in this
+// package can override it. Package-level var initializers run before any
+// test (and before TestMain, if one existed), so this is guaranteed to see
+// the real value regardless of t.Setenv calls made later. It backs
+// TestAddCogBinToPathNeverTouchesRealHome below — the regression guard for
+// the incident where a HOME-mutation race let addCogBinToPath resolve and
+// append to the operator's real ~/.zshrc.
+var realHomeAtLoad = os.Getenv("HOME")
 
 // NOT t.Parallel: these tests point $HOME at a t.TempDir, and $HOME is process-
 // global. Combining t.Parallel with a global os.Setenv("HOME", …) leaked the
@@ -77,4 +88,69 @@ func TestDetectShellRCZsh(t *testing.T) {
 	if !strings.HasSuffix(rc, ".zshrc") {
 		t.Errorf("expected .zshrc; got %s", rc)
 	}
+}
+
+// TestAddCogBinToPathNeverTouchesRealHome is a regression guard for the
+// 2026-08 incident: a HOME-mutation race (t.Parallel plus a global,
+// unsynchronized os.Setenv("HOME", …) — see the historical note above)
+// let addCogBinToPath resolve the operator's REAL ~/.zshrc mid-test and
+// append an export line pointing at a t.TempDir() path. That race is now
+// closed (t.Setenv, no t.Parallel on any test that touches HOME/SHELL), but
+// this test proves the property directly rather than trusting the
+// mechanism: with HOME overridden, addCogBinToPath must never open, read,
+// or write any file under the real home captured at package load — under
+// zsh specifically, since that's the shell the incident hit.
+func TestAddCogBinToPathNeverTouchesRealHome(t *testing.T) {
+	if realHomeAtLoad == "" {
+		t.Skip("real $HOME unavailable at package load; cannot assert isolation")
+	}
+
+	// Every rc file addCogBinToPath's shell detection could possibly resolve
+	// under the REAL home, snapshotted before the function under test runs.
+	candidates := []string{
+		filepath.Join(realHomeAtLoad, ".zshrc"),
+		filepath.Join(realHomeAtLoad, ".bashrc"),
+		filepath.Join(realHomeAtLoad, ".bash_profile"),
+		filepath.Join(realHomeAtLoad, ".config", "fish", "config.fish"),
+	}
+	before := snapshotFileHashes(t, candidates)
+
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("SHELL", "/bin/zsh")
+
+	// Belt-and-suspenders: the resolved rc path itself must not fall under
+	// the real home, independent of whether its content later changes.
+	if rc := detectShellRC(); strings.HasPrefix(rc, realHomeAtLoad+string(filepath.Separator)) {
+		t.Fatalf("detectShellRC resolved a path under the REAL home (%s) while HOME was overridden to %s: %s", realHomeAtLoad, tmp, rc)
+	}
+
+	if err := addCogBinToPath(); err != nil {
+		t.Fatalf("addCogBinToPath: %v", err)
+	}
+
+	after := snapshotFileHashes(t, candidates)
+	for _, c := range candidates {
+		if before[c] != after[c] {
+			t.Errorf("real home file %s changed while HOME was overridden to %s (this is the exact class of the 2026-08 ~/.zshrc incident)", c, tmp)
+		}
+	}
+}
+
+// snapshotFileHashes reads each path read-only and returns a sha256 hex
+// digest, or the sentinel "<absent>" when the file does not exist. It never
+// writes anything.
+func snapshotFileHashes(t *testing.T, paths []string) map[string]string {
+	t.Helper()
+	out := make(map[string]string, len(paths))
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			out[p] = "<absent>"
+			continue
+		}
+		sum := sha256.Sum256(b)
+		out[p] = hex.EncodeToString(sum[:])
+	}
+	return out
 }
