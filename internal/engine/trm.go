@@ -7,7 +7,8 @@
 //
 // This is a zero-dependency inference engine: no gonum, no CGO. All math
 // is done with raw float32 slices and manual loops. The model is tiny
-// (~1.7M params), so this is efficient enough.
+// (~2.3M params, 2,282,113 exactly for DefaultTRMConfig — see
+// docs/EVALUATION.md), so this is efficient enough.
 //
 // Binary weight format (TRM1):
 //

@@ -141,7 +141,7 @@ Consequences:
 - **Principle 5 (Stigmergic coordination)** — "substrate is the bus" holds macro; this doc refines at the mechanism layer.
 - **Principle 6 (Scale invariance)** — the I/O triad is scale-invariant in the same way Fork/Merge/Die is.
 - **Principle 8 (Identity changes by being read)** — every channel attendance is a transcription event that modifies the attendant's identity.
-- **ADR-011 (Kernel as Cognitive DNA)** — canonical identity as shared DNA-like substrate; anchor for the identity cycle story.
+- **ADR-011 (Kernel as Cognitive DNA)** — canonical identity as the shared substrate every embodiment reads from; anchor for the identity cycle story.
 - **ADR-062 (Recursive Node Architecture)** — scale at which the triad repeats per node.
 - **ADR-074 (Nested Sovereignty)** — scope boundaries that channels must respect.
 - **ADR-081 (Homeostatic Kernel Loop)** — running process that attends, routes, and consolidates; `Receptive → Consolidating` transition is where the reverse-transcription pathway lives.

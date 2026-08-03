@@ -45,7 +45,7 @@ KERNEL_PID=$!
    - `state` (expected initial: `receptive`)
 3. Send `POST /v1/chat/completions` with a minimal user message.
 4. Verify the request created a ledger event in `.cog/ledger/*/events.jsonl` (event type `cogblock.ingest`).
-5. Verify context assembly includes nucleus:
+5. Verify context assembly includes `nucleus`:
    - `GET /v1/context` returns `nucleus` field
    - `nucleus` equals identity (`CogOS` in default scaffold)
 6. Stop kernel (`kill $KERNEL_PID`) and confirm `/health` is no longer reachable.
@@ -56,7 +56,7 @@ KERNEL_PID=$!
 - Health endpoint returns identity and runtime state.
 - Chat completion endpoint accepts OpenAI-compatible request.
 - Ledger records interaction as append-only hash-chained event.
-- Context endpoint includes nucleus identity.
+- Context endpoint includes `nucleus` identity.
 - Shutdown is graceful (process exits; port is released).
 
 ### Cleanup

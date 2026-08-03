@@ -90,7 +90,7 @@ At each step, populations produce events; events update the ledger; the ledger i
 
 Three pieces of concrete evidence that this is one substrate architecturally, not two.
 
-**1. The in-code bridge already carries both payload types.** `internal/engine/constellation_bridge.go` defines `ConstellationBridge` as a single interface with `EmitHeartbeat(KernelHeartbeatPayload)` and `TrustSnapshot()` methods. The kernel exports its own coherence fingerprint, nucleus fingerprint, and ledger head *over the same bridge* the trust-node projection uses for peer heartbeats. The tangle is not a bug. It is the substrate showing through.
+**1. The in-code bridge already carries both payload types.** `internal/engine/constellation_bridge.go` defines `ConstellationBridge` as a single interface with `EmitHeartbeat(KernelHeartbeatPayload)` and `TrustSnapshot()` methods. The kernel exports its own `CoherenceFingerprint`, `NucleusFingerprint`, and `LedgerHead` *over the same bridge* the trust-node projection uses for peer heartbeats. The tangle is not a bug. It is the substrate showing through.
 
 **2. The kernel's `participants` table already has exactly the columns an identity-protocol node needs.** Verified against the live schema at `.cog/.state/constellation.db`:
 
@@ -159,7 +159,7 @@ To avoid overclaiming: this doc unifies the **architecture**, not the **code**.
 - **Principle 1 (Information in the delta)** — the ledger's append-only shape is where deltas become distinctions; each Constellation event is one.
 - **Principle 2 (CogBlock is the quantum of distinction)** — the CogBlock is the ledger's natural event unit; the Constellation aggregates CogBlocks across populations.
 - **Principle 3 (Adaptive sampling)** — attention-EMAs drive sample rate across the Constellation's populations; hot nodes sample more.
-- **Principle 4 (Boundary crossing energy signatures)** — every event that enters or exits the substrate leaves a ledger entry; the Constellation is the membrane's interior view.
+- **Principle 4 (Boundary crossing energy signatures)** — every event that enters or exits the substrate leaves a ledger entry; the Constellation is the boundary's interior view.
 - **Principle 5 (Stigmergic coordination)** — "substrate is the bus" holds macro; the Constellation is the structure of the substrate, the bus is the always-on face of it.
 - **Principle 6 (Scale invariance)** — the Constellation repeats at every scale; a repo, a CogBlock, and a full kernel each carry a projection of it.
 - **Principle 8 (Identity changes by being read)** — every read is an attention-edge update; every attendance is an identity mutation.
@@ -167,7 +167,7 @@ To avoid overclaiming: this doc unifies the **architecture**, not the **code**.
 - **ADR-033 (Event / signal / ledger separation)** — this doc is the event/ledger side; signals are the EMA layer on top.
 - **ADR-058 (Inter-workspace coordination)** — the trust-node projection's federation story; the mechanism by which multiple CogOS nodes share one Constellation across hosts.
 - **ADR-062 (Recursive node architecture)** — the recursion axis for populations; each node in the Constellation may itself host a Constellation at smaller scale.
-- **ADR-074 (Nested sovereignty)** — scope boundaries across populations; determines which edges are allowed to cross which membranes.
+- **ADR-074 (Nested sovereignty)** — scope boundaries across populations; determines which edges are allowed to cross which boundaries.
 - **ADR-081 (Homeostatic kernel loop)** — the running process that maintains the Constellation's coherence; `Receptive → Consolidating` is the reverse-transcription gate on canonical node promotions.
 
 ## Next Steps

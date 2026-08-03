@@ -2,16 +2,16 @@
 
 Reference for generating visual architecture diagrams. All diagrams should follow these principles:
 
-- **No arrows between organelles** — they coordinate through the substrate, not directly
-- **The membrane is biological** — not a hard rectangle, more like a cell wall
+- **No arrows between components** — they coordinate through the substrate, not directly
+- **The API Layer boundary is soft-edged** — not a hard rectangle, more like a permeable boundary
 - **The substrate is a medium** — texture, dots, or subtle pattern suggesting shared space
-- **Three zones are visually distinct** — membrane (outer), nucleus (center), workspace (inner)
+- **Three zones are visually distinct** — API Layer (outer), Process Core (center), workspace (inner)
 
 ---
 
-## Diagram 1: The Three-Zone Cell Model (Primary)
+## Diagram 1: The Three-Zone Kernel Model (Primary)
 
-The main architecture diagram. Shows CogOS as a cell with three zones.
+The main architecture diagram. Shows CogOS as three concentric zones.
 
 ### Zone Classification
 
@@ -19,19 +19,19 @@ Every component belongs to exactly one zone:
 
 | Component | Zone | Why |
 |-----------|------|-----|
-| Identity Core | Nucleus | Defines the node. Loaded once, persists across workspace switches |
-| Process Loop (4 states) | Nucleus | Always running, workspace-independent |
-| MCP Server | Membrane | Mediates between external MCP clients and internal state |
-| HTTP API (OpenAI/Anthropic) | Membrane | Translates protocols to internal operations |
-| Router | Membrane | Selects providers — node-level, not workspace-specific |
-| Coherence Validator | Membrane | Cross-workspace and cross-node integrity checks |
+| Identity Core | Process Core | Defines the node. Loaded once, persists across workspace switches |
+| Process Loop (4 states) | Process Core | Always running, workspace-independent |
+| MCP Server | API Layer | Mediates between external MCP clients and internal state |
+| HTTP API (OpenAI/Anthropic) | API Layer | Translates protocols to internal operations |
+| Router | API Layer | Selects providers — node-level, not workspace-specific |
+| Coherence Validator | API Layer | Cross-workspace and cross-node integrity checks |
 | Context Engine | Workspace | Assembles context from *this workspace's* data |
 | Salience Scorer | Workspace | Scores *this workspace's* files |
 | Ledger | Workspace | *This workspace's* hash chain |
 | Blob Store | Workspace | *This workspace's* content-addressed artifacts |
 | Memory (HMD) | Workspace | *This workspace's* semantic/episodic/procedural/reflective sectors |
 
-**Test:** If you switch workspaces, does this component switch too? Yes → workspace. No → nucleus or membrane.
+**Test:** If you switch workspaces, does this component switch too? Yes → workspace. No → Process Core or API Layer.
 
 ### ASCII Version
 
@@ -42,7 +42,7 @@ Every component belongs to exactly one zone:
                     ╰──────────┬─────────────╯
                                │
         ┏━━━━━━━━━━━━━━━━━━━━━━▼━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃  MEMBRANE (semipermeable — mediates inside/outside)      ┃
+        ┃  API LAYER (semipermeable — mediates inside/outside)     ┃
         ┃                                                          ┃
         ┃    ┌──────┐  ┌──────┐  ┌────────┐  ┌───────────┐       ┃
         ┃    │ MCP  │  │ HTTP │  │ Router │  │ Coherence │       ┃
@@ -52,12 +52,12 @@ Every component belongs to exactly one zone:
         ┃┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┃
         ┃                                                          ┃
         ┃            ╭━━━━━━━━━━━━━━━━━━━━╮                        ┃
-        ┃            ┃     NUCLEUS         ┃                        ┃
+        ┃            ┃     PROCESS CORE    ┃                        ┃
         ┃            ┃                     ┃                        ┃
-        ┃            ┃  Identity Core      ┃  ← the DNA            ┃
+        ┃            ┃  Identity Core      ┃  ← core identity      ┃
         ┃            ┃  Process Loop       ┃  ← always running     ┃
         ┃            ┃  (Active/Receptive/ ┃  ← changes by being   ┃
-        ┃            ┃   Consolidating/    ┃     read (epigenetic)  ┃
+        ┃            ┃   Consolidating/    ┃     read (adaptive)    ┃
         ┃            ┃   Dormant)          ┃                        ┃
         ┃            ╰━━━━━━━━━━━━━━━━━━━━╯                        ┃
         ┃                                                          ┃
@@ -70,7 +70,7 @@ Every component belongs to exactly one zone:
         ┃  │   Ledger      Blob Store                          │   ┃
         ┃  │   ██████                                          │   ┃
         ┃  │                                                   │   ┃
-        ┃  │   · · · · · cytoplasm · · · · · · · · · ·        │   ┃
+        ┃  │   · · · · · on-disk state · · · · · · · · · ·    │   ┃
         ┃  │   .cog/mem · .cog/config · .cog/ledger           │   ┃
         ┃  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘   ┃
         ┃                                                          ┃
@@ -85,16 +85,16 @@ Every component belongs to exactly one zone:
 
 ### Visual direction for image generation:
 
-- The **membrane** should look biological — rounded, organic, with pores/gates where the API components sit
-- The **nucleus** is central and visually distinct (darker, denser) — it IS the node's identity
-- **Workspace organelles float freely** in the substrate — NO arrows between them
+- The **API Layer** should look permeable — rounded, soft-edged, with pores/gates where the API components sit
+- The **Process Core** is central and visually distinct (darker, denser) — it IS the node's identity
+- **Workspace components float freely** in the substrate — NO arrows between them
 - The **substrate** should feel like a medium — dots, particles, texture suggesting shared space
-- External systems and providers are OUTSIDE the membrane
+- External systems and providers are OUTSIDE the API Layer
 - **Three zones should have distinct visual treatment:**
-  - Membrane: translucent outer layer
-  - Nucleus: solid, dense, prominent
-  - Workspace: lighter, spacious, with organelles floating
-- Color palette: warm neutrals, nucleus in a distinct accent (blue or deep indigo)
+  - API Layer: translucent outer layer
+  - Process Core: solid, dense, prominent
+  - Workspace: lighter, spacious, with components floating
+- Color palette: warm neutrals, Process Core in a distinct accent (blue or deep indigo)
 
 ---
 
@@ -102,7 +102,7 @@ Every component belongs to exactly one zone:
 
 ```
     ┌─────────────────────────────────────────┐
-    │           Zone 0: NUCLEUS               │  ← always present
+    │           Zone 0: CORE                  │  ← always present
     │           identity · self-model          │     never evicted
     ├─────────────────────────────────────────┤
     │           Zone 1: KNOWLEDGE             │  ← shifts slowly
@@ -173,7 +173,7 @@ Same three operations at every level: fork, merge, die.
     ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
     ┃  Node (laptop, port 6931)                      ┃
     ┃                                                ┃
-    ┃  ╭━━━━━━━━━━╮  ← Nucleus (shared)             ┃
+    ┃  ╭━━━━━━━━━━╮  ← Process Core (shared)        ┃
     ┃  ┃ Identity ┃                                  ┃
     ┃  ┃ Process  ┃                                  ┃
     ┃  ╰━━━━━━━━━━╯                                  ┃
@@ -193,7 +193,7 @@ Same three operations at every level: fork, merge, die.
     ┃  Node (laptop, port 6931)                                   ┃
     ┃                                                             ┃
     ┃  ╭━━━━━━━━━━━━━━╮                                           ┃
-    ┃  ┃   Kernel      ┃   (shared nucleus, shared membrane)      ┃
+    ┃  ┃   Kernel      ┃   (shared Process Core, shared API Layer)┃
     ┃  ╰━━━━━━━━━━━━━━╯                                           ┃
     ┃       │                    │                                 ┃
     ┃  ┌────▼──────────────┐  ┌──▼───────────────────┐            ┃
@@ -204,7 +204,7 @@ Same three operations at every level: fork, merge, die.
     ┃  └───────────────────┘  └──────────────────────┘            ┃
     ┃                                                             ┃
     ┃  Isolated: different identity, memory, ledger per workspace ┃
-    ┃  Shared: same kernel, same providers, same membrane         ┃
+    ┃  Shared: same kernel, same providers, same API Layer        ┃
     ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
@@ -254,7 +254,7 @@ Same three operations at every level: fork, merge, die.
 
 ---
 
-## Diagram 5: Ecosystem — The Organelle Repos
+## Diagram 5: Ecosystem — The Independent Repos
 
 ```
     ┌────────────────────────────────────────────────────────────┐
@@ -277,7 +277,7 @@ Same three operations at every level: fork, merge, die.
         │ (daily dev)  │  │ (daily dev)  │  │ (daily dev)  │
         └──────────────┘  └──────────────┘  └──────────────┘
 
-    Each organelle: independent repo, independent release, independent deploy.
+    Each repo is independent: independent release, independent deploy.
     Coordination: through the workspace substrate, not through imports.
     Discovery: at runtime via capability scanning, not at build time.
 ```
@@ -299,13 +299,13 @@ Same three operations at every level: fork, merge, die.
     │ web-dash   │ viewing  │ 3s ago      │ read-only     │
     └────────────┴──────────┴─────────────┴───────────────┘
 
-    Output rules (substrate-level, read by all output organelles):
+    Output rules (substrate-level, read by all output channels):
 
     User speaking on ANY channel → defer voice output on ALL channels
     User idle on target channel  → output permitted
     User active elsewhere        → queue, don't interrupt
     All channels idle > Ns       → dormant state, heartbeat only
 
-    Every output organelle reads this register independently.
-    No direct coordination between organelles. Stigmergic.
+    Every output channel reads this register independently.
+    No direct coordination between channels. Stigmergic.
 ```

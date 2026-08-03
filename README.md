@@ -8,7 +8,7 @@ make build && ./cogos serve --workspace ~/my-project
 ```
 
 Or install a pre-built binary. Each block below refuses to overwrite a
-binary a running `cogos` daemon is executing — it fetches the same shared
+binary a running `cogos` daemon is executing, fetching the same shared
 guard `make install` uses (`scripts/lib/refuse-if-running.sh` /
 `scripts/lib/refuse-if-running.ps1`) rather than inlining its own copy, and
 runs in a subshell/script block so a refusal exits only the install, not
@@ -60,7 +60,7 @@ Set `ALLOW_RUNNING_INSTALL=1` (bash) / `$env:ALLOW_RUNNING_INSTALL = '1'`
 `scripts/lib/refuse-if-running.sh` for what the guard checks and why it
 fails closed rather than assuming "not running" when it can't tell.
 
-Other architectures (linux/arm64, darwin/amd64 for Intel Macs) are available on the [Releases page](https://github.com/myrgic/cogos/releases/latest).
+Other architectures (linux/arm64) are available on the [Releases page](https://github.com/myrgic/cogos/releases/latest). Intel Macs (darwin/amd64) are not published as a release asset; cross-compile locally with `make darwin-amd64`.
 
 ---
 
@@ -141,7 +141,7 @@ When you submit a prompt in Claude Code, the `UserPromptSubmit` hook fires and c
 
 The context engine:
 
-1. Scores all workspace documents using a ~1.7M-parameter Mamba SSM trained as a context retrieval model, combined with git-derived salience
+1. Scores all workspace documents using a ~2.3M-parameter Mamba SSM trained as a context retrieval model, combined with git-derived salience
 2. Ranks by a composite signal (edit recency, semantic match, structural importance)
 3. Assembles a context window organized into stability zones:
 
@@ -478,7 +478,7 @@ scripts/                Setup, CLI wrapper, e2e tests, experiment harnesses
 ### Working
 
 - Continuous process daemon with four-state FSM
-- Foveated context assembly with a ~1.7M-parameter Mamba SSM context retrieval model
+- Foveated context assembly with a ~2.3M-parameter Mamba SSM context retrieval model
 - Hash-chained append-only ledger with optional chain verification
 - Three-lane observability: ledger, traces, kernel slog
 - Live event bus with in-process broker and SSE streaming
