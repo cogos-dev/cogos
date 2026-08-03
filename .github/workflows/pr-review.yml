@@ -36,8 +36,21 @@ on:
 permissions:
   contents: read
 
+# Two concurrency lanes per PR, split on whether the event can change the diff.
+#
+# A single shared lane deadlocked the gate (observed live on #527 and #528): a
+# body edit seconds after `opened` starts a second run, `cancel-in-progress`
+# kills the in-flight review mid-diff, and the replacement run skips
+# `review-agent` because it is an `edited` event — so the review that was
+# supposed to still stand was the very one just cancelled. Net: no review ever
+# runs. Agent-opened PRs hit this every time, since they set the body right
+# after creating the PR.
+#
+# `edited` cannot change the diff, so its (mechanical-only) run belongs in its
+# own lane and must never cancel a diff review. Successive pushes still cancel
+# each other correctly — they share the `diff` lane.
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number }}
+  group: pr-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'edited' && 'meta' || 'diff' }}
   cancel-in-progress: true
 
 jobs:
@@ -330,7 +343,19 @@ jobs:
         # error->failure verdict instead of vanishing (fail closed WITH a
         # signal). Skipped when the gate is unconfigured (no token) or the
         # canary already posted its own fail-closed check.
-        if: always() && steps.cred.outputs.skip != 'true' && steps.canary.outputs.sandbox != 'fail'
+        #
+        # !cancelled() because always() ALSO runs during cancellation, and a run
+        # cancelled by `cancel-in-progress` is being superseded, not failing:
+        # publishing `error` from it stamps a blocking verdict onto the head SHA
+        # that the successor run may never overwrite. A superseded run must stay
+        # silent and let its replacement speak.
+        #
+        # This does NOT fail open. A cancelled run publishes nothing, so
+        # `cog-review` is ABSENT on that SHA, and a missing required check blocks
+        # the merge exactly like a failing one — with the difference that the
+        # successor's real verdict can still land. Only an explicit approve ever
+        # passes; silence is still not approval.
+        if: always() && !cancelled() && steps.cred.outputs.skip != 'true' && steps.canary.outputs.sandbox != 'fail'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
