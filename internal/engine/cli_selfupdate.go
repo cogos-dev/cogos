@@ -40,6 +40,9 @@ func runSelfUpdateCmd(args []string, defaultWorkspace string, defaultPort int) {
 	workspace := fs.String("workspace", defaultWorkspace, "Workspace root (lock + log path)")
 	port := fs.Int("port", defaultPort, "Health endpoint port (matches daemon --port)")
 	force := fs.Bool("force", false, "Permit a downgrade on the manual path without a pin")
+	allowUnsigned := fs.Bool("allow-unsigned", false,
+		"Apply a release that carries NO Sigstore signature (tags before "+selfupdate.FirstSignedReleaseTag()+"). "+
+			"Does NOT permit an invalid signature.")
 	_ = fs.Parse(args)
 
 	if *port == 0 {
@@ -75,12 +78,13 @@ func runSelfUpdateCmd(args []string, defaultWorkspace string, defaultPort int) {
 	}
 
 	err := runSelfUpdateApply(selfUpdateApplyParams{
-		Repo:      *repo,
-		ToTag:     target,
-		Workspace: root,
-		Port:      *port,
-		Force:     *force,
-		Manual:    *to == "", // interactive path (no --to) enforces the downgrade guard unless --force
+		Repo:          *repo,
+		ToTag:         target,
+		Workspace:     root,
+		Port:          *port,
+		Force:         *force,
+		Manual:        *to == "", // interactive path (no --to) enforces the downgrade guard unless --force
+		AllowUnsigned: *allowUnsigned,
 	})
 	if errors.Is(err, errSelfUpdateUnsupported) {
 		fmt.Fprintf(os.Stderr, "self-update: auto-apply unsupported on %s; download %s from the releases page\n",
@@ -102,6 +106,11 @@ type selfUpdateApplyParams struct {
 	Port      int
 	Force     bool
 	Manual    bool
+	// AllowUnsigned relaxes GATE L0 for a release that carries NO signature
+	// (tags predating provenance.FirstSignedRelease). It never relaxes an
+	// invalid signature, and the reconcile provider never sets it — only a
+	// human passing --allow-unsigned can.
+	AllowUnsigned bool
 }
 
 // runSelfUpdateCheck is the dry-run path: resolve the target, compare against the

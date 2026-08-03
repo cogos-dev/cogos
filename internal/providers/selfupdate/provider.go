@@ -23,6 +23,7 @@ package selfupdate
 import (
 	"context"
 	"fmt"
+	"log"
 	"runtime"
 	"sync"
 	"time"
@@ -100,6 +101,19 @@ type Provider struct {
 	port       int
 	inProgress bool
 	status     reconcile.ResourceStatus
+	// blocked records that the last detached updater reached a terminal REFUSAL
+	// for the current target. It exists so Health() stops repainting that
+	// refusal as Progressing; see Health.
+	blocked bool
+	// noticedAt throttles the require_signature migration notice to the release
+	// check cadence rather than the (much faster) reconcile tick.
+	noticedAt time.Time
+}
+
+// logf is the provider's operator-visible log seam. The daemon's stderr is
+// captured into cogos.log, so this is what an operator greps. Tests replace it.
+var logf = func(format string, args ...any) {
+	log.Printf("self-update: "+format, args...)
 }
 
 // New constructs a Provider with a fresh resolver and an unknown/missing status.
@@ -148,6 +162,9 @@ type selfUpdateLive struct {
 	RunningVersion string
 	FetchErr       string
 	Target         *resolvedRelease
+	// Provenance is the detached updater's last recorded verdict, or nil when
+	// it has never made one. Projected into state attributes by BuildState.
+	Provenance *ProvenanceOutcome
 }
 
 // ─── LoadConfig ──────────────────────────────────────────────────────────────
@@ -185,6 +202,24 @@ func (p *Provider) FetchLive(ctx context.Context, config any) (any, error) {
 		return &selfUpdateLive{Disabled: true, RunningVersion: running}, nil
 	}
 
+	// The staged-migration announcement. Stage 2 flips the absent-key default
+	// from warn to enforce, which can stop a node updating; it must not arrive
+	// unannounced, so every check cycle where the operator has expressed no
+	// choice says so out loud.
+	p.noticeSignatureMigration(cfg)
+
+	// The detached updater's last verdict. Read BEFORE resolving so a refusal
+	// is projected even on a cycle where the GitHub query is throttled.
+	//
+	// The blocked flag is cleared here on every cycle and re-asserted below
+	// only if the verdict still applies to the tag we are still trying to
+	// install, so a refusal that has since been resolved (the operator relaxed
+	// the posture, or a corrected release was cut) does not stick.
+	outcome := ReadProvenanceOutcome(cfg.Root())
+	p.mu.Lock()
+	p.blocked = false
+	p.mu.Unlock()
+
 	rel, err := p.resolver.Resolve(ctx, cfg)
 	if err != nil {
 		p.setStatus(reconcile.ResourceStatus{
@@ -193,13 +228,71 @@ func (p *Provider) FetchLive(ctx context.Context, config any) (any, error) {
 			Operation: reconcile.OperationIdle,
 			Message:   fmt.Sprintf("cannot resolve target: %v", err),
 		})
-		return &selfUpdateLive{RunningVersion: running, FetchErr: err.Error()}, nil
+		return &selfUpdateLive{RunningVersion: running, FetchErr: err.Error(), Provenance: outcome}, nil
+	}
+
+	// A recorded refusal for the tag we are still trying to install outranks
+	// the ordinary "update available" status. Without this the provider would
+	// keep reporting Progressing "updating to <tag>" forever while every spawned
+	// updater refused for the same reason — an attack presenting as a spinner.
+	//
+	// NOTE ON RESPAWN CADENCE. This deliberately does NOT clear inProgress.
+	// Clearing it would release the dup-spawn guard immediately and the next
+	// reconcile tick (~30s) would fork another updater to be refused for the
+	// same reason, forever. Leaving the watchdog to expire keeps the retry at
+	// its existing ~6-minute ceiling. The status below is what makes the
+	// refusal visible; the flag is not load-bearing for that.
+	if outcome != nil && outcome.Blocked && versionEqual(outcome.Tag, rel.Tag) {
+		p.mu.Lock()
+		p.blocked = true
+		p.mu.Unlock()
+		p.setStatus(reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusOutOfSync,
+			Health:    reconcile.HealthDegraded,
+			Operation: reconcile.OperationIdle,
+			Message: fmt.Sprintf("update to %s REFUSED (%s): %s",
+				outcome.Tag, outcome.Result, outcome.Message),
+		})
+		return &selfUpdateLive{RunningVersion: running, Target: rel, Provenance: outcome}, nil
 	}
 
 	// Refresh status knowledge (not a mutation gate — purely informational).
 	pinned := cfg.Pin != ""
 	p.refreshStatusFromLive(cfg, running, rel, pinned)
-	return &selfUpdateLive{RunningVersion: running, Target: rel}, nil
+	return &selfUpdateLive{RunningVersion: running, Target: rel, Provenance: outcome}, nil
+}
+
+// noticeSignatureMigration emits the deprecation notice for a config that has
+// not chosen a require_signature posture, at most once per check_interval.
+//
+// This is the safety net for the staged rollout. Stage 1 defaults an absent key
+// to warn so nothing can brick; Stage 2 changes that default to enforce. The
+// entire justification for staging is that operators get warned first — which
+// is only true if something actually warns them. Without this the flip would
+// land silently and a node would stop updating with no prior signal, the exact
+// failure the staging was designed to prevent.
+func (p *Provider) noticeSignatureMigration(cfg *SelfUpdateConfig) {
+	if !cfg.SignatureModeUnset() {
+		return
+	}
+	interval := cfg.CheckInterval
+	if interval <= 0 {
+		interval = defaultCheckInterval
+	}
+	p.mu.Lock()
+	due := time.Since(p.noticedAt) >= interval
+	if due {
+		p.noticedAt = time.Now()
+	}
+	p.mu.Unlock()
+	if !due {
+		return
+	}
+	logf("NOTICE: require_signature is not set in %s, so update provenance is being "+
+		"verified in %q mode (failures are logged, not blocked). A future release will "+
+		"change this default to %q, which REFUSES updates whose Sigstore signature cannot "+
+		"be verified. Set require_signature explicitly to choose now.",
+		selfUpdateConfigPath(cfg.Root()), SignatureWarn, SignatureEnforce)
 }
 
 // ─── ComputePlan (PURE) ──────────────────────────────────────────────────────
@@ -451,18 +544,42 @@ func (p *Provider) BuildState(config any, live any, existing *reconcile.State) (
 	inProgress := p.inProgress
 	p.mu.Unlock()
 
+	attrs := map[string]any{
+		"running_version": lv.RunningVersion,
+		"target_tag":      target,
+		"disabled":        lv.Disabled,
+		"in_progress":     inProgress,
+	}
+
+	// Provenance posture and last verdict. These belong in state, not only in
+	// the run-directory log: "is this node actually enforcing?" and "did the
+	// last update get refused?" are questions the operator asks of the
+	// dashboard, and a security control nobody can see the status of is a
+	// control nobody can rely on.
+	if cfg, ok := config.(*SelfUpdateConfig); ok && cfg != nil {
+		attrs["require_signature"] = cfg.RequireSignature
+		attrs["require_signature_explicit"] = !cfg.SignatureModeUnset()
+		if ir := cfg.IdentityRepo(); ir != defaultRepo {
+			attrs["signature_identity_repo"] = ir
+		}
+	}
+	if o := lv.Provenance; o != nil {
+		attrs["last_provenance"] = map[string]any{
+			"tag":     o.Tag,
+			"result":  o.Result,
+			"blocked": o.Blocked,
+			"at":      o.At,
+			"message": o.Message,
+		}
+	}
+
 	state.Resources = append(state.Resources, reconcile.Resource{
-		Address:    "self-update.cogos",
-		Type:       "self-update",
-		Mode:       reconcile.ModeManaged,
-		Name:       "cogos",
-		ExternalID: externalID,
-		Attributes: map[string]any{
-			"running_version": lv.RunningVersion,
-			"target_tag":      target,
-			"disabled":        lv.Disabled,
-			"in_progress":     inProgress,
-		},
+		Address:       "self-update.cogos",
+		Type:          "self-update",
+		Mode:          reconcile.ModeManaged,
+		Name:          "cogos",
+		ExternalID:    externalID,
+		Attributes:    attrs,
 		LastRefreshed: time.Now().UTC().Format(time.RFC3339),
 	})
 	return state, nil
@@ -484,7 +601,13 @@ func (p *Provider) Health() reconcile.ResourceStatus {
 			Message:   "workspace not configured",
 		}
 	}
-	if p.inProgress {
+	// inProgress means "an updater was spawned and we have not heard back".
+	// A recorded terminal verdict IS hearing back, and it outranks the
+	// assumption — otherwise a refusal is repainted as Progressing on its way
+	// out of this function and the operator sees a spinner rather than a
+	// blocked update. This masking is why the detached updater has to record an
+	// outcome at all.
+	if p.inProgress && !p.blocked {
 		return reconcile.ResourceStatus{
 			Sync:      reconcile.SyncStatusOutOfSync,
 			Health:    reconcile.HealthProgressing,

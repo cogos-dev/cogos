@@ -120,6 +120,12 @@ func newTestUpdater(t *testing.T, toTag string) (*selfUpdater, string) {
 	u.rollbackPoll = func(time.Duration, string) error { return nil }
 	u.fetchText = func(ctx context.Context, url string) (string, error) { return "", nil }
 	u.smokeTest = func(binPath string) (string, error) { return toTag, nil }
+	// These cases exercise the download/swap/rollback core, not GATE L0, so the
+	// provenance gate is explicitly disabled rather than left at its (enforcing)
+	// zero value. The gate has its own coverage in
+	// cli_selfupdate_provenance_test.go.
+	u.requireSig = selfupdate.SignatureOff
+	u.fetchOptional = func(ctx context.Context, url string) (string, bool, error) { return "", false, nil }
 
 	// Write the current binary so backup/swap have something to copy. The
 	// lockfile is redirected into runDir via u.runDirOverride above.
