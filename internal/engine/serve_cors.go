@@ -75,6 +75,38 @@
 // (they are side-effect-free reads of an in-memory snapshot), which is why the
 // no-cors/img vector debugLoopbackOnly exists to stop on /debug/pprof/profile
 // — a 30s CPU burn — has no analogue here.
+//
+// Second exclusion tier — session/ledger reads are loopback-only:
+//
+// #507's review round 4 found the identical read primitive on routes that are
+// not named "debug" at all. GET /v1/conversation defaults session_id to the
+// live process session and returns the full untruncated turn-by-turn text;
+// GET /v1/ledger defaults session_id to empty, which LedgerQuery documents as
+// "all sessions", so it returns the hash-chained event history of every
+// session the daemon has ever handled. Both are unauthenticated simple GETs,
+// so the star fallback above was enough for any page the operator happened to
+// visit to fetch('http://127.0.0.1:6931/v1/ledger') and read the body.
+// GET /v1/events (+ /v1/events/stream) is a thin wrapper over the same
+// QueryLedger call, and GET /v1/tool-calls stitches tool.call/tool.result rows
+// — arguments and outputs included — across every session's ledger. Same data,
+// same exposure, so all four are covered.
+//
+// These do NOT get the /v1/debug treatment of dropping CORS entirely, because
+// unlike the dashboard/canvas pair these have legitimate CROSS-origin browser
+// consumers on other loopback ports (the mod3 dashboard on :7860, the
+// constellation surfaces). Dropping every Access-Control-* header would break
+// them. What has to go is only the "*" widening for non-loopback origins:
+// corsLoopbackOnly echoes a loopback Origin exactly as before, and emits no
+// Access-Control-Allow-Origin at all for anything else, so a remote page's
+// fetch() still reaches the handler but the browser refuses to hand it the
+// body. Same-origin clients (no Origin header) and non-browser clients (curl,
+// the MCP CLI) are unaffected in either direction.
+//
+// Deliberately NOT in this tier: /v1/traces and /v1/kernel-log read
+// .cog/run/*.jsonl telemetry and the daemon log rather than the ledger or the
+// conversation store, and /v1/proprioceptive is byte-locked for the dashboard.
+// They are a different data class; widening the tier to cover them is a
+// separate decision, not this fix.
 package engine
 
 import (
@@ -99,35 +131,49 @@ func corsMiddleware(next http.Handler) http.Handler {
 	const maxAge = "86400"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		policy := corsPolicyForPath(r.URL.Path)
+
 		// See the file-level "Exclusion" note: debug surfaces must never carry
 		// an Access-Control-* header, so they bypass this middleware's logic
 		// entirely — not even the OPTIONS short-circuit below runs for them.
-		if isDebugPath(r.URL.Path) {
+		if policy == corsNone {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		origin := r.Header.Get("Origin")
 
-		// Echo loopback origins so credentialed requests can round-trip;
-		// fall back to "*" for anything else. Empty Origin → same-origin
-		// (or non-browser client) → nothing to add.
-		if origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", originAllowValue(origin))
+		// allow is "" whenever the response must carry no
+		// Access-Control-Allow-Origin: no Origin header at all (same-origin
+		// fetch, curl, the MCP CLI — nothing to add), or a remote origin on a
+		// corsLoopbackOnly route.
+		allow := allowOriginFor(policy, origin)
+
+		// Vary: Origin whenever the emitted headers depend on the request's
+		// Origin. On a corsLoopbackOnly route that includes the no-Origin
+		// case, so an intermediary cannot replay a loopback-blessed response
+		// to a remote origin.
+		if origin != "" || policy == corsLoopbackOnly {
 			w.Header().Set("Vary", "Origin")
+		}
+		if allow != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allow)
 		}
 
 		if r.Method == http.MethodOptions {
 			// Preflight short-circuit: reply with the allow-list headers
 			// and 204 No Content. Do not call `next` — the mux would
-			// return 405 Method Not Allowed for most routes.
+			// return 405 Method Not Allowed for most routes. Without an
+			// Access-Control-Allow-Origin the preflight fails at the browser,
+			// which is exactly what a remote origin should get on a
+			// corsLoopbackOnly route.
 			w.Header().Set("Access-Control-Allow-Methods", allowMethods)
 			w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 			w.Header().Set("Access-Control-Max-Age", maxAge)
 			// If the request asked to send credentials (Cookie, auth
 			// header), advertise support when we're echoing a specific
 			// origin. Star-origin + credentials is not legal per spec.
-			if origin != "" && origin != "*" && originAllowValue(origin) == origin {
+			if allow != "" && allow == origin && origin != "*" {
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -136,16 +182,69 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 		// Non-preflight: still expose the allow-list headers so browsers
 		// treating a non-simple response as cacheable know the shape.
-		if origin != "" {
+		if allow != "" {
 			w.Header().Set("Access-Control-Allow-Methods", allowMethods)
 			w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
-			if origin != "*" && originAllowValue(origin) == origin {
+			if allow == origin && origin != "*" {
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 		}
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// corsPolicy classifies a request path by how much cross-origin read access
+// the middleware may grant to its responses. See the two "Exclusion" notes at
+// the top of this file for why each tier exists.
+type corsPolicy int
+
+const (
+	// corsPermissive is the default for every route not named below: echo
+	// loopback origins, widen to "*" for anything else so the middleware
+	// keeps working if cfg.BindAddr widens to a pod / Tailnet address.
+	corsPermissive corsPolicy = iota
+
+	// corsLoopbackOnly echoes loopback origins and emits NO
+	// Access-Control-Allow-Origin for anything else. The handler still runs
+	// (these are side-effect-free reads), but the browser will not hand the
+	// response body to a remote page.
+	corsLoopbackOnly
+
+	// corsNone bypasses the middleware entirely — no Access-Control-* header
+	// ever appears on the response, regardless of Origin or method.
+	corsNone
+)
+
+// corsPolicyForPath maps a request path onto its CORS tier.
+func corsPolicyForPath(path string) corsPolicy {
+	switch {
+	case isDebugPath(path):
+		return corsNone
+	case isSessionDataPath(path):
+		return corsLoopbackOnly
+	default:
+		return corsPermissive
+	}
+}
+
+// allowOriginFor returns the Access-Control-Allow-Origin value for a
+// (policy, Origin) pair, or "" when the response must carry no such header.
+func allowOriginFor(policy corsPolicy, origin string) string {
+	if origin == "" {
+		return ""
+	}
+	switch policy {
+	case corsNone:
+		return ""
+	case corsLoopbackOnly:
+		if isLoopbackOrigin(origin) {
+			return origin
+		}
+		return ""
+	default:
+		return originAllowValue(origin)
+	}
 }
 
 // isDebugPath reports whether a request path belongs to one of the kernel's
@@ -161,7 +260,42 @@ func corsMiddleware(next http.Handler) http.Handler {
 // prefixed by these strings without a path separator (e.g. /v1/debugger) is
 // NOT matched — that would be a different route with different exposure.
 func isDebugPath(path string) bool {
-	for _, p := range []string{"/debug", "/v1/debug"} {
+	return matchesAnyRoutePrefix(path, "/debug", "/v1/debug")
+}
+
+// sessionDataPrefixes are the read routes whose bodies are conversation
+// content or ledger history, and which therefore never get the "*" widening
+// (see the file-level "Second exclusion tier" note):
+//
+//	/v1/conversation — full turn-by-turn text; session_id defaults to the
+//	                   live process session
+//	/v1/ledger       — hash-chained event history; empty session_id means
+//	                   ALL sessions per LedgerQuery's own doc comment
+//	/v1/events       — thin wrapper over the same QueryLedger call, plus the
+//	                   /v1/events/stream SSE fan-out of ledger.appended
+//	/v1/tool-calls   — tool.call/tool.result rows stitched from every
+//	                   session's ledger, arguments and outputs included
+var sessionDataPrefixes = []string{
+	"/v1/conversation",
+	"/v1/ledger",
+	"/v1/events",
+	"/v1/tool-calls",
+}
+
+// isSessionDataPath reports whether a request path serves session content or
+// ledger data, i.e. belongs to the corsLoopbackOnly tier.
+func isSessionDataPath(path string) bool {
+	return matchesAnyRoutePrefix(path, sessionDataPrefixes...)
+}
+
+// matchesAnyRoutePrefix reports whether path equals one of the given route
+// prefixes or sits underneath it as a path segment. The bare, slashless form
+// is matched so a future index route cannot quietly land in the wrong tier,
+// while anything merely string-prefixed without a separator (/v1/debugger,
+// /v1/ledgerfoo) is NOT matched — that would be a different route with
+// different exposure.
+func matchesAnyRoutePrefix(path string, prefixes ...string) bool {
+	for _, p := range prefixes {
 		if path == p || strings.HasPrefix(path, p+"/") {
 			return true
 		}
