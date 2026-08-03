@@ -5,8 +5,14 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -153,4 +159,118 @@ func snapshotFileHashes(t *testing.T, paths []string) map[string]string {
 		out[p] = hex.EncodeToString(sum[:])
 	}
 	return out
+}
+
+// TestNoTestSetsHOMEGlobally makes the incident's sibling audit executable.
+//
+// TestAddCogBinToPathNeverTouchesRealHome (above) proves addCogBinToPath
+// honors $HOME, so it catches the production-side regression: any change
+// that stops reading the live $HOME — caching os.UserHomeDir() in a package
+// var, or switching to os/user.Current(), whose HomeDir comes from the
+// passwd entry and ignores $HOME entirely — makes it fail loudly.
+//
+// It cannot, however, catch the ORIGINAL incident, and that gap is why this
+// test exists. That bug was a concurrency race between tests: t.Parallel
+// plus a global os.Setenv("HOME", …) whose t.Cleanup restored the real
+// HOME/SHELL while a sibling was still inside addCogBinToPath. Go parks
+// parallel tests until the serial ones finish, so a serial guard (this file
+// uses t.Setenv, which refuses to run under t.Parallel) never overlaps the
+// offending window and cannot observe the race. Reproducing the pre-fix code
+// confirms this: the race resurfaces — nondeterministically, and usually as
+// a TempDir cleanup failure rather than a dotfile write — while the guard
+// above passes.
+//
+// So the real protection is structural: nothing may set HOME process-wide in
+// a test. t.Setenv is the only sanctioned primitive, and it is compile-time
+// incompatible with t.Parallel. This asserts that invariant across the whole
+// module, deterministically and on every run, rather than trusting a
+// point-in-time grep. It parses the AST rather than grepping so that prose
+// mentions of os.Setenv("HOME", …) in comments — several appear above — are
+// not false positives.
+func TestNoTestSetsHOMEGlobally(t *testing.T) {
+	root := moduleRoot(t)
+
+	fset := token.NewFileSet()
+	var offenders []string
+
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // unreadable subtree is not this test's concern
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "node_modules", "vendor", "testdata":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return nil // not parseable (build-tagged fixture, etc.); skip
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Setenv" {
+				return true
+			}
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "os" {
+				return true
+			}
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			name, uerr := strconv.Unquote(lit.Value)
+			if uerr != nil {
+				return true
+			}
+			if name == "HOME" || name == "USERPROFILE" {
+				rel, rerr := filepath.Rel(root, path)
+				if rerr != nil {
+					rel = path
+				}
+				offenders = append(offenders, fmt.Sprintf("%s:%d", rel, fset.Position(call.Pos()).Line))
+			}
+			return true
+		})
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walk %s: %v", root, walkErr)
+	}
+
+	if len(offenders) > 0 {
+		t.Errorf("tests must not set %s process-wide via os.Setenv; use t.Setenv, "+
+			"which scopes the override to the test and refuses to run under t.Parallel "+
+			"(this is the 2026-08 ~/.zshrc incident's root cause). Offenders:\n  %s",
+			"HOME/USERPROFILE", strings.Join(offenders, "\n  "))
+	}
+}
+
+// moduleRoot returns the directory holding go.mod, walking up from the
+// working directory so the module-wide scan above is independent of where
+// `go test` was invoked.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for {
+		if _, serr := os.Stat(filepath.Join(dir, "go.mod")); serr == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("no go.mod found at or above %s", dir)
+		}
+		dir = parent
+	}
 }
