@@ -265,3 +265,86 @@ func TestCoverageCache_RemovedSourceIsPruned(t *testing.T) {
 		t.Fatalf("coverageCache still contains %q after source was removed — eviction is broken", source)
 	}
 }
+
+// TestCoverageCache_OntologyEditInvalidatesCache is the end-to-end regression
+// test for SourceFingerprint (ontology.go): an in-place edit to an L2 mapping
+// file must invalidate the coverage cache for the sources it serves, even
+// though the ingest JSONL files themselves are byte-for-byte unchanged and
+// ComputePlan therefore still emits ActionSkip (isIngestDrift only compares
+// source-file size/mtime — it is structurally blind to an ontology_dir edit).
+//
+// Before SourceFingerprint was wired into ApplyPlan's ActionSkip cache check,
+// this scenario served cycle 1's stale coverage forever: warm-cache-hit had no
+// invalidation trigger other than a process restart.
+func TestCoverageCache_OntologyEditInvalidatesCache(t *testing.T) {
+	p, root := newTestProvider(t)
+	ingestRoot := t.TempDir()
+
+	ontDir := filepath.Join(root, ".cog", "observatory", "ontology")
+	writeHermesOntologyDir(t, ontDir)
+
+	// 3 user (intended) + 2 tool (degenerate, per the fixture's
+	// text_tool_degenerate rule) = 5 mapped, 2 degenerate.
+	source := "hermes-node-a"
+	ts := "2026-06-10T00:00:00Z"
+	var lines []string
+	for i := 1; i <= 3; i++ {
+		lines = append(lines, makeIngestRecord(source, "sess-1", "user",
+			fmt.Sprintf("user msg %d", i), ts,
+			map[string]any{"refs": map[string]any{"stable_id": fmt.Sprintf("%s:%d", source, i)}}))
+	}
+	for i := 4; i <= 5; i++ {
+		lines = append(lines, makeIngestRecord(source, "sess-1", "tool",
+			fmt.Sprintf(`{"result":"r%d"}`, i), ts,
+			map[string]any{"refs": map[string]any{"stable_id": fmt.Sprintf("%s:%d", source, i)}}))
+	}
+	writeIngestDir(t, ingestRoot, source, "20260610T000000Z-run1", lines)
+	writeCacheTestConfig(t, root, ingestRoot, ontDir)
+
+	// ── Cycle 1: full reconcile parses the source and primes the cache. ──
+	reconcileOnce(t, p, root)
+	sc1 := p.Coverage()[source]
+	if sc1.Mapped != 5 {
+		t.Fatalf("cycle 1 Mapped: want 5, got %d", sc1.Mapped)
+	}
+	if sc1.Degenerate != 2 {
+		t.Fatalf("cycle 1 Degenerate: want 2, got %d", sc1.Degenerate)
+	}
+
+	// ── In-place edit to the L2 mapping: role='tool' is no longer degenerate,
+	// it is now an intended mapping. The ingest source files are never
+	// touched, so this is exactly the drift class isIngestDrift cannot see.
+	hermesMappingPath := filepath.Join(ontDir, "mappings", "hermes-statedb.v1.yaml")
+	data, err := os.ReadFile(hermesMappingPath)
+	if err != nil {
+		t.Fatalf("read hermes mapping: %v", err)
+	}
+	edited := strings.Replace(string(data),
+		"    target_class: session.turn\n    quality: degenerate\n",
+		"    target_class: session.turn\n    quality: intended\n", 1)
+	if edited == string(data) {
+		t.Fatal("test fixture drifted: expected 'quality: degenerate' rule text not found")
+	}
+	if err := os.WriteFile(hermesMappingPath, []byte(edited), 0o644); err != nil {
+		t.Fatalf("rewrite hermes mapping: %v", err)
+	}
+
+	// ── Cycle 2: ingest source is unchanged (still ActionSkip) but the
+	// ontology fingerprint has changed, so coverage must be recomputed. ──
+	reconcileOnce(t, p, root)
+	sc2 := p.Coverage()[source]
+
+	if sc2.Degenerate != 0 {
+		t.Fatalf("cycle 2 Degenerate: want 0 (mapping edit reclassified role='tool' as intended), got %d — coverage cache did not invalidate on ontology edit", sc2.Degenerate)
+	}
+	if sc2.Mapped != 5 {
+		t.Fatalf("cycle 2 Mapped: want 5 (total record count unchanged by the reclassification), got %d", sc2.Mapped)
+	}
+
+	// And it must equal a from-scratch parse under the EDITED ontology
+	// (correctness, not just "changed").
+	want := fromScratchCoverage(t, lines, p.Ontology())[source]
+	if sc2.Mapped != want.Mapped || sc2.Degenerate != want.Degenerate || sc2.Quarantined != want.Quarantined {
+		t.Fatalf("post-edit cached coverage != from-scratch parse under edited ontology: cached=%+v scratch=%+v", sc2, want)
+	}
+}

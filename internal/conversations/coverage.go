@@ -41,6 +41,23 @@ type SourceCoverage struct {
 
 	// MappingRef is the L2 mapping version used (e.g. "claude-code-jsonl@1.0.0").
 	MappingRef string `json:"mapping_ref,omitempty"`
+
+	// ontologyFingerprint is the LoadedOntology.SourceFingerprint value of the
+	// ontology/mapping files that produced this snapshot. Provider.ApplyPlan
+	// stamps it whenever it (re)computes a source's coverage and checks it
+	// against the current cycle's fingerprint before serving a cached entry on
+	// ActionSkip — this is what lets an in-place edit to the L1 ontology or an
+	// L2 mapping (one that changes coverage classification without touching the
+	// ingest source's size/mtime or bumping the declared L2 version — exactly
+	// what isIngestDrift cannot see) invalidate the coverage cache.
+	//
+	// Deliberately unexported: it is cache-invalidation plumbing, not part of
+	// the /v1/observatory/coverage response contract documented in
+	// coverage_route.go. It rides along with the rest of this struct through
+	// CoverageTracker.All()/SetSource() (both copy the whole struct) with no
+	// extra wiring, and encoding/json silently skips unexported fields, so it
+	// never leaks into the HTTP response.
+	ontologyFingerprint string
 }
 
 // CoverageTracker accumulates coverage counters across ingest runs.

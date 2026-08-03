@@ -561,21 +561,32 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				// prune pass below never evicts a source that is still configured.
 				liveSources[action.Name] = struct{}{}
 				if cov != nil {
+					// ont.SourceFingerprint is nil-receiver-safe (returns a stable
+					// empty-ontology fingerprint when ont == nil), so this needs no
+					// special-case for enforcement-disabled workspaces.
+					currentFP := ont.SourceFingerprint(action.Name)
+
 					p.mu.Lock()
 					cached, warm := p.coverageCache[action.Name]
 					p.mu.Unlock()
 
-					if warm {
+					if warm && cached.ontologyFingerprint == currentFP {
 						// Cache hit: restore without parsing.
 						cov.SetSource(action.Name, cached)
 					} else {
-						// Cold cache (e.g. first cycle after a restart): fall back to
-						// a one-time coverage-only parse, then prime the cache.
+						// Cold cache (e.g. first cycle after a restart) OR the
+						// ontology/mapping was edited in place since the cache was
+						// primed — isIngestDrift is structurally blind to that (the
+						// source's JSONL bytes and declared L2 version are unchanged),
+						// which is exactly what SourceFingerprint exists to catch.
+						// Either way: fall back to a one-time coverage-only parse,
+						// then (re)prime the cache with the fresh fingerprint.
 						if covErr := accumulateCoverage(action, ont, cov); covErr != nil {
 							// Non-fatal: log but don't fail the action.
 							errs = append(errs, fmt.Sprintf("coverage-only pass for %s: %v", action.Name, covErr))
 						} else {
 							snap := cov.All()[action.Name]
+							snap.ontologyFingerprint = currentFP
 							p.mu.Lock()
 							p.coverageCache[action.Name] = snap
 							p.mu.Unlock()
@@ -613,10 +624,12 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 					continue
 				}
 				// applyIngestSource parsed + populated cov for this source;
-				// snapshot it into the cache so subsequent skip cycles can
-				// serve it without re-parsing.
+				// snapshot it into the cache (stamped with the ontology fingerprint
+				// this parse used) so subsequent skip cycles can serve it without
+				// re-parsing, until the fingerprint next changes.
 				if cov != nil {
 					snap := cov.All()[action.Name]
+					snap.ontologyFingerprint = ont.SourceFingerprint(action.Name)
 					p.mu.Lock()
 					p.coverageCache[action.Name] = snap
 					p.mu.Unlock()
