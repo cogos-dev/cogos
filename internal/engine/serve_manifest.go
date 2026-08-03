@@ -139,6 +139,7 @@ func classifyHTTPFamily(path string) string {
 		{"/v1/conversation", "observability"},
 		{"/v1/proprioceptive", "observability"},
 		{"/v1/debug", "observability"},
+		{"/debug", "observability"},
 		{"/v1/attention", "attention"},
 		{"/v1/constellation", "attention"},
 		{"/v1/observer", "attention"},

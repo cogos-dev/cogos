@@ -6,6 +6,16 @@
 //	GET /v1/debug/context — current context window as zones with ordering and token counts
 //
 // No external dependencies. Just curl it.
+//
+// Exposure note (#507): /v1/debug/last carries the extracted query text of the
+// most recent chat request and the filesystem paths of every injected cogdoc,
+// so these responses are excluded from the CORS middleware — isDebugPath in
+// serve_cors.go — and never carry an Access-Control-Allow-Origin header. That
+// stops a cross-origin page from reading the body via a simple fetch(). It is
+// deliberately a weaker guard than the four-layer debugLoopbackOnly used for
+// /debug/pprof: the kernel's own dashboard (GET /) and canvas (GET /canvas)
+// fetch these two routes same-origin, and debugLoopbackOnly's Referer
+// rejection would break them. See serve_cors.go for the full reasoning.
 package engine
 
 import (
