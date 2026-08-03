@@ -18,6 +18,8 @@
 package conversations
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -251,6 +253,16 @@ type LoadedOntology struct {
 	// OntologyRef is the canonical version reference for L3 tagging:
 	// "<id>@<version>", e.g. "cogos.conversations@1.0.0".
 	OntologyRef string
+
+	// l1Hash is the content hash of the L1 ontology file ("" when no L1 loaded).
+	l1Hash string
+
+	// l2Hash maps source-id → content hash of the L2 mapping file that serves
+	// that source. Together with l1Hash this backs SourceFingerprint, which lets
+	// the coverage cache detect in-place ontology/mapping edits — edits that
+	// change coverage classification but leave both the source JSONL files
+	// (size/mtime) and the declared L2 version unchanged.
+	l2Hash map[string]string
 }
 
 // ParseMappingDoc parses and validates an L2 YAML mapping document.
@@ -293,6 +305,7 @@ func LoadOntologyDir(ontologyDir string) (*LoadedOntology, error) {
 	lo := &LoadedOntology{
 		L2:               make(map[string]*MappingDoc),
 		MappedComponents: make(map[string]struct{}),
+		l2Hash:           make(map[string]string),
 	}
 
 	// ── Load L1 instances from the root of ontologyDir ───────────────────────
@@ -330,6 +343,7 @@ func LoadOntologyDir(ontologyDir string) (*LoadedOntology, error) {
 		// Last one wins if multiple L1 files exist (unexpected, but handle cleanly).
 		lo.L1 = doc
 		lo.OntologyRef = doc.ID + "@" + doc.Version
+		lo.l1Hash = hashBytes(data)
 	}
 
 	// ── Load L2 mappings from <ontologyDir>/mappings/ ─────────────────────────
@@ -365,8 +379,10 @@ func LoadOntologyDir(ontologyDir string) (*LoadedOntology, error) {
 		if len(sources) == 0 {
 			sources = []string{mdoc.Mapping.ID}
 		}
+		mappingHash := hashBytes(data)
 		for _, src := range sources {
 			lo.L2[src] = mdoc
+			lo.l2Hash[src] = mappingHash
 		}
 
 		// Accumulate mapped L1 component names from declared rules.
@@ -385,6 +401,35 @@ func LoadOntologyDir(ontologyDir string) (*LoadedOntology, error) {
 	lo.MappedComponents["session.turn"] = struct{}{}
 
 	return lo, nil
+}
+
+// hashBytes returns the hex-encoded SHA-256 of b.
+func hashBytes(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// SourceFingerprint returns a content fingerprint of the loaded ontology as it
+// applies to source: a hash over the L1 ontology file content and the L2
+// mapping file content that serves source. Two loads of byte-identical
+// ontology/mapping files produce the same fingerprint; any in-place edit to
+// either file — even one that does not bump the declared id@version — produces
+// a different fingerprint.
+//
+// The coverage cache uses this to detect ontology drift that the source-file
+// size/mtime drift check (isIngestDrift) is structurally blind to: the operator
+// can edit a mapping rule's quality or add/remove a source mapping while the
+// ingest JSONL files stay byte-for-byte unchanged.
+//
+// A nil receiver (enforcement disabled) yields a stable empty-ontology
+// fingerprint, so callers need not special-case that path.
+func (lo *LoadedOntology) SourceFingerprint(source string) string {
+	var l1, l2 string
+	if lo != nil {
+		l1 = lo.l1Hash
+		l2 = lo.l2Hash[source]
+	}
+	return hashBytes([]byte(l1 + "|" + l2))
 }
 
 // L3Tag is the version tagging appended to newly-ingested records per the L3

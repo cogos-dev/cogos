@@ -15,6 +15,7 @@ package conversations
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -306,6 +307,150 @@ version: 1.0.0
 	_, err := LoadOntologyDir(dir)
 	if err == nil {
 		t.Error("expected error for invalid L1 grammar, got nil")
+	}
+}
+
+// ─── SourceFingerprint tests ──────────────────────────────────────────────────
+
+// TestSourceFingerprint_StableAcrossIdenticalLoads asserts that two separate
+// LoadOntologyDir calls over byte-identical ontology/mapping files produce the
+// same fingerprint for the same source — the baseline correctness property
+// the coverage cache relies on to distinguish "unchanged" from "edited".
+func TestSourceFingerprint_StableAcrossIdenticalLoads(t *testing.T) {
+	dir := t.TempDir()
+	writeOntologyFixtures(t, dir)
+
+	lo1, err := LoadOntologyDir(dir)
+	if err != nil {
+		t.Fatalf("LoadOntologyDir (1st load): %v", err)
+	}
+	lo2, err := LoadOntologyDir(dir)
+	if err != nil {
+		t.Fatalf("LoadOntologyDir (2nd load): %v", err)
+	}
+
+	for _, source := range []string{"claude-code-jsonl", "hermes-node-a", "hermes-cog"} {
+		fp1 := lo1.SourceFingerprint(source)
+		fp2 := lo2.SourceFingerprint(source)
+		if fp1 == "" {
+			t.Errorf("SourceFingerprint(%q): empty fingerprint from a loaded ontology", source)
+		}
+		if fp1 != fp2 {
+			t.Errorf("SourceFingerprint(%q) not stable across identical loads: %q vs %q", source, fp1, fp2)
+		}
+	}
+}
+
+// TestSourceFingerprint_L1Edit_ChangesFingerprint asserts that editing the L1
+// ontology file in place — without touching any L2 mapping or bumping the
+// declared version — changes SourceFingerprint for every source, since every
+// source's fingerprint incorporates l1Hash.
+func TestSourceFingerprint_L1Edit_ChangesFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	writeOntologyFixtures(t, dir)
+
+	before, err := LoadOntologyDir(dir)
+	if err != nil {
+		t.Fatalf("LoadOntologyDir (before): %v", err)
+	}
+	fpBefore := before.SourceFingerprint("claude-code-jsonl")
+
+	// In-place edit to the L1 file: add a field to an existing component
+	// without bumping `version:`. This is exactly the class of edit
+	// isIngestDrift cannot see (it never reads the ontology dir at all).
+	l1Path := filepath.Join(dir, "cogos.conversations.v1.yaml")
+	data, err := os.ReadFile(l1Path)
+	if err != nil {
+		t.Fatalf("read L1: %v", err)
+	}
+	edited := strings.Replace(string(data), "tool.call:\n    description: A tool invocation.",
+		"tool.call:\n    description: A tool invocation (edited).", 1)
+	if edited == string(data) {
+		t.Fatal("test fixture drifted: expected replacement string not found in L1 fixture")
+	}
+	if err := os.WriteFile(l1Path, []byte(edited), 0o644); err != nil {
+		t.Fatalf("rewrite L1: %v", err)
+	}
+
+	after, err := LoadOntologyDir(dir)
+	if err != nil {
+		t.Fatalf("LoadOntologyDir (after): %v", err)
+	}
+	fpAfter := after.SourceFingerprint("claude-code-jsonl")
+
+	if fpBefore == fpAfter {
+		t.Errorf("SourceFingerprint unchanged after in-place L1 edit: %q", fpBefore)
+	}
+}
+
+// TestSourceFingerprint_L2Edit_ScopedToServedSources asserts that editing one
+// L2 mapping file changes SourceFingerprint only for the source(s) that
+// mapping serves, leaving sources served by a different, untouched mapping
+// file unaffected. The fixture's hermes-statedb.v1.yaml serves both
+// hermes-node-a and hermes-cog (a single file, multiple declared sources) and
+// is independent of claude-code-jsonl.v1.yaml.
+func TestSourceFingerprint_L2Edit_ScopedToServedSources(t *testing.T) {
+	dir := t.TempDir()
+	writeOntologyFixtures(t, dir)
+
+	before, err := LoadOntologyDir(dir)
+	if err != nil {
+		t.Fatalf("LoadOntologyDir (before): %v", err)
+	}
+	fpHermesNodeABefore := before.SourceFingerprint("hermes-node-a")
+	fpHermesCogBefore := before.SourceFingerprint("hermes-cog")
+	fpCCBefore := before.SourceFingerprint("claude-code-jsonl")
+
+	// In-place edit to ONLY the hermes mapping: add a quality flag to its rule.
+	hermesPath := filepath.Join(dir, "mappings", "hermes-statedb.v1.yaml")
+	data, err := os.ReadFile(hermesPath)
+	if err != nil {
+		t.Fatalf("read hermes mapping: %v", err)
+	}
+	edited := strings.Replace(string(data), "target_class: session.turn\n",
+		"target_class: session.turn\n    quality: degenerate\n", 1)
+	if edited == string(data) {
+		t.Fatal("test fixture drifted: expected replacement string not found in hermes mapping fixture")
+	}
+	if err := os.WriteFile(hermesPath, []byte(edited), 0o644); err != nil {
+		t.Fatalf("rewrite hermes mapping: %v", err)
+	}
+
+	after, err := LoadOntologyDir(dir)
+	if err != nil {
+		t.Fatalf("LoadOntologyDir (after): %v", err)
+	}
+
+	if got := after.SourceFingerprint("hermes-node-a"); got == fpHermesNodeABefore {
+		t.Errorf("SourceFingerprint(hermes-node-a) unchanged after editing the mapping that serves it: %q", got)
+	}
+	if got := after.SourceFingerprint("hermes-cog"); got == fpHermesCogBefore {
+		t.Errorf("SourceFingerprint(hermes-cog) unchanged after editing the mapping that serves it: %q", got)
+	}
+	if got := after.SourceFingerprint("claude-code-jsonl"); got != fpCCBefore {
+		t.Errorf("SourceFingerprint(claude-code-jsonl) changed after editing an UNRELATED mapping (hermes-statedb): before=%q after=%q", fpCCBefore, got)
+	}
+}
+
+// TestSourceFingerprint_NilReceiver_Stable asserts the documented nil-receiver
+// contract: a nil *LoadedOntology (enforcement disabled) must not panic and
+// must yield a stable fingerprint across calls and across sources, so callers
+// (the ApplyPlan coverage-cache check) never need to special-case it.
+func TestSourceFingerprint_NilReceiver_Stable(t *testing.T) {
+	var lo *LoadedOntology
+
+	fp1 := lo.SourceFingerprint("claude-code-jsonl")
+	fp2 := lo.SourceFingerprint("claude-code-jsonl")
+	fp3 := lo.SourceFingerprint("some-other-source")
+
+	if fp1 == "" {
+		t.Error("nil-receiver SourceFingerprint returned an empty string")
+	}
+	if fp1 != fp2 {
+		t.Errorf("nil-receiver SourceFingerprint not stable across calls: %q vs %q", fp1, fp2)
+	}
+	if fp1 != fp3 {
+		t.Errorf("nil-receiver SourceFingerprint varies by source (it should not, there is no loaded ontology): %q vs %q", fp1, fp3)
 	}
 }
 
