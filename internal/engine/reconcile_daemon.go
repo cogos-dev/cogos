@@ -680,12 +680,25 @@ func (d *ReconcileDaemon) ProviderConvergence() []ProviderConvergence {
 // live indication it was broken. Raising quarantine as a counted, clearable
 // episode is what turns removing the noise into keeping the signal rather
 // than losing it.
-func (d *ReconcileDaemon) observeConvergence(providerType string, provider reconcile.Reconcilable, cycleMs, fetchMs int64) {
+//
+// quarantined is a PARAMETER rather than a d.isQuarantined() read taken here,
+// because on one of the three call sites that read would be taken too early.
+// Quarantine is lifted by noteCycleSuccess, which runs from runOneCycle's
+// outcome defer — and defers run after the return statement, with that one
+// registered first so it runs last. A quarantined provider that self-heals
+// therefore reaches the in-sync early return with d.quarantined still
+// populated, and a live read there would feed the recovery cycle to the
+// tracker as still-quarantined: healthyNow evaluates false, healthyStreak
+// resets to 0 instead of advancing, and the episode takes ClearCycles+1
+// healthy cycles to close instead of ClearCycles. Passing the value in makes
+// each call site state what it means about the cycle it just finished, which
+// is knowable at the call site and not always equal to the live map read.
+func (d *ReconcileDaemon) observeConvergence(providerType string, provider reconcile.Reconcilable, cycleMs, fetchMs int64, quarantined bool) {
 	d.health.Observe(providerType, convObservation{
 		CycleMs:     cycleMs,
 		FetchMs:     fetchMs,
 		Degraded:    provider.Health().Health == reconcile.HealthDegraded,
-		Quarantined: d.isQuarantined(providerType),
+		Quarantined: quarantined,
 	})
 }
 
@@ -1168,7 +1181,16 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 			"plan_ms", planMs,
 			"duration_ms", dur.Milliseconds(),
 		)
-		d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs)
+		// Observed as NOT quarantined, deliberately. This return is the
+		// success path: retErr is nil and recordOutcome is still true, so the
+		// outcome defer runs noteCycleSuccess → liftQuarantine on the way out.
+		// Reading d.isQuarantined() here instead would read the map before
+		// that lift and hand the tracker a still-quarantined recovery cycle,
+		// costing a self-healed provider one extra healthy cycle before its
+		// episode could close. Nothing between here and the defer can
+		// re-quarantine: quarantine is only entered from noteCycleFailure,
+		// which this path does not reach.
+		d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs, false)
 		return nil
 	}
 
@@ -1195,7 +1217,10 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		// cadence instead of every tick.
 		recordOutcome = false
 		d.backoff.Hold(providerType, int(d.tickSeq.Load()))
-		d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs)
+		// Quarantined by construction — this branch is the isQuarantined()
+		// gate itself, and recordOutcome=false means nothing lifts it on the
+		// way out.
+		d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs, true)
 
 		slog.Debug("reconcile-daemon: drift observed but provider quarantined",
 			"provider", providerType,
@@ -1300,7 +1325,12 @@ func (d *ReconcileDaemon) runOneCycle(ctx context.Context, providerType string) 
 		"duration_ms", dur.Milliseconds(),
 	)
 
-	d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs)
+	// The full-apply path only runs when the actuation gate above found the
+	// provider un-quarantined, and quarantine is only entered from the outcome
+	// defer of this same cycle. A live read is therefore equivalent to false
+	// here; it is kept so the behaviour of this path is byte-for-byte what it
+	// was before the parameter was introduced.
+	d.observeConvergence(providerType, provider, dur.Milliseconds(), fetchMs, d.isQuarantined(providerType))
 
 	if applyFailed > 0 {
 		return fmt.Errorf("provider %s: %d action(s) failed during apply", providerType, applyFailed)

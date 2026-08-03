@@ -561,3 +561,115 @@ func TestReconcileDaemon_HealthyProviderNeverBacksOff(t *testing.T) {
 		t.Errorf("healthy provider produced %d quarantine lines, want 0", got)
 	}
 }
+
+// TestReconcileDaemon_SelfHealedProviderClearsAfterExactlyClearCycles pins the
+// ORDERING of the in-sync early return against the outcome defer that lifts
+// quarantine.
+//
+// A quarantined provider that self-heals takes the `!plan.Summary.HasChanges()`
+// early return in runOneCycle. Quarantine is lifted by noteCycleSuccess, which
+// runs from the outcome defer — registered first, so it runs last, and defers
+// run after the return statement. Reading d.isQuarantined() at the observation
+// point therefore reads the map BEFORE the lift, and the tracker sees the
+// recovery cycle as still-quarantined: healthyNow is false, healthyStreak
+// resets to 0 instead of advancing to 1, and the episode's cleared line is
+// delayed by one cycle beyond ClearCycles (4 instead of 3 with defaults).
+//
+// One cycle of latency on a clear is small, but it is a lie about the world in
+// the direction that matters: the alarm keeps saying "still broken" for a
+// provider that has already recovered, which is the same disease as the
+// always-firing counter this PR exists to cure.
+//
+// Cycles are driven directly rather than through runTick because backoff
+// widens the retry window for a failing provider — a tick is not a cycle, and
+// the quantity under test is cycles.
+func TestReconcileDaemon_SelfHealedProviderClearsAfterExactlyClearCycles(t *testing.T) {
+	read := captureLogs(t)
+	p := newFlakyReconcilable("recovers-on-schedule")
+	d := newBackoffTestDaemon(t, p, 3)
+
+	clearCycles := d.health.cfg.ClearCycles
+	if clearCycles < 2 {
+		t.Fatalf("ClearCycles = %d; this test needs >= 2 to tell N from N+1", clearCycles)
+	}
+
+	ctx := context.Background()
+
+	// Fail into quarantine.
+	for i := 0; i < 10 && !d.isQuarantined(p.Type()); i++ {
+		_ = d.runOneCycle(ctx, p.Type())
+	}
+	if !d.isQuarantined(p.Type()) {
+		t.Fatal("precondition failed: provider not quarantined")
+	}
+	// One more cycle so the quarantine axis is actually observed and the
+	// episode opens on it.
+	_ = d.runOneCycle(ctx, p.Type())
+	s, ok := findConv(d.ProviderConvergence(), p.Type())
+	if !ok || !s.Flagged || !hasReason(s, "quarantined") {
+		t.Fatalf("precondition failed: no open episode on the quarantine axis: %+v", s)
+	}
+	if got := countMsg(read(), msgAnomalyCleared); got != 0 {
+		t.Fatalf("precondition failed: %d cleared lines before recovery, want 0", got)
+	}
+
+	// The world fixes itself: nothing drifts any more and health comes back.
+	// The config is deliberately untouched, so reviewQuarantine's
+	// fingerprint check does NOT lift quarantine early — the lift has to come
+	// from the in-sync cycle's own success, which is the path under test.
+	p.setInSync(true)
+	p.setFailCount(0)
+	p.mu.Lock()
+	p.health = reconcile.HealthHealthy
+	p.mu.Unlock()
+
+	// First healthy cycle: it must count toward the clear streak. Before the
+	// fix this observation carried Quarantined=true and reset the streak to 0.
+	_ = d.runOneCycle(ctx, p.Type())
+	if d.isQuarantined(p.Type()) {
+		t.Fatal("quarantine survived an in-sync cycle: the outcome defer must lift it")
+	}
+	if got := healthyStreakFor(d, p.Type()); got != 1 {
+		t.Errorf("healthyStreak after the recovery cycle = %d, want 1 — "+
+			"the cycle that lifted quarantine must be observed as healthy, not as still-quarantined", got)
+	}
+
+	// Remaining cycles: the episode must close on cycle ClearCycles, counting
+	// the recovery cycle above as the first.
+	clearedAt := 0
+	if countMsg(read(), msgAnomalyCleared) > 0 {
+		clearedAt = 1
+	}
+	for i := 2; i <= clearCycles+2; i++ {
+		_ = d.runOneCycle(ctx, p.Type())
+		if clearedAt == 0 && countMsg(read(), msgAnomalyCleared) > 0 {
+			clearedAt = i
+		}
+	}
+
+	if clearedAt == 0 {
+		t.Fatalf("episode never closed within %d healthy cycles", clearCycles+2)
+	}
+	if clearedAt != clearCycles {
+		t.Errorf("episode closed after %d healthy cycles, want exactly %d (ClearCycles); "+
+			"%d means the recovery cycle was fed to the tracker as still-quarantined",
+			clearedAt, clearCycles, clearCycles+1)
+	}
+	if s, _ := findConv(d.ProviderConvergence(), p.Type()); s.Flagged || s.Quarantined {
+		t.Errorf("snapshot still flagged/quarantined after recovery: %+v", s)
+	}
+}
+
+// healthyStreakFor reads the tracker's consecutive-healthy counter for one
+// provider. White-box on purpose: the streak is the quantity the ordering bug
+// corrupts, and asserting it directly names the failure instead of leaving the
+// reader to infer it from a delayed log line.
+func healthyStreakFor(d *ReconcileDaemon, providerType string) int {
+	d.health.mu.Lock()
+	defer d.health.mu.Unlock()
+	s := d.health.st[providerType]
+	if s == nil {
+		return -1
+	}
+	return s.healthyStreak
+}
