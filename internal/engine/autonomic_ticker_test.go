@@ -779,6 +779,14 @@ type selfHealableProvider struct {
 	applyPlanCalls   int
 	// planHasChanges controls whether ComputePlan returns a non-empty plan.
 	planHasChanges bool
+	// applyFailed, when true, makes ApplyPlan return a Result with
+	// Status: ApplyFailed instead of ApplySucceeded — while still returning a
+	// nil top-level error. This is the exact shape LMSModelStateProvider (and
+	// any provider that treats one bad action as non-fatal) uses: it appends
+	// a failed Result and keeps going rather than aborting via the error
+	// return. Exists to cover the "nil top-level error is NOT sufficient
+	// evidence of success" fix in healDegradedProviders.
+	applyFailed bool
 }
 
 func (s *selfHealableProvider) Type() string { return s.name }
@@ -806,11 +814,18 @@ func (s *selfHealableProvider) ComputePlan(_ any, _ any, _ *reconcile.State) (*r
 
 func (s *selfHealableProvider) ApplyPlan(_ context.Context, _ *reconcile.Plan) ([]reconcile.Result, error) {
 	s.applyPlanCalls++
+	status := reconcile.ApplySucceeded
+	errMsg := ""
+	if s.applyFailed {
+		status = reconcile.ApplyFailed
+		errMsg = "simulated apply failure"
+	}
 	return []reconcile.Result{{
 		Phase:  "apply",
 		Action: string(reconcile.ActionUpdate),
 		Name:   s.name + "/heal",
-		Status: reconcile.ApplySucceeded,
+		Status: status,
+		Error:  errMsg,
 	}}, nil
 }
 
@@ -918,6 +933,60 @@ func TestHealDegradedProviders_SkipsWhenNoPlanChanges(t *testing.T) {
 		}
 		if degraded.applyPlanCalls != 0 {
 			t.Errorf("ApplyPlan should not be called when plan is empty: got %d calls", degraded.applyPlanCalls)
+		}
+	})
+}
+
+// TestHealDegradedProviders_ApplyFailedResultCountsAsFailure is the
+// regression test for the "nil top-level error is NOT sufficient evidence of
+// success" fix in healDegradedProviders (see the applyFailed loop right
+// after the ApplyPlan call): a provider whose ApplyPlan returns
+// (results, nil) with an ApplyFailed entry inside results — the shape
+// LMSModelStateProvider and similar providers use to keep applying the rest
+// of a plan after one bad action rather than aborting via the error return —
+// must be recorded as a self-heal FAILURE, not a success.
+//
+// Before the fix, this loop inspected only the top-level err, so for such a
+// provider the backoff below was structurally unreachable: every tick logged
+// "apply complete" and reset healBackoff's failure counter while the action
+// inside failed identically forever. Asserting on healBackoff.Failures
+// (observed runtime state, not a code path) is what catches that: this test
+// was confirmed to fail — healBackoff.Failures(name) stayed 0 — when the
+// applyFailed>0 branch in healDegradedProviders was temporarily reverted to
+// fall straight through to the RecordSuccess branch, and to pass again once
+// restored.
+func TestHealDegradedProviders_ApplyFailedResultCountsAsFailure(t *testing.T) {
+	name := "mlx-supervised/apply-failed-nil-err"
+	degraded := &selfHealableProvider{
+		name: name,
+		status: reconcile.ResourceStatus{
+			Sync:   reconcile.SyncStatusOutOfSync,
+			Health: reconcile.HealthDegraded,
+		},
+		planHasChanges: true,
+		applyFailed:    true,
+	}
+
+	// healBackoff is a package-global shared across every test in this file;
+	// start this provider's key from a clean slate regardless of run order,
+	// and leave it clean afterward.
+	healBackoff.RecordSuccess(name)
+	defer healBackoff.RecordSuccess(name)
+
+	withSelfHealableProviders(t, []*selfHealableProvider{degraded}, func() {
+		ctx := context.Background()
+		healDegradedProviders(ctx)
+
+		if degraded.fetchLiveCalls != 1 {
+			t.Errorf("FetchLive calls: got %d; want 1", degraded.fetchLiveCalls)
+		}
+		if degraded.applyPlanCalls != 1 {
+			t.Fatalf("ApplyPlan calls: got %d; want 1", degraded.applyPlanCalls)
+		}
+		if got := healBackoff.Failures(name); got != 1 {
+			t.Errorf("healBackoff.Failures(%q) = %d; want 1 — an ApplyFailed result "+
+				"alongside a nil top-level error must count as a self-heal failure, "+
+				"not be swallowed as success", name, got)
 		}
 	})
 }
