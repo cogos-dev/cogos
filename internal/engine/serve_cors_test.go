@@ -222,14 +222,18 @@ func TestIsLoopbackOnlyPath(t *testing.T) {
 		{"/v1/messages", true},
 		{"/v1/context/foveated", true},
 		{"/v1/peer-awareness", true},
+		// Round 6: run-log surfaces whose rows carry model-emitted content
+		// (ToolArgs in proprioceptive.jsonl, prompt/query previews in the
+		// kernel slog; /v1/traces includes the proprioceptive source via
+		// source=all).
+		{"/v1/proprioceptive", true},
+		{"/v1/traces", true},
+		{"/v1/kernel-log", true},
 		// The tier edge inside /v1/context.
 		{"/v1/context", false},
 		{"/v1/context/", false},
 		// Telemetry and metadata stay permissive.
 		{"/v1/manifest", false},
-		{"/v1/traces", false},
-		{"/v1/kernel-log", false},
-		{"/v1/proprioceptive", false},
 		{"/metrics", false},
 		{"/v1/vitals", false},
 		{"/v1/hud/state", false},
@@ -248,6 +252,8 @@ func TestIsLoopbackOnlyPath(t *testing.T) {
 		{"/v1/session", false},
 		{"/v1/agentx", false},
 		{"/v1/configs", false},
+		{"/v1/kernel/rates", false}, // sibling of /v1/kernel-log, stays META
+		{"/v1/tracesx", false},
 		{"/mcpx", false},
 		{"/memoryx", false},
 		{"/", false},
@@ -279,10 +285,14 @@ func TestCORSPolicyForPath(t *testing.T) {
 		{"/v1/blocks/manifest", corsLoopbackOnly},
 		{"/mcp", corsLoopbackOnly},
 		{"/v1/context/foveated", corsLoopbackOnly},
+		{"/v1/proprioceptive", corsLoopbackOnly},
+		{"/v1/traces", corsLoopbackOnly},
+		{"/v1/kernel-log", corsLoopbackOnly},
 		{"/v1/context", corsPermissive},
 		{"/v1/manifest", corsPermissive},
 		{"/v1/channel-sessions/register", corsPermissive},
-		{"/v1/traces", corsPermissive},
+		{"/metrics", corsPermissive},
+		{"/v1/vitals", corsPermissive},
 		{"/", corsPermissive},
 	}
 	for _, tc := range cases {
@@ -303,6 +313,13 @@ var sessionDataTestRoutes = []string{
 	"/v1/events",
 	"/v1/tool-calls",
 	"/v1/cogdoc/read",
+	// Round 6: run-log surfaces whose rows carry model-emitted tool args
+	// and prompt/query previews. All three answer 200 JSON on a fresh
+	// workspace (absent files → empty entries), so the handler-level
+	// assertions hold without setup.
+	"/v1/proprioceptive",
+	"/v1/traces",
+	"/v1/kernel-log",
 }
 
 // TestSessionDataRoutes_RemoteOriginGetsNoAllowOrigin is the regression test

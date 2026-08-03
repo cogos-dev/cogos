@@ -142,16 +142,34 @@
 //	LOOP  /v1/handoffs/*          OfferPayload carries full state blobs
 //	LOOP  /v1/identity/*          grants/current returns a live RAW TOKEN;
 //	                              POST mint response carries one too
+//	LOOP  /v1/kernel-log          kernel slog rows carry content previews at
+//	                              Info: prompt_prefix (serve_foveated.go),
+//	                              query_prefix (trm_context.go), text_preview
+//	                              (local_agent_harness.go), full build output
+//	                              (providers/site); err strings are unvetted
 //	LOOP  /v1/ledger              hash-chained cross-session history (round 4)
 //	LOOP  /v1/messages            Anthropic-compat twin of /v1/chat
 //	LOOP  /v1/peer-awareness      packet rendered from channel activity
+//	LOOP  /v1/proprioceptive      raw JSONL rows: logRejectedToolCall
+//	                              (tool_loop.go) writes model-emitted ToolArgs
+//	                              into proprioceptive.jsonl and the handler
+//	                              embeds lines unmodified as json.RawMessage.
+//	                              Forward-looking: proprioceptive.go's
+//	                              exported ComputeEntry (currently uncalled)
+//	                              writes truncated chat text on-schema and
+//	                              would flow through this same endpoint the
+//	                              moment it is wired — this placement
+//	                              anticipates that; do not treat today's
+//	                              payload as the ceiling
 //	LOOP  /v1/sessions/*          {id}[/context] embeds SessionBlock.Content
 //	                              (raw context-block text); presence rides
 //	LOOP  /v1/skills/*            exec returns skill output; list rides
 //	LOOP  /v1/tool-calls          args+outputs across all ledgers (round 4)
+//	LOOP  /v1/traces              source defaults to "all" (traces_query.go),
+//	                              which includes the proprioceptive source;
+//	                              TraceResult.Line is the same raw passthrough
 //
-//	TELEM /metrics, /v1/vitals, /v1/traces, /v1/kernel-log,
-//	      /v1/proprioceptive     host/provider gauges, run-log JSONL rows
+//	TELEM /metrics, /v1/vitals   host/provider gauges and counters only
 //	TELEM /v1/context (GET)      fovea paths+scores only — the rendered-text
 //	                             sibling /v1/context/foveated is LOOP
 //	TELEM /v1/attention, /v1/constellation/*, /v1/observer/state,
@@ -170,7 +188,12 @@
 //
 // The dividing rule: a response that can carry document/conversation/agent
 // CONTENT or a CREDENTIAL is LOOP; identifiers, paths, scores, and gauges
-// are TELEM/META. Two maintenance notes: (1) routes registered by extensions
+// are TELEM/META. The rule is about PAYLOAD CONTENTS, not route family —
+// round 6 moved /v1/proprioceptive, /v1/traces, and /v1/kernel-log out of
+// TELEM because their JSONL/log rows turned out to carry model-emitted
+// tool-call arguments and prompt/query previews (writers cited in the table);
+// "it's a telemetry endpoint" is never by itself a reason to stay permissive.
+// Two maintenance notes: (1) routes registered by extensions
 // (RegisterHTTPExtensions) or providers (providers_register.go) default to
 // permissive — a content-bearing extension route must add its prefix to
 // loopbackOnlyPrefixes; (2) new mux routes default to permissive, so
@@ -353,12 +376,15 @@ var loopbackOnlyPrefixes = []string{
 	"/v1/events",
 	"/v1/handoffs",
 	"/v1/identity",
+	"/v1/kernel-log",
 	"/v1/ledger",
 	"/v1/messages",
 	"/v1/peer-awareness",
+	"/v1/proprioceptive",
 	"/v1/sessions",
 	"/v1/skills",
 	"/v1/tool-calls",
+	"/v1/traces",
 }
 
 // isLoopbackOnlyPath reports whether a request path serves content or
