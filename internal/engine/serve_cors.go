@@ -76,37 +76,105 @@
 // no-cors/img vector debugLoopbackOnly exists to stop on /debug/pprof/profile
 // — a 30s CPU burn — has no analogue here.
 //
-// Second exclusion tier — session/ledger reads are loopback-only:
+// Second exclusion tier — content and credential surfaces are loopback-only:
 //
-// #507's review round 4 found the identical read primitive on routes that are
-// not named "debug" at all. GET /v1/conversation defaults session_id to the
-// live process session and returns the full untruncated turn-by-turn text;
-// GET /v1/ledger defaults session_id to empty, which LedgerQuery documents as
-// "all sessions", so it returns the hash-chained event history of every
-// session the daemon has ever handled. Both are unauthenticated simple GETs,
-// so the star fallback above was enough for any page the operator happened to
-// visit to fetch('http://127.0.0.1:6931/v1/ledger') and read the body.
-// GET /v1/events (+ /v1/events/stream) is a thin wrapper over the same
-// QueryLedger call, and GET /v1/tool-calls stitches tool.call/tool.result rows
-// — arguments and outputs included — across every session's ledger. Same data,
-// same exposure, so all four are covered.
+// #507's review rounds 4 and 5 found the identical read primitive on routes
+// that are not named "debug" at all — first /v1/conversation (full
+// untruncated turn text, session_id defaulting to the live session) and
+// /v1/ledger (empty session_id means ALL sessions per LedgerQuery's doc
+// comment), then /v1/cogdoc/read (raw workspace file content for any
+// resolvable cog: URI). All are unauthenticated simple GETs, so the star
+// fallback was enough for any page the operator happened to visit to
+// fetch('http://127.0.0.1:6931/v1/ledger') and read the body. Round 5's
+// response swept every registered route (the classification table below) and
+// found the same class on more surfaces, including one credential leak:
+// GET /v1/identity/grants/current returns a live grant's RAW TOKEN by design
+// (the "zero-paste primitive" — its stated consumer is "a same-loopback
+// page", which is exactly this tier's contract).
 //
-// These do NOT get the /v1/debug treatment of dropping CORS entirely, because
-// unlike the dashboard/canvas pair these have legitimate CROSS-origin browser
-// consumers on other loopback ports (the mod3 dashboard on :7860, the
-// constellation surfaces). Dropping every Access-Control-* header would break
-// them. What has to go is only the "*" widening for non-loopback origins:
-// corsLoopbackOnly echoes a loopback Origin exactly as before, and emits no
-// Access-Control-Allow-Origin at all for anything else, so a remote page's
-// fetch() still reaches the handler but the browser refuses to hand it the
-// body. Same-origin clients (no Origin header) and non-browser clients (curl,
-// the MCP CLI) are unaffected in either direction.
+// Tiered routes do NOT get the /v1/debug treatment of dropping CORS entirely,
+// because they have legitimate CROSS-origin browser consumers on other
+// loopback ports (the mod3 dashboard on :7860, the constellation surfaces).
+// Dropping every Access-Control-* header would break them. What goes is only
+// the "*" widening for non-loopback origins: corsLoopbackOnly echoes a
+// loopback Origin exactly as before, and emits no Access-Control-Allow-Origin
+// at all for anything else, so a remote page's fetch() still reaches the
+// handler but the browser refuses to hand it the body. Same-origin clients
+// (no Origin header) and non-browser clients (curl, the MCP CLI) are
+// unaffected in either direction.
 //
-// Deliberately NOT in this tier: /v1/traces and /v1/kernel-log read
-// .cog/run/*.jsonl telemetry and the daemon log rather than the ledger or the
-// conversation store, and /v1/proprioceptive is byte-locked for the dashboard.
-// They are a different data class; widening the tier to cover them is a
-// separate decision, not this fix.
+// # Route classification table
+//
+// Every route the engine registers (serve.go's mux block plus every
+// register*Routes sibling), classified by response payload. Audit coverage
+// against GET /v1/manifest — s.route()-registered paths appear there.
+// Classes:
+//
+//	NONE  — corsNone: middleware fully bypassed, no Access-Control-* ever
+//	LOOP  — corsLoopbackOnly: loopback Origin echoed, no header otherwise
+//	TELEM — corsPermissive, documented: telemetry/log/attention-score
+//	        surfaces; paths, scores, log lines — no document/conversation
+//	        bodies, no credentials
+//	META  — corsPermissive: public or identifier-level metadata
+//
+//	NONE  /debug/pprof/*, /debug/vars      pprof heap/profile, expvar
+//	NONE  /v1/debug/last, /v1/debug/context pipeline snapshot, context window
+//
+//	LOOP  /mcp                    full MCP tool surface (cogdoc read, memory
+//	                              search, session tools) over streamable HTTP
+//	LOOP  /memory/read            raw memory-file bytes; /memory/search index
+//	LOOP  /v1/agent/*, /v1/agents/* AgentSnapshot: memory entries, proposals,
+//	                              observations, per-cycle Result text
+//	LOOP  /v1/blobs/{digest}      raw blob bytes
+//	LOOP  /v1/blocks/*            raw block bytes; manifest enumerates every
+//	                              hash, so together = full content sync
+//	LOOP  /v1/bus/*               bus events incl. dashboard chat text;
+//	                              per-bus + cross-bus queries, SSE streams
+//	LOOP  /v1/chat/completions    completion grounded in foveated workspace
+//	                              context — an oracle over the corpus
+//	LOOP  /v1/claude-code/*       session listings incl. FirstPromptSummary
+//	LOOP  /v1/cogdoc/read         raw file content for any cog: URI (round 5)
+//	LOOP  /v1/config              raw kernel.yaml when mutation is enabled
+//	LOOP  /v1/context/foveated    rendered context text + block previews
+//	LOOP  /v1/conversation        full turn-by-turn text (round 4)
+//	LOOP  /v1/dispatch-jobs/{id}  dispatch result payloads
+//	LOOP  /v1/events[/stream]     QueryLedger wrapper (round 4)
+//	LOOP  /v1/handoffs/*          OfferPayload carries full state blobs
+//	LOOP  /v1/identity/*          grants/current returns a live RAW TOKEN;
+//	                              POST mint response carries one too
+//	LOOP  /v1/ledger              hash-chained cross-session history (round 4)
+//	LOOP  /v1/messages            Anthropic-compat twin of /v1/chat
+//	LOOP  /v1/peer-awareness      packet rendered from channel activity
+//	LOOP  /v1/sessions/*          {id}[/context] embeds SessionBlock.Content
+//	                              (raw context-block text); presence rides
+//	LOOP  /v1/skills/*            exec returns skill output; list rides
+//	LOOP  /v1/tool-calls          args+outputs across all ledgers (round 4)
+//
+//	TELEM /metrics, /v1/vitals, /v1/traces, /v1/kernel-log,
+//	      /v1/proprioceptive     host/provider gauges, run-log JSONL rows
+//	TELEM /v1/context (GET)      fovea paths+scores only — the rendered-text
+//	                             sibling /v1/context/foveated is LOOP
+//	TELEM /v1/attention, /v1/constellation/*, /v1/observer/state,
+//	      /v1/lightcone          attention scores, doc paths/titles, cones
+//	TELEM /v1/reconcile/coherence, /v1/kernel/rates, /v1/cluster/status,
+//	      /coherence/check, /v1/hud/state  status snapshots, session ids
+//
+//	META  GET /, /canvas         embedded dashboard HTML (fetches same-origin)
+//	META  /health, /v1/manifest, /v1/models, /v1/card, /v1/providers,
+//	      /v1/taa, /v1/settings/context, /v1/services/*
+//	META  /v1/resolve, /v1/uri/resolve  cog: URI → path + exists; discloses
+//	                             layout, never content
+//	META  /v1/channel-sessions/*, /v1/channels/{id}/peers  session-identity
+//	      records: ids, participant prefs, opaque metadata — no credential
+//	      (identity grants are the credential and they are LOOP)
+//
+// The dividing rule: a response that can carry document/conversation/agent
+// CONTENT or a CREDENTIAL is LOOP; identifiers, paths, scores, and gauges
+// are TELEM/META. Two maintenance notes: (1) routes registered by extensions
+// (RegisterHTTPExtensions) or providers (providers_register.go) default to
+// permissive — a content-bearing extension route must add its prefix to
+// loopbackOnlyPrefixes; (2) new mux routes default to permissive, so
+// classify them against this table when adding them.
 package engine
 
 import (
@@ -221,7 +289,7 @@ func corsPolicyForPath(path string) corsPolicy {
 	switch {
 	case isDebugPath(path):
 		return corsNone
-	case isSessionDataPath(path):
+	case isLoopbackOnlyPath(path):
 		return corsLoopbackOnly
 	default:
 		return corsPermissive
@@ -263,29 +331,40 @@ func isDebugPath(path string) bool {
 	return matchesAnyRoutePrefix(path, "/debug", "/v1/debug")
 }
 
-// sessionDataPrefixes are the read routes whose bodies are conversation
-// content or ledger history, and which therefore never get the "*" widening
-// (see the file-level "Second exclusion tier" note):
-//
-//	/v1/conversation — full turn-by-turn text; session_id defaults to the
-//	                   live process session
-//	/v1/ledger       — hash-chained event history; empty session_id means
-//	                   ALL sessions per LedgerQuery's own doc comment
-//	/v1/events       — thin wrapper over the same QueryLedger call, plus the
-//	                   /v1/events/stream SSE fan-out of ledger.appended
-//	/v1/tool-calls   — tool.call/tool.result rows stitched from every
-//	                   session's ledger, arguments and outputs included
-var sessionDataPrefixes = []string{
+// loopbackOnlyPrefixes are the routes whose response bodies can carry
+// document/conversation/agent content or a credential, and which therefore
+// never get the "*" widening. The per-prefix rationale lives in the
+// file-level route classification table — keep the two in sync. Sorted.
+var loopbackOnlyPrefixes = []string{
+	"/mcp",
+	"/memory",
+	"/v1/agent",
+	"/v1/agents",
+	"/v1/blobs",
+	"/v1/blocks",
+	"/v1/bus",
+	"/v1/chat",
+	"/v1/claude-code",
+	"/v1/cogdoc",
+	"/v1/config",
+	"/v1/context/foveated",
 	"/v1/conversation",
-	"/v1/ledger",
+	"/v1/dispatch-jobs",
 	"/v1/events",
+	"/v1/handoffs",
+	"/v1/identity",
+	"/v1/ledger",
+	"/v1/messages",
+	"/v1/peer-awareness",
+	"/v1/sessions",
+	"/v1/skills",
 	"/v1/tool-calls",
 }
 
-// isSessionDataPath reports whether a request path serves session content or
-// ledger data, i.e. belongs to the corsLoopbackOnly tier.
-func isSessionDataPath(path string) bool {
-	return matchesAnyRoutePrefix(path, sessionDataPrefixes...)
+// isLoopbackOnlyPath reports whether a request path serves content or
+// credential data, i.e. belongs to the corsLoopbackOnly tier.
+func isLoopbackOnlyPath(path string) bool {
+	return matchesAnyRoutePrefix(path, loopbackOnlyPrefixes...)
 }
 
 // matchesAnyRoutePrefix reports whether path equals one of the given route
@@ -310,7 +389,8 @@ func matchesAnyRoutePrefix(path string, prefixes ...string) bool {
 //
 //	http://localhost          http://localhost:PORT
 //	http://127.0.0.1          http://127.0.0.1:PORT
-//	https://localhost[:PORT]  https://127.0.0.1[:PORT]
+//	http://[::1]              http://[::1]:PORT
+//	https:// twins of all of the above
 //
 // Anything else (null origin, file://, remote) is widened to "*". We do not
 // attempt to parse the URL in full — a cheap prefix check is enough because
@@ -335,6 +415,20 @@ func isLoopbackOrigin(origin string) bool {
 		return false
 	}
 	// rest is "host[:port]" (no path — Fetch spec forbids it on Origin).
+	//
+	// IPv6 hosts are bracketed in the serialized Origin ("http://[::1]:8080"),
+	// and the colons inside the brackets would confuse the port split below,
+	// so handle the one recognized IPv6 loopback form first. A browser on an
+	// IPv6-loopback page serializes exactly "[::1]" — an origin is already in
+	// canonical form, so no expansion ("[0:0:0:0:0:0:0:1]") handling is
+	// needed, and non-loopback IPv6 hosts fall through to false.
+	if strings.HasPrefix(rest, "[") {
+		after, ok := strings.CutPrefix(rest, "[::1]")
+		if !ok {
+			return false
+		}
+		return after == "" || strings.HasPrefix(after, ":")
+	}
 	host := rest
 	if i := strings.IndexByte(rest, ':'); i >= 0 {
 		host = rest[:i]

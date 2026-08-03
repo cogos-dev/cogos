@@ -156,6 +156,14 @@ func TestIsLoopbackOrigin_Table(t *testing.T) {
 		{"http://127.0.0.1:6931", true},
 		{"https://localhost:8443", true},
 		{"https://127.0.0.1:8443", true},
+		// IPv6 loopback — browsers serialize the bracketed canonical form.
+		{"http://[::1]", true},
+		{"http://[::1]:6931", true},
+		{"https://[::1]:8443", true},
+		{"http://[::2]", false},
+		{"http://[::1]evil.example.com", false},
+		{"http://[2001:db8::1]:6931", false},
+		{"http://[0:0:0:0:0:0:0:1]", false}, // non-canonical; Origin is canonical
 		{"http://evil.example.com", false},
 		{"http://192.168.1.2:7860", false},
 		{"", false},
@@ -169,38 +177,85 @@ func TestIsLoopbackOrigin_Table(t *testing.T) {
 	}
 }
 
-// ── session/ledger read routes: loopback-only CORS (#507 review round 4) ──
+// ── content/credential routes: loopback-only CORS (#507 rounds 4 + 5) ──
 
-// TestIsSessionDataPath covers the prefix matcher for the corsLoopbackOnly
+// TestIsLoopbackOnlyPath covers the prefix matcher for the corsLoopbackOnly
 // tier. As with isDebugPath the negative cases carry the weight: a bare
 // strings.HasPrefix("/v1/ledger") would also swallow an unrelated future
-// /v1/ledgering route and silently downgrade its CORS.
-func TestIsSessionDataPath(t *testing.T) {
+// /v1/ledgering route and silently downgrade its CORS. The /v1/context pair
+// pins the tier edge inside one route family: the GET fovea list (paths and
+// scores) stays permissive while the rendered-text sibling is tiered.
+func TestIsLoopbackOnlyPath(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		path string
 		want bool
 	}{
+		// Round 4 originals.
 		{"/v1/conversation", true},
 		{"/v1/ledger", true},
 		{"/v1/events", true},
 		{"/v1/events/stream", true},
 		{"/v1/tool-calls", true},
 		{"/v1/conversation/", true},
+		// Round 5 sweep.
+		{"/v1/cogdoc/read", true},
+		{"/v1/cogdoc", true},
+		{"/memory/read", true},
+		{"/memory/search", true},
+		{"/v1/bus/somebus/events", true},
+		{"/v1/bus/events", true},
+		{"/v1/sessions", true},
+		{"/v1/sessions/abc/context", true},
+		{"/v1/handoffs", true},
+		{"/v1/blocks/manifest", true},
+		{"/v1/blobs/sha256:abc", true},
+		{"/v1/claude-code/projects", true},
+		{"/v1/identity/grants/current", true},
+		{"/v1/config", true},
+		{"/v1/dispatch-jobs/j1", true},
+		{"/v1/agents/root", true},
+		{"/v1/agent/traces", true},
+		{"/v1/skills/foo/exec", true},
+		{"/mcp", true},
+		{"/v1/chat/completions", true},
+		{"/v1/messages", true},
+		{"/v1/context/foveated", true},
+		{"/v1/peer-awareness", true},
+		// The tier edge inside /v1/context.
+		{"/v1/context", false},
+		{"/v1/context/", false},
+		// Telemetry and metadata stay permissive.
 		{"/v1/manifest", false},
-		{"/v1/chat/completions", false},
 		{"/v1/traces", false},
 		{"/v1/kernel-log", false},
 		{"/v1/proprioceptive", false},
+		{"/metrics", false},
+		{"/v1/vitals", false},
+		{"/v1/hud/state", false},
+		{"/v1/resolve", false},
+		{"/v1/uri/resolve", false},
+		{"/v1/channel-sessions", false},
+		{"/v1/channels/ch1/peers", false},
+		{"/v1/constellation/fovea", false},
+		{"/v1/observer/state", false},
+		{"/v1/services", false},
+		{"/health", false},
+		// Separator discipline: string-prefixed but different routes.
 		{"/v1/ledgering", false},
 		{"/v1/eventsource", false},
 		{"/v1/conversations", false},
+		{"/v1/session", false},
+		{"/v1/agentx", false},
+		{"/v1/configs", false},
+		{"/mcpx", false},
+		{"/memoryx", false},
 		{"/", false},
 		{"", false},
 	}
 	for _, tc := range cases {
-		if got := isSessionDataPath(tc.path); got != tc.want {
-			t.Errorf("isSessionDataPath(%q) = %v; want %v", tc.path, got, tc.want)
+		if got := isLoopbackOnlyPath(tc.path); got != tc.want {
+			t.Errorf("isLoopbackOnlyPath(%q) = %v; want %v", tc.path, got, tc.want)
 		}
 	}
 }
@@ -219,8 +274,15 @@ func TestCORSPolicyForPath(t *testing.T) {
 		{"/v1/ledger", corsLoopbackOnly},
 		{"/v1/events", corsLoopbackOnly},
 		{"/v1/tool-calls", corsLoopbackOnly},
+		{"/v1/cogdoc/read", corsLoopbackOnly},
+		{"/v1/identity/grants/current", corsLoopbackOnly},
+		{"/v1/blocks/manifest", corsLoopbackOnly},
+		{"/mcp", corsLoopbackOnly},
+		{"/v1/context/foveated", corsLoopbackOnly},
+		{"/v1/context", corsPermissive},
 		{"/v1/manifest", corsPermissive},
 		{"/v1/channel-sessions/register", corsPermissive},
+		{"/v1/traces", corsPermissive},
 		{"/", corsPermissive},
 	}
 	for _, tc := range cases {
@@ -231,14 +293,16 @@ func TestCORSPolicyForPath(t *testing.T) {
 }
 
 // sessionDataTestRoutes are the corsLoopbackOnly routes exercised end-to-end
-// through the wrapped handler. /v1/events/stream is deliberately absent — it
-// is a long-lived SSE handler and the prefix match is covered by the unit
-// table above.
+// through the wrapped handler with handler-level assertions (JSON answers,
+// no 403). Routes whose handlers need setup (MCP sessions, live buses) or
+// hold the connection (SSE streams) are covered by the header-only loop in
+// TestLoopbackOnlyTier_AllPrefixes and the unit table above instead.
 var sessionDataTestRoutes = []string{
 	"/v1/conversation",
 	"/v1/ledger",
 	"/v1/events",
 	"/v1/tool-calls",
+	"/v1/cogdoc/read",
 }
 
 // TestSessionDataRoutes_RemoteOriginGetsNoAllowOrigin is the regression test
@@ -305,7 +369,7 @@ func TestSessionDataRoutes_LoopbackOriginStillAllowed(t *testing.T) {
 	srv := newTestServer(t)
 
 	for _, path := range sessionDataTestRoutes {
-		for _, origin := range []string{"http://localhost:7860", "http://127.0.0.1:6931"} {
+		for _, origin := range []string{"http://localhost:7860", "http://127.0.0.1:6931", "http://[::1]:6931"} {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
 			req.RemoteAddr = "127.0.0.1:9999"
 			req.Header.Set("Origin", origin)
@@ -354,10 +418,46 @@ func TestSessionDataRoutes_SameOriginAndCLIUnaffected(t *testing.T) {
 	}
 }
 
+// TestLoopbackOnlyTier_AllPrefixes sweeps EVERY prefix in
+// loopbackOnlyPrefixes end-to-end with header-only assertions, so a prefix
+// listed in the tier cannot silently fail to take effect (e.g. a typo'd
+// entry). Handler status is deliberately not asserted — some handlers 400 or
+// 404 without setup, some (config) 403 when their feature is disabled; the
+// middleware sets its headers before the handler runs either way.
+func TestLoopbackOnlyTier_AllPrefixes(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+
+	for _, prefix := range loopbackOnlyPrefixes {
+		// Remote origin: no allow-origin, ever.
+		req := httptest.NewRequest(http.MethodGet, prefix, nil)
+		req.RemoteAddr = "127.0.0.1:9999"
+		req.Header.Set("Origin", "http://evil.example.com")
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("%s from remote origin: Allow-Origin = %q; want empty", prefix, got)
+		}
+		if got := w.Header().Get("Vary"); got != "Origin" {
+			t.Errorf("%s from remote origin: Vary = %q; want %q", prefix, got, "Origin")
+		}
+
+		// Loopback origin: still echoed.
+		req2 := httptest.NewRequest(http.MethodGet, prefix, nil)
+		req2.RemoteAddr = "127.0.0.1:9999"
+		req2.Header.Set("Origin", "http://localhost:7860")
+		w2 := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w2, req2)
+		if got := w2.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:7860" {
+			t.Errorf("%s from loopback origin: Allow-Origin = %q; want the echoed origin", prefix, got)
+		}
+	}
+}
+
 // TestCORSPermissiveRoutesKeepStarFallback guards the blast radius: the tier
-// split must not change anything for the routes that are not session/ledger
-// reads. /v1/channel-sessions/register is the mod3 dashboard's cross-origin
-// POST that motivated this middleware in the first place.
+// split must not change anything for the routes that are not content or
+// credential surfaces. /v1/channel-sessions/register is the mod3 dashboard's
+// cross-origin POST that motivated this middleware in the first place.
 func TestCORSPermissiveRoutesKeepStarFallback(t *testing.T) {
 	t.Parallel()
 	srv := newTestServer(t)
