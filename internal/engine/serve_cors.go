@@ -70,11 +70,15 @@
 // Access-Control-Allow-Origin header, so dropping CORS headers here costs
 // those UIs nothing while fully closing the cross-origin read. Applying
 // debugLoopbackOnly instead would break them outright — every dashboard fetch
-// carries a Referer, which that guard rejects by design. Triggering these
+// carries a Referer, which that guard rejects by design. Triggering these two
 // endpoints cross-origin without being able to read the response is harmless
-// (they are side-effect-free reads of an in-memory snapshot), which is why the
+// because /v1/debug/last and /v1/debug/context specifically are GET-only,
+// side-effect-free reads of an in-memory snapshot — which is why the
 // no-cors/img vector debugLoopbackOnly exists to stop on /debug/pprof/profile
-// — a 30s CPU burn — has no analogue here.
+// (a 30s CPU burn) has no analogue here. That reasoning is about THESE TWO
+// ROUTES, not about the tiers generally: do not carry it forward to
+// corsLoopbackOnly, whose members are not all side-effect-free. See "What
+// this tier does and does not do" below.
 //
 // Second exclusion tier — content and credential surfaces are loopback-only:
 //
@@ -103,15 +107,76 @@
 // (no Origin header) and non-browser clients (curl, the MCP CLI) are
 // unaffected in either direction.
 //
+// # What this tier does and does not do
+//
+// corsLoopbackOnly closes cross-origin READ exposure and nothing else. This
+// middleware never rejects a request; it only decides which Access-Control-*
+// headers the RESPONSE carries. A remote page's fetch() still reaches the
+// handler and the handler still runs to completion. What the withheld
+// Access-Control-Allow-Origin removes is the browser's permission to hand
+// that response body back to the calling page.
+//
+// For the read-only routes in the tier that is the whole story. It is NOT the
+// whole story for the write-capable ones, and this file previously claimed
+// otherwise ("these are side-effect-free reads" — false, corrected here). The
+// tier is prefix-scoped, so it sweeps in every method under a prefix, and
+// several of those prefixes carry mutations:
+//
+//	POST /mcp                      the entire MCP tool surface
+//	POST /v1/chat/completions, /v1/messages, /v1/context/foveated
+//	POST /v1/identity/grants       mints a credential
+//	POST /v1/identity/verify, /v1/identity/grants/{id}/revoke
+//	POST /v1/sessions/register, /v1/sessions/{id}/heartbeat|end|fork
+//	POST /v1/bus/send, /v1/bus/open
+//	POST /v1/handoffs/offer, /v1/handoffs/{id}/claim|complete
+//	POST /v1/skills/{name}/exec    runs a skill
+//	POST /v1/claude-code/spawn     spawns a subprocess
+//	POST /v1/agents/{id}/tick|dispatch, /v1/agent/trigger
+//	POST /v1/config/rollback
+//
+// Each of those decodes its body with json.NewDecoder(r.Body).Decode and
+// requires no Content-Type and no custom header. A cross-origin page can
+// therefore send a CORS-SIMPLE request — POST with Content-Type: text/plain
+// carrying raw JSON — which triggers NO preflight, and the side effect
+// executes. The attacker cannot read the response (that is what this tier
+// fixed) but the write lands. That is CSRF, and this tier does not stop it.
+//
+// Two qualifications, neither of them a fix:
+//
+//   - PATCH /v1/config, PUT /v1/blocks/{hash} and DELETE /v1/bus/consumers/
+//     are not reachable that way: PATCH/PUT/DELETE are not CORS-safelisted
+//     methods, so the browser preflights them, and the preflight now fails
+//     for a remote origin because this tier withholds Access-Control-Allow-
+//     Origin on the OPTIONS response too. That falls out of the read fix; it
+//     is not a CSRF defense, and it covers only the non-simple methods.
+//   - The gap is not specific to this tier. corsMiddleware is the ENTIRE
+//     middleware chain (`handler := corsMiddleware(mux)` in serve.go) — the
+//     daemon has no auth layer — so the same simple-request write vector
+//     applies to permissive POST routes as well (POST /v1/attention, POST
+//     /v1/channel-sessions/register, ...).
+//
+// Write-side CSRF is a known, PRE-EXISTING gap, deliberately deferred rather
+// than overlooked. It predates this change and affects routes this change did
+// not create. Closing it means requiring something that forces a preflight on
+// every write route — a custom X-Cogos-* header, or an Origin allow-list
+// enforced as request rejection rather than as a response header. Either is a
+// BREAKING change for every existing loopback client (the mod3 dashboard on
+// :7860, the canvas, THESEUS), so it needs its own coordinated change with
+// its own blast radius rather than riding along here.
+//
 // # Route classification table
 //
 // Every route the engine registers (serve.go's mux block plus every
-// register*Routes sibling), classified by response payload. Audit coverage
-// against GET /v1/manifest — s.route()-registered paths appear there.
-// Classes:
+// register*Routes sibling), classified by RESPONSE PAYLOAD — that is, by
+// cross-origin read exposure. The classification says nothing about whether a
+// route mutates state, and no tier here gates mutation; see "What this tier
+// does and does not do" above. Audit coverage against GET /v1/manifest —
+// s.route()-registered paths appear there. Classes:
 //
 //	NONE  — corsNone: middleware fully bypassed, no Access-Control-* ever
-//	LOOP  — corsLoopbackOnly: loopback Origin echoed, no header otherwise
+//	LOOP  — corsLoopbackOnly: loopback Origin echoed, no header otherwise.
+//	        Blocks the cross-origin READ only; a mutating POST under one of
+//	        these prefixes still executes (see the section above)
 //	TELEM — corsPermissive, documented: telemetry/log/attention-score
 //	        surfaces; paths, scores, log lines — no document/conversation
 //	        bodies, no credentials
@@ -193,6 +258,8 @@
 // TELEM because their JSONL/log rows turned out to carry model-emitted
 // tool-call arguments and prompt/query previews (writers cited in the table);
 // "it's a telemetry endpoint" is never by itself a reason to stay permissive.
+// The rule is also strictly about READ exposure: a route is not in LOOP
+// because it mutates, and putting one there does not protect the mutation.
 // Two maintenance notes: (1) routes registered by extensions
 // (RegisterHTTPExtensions) or providers (providers_register.go) default to
 // permissive — a content-bearing extension route must add its prefix to
@@ -285,9 +352,11 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// corsPolicy classifies a request path by how much cross-origin read access
-// the middleware may grant to its responses. See the two "Exclusion" notes at
-// the top of this file for why each tier exists.
+// corsPolicy classifies a request path by how much cross-origin READ access
+// the middleware may grant to its responses. It never decides whether a
+// request runs — no tier here rejects anything (see "What this tier does and
+// does not do" in the file header). See the two "Exclusion" notes at the top
+// of this file for why each tier exists.
 type corsPolicy int
 
 const (
@@ -297,9 +366,17 @@ const (
 	corsPermissive corsPolicy = iota
 
 	// corsLoopbackOnly echoes loopback origins and emits NO
-	// Access-Control-Allow-Origin for anything else. The handler still runs
-	// (these are side-effect-free reads), but the browser will not hand the
-	// response body to a remote page.
+	// Access-Control-Allow-Origin for anything else, so the browser will not
+	// hand the response body to a remote page.
+	//
+	// This withholds permission to READ; it does not reject the request. The
+	// handler still runs, and the routes in this tier are NOT all
+	// side-effect-free: the tier is prefix-scoped and sweeps in mutating
+	// POSTs (POST /mcp, /v1/skills/{name}/exec, /v1/claude-code/spawn, the
+	// session / bus / handoff / identity POSTs), each of which a cross-origin
+	// CORS-simple request can still trigger. Write-side CSRF is a known
+	// pre-existing gap this tier does not address — see "What this tier does
+	// and does not do" in the file header for the full statement.
 	corsLoopbackOnly
 
 	// corsNone bypasses the middleware entirely — no Access-Control-* header
