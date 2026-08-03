@@ -17,7 +17,7 @@ AWS started as internal infrastructure Amazon needed to run its own business. Th
 | CloudTrail | Hash-chained ledger | Tamper-evident audit trail |
 | Lambda | Agent invocations | Transient compute triggered by events |
 | CloudWatch | Salience + coherence | Observability and drift detection |
-| VPC | Workspace membrane | Isolation and access control |
+| VPC | Workspace boundary | Isolation and access control |
 | Account | Workspace | The organizational unit of state |
 | Region | Node | Physical deployment boundary |
 
@@ -31,7 +31,7 @@ An autopoietic system continuously produces and maintains itself:
 
 1. **Self-maintaining** — consolidation, salience updates, and coherence checks run continuously
 2. **Self-referential** — the system's own behavior generates the signals it uses to improve
-3. **Bounded** — the workspace membrane defines self vs external
+3. **Bounded** — the workspace boundary defines self vs external
 4. **Component-producing** — new memory, trust scores, and context assemblies are produced by the system's own metabolic process
 
 Error signals are not failures — they are the data the system uses to understand how its current orientation affects future outcomes. A system that tolerates and learns from miscommunication is antifragile. One that requires perfect fidelity is fragile.
@@ -49,7 +49,7 @@ Error signals are not failures — they are the data the system uses to understa
 
 - **Primitives** — identity, memory, compute, storage, audit, observability
 - **Protocols** — MCP, OpenAI-compatible, Anthropic-compatible, BEP, Constellation
-- **Boundaries** — workspace membrane, trust membrane, channel isolation
+- **Boundaries** — workspace boundary, trust boundary, channel isolation
 - **Guarantees** — hash-chained integrity, content-addressed storage, cryptographic identity
 
-Other systems build on these primitives. Agent harnesses are clients. Modality servers are peripherals. User interfaces are projection surfaces. The kernel is the nucleus. The substrate is the platform.
+Other systems build on these primitives. Agent harnesses are clients. Modality servers are peripherals. User interfaces are projection surfaces. The kernel is the Process Core. The substrate is the platform.

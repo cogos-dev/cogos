@@ -6,12 +6,12 @@ The biological three-layer cascade plus reverse transcription gives the kernel f
 
 ## The Four Cycles
 
-| Cycle | Biology | Kernel role | Time constant | Gatekeeping |
-|-------|---------|-------------|---------------|-------------|
-| **Replication** | DNA → DNA (polymerases + checkpoints) | Identity preservation across time; snapshots, backups, node fork | Slow, deliberate | Authoritative — high integrity bar |
-| **Transcription** | DNA → RNA (RNA polymerase, promoters, TFs) | Identity → active context; attention events, query time | Fast, frequent | Context-scoped, ephemeral |
-| **Translation** | RNA → protein (ribosomes, tRNA) | Active context → behavior; output generation | Fast, downstream of transcription | Action-scoped |
-| **Reverse transcription** | RNA → DNA (reverse transcriptase) | Transient state → canonical identity; consolidation | Medium-slow, batched | **Security boundary** |
+| Cycle | Kernel role | Time constant | Gatekeeping |
+|-------|-------------|---------------|-------------|
+| **Replication** | Identity preservation across time; snapshots, backups, node fork | Slow, deliberate | Authoritative — high integrity bar |
+| **Transcription** | Identity → active context; attention events, query time | Fast, frequent | Context-scoped, ephemeral |
+| **Translation** | Active context → behavior; output generation | Fast, downstream of transcription | Action-scoped |
+| **Reverse transcription** | Transient state → canonical identity; consolidation | Medium-slow, batched | **Security boundary** |
 
 Central dogma (Crick 1958) plus the well-established reverse pathway (reverse transcriptase, originally discovered in retroviruses). Biology confidence: textbook.
 

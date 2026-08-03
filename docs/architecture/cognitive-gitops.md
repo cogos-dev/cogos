@@ -10,7 +10,7 @@ CogOS introduces a repository coordination model distinct from both monorepo and
 | **Polyrepo** | CI/CD pipelines + API contracts | None — rule-based | Loose (contract-bound) |
 | **Cognitive** | Workspace substrate | Tunable — 0 to full inference | Stigmergic (substrate-mediated) |
 
-Each component repository functions as an organelle: its own lifecycle, versioning, and release cadence. It trusts that its output is somebody else's input. It trusts that its input is somebody else's output. It does not need to know the full system graph.
+Each component repository is self-contained: its own lifecycle, versioning, and release cadence. It trusts that its output is somebody else's input. It trusts that its input is somebody else's output. It does not need to know the full system graph.
 
 ## How It Works
 

@@ -57,12 +57,12 @@ Surprise in both directions is information:
 
 | Zone | Expected volatility | Sample behavior |
 |------|-------------------|----------------|
-| 0 — Nucleus | Very low | Rarely checked. Surprise here is a major event. |
+| 0 — Core | Very low | Rarely checked. Surprise here is a major event. |
 | 1 — Knowledge | Low | Checked on consolidation cycles. |
 | 2 — History | Medium | Re-ranked per request. |
 | 3 — Current | Very high | Changes every request. Not surprising. |
 
-**Physical intuition:** The stability ordering of the foveated zones follows the same pattern as standing waves in a bounded container — the center is always the calmest point (the node), the boundary is always the most active (the antinode). This isn't a design choice. It's a consequence of wave physics in any bounded oscillating system. The nucleus *must* be the most stable zone because it sits at the node where incoming and outgoing signals cancel.
+**Physical intuition:** The stability ordering of the foveated zones follows the same pattern as standing waves in a bounded container — the center is always the calmest point (the node), the boundary is always the most active (the antinode). This isn't a design choice. It's a consequence of wave physics in any bounded oscillating system. Zone 0 *must* be the most stable zone because it sits at the node where incoming and outgoing signals cancel.
 
 **Design principle:** Frequency and delta should be inversely correlated. Hot paths should be boring. Interesting stuff can happen on cold paths.
 
@@ -70,7 +70,7 @@ Surprise in both directions is information:
 
 ## 4. Boundary Crossing Energy Signatures
 
-Every crossing of the membrane leaves a distinct energy signature — a ledger entry recording the fingerprint, direction, and magnitude of the distinction.
+Every crossing of the trust boundary leaves a distinct energy signature — a ledger entry recording the fingerprint, direction, and magnitude of the distinction.
 
 Each crossing creates a radial wave of secondary distinctions through the substrate:
 1. Context engine updates (first ripple)
@@ -80,25 +80,25 @@ Each crossing creates a radial wave of secondary distinctions through the substr
 
 The area under the spike = total metabolic cost of the crossing.
 
-### The adaptive membrane
+### The adaptive boundary
 
-The membrane modulates its own permeability based on energy signatures:
+The boundary modulates its own permeability based on energy signatures:
 - High disruption from last crossing → tighten (more filtering)
 - Low disruption → relax (less filtering)
 - Series of small crossings → stable exchange pattern
 - One massive crossing → metabolize before accepting more
 
-## 5. Stigmergic Coordination (The Cytoplasm Model)
+## 5. Stigmergic Coordination (The Shared-Substrate Model)
 
-Components coordinate through the substrate, not through direct messaging. This is the organelle/cytoplasm pattern:
+Components coordinate through the substrate, not through direct messaging:
 
-- **No direct coupling** — organelles don't import each other
+- **No direct coupling** — components don't import each other
 - **Substrate is the bus** — all information passes through the shared medium
 - **Discovery over routing** — components find what they need by scanning
-- **Small transformation functions** — each organelle does one kind of work
+- **Small transformation functions** — each component does one kind of work
 - **Low-rank observables** — entities in the substrate are simple and content-addressed
 
-Adding a new organelle requires zero changes to existing components. It just starts reading from and writing to the substrate.
+Adding a new component requires zero changes to existing ones. It just starts reading from and writing to the substrate.
 
 ## 6. Scale Invariance
 
@@ -135,11 +135,11 @@ Every boundary crossing is logged in the ledger. The user can audit exactly what
 
 ## 8. Identity Changes by Being Read
 
-The identity card is the DNA — the pattern stored in the nucleus. It is not static:
+The identity card is the node's core identity — the pattern stored in the Process Core. It is not static:
 
-- Every time the nucleus is included in a context window, that's a transcription event
+- Every time the identity is included in a context window, that's a read event
 - The model reads the identity, produces a response, the response gets ledgered
 - The ledger informs consolidation, consolidation can update the identity
 - The identity changes by being used
 
-The same identity expressed across different workspaces produces different behavior — like the same DNA in different tissue environments (epigenetic expression). The genome is shared; the expression is local.
+The same identity, loaded into different workspaces, produces different behavior: the identity is fixed, but its expression adapts to context.

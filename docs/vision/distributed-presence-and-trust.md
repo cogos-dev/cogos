@@ -1,10 +1,10 @@
-# Distributed Presence, Learned Boundaries, and the Trust Membrane
+# Distributed Presence, Learned Boundaries, and Trust
 
 *Design vision document — April 2026*
 
 ## The Core Claim
 
-CogOS is not an agent framework. It is an intelligent membrane between cognitive systems — human and artificial — that learns the shape of each relationship through use.
+CogOS is not an agent framework. It is an intelligent trust boundary between cognitive systems — human and artificial — that learns the shape of each relationship through use.
 
 ## Multi-Device Presence Awareness
 
@@ -42,7 +42,7 @@ Because identity lives in the substrate, a user's learned interaction model trav
 
 The interface shapes itself to the user, not the other way around.
 
-## The Trust Membrane
+## The Trust Boundary
 
 ### Trust as Relationship, Not Configuration
 
@@ -61,9 +61,9 @@ Trust must work the way it works between humans: gradually earned through consis
 
 CogOS must support this arc. A new user's node should start constrained and become more autonomous as trust is established through demonstrated reliability.
 
-### The Semiconductive Membrane
+### A Selectively Permeable Boundary
 
-The boundary between CogOS and the systems it mediates is not a wall (fully impermeable) or an open door (fully permeable). It is a **semiconductive membrane** — selectively permeable based on:
+The boundary between CogOS and the systems it mediates is not a wall (fully impermeable) or an open door (fully permeable). It is a **trust boundary** — selectively permeable based on:
 
 - **Identity** — who is making the request
 - **Context** — what is the current state of the interaction
@@ -81,7 +81,7 @@ Some boundaries are always permeable:
 - Public capability advertisements are always available
 - The user can always inspect what the system is doing
 
-Everything in between is the learned zone — the membrane that becomes more or less permeable based on accumulated trust.
+Everything in between is the learned zone — the boundary that becomes more or less permeable based on accumulated trust.
 
 ### Trust for AI Systems Too
 
@@ -101,10 +101,10 @@ The hash-chained ledger, content-addressed blob store, and coherence validation 
 | Barge-in detection | Mod³ VAD | Canonical (local only) |
 | Identity-keyed learning | Substrate identity + ledger | Canonical (substrate), Planned (learning) |
 | Conversational boundary model | Attention signals as training data | Planned |
-| Semiconductive membrane | Workspace membrane (ADR-001) | Canonical (concept), Planned (adaptive) |
+| Trust boundary | Workspace membrane (ADR-001) | Canonical (concept), Planned (adaptive) |
 | Trust arc | Hash-chained ledger + coherence | Canonical (verification), Exploratory (learned trust) |
 | Portable interaction models | FWP / federated workspace | Exploratory |
 
 ## The One-Line Version
 
-CogOS is a substrate-centered cognitive workspace that serves as an intelligent, trust-bearing membrane between humans, AI systems, and devices — learning the shape of each relationship through use.
+CogOS is a substrate-centered cognitive workspace that serves as an intelligent, trust-bearing boundary between humans, AI systems, and devices — learning the shape of each relationship through use.
