@@ -164,8 +164,8 @@ func TestAcceptance_A1_RoundtripClean(t *testing.T) {
 	script := cogblockScript(t)
 
 	for _, name := range []string{
-		"2026-05-19-chaz-substrate-physics-sequence.cog.md",
-		"2026-05-20-substrate-coupling-pattern-formalization.cog.md",
+		"2026-05-19-example-quote-sequence.cog.md",
+		"2026-05-20-example-distinction-set.cog.md",
 	} {
 		t.Run(name, func(t *testing.T) {
 			cmd := exec.Command("python3", script, "roundtrip", fixturePath(t, name))
@@ -188,7 +188,7 @@ func TestAcceptance_A2_QuoteBoundaries(t *testing.T) {
 	root := stageRoot(t)
 	compiler := NewProjectionCompiler()
 
-	src := fixturePath(t, "2026-05-19-chaz-substrate-physics-sequence.cog.md")
+	src := fixturePath(t, "2026-05-19-example-quote-sequence.cog.md")
 	_, _, plan, _, _ := runReconcileCycle(t, compiler, root, []string{src})
 
 	events := compiler.EmittedEvents()
@@ -235,7 +235,7 @@ func TestAcceptance_A3_DistinctionBoundaries(t *testing.T) {
 	root := stageRoot(t)
 	compiler := NewProjectionCompiler()
 
-	src := fixturePath(t, "2026-05-20-substrate-coupling-pattern-formalization.cog.md")
+	src := fixturePath(t, "2026-05-20-example-distinction-set.cog.md")
 	_, _, plan, _, _ := runReconcileCycle(t, compiler, root, []string{src})
 
 	events := compiler.EmittedEvents()
@@ -317,8 +317,8 @@ func TestAcceptance_A4_Idempotency(t *testing.T) {
 	root := stageRoot(t)
 
 	srcs := []string{
-		fixturePath(t, "2026-05-19-chaz-substrate-physics-sequence.cog.md"),
-		fixturePath(t, "2026-05-20-substrate-coupling-pattern-formalization.cog.md"),
+		fixturePath(t, "2026-05-19-example-quote-sequence.cog.md"),
+		fixturePath(t, "2026-05-20-example-distinction-set.cog.md"),
 	}
 
 	// Pass 1: full extraction. Use one compiler instance per pass to
@@ -370,7 +370,7 @@ func TestAcceptance_A5_SingleBlockModification(t *testing.T) {
 	root := stageRoot(t)
 
 	// Copy the 2026-05-19 fixture into a writable location.
-	original := fixturePath(t, "2026-05-19-chaz-substrate-physics-sequence.cog.md")
+	original := fixturePath(t, "2026-05-19-example-quote-sequence.cog.md")
 	mutable := filepath.Join(root, "fixture.cog.md")
 	originalData, err := os.ReadFile(original)
 	if err != nil {
@@ -391,8 +391,8 @@ func TestAcceptance_A5_SingleBlockModification(t *testing.T) {
 
 	// Modify a single block's content: swap a substring inside Quote 3's
 	// blockquote. The marker is a verbatim phrase from the fixture.
-	const marker = "This also means that the wave is initiated by the highest-energy distinction"
-	const replacement = "MODIFIED: the wave is initiated by the highest-energy distinction"
+	const marker = "This sentence is the fixture's designated mutation target"
+	const replacement = "MODIFIED: this sentence is the fixture's designated mutation target"
 	if !strings.Contains(string(originalData), marker) {
 		t.Fatalf("test marker %q not in fixture; update marker", marker)
 	}
@@ -457,7 +457,7 @@ func TestProjectionCompiler_FetchLiveParseCache(t *testing.T) {
 	c := NewProjectionCompiler()
 
 	// Copy a fixture cogdoc into a writable source we can mutate.
-	orig, err := os.ReadFile(fixturePath(t, "2026-05-19-chaz-substrate-physics-sequence.cog.md"))
+	orig, err := os.ReadFile(fixturePath(t, "2026-05-19-example-quote-sequence.cog.md"))
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}

@@ -13,7 +13,7 @@ import "time"
 //
 // It is deliberately NOT 22000. BEP is Syncthing-derived, and 22000 is
 // Syncthing's canonical sync port — so inheriting it collided out of the box
-// for anyone already running personal Syncthing (observed during the Eclipse
+// for anyone already running personal Syncthing (observed during a second-
 // node bring-up, #336). 6932 sits one above the kernel daemon's HTTP port
 // (6931 = ln(2)×10⁴) and is clear of the Syncthing range (22000/21027/22067).
 //

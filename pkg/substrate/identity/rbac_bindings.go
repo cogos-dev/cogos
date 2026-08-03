@@ -86,8 +86,8 @@ type RoleBindingSpec struct {
 // ─── AccountBinding ─────────────────────────────────────────────────────────
 
 // AccountBindingCRD binds a substrate identity to a local OS account on a
-// named node. Enables the reconciler to assert "on node darkstar, identity
-// cog runs as OS user slowbro."
+// named node. Enables the reconciler to assert "on node node-a, identity
+// cog runs as OS user example-user."
 // Stored at: .cog/config/rbac/bindings/accountbinding/<name>.yaml
 type AccountBindingCRD struct {
 	APIVersion string             `yaml:"apiVersion"` // "cog.os/v1alpha1"
@@ -100,9 +100,9 @@ type AccountBindingCRD struct {
 type AccountBindingSpec struct {
 	// Subject is the identity sub-slug (e.g. "cog").
 	Subject string `yaml:"subject"`
-	// Node is the node identity slug the account lives on (e.g. "darkstar").
+	// Node is the node identity slug the account lives on (e.g. "node-a").
 	Node string `yaml:"node"`
-	// Account is the OS account name (e.g. "slowbro").
+	// Account is the OS account name (e.g. "example-user").
 	Account string `yaml:"account"`
 }
 
@@ -138,7 +138,7 @@ type NodeBindingCRD struct {
 type NodeBindingSpec struct {
 	// Subject is the identity sub-slug (e.g. "cog").
 	Subject string `yaml:"subject"`
-	// Node is the node identity slug (e.g. "darkstar", "eclipse").
+	// Node is the node identity slug (e.g. "node-a", "node-b").
 	Node string `yaml:"node"`
 	// Relation declares the type of node relationship.
 	// "can-embody" — the identity may run as a process on this node.
@@ -163,7 +163,7 @@ type WorkspaceBindingCRD struct {
 
 // WorkspaceBindingSpec declares the subject → workspace-URI → access triple.
 type WorkspaceBindingSpec struct {
-	// Subject is the identity sub-slug (e.g. "cog", "chaz").
+	// Subject is the identity sub-slug (e.g. "cog", "example-user").
 	Subject string `yaml:"subject"`
 	// WorkspaceURI is the cog:// address of the workspace (e.g. "cog://workspaces/cog").
 	WorkspaceURI string `yaml:"workspace_uri"`
@@ -197,7 +197,7 @@ type HarnessBindingCRD struct {
 type HarnessBindingSpec struct {
 	// SessionID is the session identifier from the session-register event.
 	SessionID string `yaml:"session_id"`
-	// Subject is the identity sub-slug being bound (e.g. "chaz", "cog").
+	// Subject is the identity sub-slug being bound (e.g. "example-user", "cog").
 	Subject string `yaml:"subject"`
 	// Type distinguishes the user identity ("user") from the agent identity
 	// ("agent") in a dual-identity agentic harness session.

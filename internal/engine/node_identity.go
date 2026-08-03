@@ -71,10 +71,10 @@ const (
 	// NOT COGOS_NODE_ID: the latter is already taken by the harness presence
 	// hooks (session-start.d/51-presence-started.py), where it is documented as
 	// `$(hostname -s)` and returned verbatim as a hostname-shaped NAME. Honoring
-	// that variable here would let an operator who exports COGOS_NODE_ID=darkstar
+	// that variable here would let an operator who exports COGOS_NODE_ID=node-a
 	// to stabilize presence events silently replace the kernel's node id — and
 	// therefore SourceIdentity on every emitted CogBlock — with the string
-	// "darkstar". Different namespace, different meaning, kept apart on purpose.
+	// "node-a". Different namespace, different meaning, kept apart on purpose.
 	nodeIDEnvVar = "COG_NODE_ID"
 
 	// nodeDirEnvVar overrides the machine-local node dir. Kernel-owned and

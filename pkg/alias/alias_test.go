@@ -97,7 +97,7 @@ aliases:
   m3:
     workspace: myrgic/mod3
     description: "mod3 voice server"
-    node: darkstar
+    node: node-a
 `)
 	m, err := alias.Load(dir)
 	if err != nil {
@@ -107,7 +107,7 @@ aliases:
 	if !ok {
 		t.Fatal("Expand: alias not found")
 	}
-	if ws != "myrgic/mod3" || node != "darkstar" {
+	if ws != "myrgic/mod3" || node != "node-a" {
 		t.Fatalf("Expand: got ws=%q node=%q", ws, node)
 	}
 }
@@ -397,7 +397,7 @@ func TestAddLongFormRoundTrip(t *testing.T) {
 	m, _ := alias.Load(dir)
 	if err := m.Add("m3", "myrgic/mod3", alias.AliasOpts{
 		Description: "voice server",
-		Node:        "darkstar",
+		Node:        "node-a",
 	}); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestAddLongFormRoundTrip(t *testing.T) {
 		t.Fatalf("expected 1 entry, got %d", len(entries))
 	}
 	e := entries[0]
-	if e.Description != "voice server" || e.Node != "darkstar" {
+	if e.Description != "voice server" || e.Node != "node-a" {
 		t.Errorf("round-trip: got desc=%q node=%q", e.Description, e.Node)
 	}
 }

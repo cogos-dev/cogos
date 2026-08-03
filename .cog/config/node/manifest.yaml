@@ -1,12 +1,17 @@
 # Node Manifest — single source of truth for services, ports, and consumers.
 # All port references in the workspace derive from this file via `cog node sync`.
+#
+# This is a reference example, not a live per-node config: it documents the
+# schema LoadManifest (internal/engine/node_manifest.go) parses, using
+# generic placeholder paths rather than any specific machine's real layout.
+# A live workspace supplies its own manifest.yaml with real local paths.
 apiVersion: cog.os/v1
 kind: NodeManifest
 
 services:
   kernel:
     port: 6931
-    binary: /Users/slowbro/.cogos/bin/cogos-v3
+    binary: "{{home}}/.cogos/bin/cogos-v3"
     command: "{{binary}} serve --workspace {{workspace}} --port {{port}}"
     health: /health
     restart: always
@@ -17,7 +22,7 @@ services:
         type: json
         jsonpath: ".mcpServers.cogos.url"
         template: "http://localhost:{{port}}/mcp"
-      - path: .cog/config/openclaw-gateway/config.yaml
+      - path: .cog/config/gateway/config.yaml
         type: sed
         match: "localhost:6931"
         replace: "localhost:{{port}}"
@@ -25,40 +30,38 @@ services:
         type: sed
         match: "COG_KERNEL_PORT:-[0-9]*"
         replace: "COG_KERNEL_PORT:-{{port}}"
-      - path: "~/Library/LaunchAgents/com.cogos.kernel.plist"
+      - path: "{{home}}/Library/LaunchAgents/com.cogos.kernel.plist"
         type: plist
         key: ProgramArguments
         # Port argument is at index 5 in the ProgramArguments array
 
-  mod3:
+  # example-service is a stand-in for a node-local companion service
+  # (e.g. a voice/TTS sidecar) managed the same way the kernel is.
+  example-service:
     port: 7860
-    workdir: apps/tts-mcp
-    venv: apps/tts-mcp/.venv
-    command: "{{venv}}/bin/python {{workdir}}/server.py --all --port {{port}}"
+    workdir: apps/example-service
+    venv: apps/example-service/.venv
+    command: "{{venv}}/bin/python {{workdir}}/server.py --port {{port}}"
     health: /health
     restart: on-failure
     depends_on: []
     consumers:
       - path: .mcp.json
         type: json
-        jsonpath: ".mcpServers.mod3.args[3]"
+        jsonpath: ".mcpServers.example-service.args[3]"
         template: "{{port}}"
-      - path: .cog/config/openclaw-gateway/config.yaml
+      - path: .cog/config/gateway/config.yaml
         type: sed
         match: "localhost:7860"
         replace: "localhost:{{port}}"
-      - path: .cog/config/services/mod3.service.yaml
-        type: sed
-        match: "7860"
-        replace: "{{port}}"
 
-  # gateway is the openclaw binary — kernel knows it for dependency-graph
-  # purposes but does not probe or control it. kind: external.
+  # gateway is an externally-managed process — kernel knows it for
+  # dependency-graph purposes but does not probe or control it. kind: external.
   gateway:
     kind: external
     port: 18789
-    binary: "~/.openclaw/bin/openclaw"
-    command: "{{binary}} gateway"
+    binary: "{{home}}/.example-gateway/bin/gateway"
+    command: "{{binary}} serve"
     health: /health
     restart: always
     depends_on: [kernel]
@@ -67,19 +70,10 @@ services:
         type: json
         jsonpath: ".network.gateway_port"
         template: "{{port}}"
-      - path: .cog/config/openclaw-gateway/config.yaml
+      - path: .cog/config/gateway/config.yaml
         type: sed
         match: "port: 18789"
         replace: "port: {{port}}"
-
-  cog-chat:
-    port: 8765
-    binary: apps/web/bin/cog-chat
-    command: "{{binary}}"
-    health: /api/health
-    restart: on-failure
-    depends_on: [kernel]
-    consumers: []
 
   dashboard:
     port: 5180
@@ -87,14 +81,4 @@ services:
     health: /api/status
     restart: manual
     depends_on: [kernel]
-    consumers: []
-
-  # openclaw is the OpenClaw server when externally launched (not via gateway).
-  # Kernel probes health but does not control the lifecycle. kind: observed.
-  openclaw:
-    kind: observed
-    port: 18790
-    health: /health
-    restart: ""
-    depends_on: []
     consumers: []

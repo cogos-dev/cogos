@@ -35,7 +35,7 @@ func TestSanitizeComponent_ColonKey_BothSeparators(t *testing.T) {
 	// Simulate a Windows absolute path: the drive-letter colon at index 1
 	// ("C:") is legitimate and must survive; the session component must not
 	// introduce any other colon.
-	backslashPath := strings.Join([]string{`C:\Users\eclipse\workspace`, ".cog", "ledger", safe, "events.jsonl"}, `\`)
+	backslashPath := strings.Join([]string{`C:\Users\example-user\workspace`, ".cog", "ledger", safe, "events.jsonl"}, `\`)
 	if n := strings.Count(backslashPath, ":"); n != 1 {
 		t.Fatalf("backslash path %q has %d colons, want exactly 1 (the drive letter): %q", backslashPath, n, backslashPath)
 	}

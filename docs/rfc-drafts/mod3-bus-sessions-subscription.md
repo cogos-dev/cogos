@@ -191,8 +191,8 @@ Mod3 maintains a new in-memory map `_bus_session_state`:
 ```python
 # Pseudocode — not implementation
 {
-    "slowbro-laptop-cogos-gap-closure": {
-        "session_id": "slowbro-laptop-cogos-gap-closure",
+    "node-a-laptop-cogos-gap-closure": {
+        "session_id": "node-a-laptop-cogos-gap-closure",
         "workspace": "${COGOS_WORKSPACE:-$HOME/workspaces/cog}",
         "role": "claude-code",
         "status": "active",
@@ -266,7 +266,7 @@ returns current channel membership with joined agent-session state:
     {
       "channel_session_id": "cs-a1b2c3d4e5f6",
       "participant_id": "claude-code-session-A",
-      "agent_session_id": "slowbro-laptop-cogos-gap-closure",
+      "agent_session_id": "node-a-laptop-cogos-gap-closure",
       "assigned_voice": "bm_lewis",
       "state": "speaking",
       "workspace": "${COGOS_WORKSPACE:-$HOME/workspaces/cog}",
@@ -277,7 +277,7 @@ returns current channel membership with joined agent-session state:
     {
       "channel_session_id": "cs-f6e5d4c3b2a1",
       "participant_id": "claude-code-session-B",
-      "agent_session_id": "slowbro-laptop-eval-runner",
+      "agent_session_id": "node-a-laptop-eval-runner",
       "assigned_voice": "af_heart",
       "state": "idle",
       "workspace": "${MYRGIC_REPOS_ROOT:-$HOME/workspaces/myrgic}",
@@ -346,7 +346,7 @@ when a member's agent-session state changes (register/heartbeat arriving from
   "from": "mod3",
   "payload": {
     "channel_id": "general",
-    "members": ["slowbro-laptop-cogos-gap-closure", "slowbro-laptop-eval-runner"],
+    "members": ["node-a-laptop-cogos-gap-closure", "node-a-laptop-eval-runner"],
     "event": "member_joined",   // "member_joined" | "member_left" | "state_changed"
     "summary": "2 agents in channel general"
   }

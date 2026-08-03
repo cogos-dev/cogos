@@ -2,6 +2,7 @@
 /cogos
 /cogos-v3
 /cog-v3
+/cog-fts5
 *.exe
 *.dylib
 *.so

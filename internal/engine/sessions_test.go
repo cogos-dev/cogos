@@ -1258,8 +1258,8 @@ func TestSessionRegister_TwoComponentIDRejected(t *testing.T) {
 	if err := ValidateSessionID("a-b-c"); err != nil {
 		t.Errorf("ValidateSessionID(\"a-b-c\") returned err %v; want nil", err)
 	}
-	if err := ValidateSessionID("slowbro-laptop-cogos-gap-closure"); err != nil {
-		t.Errorf("ValidateSessionID on 5-component id: %v", err)
+	if err := ValidateSessionID("node-a-laptop-cogos-gap-closure"); err != nil {
+		t.Errorf("ValidateSessionID on multi-component id: %v", err)
 	}
 }
 

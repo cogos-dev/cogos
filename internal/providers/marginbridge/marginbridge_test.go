@@ -176,7 +176,7 @@ func writeConfig(t *testing.T, root string, yamlBody string) {
 
 const testYAML = `
 repo: myrgic/thinking-through-distinction-internal
-operator_gh_login: chazmaniandinkle
+operator_gh_login: test-gh-operator
 watch_dirs: [comments/inbox, signals/inbox]
 watch_files: [comments/ledger.json]
 poll_min_interval_s: 40
@@ -382,7 +382,7 @@ func TestApplyPlan_BaselineActionIsSilentNoOp(t *testing.T) {
 
 func TestApplyPlan_UntrustedInboxSignalWakes(t *testing.T) {
 	gh := newMockGH()
-	gh.setSelfLogin("chazmaniandinkle")
+	gh.setSelfLogin("test-gh-operator")
 	gh.setCommitAuthor("my/repo", "signals/inbox/a.json", "some-bot", false)
 	gh.setContent("my/repo", "signals/inbox/a.json", "s1", `{"text":"hello from a bot"}`)
 
@@ -424,8 +424,8 @@ func TestApplyPlan_OperatorInboxSignalStillWakes(t *testing.T) {
 	// — echo suppression is watch-file-specific (bridge_github.py lines
 	// 139-146: "phone receipts ride the inbox afferent regardless").
 	gh := newMockGH()
-	gh.setSelfLogin("chazmaniandinkle")
-	gh.setCommitAuthor("my/repo", "comments/inbox/receipt.json", "chazmaniandinkle", true)
+	gh.setSelfLogin("test-gh-operator")
+	gh.setCommitAuthor("my/repo", "comments/inbox/receipt.json", "test-gh-operator", true)
 	gh.setContent("my/repo", "comments/inbox/receipt.json", "s2", `[{"c":1},{"c":2}]`)
 
 	p := newTestProvider(gh)
@@ -458,8 +458,8 @@ func TestApplyPlan_OperatorInboxSignalStillWakes(t *testing.T) {
 
 func TestApplyPlan_WatchFileEchoFromOperatorIsSuppressed(t *testing.T) {
 	gh := newMockGH()
-	gh.setSelfLogin("chazmaniandinkle")
-	gh.setCommitAuthor("my/repo", "comments/ledger.json", "chazmaniandinkle", true)
+	gh.setSelfLogin("test-gh-operator")
+	gh.setCommitAuthor("my/repo", "comments/ledger.json", "test-gh-operator", true)
 
 	p := newTestProvider(gh)
 	sink := &mockSink{}
@@ -486,7 +486,7 @@ func TestApplyPlan_WatchFileEchoFromOperatorIsSuppressed(t *testing.T) {
 
 func TestApplyPlan_WatchFileFromUntrustedAuthorWakes(t *testing.T) {
 	gh := newMockGH()
-	gh.setSelfLogin("chazmaniandinkle")
+	gh.setSelfLogin("test-gh-operator")
 	gh.setCommitAuthor("my/repo", "comments/ledger.json", "someone-else", false)
 
 	p := newTestProvider(gh)
@@ -525,8 +525,8 @@ func TestResolveSelfLogin_TransientErrorDoesNotPermanentlyCacheEmptyLogin(t *tes
 	// network blip, auth hiccup during startup); a later attempt succeeds
 	// and returns the real operator login.
 	gh.queueError("user", fmt.Errorf("gh api user: exit status 1: HTTP 500: rate limited"), 1)
-	gh.setSelfLogin("chazmaniandinkle")
-	gh.setCommitAuthor("my/repo", "comments/ledger.json", "chazmaniandinkle", true)
+	gh.setSelfLogin("test-gh-operator")
+	gh.setCommitAuthor("my/repo", "comments/ledger.json", "test-gh-operator", true)
 
 	p := newTestProvider(gh)
 	sink := &mockSink{}
@@ -584,8 +584,8 @@ func TestResolveSelfLogin_TransientErrorDoesNotPermanentlyCacheEmptyLogin(t *tes
 	resolved = p.selfLoginResolv
 	login := p.selfLogin
 	p.mu.Unlock()
-	if !resolved || login != "chazmaniandinkle" {
-		t.Errorf("resolveSelfLogin: expected resolved=true login=chazmaniandinkle after the successful retry; got resolved=%v login=%q", resolved, login)
+	if !resolved || login != "test-gh-operator" {
+		t.Errorf("resolveSelfLogin: expected resolved=true login=test-gh-operator after the successful retry; got resolved=%v login=%q", resolved, login)
 	}
 }
 
@@ -973,7 +973,7 @@ func TestPartialFetchFailure_WatchFileCarriesForwardAndWakesOnLaterChange(t *tes
 
 func TestApplyFailure_CarriesForwardOldShaAndRetriesNextCycle(t *testing.T) {
 	gh := newMockGH()
-	gh.setSelfLogin("chazmaniandinkle")
+	gh.setSelfLogin("test-gh-operator")
 	gh.setCommitAuthor("my/repo", "signals/inbox/a.json", "some-bot", false)
 	gh.setContent("my/repo", "signals/inbox/a.json", "sha-a2", `{"text":"a changed"}`)
 	gh.setCommitAuthor("my/repo", "signals/inbox/b.json", "some-bot", false)

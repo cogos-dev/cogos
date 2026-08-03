@@ -43,15 +43,15 @@ spec:
   subject: cog
   role_ref: orchestrator
 `)
-	writeFixtureBinding(t, root, "accountbinding", "cog-on-darkstar.yaml", `
+	writeFixtureBinding(t, root, "accountbinding", "cog-on-node-a.yaml", `
 apiVersion: cog.os/v1alpha1
 kind: AccountBinding
 metadata:
-  name: cog-on-darkstar
+  name: cog-on-node-a
 spec:
   subject: cog
-  node: darkstar
-  account: slowbro
+  node: node-a
+  account: example-user
 `)
 	writeFixtureBinding(t, root, "nodebinding", "cog-can-embody.yaml", `
 apiVersion: cog.os/v1alpha1
@@ -60,7 +60,7 @@ metadata:
   name: cog-can-embody
 spec:
   subject: cog
-  node: darkstar
+  node: node-a
   relation: can-embody
 `)
 	writeFixtureBinding(t, root, "workspacebinding", "cog-workspace-owner.yaml", `
@@ -217,8 +217,8 @@ metadata:
   name: ab
 spec:
   subject: cog
-  node: darkstar
-  account: slowbro
+  node: node-a
+  account: example-user
 `)
 	writeFixtureBinding(t, root, "nodebinding", "nb.yaml", `
 apiVersion: cog.os/v1alpha1
@@ -227,7 +227,7 @@ metadata:
   name: nb
 spec:
   subject: cog
-  node: darkstar
+  node: node-a
   relation: can-embody
 `)
 	writeFixtureBinding(t, root, "workspacebinding", "wb.yaml", `

@@ -59,7 +59,7 @@ func fakeHealthServer(t *testing.T, version, identity, nodeID string) *httptest.
 func TestResourceKernelStatus_Reachable(t *testing.T) {
 	t.Parallel()
 
-	ts := fakeHealthServer(t, "0.13.0", "cog", "darkstar-1")
+	ts := fakeHealthServer(t, "0.13.0", "cog", "node-a-1")
 	defer ts.Close()
 
 	srv, _ := newMCPForTestWithFakeHealth(t, ts)
@@ -95,8 +95,8 @@ func TestResourceKernelStatus_Reachable(t *testing.T) {
 	if got["identity"] != "cog" {
 		t.Errorf("identity = %v; want cog", got["identity"])
 	}
-	if got["node_id"] != "darkstar-1" {
-		t.Errorf("node_id = %v; want darkstar-1", got["node_id"])
+	if got["node_id"] != "node-a-1" {
+		t.Errorf("node_id = %v; want node-a-1", got["node_id"])
 	}
 }
 

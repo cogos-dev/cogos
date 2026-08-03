@@ -8,7 +8,7 @@
 //	{
 //	  "ontology_ref": "cogos.conversations@1.0.0",
 //	  "sources": {
-//	    "hermes-darkstar": {
+//	    "hermes-node-a": {
 //	      "mapped": 12453,
 //	      "degenerate": 16547,
 //	      "quarantined": 0,

@@ -642,7 +642,7 @@ func TestChannelSessionRegister_IssSub_StoredOnRecord(t *testing.T) {
 		"session_id":     "cs-identity-test",
 		"participant_id": "channel-client::claude-code-channel",
 		"iss":            "https://cogos.local",
-		"sub":            "chaz",
+		"sub":            "test-subject",
 	})
 	resp, err := http.Post(front.URL+"/v1/channel-sessions/register",
 		"application/json", bytes.NewReader(body))
@@ -663,8 +663,8 @@ func TestChannelSessionRegister_IssSub_StoredOnRecord(t *testing.T) {
 	if rec.Iss != "https://cogos.local" {
 		t.Fatalf("expected Iss=https://cogos.local on record, got %q", rec.Iss)
 	}
-	if rec.Sub != "chaz" {
-		t.Fatalf("expected Sub=chaz on record, got %q", rec.Sub)
+	if rec.Sub != "test-subject" {
+		t.Fatalf("expected Sub=test-subject on record, got %q", rec.Sub)
 	}
 }
 
@@ -695,16 +695,16 @@ func TestChannelSessionRegister_IssSub_IdempotentOnReregister(t *testing.T) {
 		}
 	}
 
-	registerWith("chaz")
+	registerWith("test-subject")
 	rec, _ := s.channelSessionRegistry.Get("cs-idem-test")
-	if rec.Sub != "chaz" {
-		t.Fatalf("expected Sub=chaz after first register, got %q", rec.Sub)
+	if rec.Sub != "test-subject" {
+		t.Fatalf("expected Sub=test-subject after first register, got %q", rec.Sub)
 	}
 
 	// Re-register with updated sub — Put overwrites.
-	registerWith("chaz-updated")
+	registerWith("test-subject-updated")
 	rec, _ = s.channelSessionRegistry.Get("cs-idem-test")
-	if rec.Sub != "chaz-updated" {
-		t.Fatalf("expected Sub=chaz-updated after re-register, got %q", rec.Sub)
+	if rec.Sub != "test-subject-updated" {
+		t.Fatalf("expected Sub=test-subject-updated after re-register, got %q", rec.Sub)
 	}
 }

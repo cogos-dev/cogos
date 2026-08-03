@@ -18,7 +18,7 @@ import (
 
 // reasoningStubProvider wraps StubProvider to inject ReasoningContent into
 // Complete() responses, simulating a non-streaming reasoning-model reply
-// (e.g. LM Studio Eclipse 26b A4B).
+// (e.g. an LM Studio-served 26b A4B model).
 type reasoningStubProvider struct {
 	StubProvider
 	reasoningContent string

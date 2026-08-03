@@ -33,8 +33,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// LinkFeedChannelID is the Discord channel for #link-feed.
-const LinkFeedChannelID = "1366246672275083375"
+// LinkFeedChannelEnvVar overrides the #link-feed Discord channel id.
+//
+// The channel id is deliberately NOT a compiled-in constant: a Discord
+// snowflake identifies one operator's private channel, and this repo is
+// public. It is read from the same untracked auth.yaml that already holds the
+// bot token (the feature cannot run without that file anyway), or from this
+// environment variable.
+const LinkFeedChannelEnvVar = "COGOS_LINKFEED_CHANNEL_ID"
 
 // LinkFeedCheckInterval is how often the agent should pull new links.
 const LinkFeedCheckInterval = 2 * time.Hour
@@ -90,9 +96,27 @@ type linkFeedState struct {
 	TotalLinks    int    `json:"total_links"`
 }
 
-// discordAuth holds the bot token from auth.yaml.
+// discordAuth holds the bot token and channel id from auth.yaml.
 type discordAuth struct {
 	Token string `yaml:"token"`
+	// ChannelID is the #link-feed channel snowflake. Lives here rather than
+	// in source because it names one operator's private channel; auth.yaml is
+	// untracked and already required for this feature.
+	ChannelID string `yaml:"channel_id"`
+}
+
+// resolveChannelID returns the #link-feed channel id from auth.yaml, falling
+// back to LinkFeedChannelEnvVar. Returns an error naming both places rather
+// than silently pulling from the wrong channel.
+func resolveChannelID(auth *discordAuth) (string, error) {
+	if auth != nil && auth.ChannelID != "" {
+		return auth.ChannelID, nil
+	}
+	if v := strings.TrimSpace(os.Getenv(LinkFeedChannelEnvVar)); v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("link-feed channel id not configured: set channel_id in %s or $%s",
+		discordAuthRelPath, LinkFeedChannelEnvVar)
 }
 
 // discordMessage is a minimal Discord message for JSON unmarshalling.
@@ -260,13 +284,17 @@ func pullDiscordLinkFeed(ctx context.Context, root string) ([]LinkFeedItem, erro
 	if err != nil {
 		return nil, fmt.Errorf("discord auth: %w", err)
 	}
+	channelID, err := resolveChannelID(auth)
+	if err != nil {
+		return nil, err
+	}
 
 	// 2. Read state
 	state, err := readLinkFeedState(root)
 	if err != nil {
 		// Fresh start — no state file yet
 		state = &linkFeedState{
-			ChannelID: LinkFeedChannelID,
+			ChannelID: channelID,
 		}
 	}
 
@@ -281,7 +309,7 @@ func pullDiscordLinkFeed(ctx context.Context, root string) ([]LinkFeedItem, erro
 	var allMessages []discordMessage
 	afterID := state.LastMessageID
 	for {
-		messages, err := fetchDiscordMessages(ctx, auth.Token, LinkFeedChannelID, afterID)
+		messages, err := fetchDiscordMessages(ctx, auth.Token, channelID, afterID)
 		if err != nil {
 			return nil, fmt.Errorf("discord API: %w", err)
 		}

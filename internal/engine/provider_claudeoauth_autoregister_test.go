@@ -44,34 +44,34 @@ func TestResolveHomeDir(t *testing.T) {
 		{
 			name: "darwin uses HOME",
 			goos: "darwin",
-			env:  map[string]string{"HOME": "/Users/chaz", "USERPROFILE": `C:\Users\chaz`},
-			want: "/Users/chaz",
+			env:  map[string]string{"HOME": "/Users/testuser", "USERPROFILE": `C:\Users\testuser`},
+			want: "/Users/testuser",
 		},
 		{
 			name: "linux uses HOME",
 			goos: "linux",
-			env:  map[string]string{"HOME": "/home/chaz"},
-			want: "/home/chaz",
+			env:  map[string]string{"HOME": "/home/testuser"},
+			want: "/home/testuser",
 		},
 		{
 			name: "windows prefers USERPROFILE over HOMEDRIVE+HOMEPATH",
 			goos: "windows",
 			env: map[string]string{
 				"HOME":        `should-not-be-used`,
-				"USERPROFILE": `C:\Users\chaz`,
+				"USERPROFILE": `C:\Users\testuser`,
 				"HOMEDRIVE":   `D:`,
-				"HOMEPATH":    `\Other\chaz`,
+				"HOMEPATH":    `\Other\testuser`,
 			},
-			want: `C:\Users\chaz`,
+			want: `C:\Users\testuser`,
 		},
 		{
 			name: "windows falls back to HOMEDRIVE+HOMEPATH when USERPROFILE unset",
 			goos: "windows",
 			env: map[string]string{
 				"HOMEDRIVE": `C:`,
-				"HOMEPATH":  `\Users\chaz`,
+				"HOMEPATH":  `\Users\testuser`,
 			},
-			want: `C:\Users\chaz`,
+			want: `C:\Users\testuser`,
 		},
 		{
 			name: "windows with nothing set returns empty",
@@ -342,7 +342,7 @@ func TestBuildRouter_ClaudeOAuthAutoRegistration_AtBoot(t *testing.T) {
 // itself (independent of claude-oauth specifics): a hook registered before
 // Start runs once during the synchronous warm-up, and again once the ticker
 // fires, which is the mechanism the reconcile-loop re-check (gap 2 of the
-// Eclipse auto-register ruling) depends on to notice a credential created
+// peer-node auto-register ruling) depends on to notice a credential created
 // after boot without a kernel restart.
 func TestSimpleRouter_TickHooksRunOnEveryTick(t *testing.T) {
 	t.Parallel()

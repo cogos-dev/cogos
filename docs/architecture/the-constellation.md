@@ -98,7 +98,7 @@ Three pieces of concrete evidence that this is one substrate architecturally, no
 CREATE TABLE participants (
     id TEXT PRIMARY KEY,              -- "human:<node_id>" or "agent:<session_id>"
     type TEXT NOT NULL,               -- "agent" | "human" | "service"
-    name TEXT NOT NULL,               -- "cog", "claude", "sandy", "chaz"
+    name TEXT NOT NULL,               -- "cog", "claude", "agent-b", "operator"
     identity_path TEXT,               -- path to identity card if agent
     session_id TEXT,                  -- current session if active
     active INTEGER NOT NULL DEFAULT 1,

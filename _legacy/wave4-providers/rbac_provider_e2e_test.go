@@ -67,15 +67,15 @@ spec:
   subject: cog
   role_ref: orchestrator
 `)
-	writeE2EBindingFile(t, root, "accountbinding", "cog-on-darkstar", `
+	writeE2EBindingFile(t, root, "accountbinding", "cog-on-node-a", `
 apiVersion: cog.os/v1alpha1
 kind: AccountBinding
 metadata:
-  name: cog-on-darkstar
+  name: cog-on-node-a
 spec:
   subject: cog
-  node: darkstar
-  account: slowbro
+  node: node-a
+  account: example-user
 `)
 	writeE2EBindingFile(t, root, "nodebinding", "cog-can-embody", `
 apiVersion: cog.os/v1alpha1
@@ -84,7 +84,7 @@ metadata:
   name: cog-can-embody
 spec:
   subject: cog
-  node: darkstar
+  node: node-a
   relation: can-embody
 `)
 	writeE2EBindingFile(t, root, "workspacebinding", "cog-workspace-owner", `
@@ -162,7 +162,7 @@ spec:
 	// Verify all four kinds were written to disk.
 	diskFiles := map[string]string{
 		"rolebinding/cog-orchestrator.yaml":     filepath.Join(root, ".cog", "config", "rbac", "bindings", "rolebinding", "cog-orchestrator.yaml"),
-		"accountbinding/cog-on-darkstar.yaml":   filepath.Join(root, ".cog", "config", "rbac", "bindings", "accountbinding", "cog-on-darkstar.yaml"),
+		"accountbinding/cog-on-node-a.yaml":     filepath.Join(root, ".cog", "config", "rbac", "bindings", "accountbinding", "cog-on-node-a.yaml"),
 		"nodebinding/cog-can-embody.yaml":       filepath.Join(root, ".cog", "config", "rbac", "bindings", "nodebinding", "cog-can-embody.yaml"),
 		"workspacebinding/cog-workspace-owner.yaml": filepath.Join(root, ".cog", "config", "rbac", "bindings", "workspacebinding", "cog-workspace-owner.yaml"),
 	}
@@ -181,8 +181,8 @@ spec:
 	if _, ok := ls1.RoleBindings["rolebinding/cog-orchestrator"]; !ok {
 		t.Error("live state missing rolebinding/cog-orchestrator after apply")
 	}
-	if _, ok := ls1.AccountBindings["accountbinding/cog-on-darkstar"]; !ok {
-		t.Error("live state missing accountbinding/cog-on-darkstar after apply")
+	if _, ok := ls1.AccountBindings["accountbinding/cog-on-node-a"]; !ok {
+		t.Error("live state missing accountbinding/cog-on-node-a after apply")
 	}
 	if _, ok := ls1.NodeBindings["nodebinding/cog-can-embody"]; !ok {
 		t.Error("live state missing nodebinding/cog-can-embody after apply")
@@ -263,7 +263,7 @@ func TestRBACProvider_E2E_HarnessBindingEphemeral(t *testing.T) {
 			Subject:     "cog",
 			Type:        bindingType,
 			HarnessType: "claude-code",
-			NodeID:      "darkstar",
+			NodeID:      "node-a",
 		},
 	}
 

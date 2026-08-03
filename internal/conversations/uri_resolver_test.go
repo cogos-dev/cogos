@@ -47,8 +47,8 @@ func TestParseConversationURI_Paths(t *testing.T) {
 		},
 		{
 			name:    "hermes source",
-			uri:     "cog:conversations/hermes-darkstar/20260605_184354",
-			wantSrc: "hermes-darkstar", wantSess: "20260605_184354",
+			uri:     "cog:conversations/hermes-node-a/20260605_184354",
+			wantSrc: "hermes-node-a", wantSess: "20260605_184354",
 		},
 		{
 			name:      "wrong scheme",

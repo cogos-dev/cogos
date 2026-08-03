@@ -19,7 +19,7 @@
 //	  m3:                                        # long form with metadata
 //	    workspace: myrgic/mod3
 //	    description: "mod3 voice server"
-//	    node: darkstar                           # optional node pin
+//	    node: node-a                             # optional node pin
 //
 // Validation rules:
 //   - Alias name must match ^[a-z][a-z0-9_-]{0,30}$
@@ -98,7 +98,7 @@ type rawEntry struct {
 type AliasOpts struct {
 	// Description is a human-readable note stored alongside the alias.
 	Description string
-	// Node pins the alias to a specific node name (e.g. "darkstar").
+	// Node pins the alias to a specific node name (e.g. "node-a").
 	// Empty means "any node that hosts the workspace".
 	Node string
 }

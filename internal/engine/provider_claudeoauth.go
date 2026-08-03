@@ -362,7 +362,7 @@ func (s *claudeCodeCredentialSource) readCredFile() (OAuthCredential, bool) {
 // poison Claude Code's file fallback store with a stale token, which forces an
 // interactive `claude /login`.
 //
-// Observed live 2026-06-04 (issue #363): under an eclipse-down fallback loop
+// Observed live 2026-06-04 (issue #363): under a peer-node-down fallback loop
 // the kernel routed periodic inference to claude-oauth ~every 10s; each refresh
 // triggered this WriteBack, rewriting the file every ~10s and injecting a stale
 // token, causing repeated "OAuth token revoked · Please run /login" logouts

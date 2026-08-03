@@ -114,18 +114,18 @@ func TestCoverageTracker_Reset(t *testing.T) {
 
 func TestCoverageTracker_MultipleSources(t *testing.T) {
 	ct := NewCoverageTracker()
-	ct.RecordMapped("hermes-darkstar")
-	ct.RecordMapped("hermes-darkstar")
+	ct.RecordMapped("hermes-node-a")
+	ct.RecordMapped("hermes-node-a")
 	ct.RecordQuarantined("claude-code-jsonl", "tool_result")
-	ct.SetRefs("hermes-darkstar", "cogos.conversations@1.0.0", "hermes-statedb.v1@1.0.0")
+	ct.SetRefs("hermes-node-a", "cogos.conversations@1.0.0", "hermes-statedb.v1@1.0.0")
 	ct.SetRefs("claude-code-jsonl", "cogos.conversations@1.0.0", "claude-code-jsonl@1.0.0")
 
 	m := ct.All()
 	if len(m) != 2 {
 		t.Errorf("expected 2 sources, got %d", len(m))
 	}
-	if m["hermes-darkstar"].Mapped != 2 {
-		t.Errorf("hermes-darkstar mapped: want 2, got %d", m["hermes-darkstar"].Mapped)
+	if m["hermes-node-a"].Mapped != 2 {
+		t.Errorf("hermes-node-a mapped: want 2, got %d", m["hermes-node-a"].Mapped)
 	}
 	if m["claude-code-jsonl"].Quarantined != 1 {
 		t.Errorf("claude-code-jsonl quarantined: want 1, got %d", m["claude-code-jsonl"].Quarantined)
@@ -186,7 +186,7 @@ func TestCoverageFromIngest_MixedSourcesFullCycle(t *testing.T) {
 // ─── Bug regression tests ─────────────────────────────────────────────────────
 
 // makeHermesOntology creates a LoadedOntology that mirrors the hermes-statedb
-// mapping spec: hermes-darkstar and hermes-cog are mapped sources, role='tool'
+// mapping spec: hermes-node-a and hermes-cog are mapped sources, role='tool'
 // records are classified as degenerate (text_tool_degenerate rule).
 func makeHermesOntology(t *testing.T) *LoadedOntology {
 	t.Helper()
@@ -221,7 +221,7 @@ relations: {}
   id: hermes-statedb.v1
   version: 1.0.0
   sources:
-    - hermes-darkstar
+    - hermes-node-a
     - hermes-cog
   ontology: "cogos.conversations@^1"
 rules:
@@ -262,7 +262,7 @@ func TestCoverageRecordDegenerateWiredForToolRole(t *testing.T) {
 	acc.Coverage = cov
 
 	ts := "2026-06-10T00:00:00Z"
-	source := "hermes-darkstar"
+	source := "hermes-node-a"
 
 	lines := []string{
 		// 3 intended (user + assistant)
@@ -344,7 +344,7 @@ relations: {}
   id: hermes-statedb.v1
   version: 1.0.0
   sources:
-    - hermes-darkstar
+    - hermes-node-a
     - hermes-cog
   ontology: "cogos.conversations@^1"
 rules:
@@ -366,7 +366,7 @@ rules:
 	}
 
 	// Write test ingest data: 4 user, 3 assistant, 2 tool records.
-	source := "hermes-darkstar"
+	source := "hermes-node-a"
 	ts := "2026-06-10T00:00:00Z"
 	var lines []string
 	for i := 1; i <= 4; i++ {

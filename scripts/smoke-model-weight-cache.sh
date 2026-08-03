@@ -3,8 +3,8 @@
 #
 # Proves the cross-node model-weight cache end to end against TWO real cogos
 # daemons (no httptest, no loopback in-process fakes): node A is the
-# authoritative source (the "Eclipse" role), node B is the cache (the
-# "Darkstar" role). Exercises every behavior from the design review:
+# authoritative source (the authoritative role), node B is the cache (the
+# caching role). Exercises every behavior from the design review:
 #
 #   1. Build binary + init two fresh workspaces with blob stores
 #   2. Start two daemons on alternate ports

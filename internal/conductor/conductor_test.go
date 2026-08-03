@@ -299,14 +299,14 @@ func TestSetSessionModeAndConfig(t *testing.T) {
 			t.Fatalf("Initialize: %v", err)
 		}
 		sid, _ := r.cond.NewSession(ctx, defaultSpec("/x"))
-		if err := r.cond.SetConfigOption(ctx, sid, "backend", "eclipse-26b"); err != nil {
+		if err := r.cond.SetConfigOption(ctx, sid, "backend", "test-backend-b"); err != nil {
 			t.Fatalf("SetConfigOption: %v", err)
 		}
 		agent.mu.Lock()
 		cfg := agent.cfgSet[string(sid)]
 		agent.mu.Unlock()
-		if cfg != "eclipse-26b" {
-			t.Errorf("config value = %q, want eclipse-26b", cfg)
+		if cfg != "test-backend-b" {
+			t.Errorf("config value = %q, want test-backend-b", cfg)
 		}
 	})
 }

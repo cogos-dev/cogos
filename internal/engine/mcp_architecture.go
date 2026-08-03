@@ -84,7 +84,7 @@ type architectureProposeInput struct {
 	Slug           string `json:"slug" jsonschema:"proposed kebab-slug; must not already exist"`
 	Title          string `json:"title" jsonschema:"human-readable title"`
 	ContextSummary string `json:"context_summary" jsonschema:"1-3 sentence context for preservation_directive"`
-	Author         string `json:"author,omitempty" jsonschema:"identity slug of author (default: slowbro)"`
+	Author         string `json:"author,omitempty" jsonschema:"identity slug of author"`
 }
 
 type architectureProjectInput struct {

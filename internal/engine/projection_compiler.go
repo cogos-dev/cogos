@@ -16,7 +16,7 @@
 //
 // Deferred:
 //
-//   - LLM extraction path (E4B-on-Darkstar) for blocks without explicit
+//   - LLM extraction path (local E4B backend) for blocks without explicit
 //     boundaries.
 //   - FrictionEvent coherence checker.
 //   - fsnotify watch trigger (the ReconcileDaemon's periodic tick covers v0).

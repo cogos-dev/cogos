@@ -141,7 +141,7 @@ type registerSessionInput struct {
 	// Identity binding fields (G0b — all optional; naked-by-default).
 	// When Subject is non-empty and a harnessBackend is wired, a
 	// HarnessBindingCRD is created linking sessionID → Subject.
-	Subject     string `json:"subject,omitempty"`      // identity sub-slug (e.g. "chaz", "cog")
+	Subject     string `json:"subject,omitempty"`      // identity sub-slug (e.g. "operator", "cog")
 	Iss         string `json:"iss,omitempty"`          // OIDC issuer hint (e.g. "anthropic.claude-code")
 	BindingType string `json:"binding_type,omitempty"` // "agent" (default) or "user"
 }
