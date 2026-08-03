@@ -101,7 +101,7 @@ The hash-chained ledger, content-addressed blob store, and coherence validation 
 | Barge-in detection | Mod³ VAD | Canonical (local only) |
 | Identity-keyed learning | Substrate identity + ledger | Canonical (substrate), Planned (learning) |
 | Conversational boundary model | Attention signals as training data | Planned |
-| Trust boundary | Workspace membrane (ADR-001) | Canonical (concept), Planned (adaptive) |
+| Trust boundary | Workspace boundary geometry (ADR-001, *Workspace Membrane Geometry*) | Canonical (concept), Planned (adaptive) |
 | Trust arc | Hash-chained ledger + coherence | Canonical (verification), Exploratory (learned trust) |
 | Portable interaction models | FWP / federated workspace | Exploratory |
 
