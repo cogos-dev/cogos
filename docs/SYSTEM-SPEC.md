@@ -41,19 +41,19 @@ Theory can inform naming and intuition, but engineering success must not be mist
 
 CogOS is the substrate layer beneath active sessions. In the channel-native framing, Claude Code (or any agent harness) is the active session authority while CogOS provides continuity, memory, verified history, embodiment services, and attention/salience infrastructure.
 
-### Three-zone cell architecture
+### Three-zone kernel architecture
 
-The system has three zones, like a biological cell:
+The system has three zones:
 
 | Zone | Contains | Function |
 |------|----------|----------|
-| **Membrane** | MCP Server, HTTP API, Router, Coherence | Mediates between inside and outside. Semipermeable — controls what crosses the boundary. |
-| **Nucleus** | Identity Core, Process Loop | Defines the node. Always loaded, always running. The identity changes by being read (epigenetic model). |
+| **API Layer** | MCP Server, HTTP API, Router, Coherence | Mediates between inside and outside. A soft, permeable boundary — controls what crosses. |
+| **Process Core** | Identity Core, Process Loop | Defines the node. Always loaded, always running. The identity changes by being read. |
 | **Workspace** | Context Engine, Salience, Ledger, Memory, Blob Store | The cognitive substrate. Workspace-scoped — switch workspaces and these components operate on different data. |
 
 ### Coordination model
 
-Components coordinate through the substrate, not through direct connections. This is stigmergic coordination — organelles modify the shared medium and other organelles react to what they find. No component imports another component's code. Adding a new organelle requires zero changes to existing ones.
+Components coordinate through the substrate, not through direct connections. This is stigmergic coordination — components modify the shared medium and other components react to what they find. No component imports another component's code. Adding a new component requires zero changes to existing ones.
 
 ### Architectural principle
 
@@ -81,7 +81,7 @@ Selects what matters for active work through foveated assembly. Context is arran
 
 | Zone | Contents | Stability |
 |------|----------|-----------|
-| 0 — Nucleus | Identity | Always present, never evicted |
+| 0 — Core | Identity | Always present, never evicted |
 | 1 — Knowledge | CogDocs, indexed memory | Shifts slowly, high cache hit rate |
 | 2 — History | Conversation turns | Scored by relevance, evictable |
 | 3 — Current | The current message | Always present |
@@ -118,13 +118,13 @@ Identity is coherence with history — not a static credential. The [Constellati
 
 Stolen keys cannot impersonate because trust is coupled to history.
 
-### The trust membrane
+### The trust boundary
 
-The boundary between CogOS and external systems is a semiconductive membrane — selectively permeable based on identity, context, history, sensitivity, and direction. Some boundaries are always impermeable (private memory, cryptographic identity, ledger integrity). Some are always permeable (health status, capability advertisements). Everything in between is the learned zone.
+The boundary between CogOS and external systems is selectively permeable based on identity, context, history, sensitivity, and direction. Some boundaries are always impermeable (private memory, cryptographic identity, ledger integrity). Some are always permeable (health status, capability advertisements). Everything in between is the learned zone.
 
 ### Sovereignty gradient
 
-Data stays local by default. Only abstracted queries cross the membrane to remote servers, and every crossing is recorded in the ledger. Raw audio, personal models, conversation history, and memory never leave the user's hardware unless explicitly configured.
+Data stays local by default. Only abstracted queries cross the trust boundary to remote servers, and every crossing is recorded in the ledger. Raw audio, personal models, conversation history, and memory never leave the user's hardware unless explicitly configured.
 
 ---
 
@@ -147,14 +147,14 @@ The process states map to adaptive sample rates — the system spends attention 
 
 ### Node vs workspace
 
-- **Node** = the daemon process + its membrane (one per machine)
+- **Node** = the daemon process + its API layer (one per machine)
 - **Workspace** = the cognitive state (memory, identity, ledger, config)
 - A node can host multiple workspaces
 - A workspace can span multiple nodes via BEP + Constellation
 
 ### Ecosystem
 
-Each subsystem is its own repo, its own release cycle, its own organelle:
+Each subsystem is its own repo, its own release cycle, its own component:
 
 | Repo | Role |
 |------|------|
@@ -162,11 +162,11 @@ Each subsystem is its own repo, its own release cycle, its own organelle:
 | [myrgic/constellation](https://github.com/myrgic/constellation) | Identity & trust protocol |
 | [myrgic/mod3](https://github.com/myrgic/mod3) | Modality server (TTS, VAD, speech queuing) |
 
-Organelles coordinate through the substrate, not through imports. Discovery happens at runtime through capability scanning.
+Components coordinate through the substrate, not through imports. Discovery happens at runtime through capability scanning.
 
 ### Cognitive GitOps
 
-CogOS introduces a third repo coordination model beyond monorepo and polyrepo. Each component repo is an organelle — it trusts that its output is somebody else's input and its input is somebody else's output. The workspace substrate is the coordination layer. An inference dial tunes how much intelligence is applied at any boundary, from 0 (pure automation) to 1 (full cognitive reasoning).
+CogOS introduces a third repo coordination model beyond monorepo and polyrepo. Each component repo trusts that its output is somebody else's input and its input is somebody else's output. The workspace substrate is the coordination layer. An inference dial tunes how much intelligence is applied at any boundary, from 0 (pure automation) to 1 (full cognitive reasoning).
 
 ---
 
@@ -182,7 +182,7 @@ The system minimizes thermodynamic cost by spending attention where it expects t
 
 ### Boundary crossing energy signatures
 
-Every crossing of the membrane leaves a distinct energy signature in the ledger. The crossing creates a radial wave of secondary distinctions that propagates through the substrate. The membrane learns to modulate its own permeability from the energy signatures of previous crossings.
+Every crossing of the trust boundary leaves a distinct energy signature in the ledger. The crossing creates a radial wave of secondary distinctions that propagates through the substrate. The boundary learns to modulate its own permeability from the energy signatures of previous crossings.
 
 ### Scale invariance
 
