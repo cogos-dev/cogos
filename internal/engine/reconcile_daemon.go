@@ -438,10 +438,21 @@ func (d *ReconcileDaemon) noteCycleFailure(providerType string) {
 }
 
 // quarantineRecoveryHint is the operator-facing string carried on the
-// quarantine WARN and the convergence snapshot.
+// quarantine WARN and the convergence snapshot (ProviderConvergence.Recovery,
+// served at GET /v1/reconcile/convergence).
+//
+// `cogos reconcile <type>` runs in its own independent process — it does its
+// own LoadConfig→FetchLive→ComputePlan→ApplyPlan cycle and never touches this
+// daemon's quarantine/backoff state, so it fixes drift directly but does NOT
+// resume the live daemon. POST /v1/reconcile/{type}/resume
+// (serve_reconcile_resume.go) is the real "resume immediately" lever: it
+// calls this daemon's own Resume, in-process.
 func quarantineRecoveryHint(providerType string) string {
-	return "fix the underlying fault; quarantine lifts automatically when the provider's config changes or its next observation is in sync, " +
-		"or resume immediately with `cogos reconcile " + providerType + "`; a kernel restart clears all quarantines"
+	return "fix the underlying fault; quarantine lifts automatically when the provider's config changes or its next observation is in sync; " +
+		"resume this daemon immediately with `POST /v1/reconcile/" + providerType + "/resume` " +
+		"(requires enable_reconcile_control: true in kernel.yaml); " +
+		"`cogos reconcile " + providerType + "` reconciles drift directly but runs in its own process and does NOT resume this daemon or lift its quarantine; " +
+		"a kernel restart clears all quarantines"
 }
 
 // noteCycleSuccess clears a provider's failure streak and lifts quarantine.

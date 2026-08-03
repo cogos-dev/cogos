@@ -223,6 +223,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "GET /v1/manifest", s.handleManifest)
 	s.route(mux, "GET /v1/reconcile/coherence", s.handleReconcileCoherence)
 	s.route(mux, "GET /v1/reconcile/convergence", s.handleReconcileConvergence)
+	s.route(mux, "POST /v1/reconcile/{type}/resume", s.handleReconcileResume)
 	s.route(mux, "GET /v1/kernel/rates", s.handleKernelRates)
 
 	// RFC-040 S1: Prometheus text-exposition interop door over the current

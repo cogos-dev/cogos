@@ -151,6 +151,15 @@ type Config struct {
 	// to opt in.
 	EnableConfigMutation bool
 
+	// EnableReconcileControl gates the reconcile mutation endpoint:
+	// POST /v1/reconcile/{type}/resume (see serve_reconcile_resume.go).
+	// Default false: any local process on the same host could otherwise lift
+	// a provider's quarantine and force an immediate reconcile cycle over
+	// loopback. Set enable_reconcile_control: true in kernel.yaml to opt in.
+	// Same opt-in-default-off pattern as EnableSkillExec / EnableServiceControl
+	// / EnableConfigMutation.
+	EnableReconcileControl bool
+
 	// DigestPaths maps stream tailer adapter names to JSONL file/directory paths.
 	// Empty map means external digestion is disabled.
 	DigestPaths map[string]string
@@ -212,28 +221,29 @@ type Config struct {
 
 // kernelConfigSection holds settings that can appear at the top level or inside v3:.
 type kernelConfigSection struct {
-	Port                  int      `yaml:"port"`
-	BindAddr              string   `yaml:"bind_addr"`
-	ConsolidationInterval int      `yaml:"consolidation_interval"`
-	HeartbeatInterval     int      `yaml:"heartbeat_interval"`
-	SalienceDaysWindow    int      `yaml:"salience_days_window"`
-	OutputReserve         int      `yaml:"output_reserve"`
-	MaxFovealDocs         int      `yaml:"max_foveal_docs"`
-	SalienceFloor         *float64 `yaml:"salience_floor"`
-	DefaultBudget         int      `yaml:"default_budget"`
-	ExcludeSubstrings     []string `yaml:"exclude_substrings"`
-	TRMWeightsPath        string   `yaml:"trm_weights_path"`
-	TRMEmbeddingsPath     string   `yaml:"trm_embeddings_path"`
-	TRMChunksPath         string   `yaml:"trm_chunks_path"`
-	OllamaEmbedEndpoint   string   `yaml:"ollama_embed_endpoint"`
-	OllamaEmbedModel      string   `yaml:"ollama_embed_model"`
-	ToolCallValidation    *bool    `yaml:"tool_call_validation_enabled"`
-	EnableSkillExec       *bool    `yaml:"enable_skill_exec"`
-	EnableServiceControl  *bool    `yaml:"enable_service_control"`
-	EnableConfigMutation  *bool    `yaml:"enable_config_mutation"`
-	IdentityNakedDefault  *bool    `yaml:"identity_naked_default,omitempty"`
-	LocalModel            string   `yaml:"local_model"`
-	HarnessProvider       string   `yaml:"harness_provider"`
+	Port                   int      `yaml:"port"`
+	BindAddr               string   `yaml:"bind_addr"`
+	ConsolidationInterval  int      `yaml:"consolidation_interval"`
+	HeartbeatInterval      int      `yaml:"heartbeat_interval"`
+	SalienceDaysWindow     int      `yaml:"salience_days_window"`
+	OutputReserve          int      `yaml:"output_reserve"`
+	MaxFovealDocs          int      `yaml:"max_foveal_docs"`
+	SalienceFloor          *float64 `yaml:"salience_floor"`
+	DefaultBudget          int      `yaml:"default_budget"`
+	ExcludeSubstrings      []string `yaml:"exclude_substrings"`
+	TRMWeightsPath         string   `yaml:"trm_weights_path"`
+	TRMEmbeddingsPath      string   `yaml:"trm_embeddings_path"`
+	TRMChunksPath          string   `yaml:"trm_chunks_path"`
+	OllamaEmbedEndpoint    string   `yaml:"ollama_embed_endpoint"`
+	OllamaEmbedModel       string   `yaml:"ollama_embed_model"`
+	ToolCallValidation     *bool    `yaml:"tool_call_validation_enabled"`
+	EnableSkillExec        *bool    `yaml:"enable_skill_exec"`
+	EnableServiceControl   *bool    `yaml:"enable_service_control"`
+	EnableConfigMutation   *bool    `yaml:"enable_config_mutation"`
+	EnableReconcileControl *bool    `yaml:"enable_reconcile_control"`
+	IdentityNakedDefault   *bool    `yaml:"identity_naked_default,omitempty"`
+	LocalModel             string   `yaml:"local_model"`
+	HarnessProvider        string   `yaml:"harness_provider"`
 	// DispatchTimeoutCapSeconds caps dispatch timeout_seconds requests.
 	// 0 means use DefaultDispatchTimeoutCapSeconds (600).
 	DispatchTimeoutCapSeconds int               `yaml:"dispatch_timeout_cap_seconds,omitempty"`
@@ -383,6 +393,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.EnableConfigMutation != nil {
 		cfg.EnableConfigMutation = *s.EnableConfigMutation
+	}
+	if s.EnableReconcileControl != nil {
+		cfg.EnableReconcileControl = *s.EnableReconcileControl
 	}
 	if s.IdentityNakedDefault != nil {
 		cfg.IdentityNakedDefault = *s.IdentityNakedDefault
