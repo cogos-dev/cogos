@@ -65,6 +65,7 @@ type PeerConnection struct {
 	Wire      *bep.Wire
 	Connected bool
 	LastPing  time.Time
+	LastPong  time.Time
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
@@ -519,12 +520,20 @@ func (e *BEPEngine) runPeerLoop(pc *PeerConnection, peerID bep.DeviceID) {
 				e.model.HandleResponse(resp)
 
 			case bep.MessageTypePing:
-				// Respond with Ping.
-				pong := &bep.Ping{}
-				if err := pc.Wire.WriteMessage(bep.MessageTypePing, pong.Marshal()); err != nil {
+				// Reply with Pong. Pong must never itself trigger a reply,
+				// or two peers volley Ping frames forever (see
+				// MessageTypePong docs in pkg/substrate/bep/proto.go).
+				pong := &bep.Pong{}
+				if err := pc.Wire.WriteMessage(bep.MessageTypePong, pong.Marshal()); err != nil {
 					log.Printf("[bep-engine] pong to %s failed: %v", peerShort, err)
 					return
 				}
+
+			case bep.MessageTypePong:
+				// Liveness only — record and do NOT reply. Replying here is
+				// the whole bug: it turns one Ping into an infinite volley
+				// between two symmetric peers.
+				pc.LastPong = time.Now()
 
 			case bep.MessageTypeDispatch:
 				// Phase 2 S4: incoming remote dispatch request — run locally
