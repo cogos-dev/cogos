@@ -121,6 +121,31 @@ func (s KernelHealthSnapshot) AllGreen() bool {
 	return s.Counts.Degraded == 0 && s.Counts.Missing == 0 && s.Counts.Suspended == 0 && s.Anomalies == 0
 }
 
+// HasActionableDegradation reports whether any provider is in a health state
+// the control loop can actually act on — Degraded or Missing. This
+// deliberately mirrors healDegradedProviders' needsHeal exemption (see
+// healDegradedProviders below): Suspended providers are excluded because
+// self-heal treats them as intentionally paused or already converging, not
+// as something an LLM cycle can fix by looking at them.
+//
+// This exists separately from AllGreen() because the two answer different
+// questions. AllGreen() is a liveness-report predicate — "is everything
+// nominal" — and legitimately treats any Suspended provider as not-green.
+// shouldEscalate's degraded_health branch was using AllGreen() to answer an
+// actionability question ("should the control loop wake an LLM"), which is
+// wrong: a permanently-parked opt-in provider (no config, no declared
+// dependency) is Suspended forever by design, and !AllGreen() fired an LLM
+// escalation on every tick for as long as it stayed that way. Measured over
+// a 43-day kernel log: 5,515 of 6,221 escalations (88.6%) were
+// degraded_health, nearly all attributable to three permanently-Suspended
+// providers (margin-bridge with no config yaml, mcp-tools with
+// OPENCLAW_URL unset, mlx-inference with nothing declared) that self-heal
+// was already correctly ignoring. Use HasActionableDegradation() for
+// escalation decisions; keep AllGreen() for reporting.
+func (s KernelHealthSnapshot) HasActionableDegradation() bool {
+	return s.Counts.Degraded > 0 || s.Counts.Missing > 0
+}
+
 // HasOperationInProgress reports whether any provider is currently running an
 // apply operation (Syncing / Waiting). Operations in progress don't
 // necessarily warrant LLM attention — the system is already converging. We
@@ -263,8 +288,14 @@ func shouldEscalate(snap KernelHealthSnapshot, triggerPending bool, lastLLMCycle
 	if snap.Anomalies > 0 {
 		return escalateAbandonedInference
 	}
-	// Health degradation is the next-highest-priority signal.
-	if !snap.AllGreen() {
+	// Health degradation is the next-highest-priority signal. Use
+	// HasActionableDegradation rather than !AllGreen(): Suspended providers
+	// are excluded to match healDegradedProviders' needsHeal exemption — a
+	// provider that's intentionally paused (no config, opt-in dependency
+	// unset) is not something an LLM cycle can act on, and !AllGreen() alone
+	// was waking the LLM every tick for permanently-Suspended providers. See
+	// HasActionableDegradation's doc comment for the measured impact.
+	if snap.HasActionableDegradation() {
 		return escalateDegradedHealth
 	}
 	// OutOfSync on any provider (without health degradation) still warrants

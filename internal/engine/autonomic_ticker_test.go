@@ -81,7 +81,14 @@ func TestShouldEscalate_MissingProvider(t *testing.T) {
 	}
 }
 
-func TestShouldEscalate_SuspendedProvider(t *testing.T) {
+func TestShouldEscalate_SuspendedProviderOnlyDoesNotEscalate(t *testing.T) {
+	// A Suspended-only snapshot must NOT escalate degraded_health.
+	// healDegradedProviders' needsHeal check deliberately excludes Suspended
+	// (it's "intentionally paused or already converging"); shouldEscalate
+	// must honor that same exemption via HasActionableDegradation rather
+	// than !AllGreen(), or a permanently-parked opt-in provider (no config,
+	// unset env dependency) forces an LLM escalation every tick forever.
+	// This is the regression test for the 88.6% degraded_health measurement.
 	snap := KernelHealthSnapshot{
 		Timestamp: time.Now().UTC(),
 		Providers: map[string]reconcile.ResourceStatus{
@@ -90,9 +97,29 @@ func TestShouldEscalate_SuspendedProvider(t *testing.T) {
 		Counts: HealthCounts{Suspended: 1},
 	}
 
+	// Fresh lastLLMCycle so the idle re-checkin safety valve doesn't also
+	// fire and mask a regression in the degraded_health branch.
+	reason := shouldEscalate(snap, false, time.Now().UTC(), AutonomicConfig{IdleRecheckIn: time.Hour})
+	if reason != "" {
+		t.Errorf("suspended-only provider: expected no escalation, got %q", reason)
+	}
+}
+
+func TestShouldEscalate_DegradedProviderStillEscalatesAmongSuspended(t *testing.T) {
+	// A Degraded provider must still escalate degraded_health, even
+	// alongside Suspended providers that are correctly exempted.
+	snap := KernelHealthSnapshot{
+		Timestamp: time.Now().UTC(),
+		Providers: map[string]reconcile.ResourceStatus{
+			"sus":    {Sync: reconcile.SyncStatusSynced, Health: reconcile.HealthSuspended},
+			"broken": {Sync: reconcile.SyncStatusOutOfSync, Health: reconcile.HealthDegraded},
+		},
+		Counts: HealthCounts{Suspended: 1, Degraded: 1},
+	}
+
 	reason := shouldEscalate(snap, false, time.Now().UTC(), AutonomicConfig{IdleRecheckIn: time.Hour})
 	if reason != escalateDegradedHealth {
-		t.Errorf("suspended provider: expected %q, got %q", escalateDegradedHealth, reason)
+		t.Errorf("degraded among suspended: expected %q, got %q", escalateDegradedHealth, reason)
 	}
 }
 
