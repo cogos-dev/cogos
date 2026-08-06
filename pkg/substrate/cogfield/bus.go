@@ -22,4 +22,19 @@ type BusRegistryEntry struct {
 	LastEventSeq int      `json:"last_event_seq"`
 	LastEventAt  string   `json:"last_event_at"`
 	EventCount   int      `json:"event_count"`
+	// Generation counts size-based rotations of this bus's events.jsonl.
+	// It fences registry seq writes against reordering across a rotation
+	// boundary (see bus_session.go's updateRegistrySeqIfNewer / resetRegistrySeq):
+	// a write is only applied when the caller's generation matches (advance)
+	// or strictly exceeds (reset) the persisted value. Absent from entries
+	// written before this field existed, which unmarshal it to the zero
+	// value — the same value a bus that has never rotated carries, so no
+	// migration is needed: an old entry and a never-rotated new entry are
+	// indistinguishable, both correctly at generation 0.
+	//
+	// PUBLIC SHAPE: this struct is serialized verbatim by GET /v1/bus/list
+	// (internal/engine/serve_bus.go), so adding or renaming a field here
+	// changes both the on-disk registry.json and that endpoint's response.
+	// Treat it as an API surface, not an internal record.
+	Generation int64 `json:"generation"`
 }

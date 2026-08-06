@@ -1,8 +1,7 @@
 // bus_session.go — per-bus session manager + hash-chained event log.
 //
-// Track 5 Phase 3: ported verbatim from the root package's bus_session.go so
-// that the `/v1/bus/*` HTTP surface lives in engine.  The storage layout is
-// identical to root:
+// Track 5 Phase 3: this is where the `/v1/bus/*` HTTP surface lives in
+// engine. Storage layout:
 //
 //	{workspace}/.cog/.state/buses/
 //	  registry.json                     — bus metadata catalogue
@@ -11,9 +10,9 @@
 // Bus events use pkg/cogfield.Block as the wire type; the hash chain is
 // per-bus (distinct from the ledger chain in ledger.go — do NOT merge).
 //
-// Byte-compat with root: the canonical form used for hash computation and the
-// event JSON shape must stay identical.  The bridge at
-// cog-sandbox-mcp/src/cog_sandbox_mcp/tools/cogos_bridge.py reads:
+// Byte-compat matters here: the canonical form used for hash computation and
+// the event JSON shape must stay identical across releases, since the bridge
+// at cog-sandbox-mcp/src/cog_sandbox_mcp/tools/cogos_bridge.py reads:
 //
 //	{v: 2, bus_id, seq, ts, from, type, payload, prev_hash?, prev?, hash}
 package engine
@@ -138,8 +137,7 @@ func (m *BusSessionManager) pruneBusArchives(busID string, keep int) {
 }
 
 // BusBlock is the wire format for bus events. Alias to the canonical
-// pkg/cogfield.Block so the byte-compat JSON shape is guaranteed — the
-// root package uses the same type.
+// pkg/cogfield.Block so the byte-compat JSON shape is guaranteed.
 type BusBlock = cogfield.Block
 
 // BusRegistryEntry matches registry.json shape — aliased for the same reason.
@@ -152,8 +150,7 @@ type busEventHandler struct {
 }
 
 // BusSessionManager manages CogBus operations: bus creation, event appending,
-// and reading event history. Direct verbatim port of root's busSessionManager
-// to preserve byte-compat.
+// and reading event history.
 type BusSessionManager struct {
 	mu            sync.Mutex
 	workspaceRoot string
@@ -162,11 +159,36 @@ type BusSessionManager struct {
 	// busID so that getLastEvent can return without scanning events.jsonl on
 	// every AppendEvent call.  Both maps are populated on the first successful
 	// AppendEvent for a bus and on every subsequent write; they are reset to
-	// zero-values on rotation (seq semantics are per-file — see archiveBus in
-	// root's bus_session.go which resets LastEventSeq/EventCount to 0 after
-	// rename).  Protected by m.mu.
+	// zero-values on rotation (seq semantics are per-file — AppendEvent's
+	// rotation branch below resets LastEventSeq/EventCount to 0 after the
+	// rename).  AppendEvent's rotation path mirrors this reset into the
+	// registry via resetRegistrySeq, so the in-memory cache and the on-disk
+	// registry entry reset in lockstep — see resetRegistrySeq's doc comment
+	// for why a plain updateRegistrySeqIfNewer call is not sufficient here.
+	// Protected by m.mu.
 	lastSeq  map[string]int64
 	lastHash map[string]string
+
+	// generation counts size-based rotations of busID's events.jsonl, and
+	// fences registry seq writes against reordering across a rotation
+	// boundary — see currentGenerationLocked and the doc comments on
+	// updateRegistrySeqIfNewer / resetRegistrySeq for the race this closes
+	// (a non-rotating append's registry advance landing AFTER a later
+	// rotating append's registry reset, reinstating the pre-rotation seq and
+	// silently freezing the registry again).
+	//
+	// Primed from the persisted registry entry's Generation field on first
+	// touch per busID this process (see currentGenerationLocked) so a
+	// process restart doesn't reset the counter to 0 while the persisted
+	// value is already ahead — that would make every subsequent write's
+	// generation permanently mismatch the persisted one and never apply.
+	// Incremented only on a successful rotation, under m.mu, so the
+	// generation captured by any two AppendEvent calls reflects their true
+	// m.mu-serialized order — the ordering question this fixes is decided
+	// here, at the one point in AppendEvent where ordering is already
+	// serialized, not later where the two write paths run concurrently and
+	// unordered. Protected by m.mu.
+	generation map[string]int64
 
 	// registryFileMu single-flights this PROCESS's attempts at the
 	// cross-process registry filelock (RegisterBus's correctness path and
@@ -217,6 +239,7 @@ func NewBusSessionManager(workspaceRoot string) *BusSessionManager {
 		workspaceRoot:    workspaceRoot,
 		lastSeq:          make(map[string]int64),
 		lastHash:         make(map[string]string),
+		generation:       make(map[string]int64),
 		registeredActive: make(map[string]bool),
 	}
 }
@@ -278,8 +301,8 @@ func (m *BusSessionManager) EventsPath(busID string) string {
 
 // computeBusBlockHash computes the V2 content-addressed hash for a bus block.
 // Hashes the full canonical envelope (all fields except hash and sig). The
-// field set and order MUST stay identical to root's computeBlockHash — the
-// hash is byte-compat observable.
+// field set and order MUST stay identical release-to-release — the hash is
+// byte-compat observable by cog-sandbox-mcp's bridge (see the file header).
 func computeBusBlockHash(block *BusBlock) string {
 	canonical := struct {
 		V       int                    `json:"v"`
@@ -487,8 +510,8 @@ func (m *BusSessionManager) saveRegistry(entries []BusRegistryEntry) error {
 // Handlers are dispatched synchronously after the lock is released.
 //
 // The bus directory + events.jsonl are created on demand if they don't yet
-// exist — matches root's behaviour where handleBusSend pre-creates them but
-// downstream callers (e.g. the chat pipeline) can skip that step.
+// exist, so downstream callers (e.g. the chat pipeline) don't have to
+// pre-create them before their first append.
 func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload map[string]interface{}) (*BusBlock, error) {
 	// EnsureBus is idempotent and takes its own lock-free path; do it
 	// before acquiring m.mu to keep the critical section small.
@@ -500,6 +523,13 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 
 	lastSeq, lastHash := m.getLastEvent(busID)
 	newSeq := lastSeq + 1
+
+	// Capture the generation this append belongs to HERE, under m.mu, at the
+	// same point newSeq is decided — see the generation field's doc comment.
+	// writeGen is what actually gets passed to the registry write below;
+	// it only changes (to gen+1) if THIS append is the one that rotates.
+	gen := m.currentGenerationLocked(busID)
+	writeGen := gen
 
 	var prev []string
 	if lastHash != "" {
@@ -546,8 +576,9 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	// Size-based rotation: if events.jsonl has grown past the threshold,
 	// rename it to a timestamped archive and start a fresh file.
 	// Cache is cleared for this busID so the next getLastEvent call starts
-	// from a known-empty file (seq resets to 0; seq semantics are per-file,
-	// matching root's archiveBus which resets LastEventSeq/EventCount to 0).
+	// from a known-empty file — seq semantics are per-file, so LastEventSeq
+	// and EventCount reset to 0 for the fresh file (mirrored into the
+	// registry below via resetRegistrySeq).
 	rotated := false
 	if fi, statErr := os.Stat(eventsFile); statErr == nil && fi.Size() >= eventsFileMaxBytes {
 		ts := time.Now().UTC().Format("2006-01-02T150405Z")
@@ -562,6 +593,8 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 				nf.Close()
 				m.lastSeq[busID] = 0
 				m.lastHash[busID] = ""
+				m.generation[busID] = gen + 1
+				writeGen = gen + 1
 				rotated = true
 			} else {
 				slog.Warn("bus: size-rotation create failed, retaining seq cache", "err", createErr, "bus_id", busID)
@@ -576,17 +609,47 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	copy(handlers, m.eventHandlers)
 	m.mu.Unlock()
 
+	// Test-only synchronization seam — always nil in production. See its
+	// doc comment for what it's for.
+	if appendEventPostUnlockHook != nil {
+		appendEventPostUnlockHook(busID, rotated, writeGen)
+	}
+
 	// Archive retention runs OUTSIDE m.mu: it lists a directory and unlinks
 	// files, and holding the bus lock across that would stall every unrelated
 	// bus operation.  Only runs on the append that actually rotated, so the
 	// cost is amortised across a whole events file.
+	//
+	// Both registry writes below run outside m.mu for the same reason
+	// (documented in detail on updateRegistrySeqIfNewer): putting the
+	// load-modify-save-plus-cross-process-flock cycle under the per-bus hot
+	// mutex would serialize every unrelated bus operation in this process
+	// behind disk I/O and flock(2) retries — exactly the #505 thread-storm
+	// this package already had to fix once. Running outside m.mu instead
+	// means these two writes can race each other, which is what
+	// writeGen/gen (captured above, under m.mu, where their relative order
+	// IS decided) exist to fence.
 	if rotated {
 		m.pruneBusArchives(busID, archiveRetentionFor(busID))
-	}
 
-	// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
-	// cross-process filelock, and must never stall unrelated bus operations.
-	m.updateRegistrySeqIfNewer(busID, newSeq, evt.Ts)
+		// Reset the registry entry in lockstep with the in-memory cache
+		// reset above (m.lastSeq[busID] = 0). The event just appended
+		// (newSeq) now lives in the archived file, not the fresh one, so
+		// the registry should reflect the fresh file's true state — zero
+		// events — rather than record the archived file's terminal seq via
+		// the normal advance-only path. See resetRegistrySeq's doc comment
+		// for why this must be an unconditional-on-seq (but generation-
+		// fenced) reset, not updateRegistrySeqIfNewer(busID, newSeq, ...):
+		// the latter would write newSeq (the old file's terminal value)
+		// into the registry, after which every following append's small
+		// per-file seq (1, 2, 3, …) would trip the monotonic guard and be
+		// dropped forever — exactly the staleness bug this method fixes.
+		m.resetRegistrySeq(busID, evt.Ts, writeGen)
+	} else {
+		// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
+		// cross-process filelock, and must never stall unrelated bus operations.
+		m.updateRegistrySeqIfNewer(busID, newSeq, writeGen, evt.Ts)
+	}
 
 	for _, h := range handlers {
 		h.handler(busID, &evt)
@@ -644,6 +707,43 @@ func (m *BusSessionManager) getLastEvent(busID string) (int, string) {
 	return block.Seq, block.Hash
 }
 
+// currentGenerationLocked returns busID's in-memory rotation generation,
+// priming it from the persisted registry entry the first time this process
+// touches busID (same one-time-cost-then-cached shape as getLastEvent's
+// cache-miss file scan above — including doing that one-time file I/O while
+// holding m.mu, which is the existing precedent for this file, not new
+// practice this change introduces). After priming, the value lives purely
+// in-memory and is only ever advanced by this process's own rotations
+// (see the generation field's doc comment), so every subsequent call is a
+// map lookup.
+//
+// The registry read here is intentionally lock-free (no registryFileMu, no
+// cross-process filelock) — it's a best-effort seed, not a correctness-
+// critical read: if it races a concurrent writer and sees a slightly stale
+// value, the persisted Generation this process seeds from was itself either
+// written by this same process in a prior run, or (in the narrower,
+// pre-existing cross-process-same-bus-writer case that this fix does not
+// newly create — see resetRegistrySeq's doc comment) by a peer process,
+// and worst case this process's first generation-fenced write for busID is
+// skipped as a mismatch and self-heals on the next append, same as any
+// other best-effort skip on this path.
+//
+// Caller must hold m.mu.
+func (m *BusSessionManager) currentGenerationLocked(busID string) int64 {
+	if g, ok := m.generation[busID]; ok {
+		return g
+	}
+	var g int64
+	for _, entry := range m.loadRegistry() {
+		if entry.BusID == busID {
+			g = entry.Generation
+			break
+		}
+	}
+	m.generation[busID] = g
+	return g
+}
+
 // LatestEventHash returns the seq and content-addressed hash of the latest
 // event written to busID, without appending. Returns ("", 0) if no event has
 // been written yet. Acquires the bus mutex for a moment, then releases it.
@@ -679,7 +779,27 @@ const registrySeqSkipLogEvery = 100
 // correct, but skipping outright when another goroutine is already inside
 // the cross-process lock attempt keeps this path from ever queuing, which is
 // what "best-effort" means for metadata that self-heals on the next append.
-func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, ts string) {
+//
+// gen fences this write against a rotation that has ALREADY completed for
+// this bus by the time this call reaches the lock: this call and
+// resetRegistrySeq both run outside m.mu with no other ordering between
+// them, so a call like this one — computed for the generation that was
+// current when its seq was assigned — can be delayed (GC pause, scheduler
+// preemption, or simply losing a race against a rotating append's much
+// heavier resetRegistrySeq path) long enough for a LATER rotation's reset to
+// land first. Without the gen check, the `entry.LastEventSeq >= seq` guard
+// alone doesn't catch this: a fresh reset sets LastEventSeq to 0, so any
+// positive seq from the stale pre-rotation generation now looks newer and
+// overwrites it — silently reinstating the pre-rotation terminal seq and
+// freezing every post-rotation append's small seq (1, 2, 3, …) behind that
+// guard forever, exactly the bug resetRegistrySeq exists to fix, just
+// reached by a race instead of a deterministic gap. Requiring gen to match
+// the persisted entry.Generation exactly makes that reordering impossible to
+// apply, not merely unlikely: a write for a generation the registry has
+// already moved past (or hasn't reached yet, which "≠" also catches, though
+// that direction shouldn't arise given gen is only ever captured from a
+// monotonically-advancing in-process counter) is rejected outright.
+func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, gen int64, ts string) {
 	if !m.registryFileMu.TryLock() {
 		m.recordRegistrySeqSkip(busID, "in-process contention")
 		return
@@ -700,6 +820,15 @@ func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, ts s
 	registry := m.loadRegistry()
 	for i, entry := range registry {
 		if entry.BusID == busID {
+			if entry.Generation != gen {
+				// This write belongs to a generation the registry has since
+				// moved past (a rotation's reset landed first) or has not
+				// yet caught up to — either way, applying LastEventSeq/seq
+				// here would relate two different files' seq spaces. Skip;
+				// best-effort, self-heals once a write for the registry's
+				// actual current generation arrives.
+				return
+			}
 			if entry.LastEventSeq >= seq {
 				return // stale out-of-order update; newer one already landed
 			}
@@ -713,6 +842,99 @@ func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, ts s
 		slog.Warn("bus: failed to update registry seq", "err", err, "bus_id", busID)
 	}
 }
+
+// resetRegistrySeq resets busID's registry entry to reflect the fresh
+// events.jsonl a size-based rotation just created: LastEventSeq and
+// EventCount return to 0, Generation advances to gen, LastEventAt is
+// stamped with ts. This completes the symmetry AppendEvent's rotation path
+// starts by resetting the in-memory cache (m.lastSeq[busID] = 0,
+// m.lastHash[busID] = "").
+//
+// Before this method existed only the in-memory half of that reset ever
+// happened on the automatic size-rotation path: the registry kept the old
+// file's terminal seq (e.g. 109619) while the in-memory cursor restarted at
+// 0, so every following append's seq (1, 2, 3, …) tripped
+// updateRegistrySeqIfNewer's `entry.LastEventSeq >= seq` monotonic guard and
+// was silently dropped — forever, since the cache never returns to a value
+// large enough to pass the guard again. The registry entry's LastEventAt
+// froze at the moment of the bus's first rotation even though the bus kept
+// being written to.
+//
+// Unlike updateRegistrySeqIfNewer, this BLOCKS on the registry lock (like
+// RegisterBus) instead of skipping under contention — deliberately, not by
+// oversight. Rotation is rare (once per eventsFileMaxBytes of writes, not
+// once per event), so blocking here is cheap and does not reintroduce the
+// #505 thread-storm updateRegistrySeqIfNewer's TryLock exists to avoid. It
+// also matters more here than on the per-event path: a skipped *advance*
+// self-heals on the very next append (later, larger seq values still pass
+// the guard), but a skipped *reset* would leave the registry pinned to the
+// old file's terminal seq while the in-memory cursor has already restarted
+// at 0 — reproducing this exact bug for every append until the NEXT
+// rotation attempts another reset.
+//
+// gen must be strictly greater than the persisted entry.Generation to apply
+// — NOT unconditional, unlike the pre-generation-fencing version of this
+// method. Two rotations of the same bus can themselves race (this method
+// always blocks rather than skipping, so nothing here prevents a second,
+// later-captured rotation's reset from reaching the lock before an earlier
+// one that got descheduled); accepting an out-of-order reset would let a
+// stale gen clobber Generation backward, which would then make every
+// legitimate advance captured under the true (already-higher) in-memory
+// generation permanently mismatch the regressed persisted value — the same
+// frozen-registry failure mode, reached through the reset path instead of
+// the advance path. Requiring strict-greater makes a stale reset a no-op
+// instead of a regression, symmetric with updateRegistrySeqIfNewer's exact-
+// match guard.
+func (m *BusSessionManager) resetRegistrySeq(busID, ts string, gen int64) {
+	m.registryFileMu.Lock()
+	defer m.registryFileMu.Unlock()
+
+	if err := os.MkdirAll(m.BusesDir(), 0755); err != nil {
+		slog.Warn("bus: registry seq reset mkdir failed", "err", err, "bus_id", busID)
+		return
+	}
+	lock, err := filelock.Acquire(m.RegistryPath()+".lock", registryLockTimeout)
+	if err != nil {
+		slog.Warn("bus: registry seq reset could not acquire lock", "err", err, "bus_id", busID)
+		return
+	}
+	defer lock.Release()
+
+	registry := m.loadRegistry()
+	for i, entry := range registry {
+		if entry.BusID == busID {
+			if gen <= entry.Generation {
+				// A newer generation's reset already landed (or somehow
+				// this bus's persisted generation is already ahead) —
+				// applying this one would regress Generation and freeze
+				// the registry against the actual current generation's
+				// future advances. Skip.
+				return
+			}
+			registry[i].Generation = gen
+			registry[i].LastEventSeq = 0
+			registry[i].LastEventAt = ts
+			registry[i].EventCount = 0
+			break
+		}
+	}
+	if err := m.saveRegistry(registry); err != nil {
+		slog.Warn("bus: failed to reset registry seq after rotation", "err", err, "bus_id", busID)
+	}
+}
+
+// appendEventPostUnlockHook, when non-nil, is invoked by AppendEvent
+// immediately after releasing m.mu and before the registry seq write
+// (resetRegistrySeq / updateRegistrySeqIfNewer), with the generation that
+// write is about to use. Always nil in production — this is a
+// synchronization seam for deterministically reproducing the ordering race
+// generation fencing closes: tests use it to pause a non-rotating append
+// right after it releases m.mu (mirroring "goroutine A" in the reviewer
+// finding this fixes) until a separately-driven rotating append's reset has
+// already landed (mirroring "goroutine B"), then let the paused append's
+// stale-generation write proceed and assert it was rejected. Same spirit as
+// eventsFileMaxBytes above being a var instead of a const for test control.
+var appendEventPostUnlockHook func(busID string, rotated bool, gen int64)
 
 // recordRegistrySeqSkip increments the skip counter and logs at a rate
 // limit — see registrySeqSkipLogEvery.
