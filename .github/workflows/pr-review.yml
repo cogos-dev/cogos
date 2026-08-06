@@ -22,6 +22,10 @@ name: PR Review Gate
 # parse errors, missing credentials, sandbox-canary failure — lands `failure`,
 # a BLOCKING conclusion. (GitHub treats a `neutral` required check as PASSING,
 # so neutral would be fail-OPEN — never use it here.) Silence is not approval.
+# The `edited`-event gate (see the review-agent job's first step) is another
+# deliberate silent path: when no verdict yet exists for the current head SHA
+# it posts NOTHING and lets the run already in flight for that SHA speak —
+# same absence-blocks-merge logic as a superseded diff run, below.
 
 on:
   pull_request:
@@ -29,8 +33,14 @@ on:
     # Conventional-Commits title check, then have its title edited to a
     # non-compliant string via the UI (no push, no re-run), leaving a stale
     # green check that a squash-merge bakes in as the commit subject. The
-    # cheap mechanical job re-validates on edit; the expensive cog-review job
-    # skips edits (the diff is unchanged, so its verdict still stands).
+    # cheap mechanical job re-validates on edit unconditionally.
+    #
+    # The expensive cog-review job does NOT unconditionally skip edits: it
+    # reads the PR description as well as the diff, so an edit CAN invalidate
+    # a standing verdict (a description corrected to no longer contradict a
+    # still-shipping diff — see #534). review-agent's first step decides,
+    # per-run, whether this particular edit warrants a re-review; see that
+    # step and the concurrency-lanes comment below for the exact rule.
     types: [opened, synchronize, reopened, ready_for_review, edited]
 
 permissions:
@@ -49,6 +59,27 @@ permissions:
 # `edited` cannot change the diff, so its (mechanical-only) run belongs in its
 # own lane and must never cancel a diff review. Successive pushes still cancel
 # each other correctly — they share the `diff` lane.
+#
+# This does NOT mean review-agent may simply run unconditionally on `edited`:
+# that reopens the same race in a new shape. If review-agent ran on every
+# edit, the edit seconds after `opened` would start a SECOND review
+# concurrently with the still-running `opened` review — same SHA, two
+# reviewers racing to post a verdict, last writer wins nondeterministically.
+# (The 'meta' lane no longer cancels 'diff' — that split is what fixed
+# #527/#528 — so this pair would not even be serialized away by
+# concurrency.) The rule that closes both problems without reopening either:
+# an `edited` run reviews ONLY IF a completed cog-review check-run already
+# exists for the CURRENT head SHA (implemented as the "Skip stale edits" gate
+# step, review-agent's first step, below — `if:` expressions can't call the
+# API, so this has to be a step, not a job condition). Three cases it covers:
+#   - body set right after `opened`, no verdict yet -> gate says no,
+#     #527/#528 stays fixed.
+#   - body corrected after a BLOCKING verdict already landed on this SHA ->
+#     gate says yes, re-review runs in the 'meta' lane, #534 gets a real path
+#     forward instead of requiring an unrelated push to unstick it.
+#   - body edited to contradict an already-posted APPROVE -> gate says yes
+#     too, which incidentally closes a real fail-open hole: approve, edit the
+#     body to say something else, merge before anyone notices.
 concurrency:
   group: pr-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'edited' && 'meta' || 'diff' }}
   cancel-in-progress: true
@@ -93,14 +124,25 @@ jobs:
   # the API-created `cog-review` verdict check — two same-named checks with
   # potentially opposite conclusions (job green while verdict is failure) makes
   # required-status-check matching ambiguous. Caught live on PR #436.
+  #
+  # This job-level `if:` used to also carry `github.event.action != 'edited'`
+  # — an unconditional skip of every edit. PR #534 showed that reasoning only
+  # holds for diff-derived findings: cog-review reads the PR description too,
+  # and #534 shipped a confirmed finding that the description contradicted
+  # the diff. Correcting the description could not clear the verdict, because
+  # `edited` never re-ran the reviewer — the PR sat blocked with no
+  # legitimate path forward. `if:` can't call the GitHub API, so the
+  # replacement logic (run on `edited` only when a verdict already exists for
+  # the current head SHA) is a step, not a job condition — see "Skip stale
+  # edits", the first step below, and the concurrency-lanes comment above for
+  # why the naive unconditional-run fix would reintroduce #527/#528.
   review-agent:
     # Same-repo PRs only: fork PRs get neither secrets nor a writable token,
     # and an AI reviewer must not ingest fork content without the
     # pull_request_target hardening. Skipping is explicit, not incidental.
     if: >-
       github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.action != 'edited'
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -116,7 +158,54 @@ jobs:
       BASE_REF: ${{ github.base_ref }}
       REPO_FULL: ${{ github.repository }}
     steps:
+      # `if:` expressions can't call the GitHub API, so the edited-event
+      # decision described in the concurrency-lanes and job-if comments above
+      # lives here. Runs before checkout so the skip path (should_run=false)
+      # costs one API call, nothing more.
+      #
+      # Non-`edited` events (opened/synchronize/reopened/ready_for_review)
+      # always proceed unchanged — should_run=true, no API call needed.
+      #
+      # `edited` events proceed ONLY IF a completed `cog-review` check-run
+      # already exists for the CURRENT head SHA (github.event.pull_request.
+      # head.sha — the same HEAD_SHA every downstream step in this job uses).
+      # No completed check-run for this SHA means no verdict has landed yet,
+      # most commonly because the PR was just opened and its body is being
+      # set within seconds of that (the #527/#528 pattern) — so this run
+      # backs off and lets whichever run is already in flight for this SHA
+      # finish and speak. A completed check-run — success OR failure — means
+      # a verdict already stands and an edit CAN legitimately change what it
+      # should say (#534: a corrected description; or an approve a later
+      # edit quietly contradicts), so this run proceeds and re-reviews.
+      #
+      # Checked against the first page only (default 30 check-runs for this
+      # SHA): this repo does not accumulate anywhere near that many reruns
+      # per commit, and undercounting here only makes the gate MORE
+      # conservative (skip when unsure), never less.
+      #
+      # If the API call itself fails, the script (inherited `-e` plus this
+      # step's own `-u`/pipefail) exits non-zero before writing an output.
+      # should_run then reads as empty in every downstream `if:`, which is
+      # neither 'true' nor 'false' — every step below skips, nothing gets
+      # posted for this run. Fail closed by omission: identical in effect to
+      # a superseded diff run posting nothing, per the header comment above.
+      - name: Skip stale edits (no verdict yet for this head SHA)
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_ACTION" != "edited" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HAS_VERDICT=$(gh api "repos/$REPO_FULL/commits/$HEAD_SHA/check-runs" \
+            --jq '[.check_runs[] | select(.name == "cog-review" and .status == "completed")] | length > 0')
+          echo "should_run=$HAS_VERDICT" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.should_run == 'true'
         with:
           fetch-depth: 0
 
@@ -127,6 +216,7 @@ jobs:
       # blocking signal is the check-run conclusion, not the job status.
       - name: Gate on reviewer credentials
         id: cred
+        if: steps.gate.outputs.should_run == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -146,7 +236,7 @@ jobs:
           fi
 
       - name: Prepare diff and prompt
-        if: steps.cred.outputs.skip != 'true'
+        if: steps.gate.outputs.should_run == 'true' && steps.cred.outputs.skip != 'true'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -179,7 +269,7 @@ jobs:
           } > /tmp/cog-review/prompt.md
 
       - name: Install Claude Code CLI
-        if: steps.cred.outputs.skip != 'true'
+        if: steps.gate.outputs.should_run == 'true' && steps.cred.outputs.skip != 'true'
         run: npm install -g @anthropic-ai/claude-code
 
       # Sandbox canary (round-1 self-review finding, then verified locally):
@@ -194,7 +284,7 @@ jobs:
       # approval spent.
       - name: Verify reviewer sandbox (deny-list canary)
         id: canary
-        if: steps.cred.outputs.skip != 'true'
+        if: steps.gate.outputs.should_run == 'true' && steps.cred.outputs.skip != 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -267,7 +357,7 @@ jobs:
           fi
 
       - name: Run review
-        if: steps.cred.outputs.skip != 'true' && steps.canary.outputs.sandbox == 'ok'
+        if: steps.gate.outputs.should_run == 'true' && steps.cred.outputs.skip != 'true' && steps.canary.outputs.sandbox == 'ok'
         timeout-minutes: 15
         env:
           # The token exists ONLY in canary+review step envs. The agent has no
@@ -355,7 +445,16 @@ jobs:
         # the merge exactly like a failing one — with the difference that the
         # successor's real verdict can still land. Only an explicit approve ever
         # passes; silence is still not approval.
-        if: always() && !cancelled() && steps.cred.outputs.skip != 'true' && steps.canary.outputs.sandbox != 'fail'
+        #
+        # steps.gate.outputs.should_run == 'true' is required explicitly here,
+        # not inferred from steps.cred/.canary: when the "Skip stale edits"
+        # gate says no, every step between it and this one was skipped by its
+        # own `if:`, so steps.cred.outputs.skip and steps.canary.outputs.sandbox
+        # both read as EMPTY STRING — and empty != 'true' / empty != 'fail'
+        # would make the rest of this condition true under always(), publishing
+        # a stray "error" verdict on a run this job never actually attempted.
+        # The explicit should_run check is what keeps the skip path silent.
+        if: always() && !cancelled() && steps.gate.outputs.should_run == 'true' && steps.cred.outputs.skip != 'true' && steps.canary.outputs.sandbox != 'fail'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
