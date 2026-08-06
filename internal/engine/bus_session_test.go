@@ -744,3 +744,103 @@ func TestSaveRegistryAtomic(t *testing.T) {
 		t.Errorf("loadRegistry = %+v, want one bus_test entry with seq=3", got)
 	}
 }
+
+// TestArchiveRetentionFor verifies the per-bus retention lookup: exact names,
+// family prefixes, and the keep-everything default for undeclared buses.
+func TestArchiveRetentionFor(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		busID string
+		want  int
+	}{
+		{"bus_traces", 8},         // exact match, prefixed
+		{"traces", 8},             // exact match, unprefixed
+		{"bus_kernel_proprio", 8}, // exact match wins over the "kernel" segment
+		{"bus_peer_awareness", 8}, // exact match wins over the "peer" segment
+		{"bus_chat_abc-123", -1},  // conversation content: never auto-pruned
+		{"bus_mcp_deadbeef", -1},  // conversation content: never auto-pruned
+		{"bus_sessions", -1},      // undeclared: keep everything
+		{"", -1},                  // degenerate input must not panic or prune
+	}
+	for _, tc := range cases {
+		if got := archiveRetentionFor(tc.busID); got != tc.want {
+			t.Errorf("archiveRetentionFor(%q) = %d, want %d", tc.busID, got, tc.want)
+		}
+	}
+}
+
+// TestPruneBusArchives_KeepsNewest verifies that pruning removes the oldest
+// archives, keeps the newest `keep`, and never touches the live events.jsonl.
+func TestPruneBusArchives_KeepsNewest(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "bus_prunetest"
+	if _, err := mgr.AppendEvent(busID, "test", "seed", map[string]any{"n": 1}); err != nil {
+		t.Fatalf("seed append: %v", err)
+	}
+	busDir := filepath.Join(mgr.BusesDir(), busID)
+
+	// Five archives, lexically ordered oldest -> newest.
+	stamps := []string{
+		"2026-01-01T000000Z", "2026-02-01T000000Z", "2026-03-01T000000Z",
+		"2026-04-01T000000Z", "2026-05-01T000000Z",
+	}
+	for _, ts := range stamps {
+		p := filepath.Join(busDir, "events."+ts+".jsonl")
+		if err := os.WriteFile(p, []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("write archive %s: %v", ts, err)
+		}
+	}
+
+	mgr.pruneBusArchives(busID, 2)
+
+	for _, ts := range stamps[:3] {
+		if _, err := os.Stat(filepath.Join(busDir, "events."+ts+".jsonl")); !os.IsNotExist(err) {
+			t.Errorf("archive %s should have been pruned, stat err = %v", ts, err)
+		}
+	}
+	for _, ts := range stamps[3:] {
+		if _, err := os.Stat(filepath.Join(busDir, "events."+ts+".jsonl")); err != nil {
+			t.Errorf("archive %s should have been kept: %v", ts, err)
+		}
+	}
+	// The live file must survive pruning.
+	if _, err := os.Stat(filepath.Join(busDir, "events.jsonl")); err != nil {
+		t.Errorf("live events.jsonl must never be pruned: %v", err)
+	}
+}
+
+// TestPruneBusArchives_KeepAllIsNoop is the regression guard that matters most:
+// a bus with no declared retention must never lose an archive.
+func TestPruneBusArchives_KeepAllIsNoop(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "bus_chat_keepme"
+	if _, err := mgr.AppendEvent(busID, "test", "seed", map[string]any{"n": 1}); err != nil {
+		t.Fatalf("seed append: %v", err)
+	}
+	busDir := filepath.Join(mgr.BusesDir(), busID)
+	for _, ts := range []string{"2026-01-01T000000Z", "2026-02-01T000000Z"} {
+		if err := os.WriteFile(filepath.Join(busDir, "events."+ts+".jsonl"), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("write archive: %v", err)
+		}
+	}
+
+	mgr.pruneBusArchives(busID, archiveRetentionFor(busID))
+
+	entries, err := os.ReadDir(busDir)
+	if err != nil {
+		t.Fatalf("read bus dir: %v", err)
+	}
+	var archives int
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "events.") && e.Name() != "events.jsonl" {
+			archives++
+		}
+	}
+	if archives != 2 {
+		t.Errorf("undeclared bus must keep all archives, got %d want 2", archives)
+	}
+}
