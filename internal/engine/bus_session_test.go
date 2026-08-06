@@ -619,14 +619,12 @@ func TestAppendEvent_RotatesAtThreshold(t *testing.T) {
 }
 
 // TestAppendEvent_SeqResetsAcrossRotation verifies that after a size-based
-// rotation the next event starts at seq=1 (per-file semantics).
-//
-// Seq semantics are per-file, confirmed by inspecting root/bus_session.go's
-// archiveBus function which explicitly sets LastEventSeq=0 and EventCount=0
-// after rename — matching the chat.reset genesis-event pattern (seq=1 on the
-// new file).  The engine package preserves these semantics: rotation clears
-// the cache (lastSeq[busID]=0, lastHash[busID]="") so the next AppendEvent
-// builds a new chain from seq=1.
+// rotation the next event starts at seq=1 (per-file semantics): rotation
+// clears the cache (lastSeq[busID]=0, lastHash[busID]="") so the next
+// AppendEvent builds a new chain from seq=1, matching AppendEvent's
+// size-based rotation branch which explicitly sets LastEventSeq=0 and
+// EventCount=0 (both in-memory and, via resetRegistrySeq, in the registry)
+// after the rename.
 func TestAppendEvent_SeqResetsAcrossRotation(t *testing.T) {
 	// Not parallel: mutates package-level eventsFileMaxBytes.
 	root := t.TempDir()

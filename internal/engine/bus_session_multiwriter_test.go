@@ -51,8 +51,8 @@ func TestUpdateRegistrySeqIfNewer_NoRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m.updateRegistrySeqIfNewer("bus-a", 5, "2026-07-07T00:00:05Z")
-	m.updateRegistrySeqIfNewer("bus-a", 3, "2026-07-07T00:00:03Z") // stale, out of order
+	m.updateRegistrySeqIfNewer("bus-a", 5, 0, "2026-07-07T00:00:05Z")
+	m.updateRegistrySeqIfNewer("bus-a", 3, 0, "2026-07-07T00:00:03Z") // stale, out of order
 
 	registry := m.LoadRegistry()
 	if len(registry) != 1 {
