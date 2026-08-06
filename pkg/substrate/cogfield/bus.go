@@ -31,5 +31,10 @@ type BusRegistryEntry struct {
 	// value — the same value a bus that has never rotated carries, so no
 	// migration is needed: an old entry and a never-rotated new entry are
 	// indistinguishable, both correctly at generation 0.
+	//
+	// PUBLIC SHAPE: this struct is serialized verbatim by GET /v1/bus/list
+	// (internal/engine/serve_bus.go), so adding or renaming a field here
+	// changes both the on-disk registry.json and that endpoint's response.
+	// Treat it as an API surface, not an internal record.
 	Generation int64 `json:"generation"`
 }
