@@ -687,6 +687,98 @@ func TestAppendEvent_SeqResetsAcrossRotation(t *testing.T) {
 	}
 }
 
+// TestAppendEvent_RegistrySeqAdvancesAcrossRotation is a regression guard
+// for the bug where a bus's registry entry stopped advancing forever after
+// its FIRST size-based rotation: AppendEvent's rotation path reset the
+// in-memory cursor (m.lastSeq[busID] = 0) but never touched the registry,
+// so updateRegistrySeqIfNewer's monotonic guard (entry.LastEventSeq >= seq)
+// rejected every later, smaller per-file seq — last_event_at froze at the
+// moment of the first rotation even though the bus kept being written to.
+//
+// Rotates the bus at least twice and asserts the registry's LastEventSeq /
+// EventCount / LastEventAt keep tracking live writes after BOTH rotations,
+// not just surviving the first one — a fix that only patched the first
+// rotation (e.g. a one-shot flag) would pass a single-rotation check and
+// still be broken in production, where buses rotate repeatedly over time.
+func TestAppendEvent_RegistrySeqAdvancesAcrossRotation(t *testing.T) {
+	// Not parallel: mutates package-level eventsFileMaxBytes.
+	root := t.TempDir()
+
+	original := eventsFileMaxBytes
+	eventsFileMaxBytes = 512
+	t.Cleanup(func() { eventsFileMaxBytes = original })
+
+	mgr := NewBusSessionManager(root)
+	busID := "reg-seq-bus"
+
+	if err := mgr.EnsureBus(busID); err != nil {
+		t.Fatalf("EnsureBus: %v", err)
+	}
+	// Seed a registry entry — AppendEvent's registry-seq paths only update an
+	// EXISTING entry (they never create one), matching production where
+	// RegisterBus always runs before a bus is written to.
+	if err := mgr.RegisterBus(busID, "sess1", "test"); err != nil {
+		t.Fatalf("RegisterBus: %v", err)
+	}
+
+	// Detect rotations by watching evt.Seq drop between consecutive appends
+	// (per-file seq semantics: the first event of a new generation always
+	// has a smaller seq than the last event of the generation it followed —
+	// see TestAppendEvent_SeqResetsAcrossRotation). This is more reliable
+	// than counting archive files on disk: the archive filename has
+	// one-second resolution (events.<RFC3339-ish-UTC>.jsonl), so multiple
+	// rotations within the same wall-clock second — routine at this test's
+	// tiny 512-byte threshold — collide on the same filename and would
+	// undercount rotations if counted by directory listing.
+	var lastEvt *BusBlock
+	rotations := 0
+	for i := 0; i < 5000 && rotations < 2; i++ {
+		evt, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": strings.Repeat("z", 20)})
+		if err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+
+		if lastEvt != nil && evt.Seq < lastEvt.Seq {
+			rotations++
+
+			// evt is the FIRST write of the new generation — exactly the
+			// write that used to be silently dropped by
+			// updateRegistrySeqIfNewer's monotonic guard once the registry
+			// was left pinned at the old generation's terminal seq.
+			entries := mgr.LoadRegistry()
+			if len(entries) != 1 {
+				t.Fatalf("after rotation #%d: registry has %d entries, want 1", rotations, len(entries))
+			}
+			got := entries[0]
+			if got.LastEventSeq != evt.Seq {
+				t.Errorf("after rotation #%d: registry LastEventSeq = %d, want %d (evt seq) — registry stopped advancing, staleness bug reproduced", rotations, got.LastEventSeq, evt.Seq)
+			}
+			if got.EventCount != evt.Seq {
+				t.Errorf("after rotation #%d: registry EventCount = %d, want %d", rotations, got.EventCount, evt.Seq)
+			}
+			if got.LastEventAt != evt.Ts {
+				t.Errorf("after rotation #%d: registry LastEventAt = %q, want %q (the just-appended event's ts) — a bus written to moments ago must not report as stale", rotations, got.LastEventAt, evt.Ts)
+			}
+		}
+		lastEvt = evt
+	}
+
+	if rotations < 2 {
+		t.Fatalf("only %d rotation(s) occurred in 5000 appends; need at least 2 to exercise the second-rotation regression", rotations)
+	}
+
+	// Final sanity check against the very last event appended, independent
+	// of the per-rotation assertions above.
+	entries := mgr.LoadRegistry()
+	got := entries[0]
+	if got.LastEventAt != lastEvt.Ts {
+		t.Fatalf("final registry LastEventAt = %q, want %q (last appended event's ts)", got.LastEventAt, lastEvt.Ts)
+	}
+	if got.LastEventSeq != lastEvt.Seq {
+		t.Fatalf("final registry LastEventSeq = %d, want %d (last appended event's seq)", got.LastEventSeq, lastEvt.Seq)
+	}
+}
+
 // TestBusSessionEventHandlerDispatch verifies that registered handlers
 // fire after AppendEvent, outside the lock.
 func TestBusSessionEventHandlerDispatch(t *testing.T) {

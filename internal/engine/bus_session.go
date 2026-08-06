@@ -164,7 +164,11 @@ type BusSessionManager struct {
 	// AppendEvent for a bus and on every subsequent write; they are reset to
 	// zero-values on rotation (seq semantics are per-file — see archiveBus in
 	// root's bus_session.go which resets LastEventSeq/EventCount to 0 after
-	// rename).  Protected by m.mu.
+	// rename).  AppendEvent's rotation path mirrors this reset into the
+	// registry via resetRegistrySeq, so the in-memory cache and the on-disk
+	// registry entry reset in lockstep — see resetRegistrySeq's doc comment
+	// for why a plain updateRegistrySeqIfNewer call is not sufficient here.
+	// Protected by m.mu.
 	lastSeq  map[string]int64
 	lastHash map[string]string
 
@@ -582,11 +586,25 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	// cost is amortised across a whole events file.
 	if rotated {
 		m.pruneBusArchives(busID, archiveRetentionFor(busID))
-	}
 
-	// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
-	// cross-process filelock, and must never stall unrelated bus operations.
-	m.updateRegistrySeqIfNewer(busID, newSeq, evt.Ts)
+		// Reset the registry entry in lockstep with the in-memory cache
+		// reset above (m.lastSeq[busID] = 0). The event just appended
+		// (newSeq) now lives in the archived file, not the fresh one, so
+		// the registry should reflect the fresh file's true state — zero
+		// events — rather than record the archived file's terminal seq via
+		// the normal advance-only path. See resetRegistrySeq's doc comment
+		// for why this must be an unconditional reset, not
+		// updateRegistrySeqIfNewer(busID, newSeq, ...): the latter would
+		// write newSeq (the old file's terminal value) into the registry,
+		// after which every following append's small per-file seq (1, 2,
+		// 3, …) would trip the monotonic guard and be dropped forever —
+		// exactly the staleness bug this method fixes.
+		m.resetRegistrySeq(busID, evt.Ts)
+	} else {
+		// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
+		// cross-process filelock, and must never stall unrelated bus operations.
+		m.updateRegistrySeqIfNewer(busID, newSeq, evt.Ts)
+	}
 
 	for _, h := range handlers {
 		h.handler(busID, &evt)
@@ -711,6 +729,65 @@ func (m *BusSessionManager) updateRegistrySeqIfNewer(busID string, seq int, ts s
 	}
 	if err := m.saveRegistry(registry); err != nil {
 		slog.Warn("bus: failed to update registry seq", "err", err, "bus_id", busID)
+	}
+}
+
+// resetRegistrySeq unconditionally resets busID's registry entry to reflect
+// the fresh events.jsonl a size-based rotation just created: LastEventSeq
+// and EventCount return to 0, LastEventAt is stamped with ts. This
+// completes the symmetry AppendEvent's rotation path starts by resetting
+// the in-memory cache (m.lastSeq[busID] = 0, m.lastHash[busID] = "") —
+// mirroring root's archiveBus, which resets both the chain state and the
+// registry entry together (see TestAppendEvent_SeqResetsAcrossRotation's
+// doc comment for the root-package citation).
+//
+// Before this method existed only the in-memory half of that reset ever
+// happened on the automatic size-rotation path: the registry kept the old
+// file's terminal seq (e.g. 109619) while the in-memory cursor restarted at
+// 0, so every following append's seq (1, 2, 3, …) tripped
+// updateRegistrySeqIfNewer's `entry.LastEventSeq >= seq` monotonic guard and
+// was silently dropped — forever, since the cache never returns to a value
+// large enough to pass the guard again. The registry entry's LastEventAt
+// froze at the moment of the bus's first rotation even though the bus kept
+// being written to.
+//
+// Unlike updateRegistrySeqIfNewer, this BLOCKS on the registry lock (like
+// RegisterBus) instead of skipping under contention — deliberately, not by
+// oversight. Rotation is rare (once per eventsFileMaxBytes of writes, not
+// once per event), so blocking here is cheap and does not reintroduce the
+// #505 thread-storm updateRegistrySeqIfNewer's TryLock exists to avoid. It
+// also matters more here than on the per-event path: a skipped *advance*
+// self-heals on the very next append (later, larger seq values still pass
+// the guard), but a skipped *reset* would leave the registry pinned to the
+// old file's terminal seq while the in-memory cursor has already restarted
+// at 0 — reproducing this exact bug for every append until the NEXT
+// rotation attempts another reset.
+func (m *BusSessionManager) resetRegistrySeq(busID, ts string) {
+	m.registryFileMu.Lock()
+	defer m.registryFileMu.Unlock()
+
+	if err := os.MkdirAll(m.BusesDir(), 0755); err != nil {
+		slog.Warn("bus: registry seq reset mkdir failed", "err", err, "bus_id", busID)
+		return
+	}
+	lock, err := filelock.Acquire(m.RegistryPath()+".lock", registryLockTimeout)
+	if err != nil {
+		slog.Warn("bus: registry seq reset could not acquire lock", "err", err, "bus_id", busID)
+		return
+	}
+	defer lock.Release()
+
+	registry := m.loadRegistry()
+	for i, entry := range registry {
+		if entry.BusID == busID {
+			registry[i].LastEventSeq = 0
+			registry[i].LastEventAt = ts
+			registry[i].EventCount = 0
+			break
+		}
+	}
+	if err := m.saveRegistry(registry); err != nil {
+		slog.Warn("bus: failed to reset registry seq after rotation", "err", err, "bus_id", busID)
 	}
 }
 
