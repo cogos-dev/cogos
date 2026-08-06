@@ -27,6 +27,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +44,98 @@ import (
 // events.jsonl is opened.  Exposed as a var (not const) so tests can override
 // it without build-tag gymnastics; reset to the default in t.Cleanup.
 var eventsFileMaxBytes int64 = 64 * 1024 * 1024 // 64 MB
+
+// busArchiveRetention declares, per bus, how many rotated events.<ts>.jsonl
+// archives to keep.  Rotation without retention grows without bound: on one
+// long-running node the `traces` bus reached 11.2 GB across 173 archives with
+// nothing ever reclaiming them, and the accumulated bus directory was the
+// largest writer on the machine.
+//
+// Retention is deliberately declared PER BUS rather than as a global default,
+// because different buses stand in different relationships to the substrate.
+// Trace and telemetry buses are disposable instrumentation — the current window
+// is the only part anyone reads.  Chat and MCP buses carry conversation
+// content, which is ground truth and must never be reclaimed on a timer.  A
+// global default would have to pick one of those and be wrong for the other.
+//
+// A bus with no entry here keeps every archive forever, which is the historical
+// behaviour: this map is opt-in, so adding retention can never silently delete
+// history for a bus nobody considered.
+//
+// Exposed as a var (not const) so tests can override it without build-tag
+// gymnastics; reset to the default in t.Cleanup.
+var busArchiveRetention = map[string]int{
+	"traces":         8,
+	"kernel_proprio": 8,
+	"peer_awareness": 8,
+}
+
+// busArchiveKeepAll is the sentinel returned for buses with no declared
+// retention: keep every archive.
+const busArchiveKeepAll = -1
+
+// archiveRetentionFor reports how many rotated archives to keep for busID, or
+// busArchiveKeepAll when the bus has declared no retention.
+//
+// Bus IDs reaching this function are prefixed by producer ("bus_traces",
+// "bus_chat_<uuid>"), so the lookup matches on the prefix-stripped name and
+// then on the leading segment, letting one entry cover a whole family
+// ("chat" would cover every per-conversation chat bus) without enumerating
+// instance IDs.
+func archiveRetentionFor(busID string) int {
+	name := strings.TrimPrefix(busID, "bus_")
+	if n, ok := busArchiveRetention[name]; ok {
+		return n
+	}
+	if idx := strings.IndexByte(name, '_'); idx > 0 {
+		if n, ok := busArchiveRetention[name[:idx]]; ok {
+			return n
+		}
+	}
+	return busArchiveKeepAll
+}
+
+// pruneBusArchives removes the oldest rotated archives for busID, keeping the
+// newest keep of them.  Archives are named events.<RFC3339-ish-UTC>.jsonl, so
+// lexical order over the filename is chronological order and no stat calls are
+// needed to sort.  The live events.jsonl is never a candidate.
+//
+// Callers must NOT hold m.mu: this does directory I/O and unlinks, and holding
+// the bus lock across it would stall every unrelated bus operation.  Errors are
+// logged and swallowed — failing to reclaim disk must never fail an append that
+// has already been durably written.
+func (m *BusSessionManager) pruneBusArchives(busID string, keep int) {
+	if keep < 0 {
+		return
+	}
+	busDir := filepath.Join(m.BusesDir(), pathsafe.SanitizeComponent(busID))
+	entries, err := os.ReadDir(busDir)
+	if err != nil {
+		slog.Warn("bus: archive prune could not read bus dir", "err", err, "bus_id", busID)
+		return
+	}
+	var archives []string
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() || n == "events.jsonl" {
+			continue
+		}
+		if strings.HasPrefix(n, "events.") && strings.HasSuffix(n, ".jsonl") {
+			archives = append(archives, n)
+		}
+	}
+	if len(archives) <= keep {
+		return
+	}
+	sort.Strings(archives) // lexical == chronological for the timestamp format
+	for _, n := range archives[:len(archives)-keep] {
+		if err := os.Remove(filepath.Join(busDir, n)); err != nil {
+			slog.Warn("bus: archive prune failed", "err", err, "bus_id", busID, "file", n)
+			continue
+		}
+		slog.Info("bus: pruned rotated archive", "bus_id", busID, "file", n, "keep", keep)
+	}
+}
 
 // BusBlock is the wire format for bus events. Alias to the canonical
 // pkg/cogfield.Block so the byte-compat JSON shape is guaranteed — the
@@ -454,6 +548,7 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	// Cache is cleared for this busID so the next getLastEvent call starts
 	// from a known-empty file (seq resets to 0; seq semantics are per-file,
 	// matching root's archiveBus which resets LastEventSeq/EventCount to 0).
+	rotated := false
 	if fi, statErr := os.Stat(eventsFile); statErr == nil && fi.Size() >= eventsFileMaxBytes {
 		ts := time.Now().UTC().Format("2006-01-02T150405Z")
 		archivePath := filepath.Join(m.BusesDir(), pathsafe.SanitizeComponent(busID), "events."+ts+".jsonl")
@@ -467,6 +562,7 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 				nf.Close()
 				m.lastSeq[busID] = 0
 				m.lastHash[busID] = ""
+				rotated = true
 			} else {
 				slog.Warn("bus: size-rotation create failed, retaining seq cache", "err", createErr, "bus_id", busID)
 			}
@@ -479,6 +575,14 @@ func (m *BusSessionManager) AppendEvent(busID, eventType, from string, payload m
 	handlers := make([]busEventHandler, len(m.eventHandlers))
 	copy(handlers, m.eventHandlers)
 	m.mu.Unlock()
+
+	// Archive retention runs OUTSIDE m.mu: it lists a directory and unlinks
+	// files, and holding the bus lock across that would stall every unrelated
+	// bus operation.  Only runs on the append that actually rotated, so the
+	// cost is amortised across a whole events file.
+	if rotated {
+		m.pruneBusArchives(busID, archiveRetentionFor(busID))
+	}
 
 	// Registry seq update runs OUTSIDE m.mu: it blocks (briefly) on the
 	// cross-process filelock, and must never stall unrelated bus operations.
