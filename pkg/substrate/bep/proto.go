@@ -25,8 +25,9 @@ const (
 	MessageTypeResponse       MessageType = 4
 	MessageTypePing           MessageType = 6
 	MessageTypeClose          MessageType = 7
-	MessageTypeDispatch       MessageType = 8 // Phase 2 S4: remote harness dispatch request
-	MessageTypeDispatchResult MessageType = 9 // Phase 2 S4: remote harness dispatch result
+	MessageTypeDispatch       MessageType = 8  // Phase 2 S4: remote harness dispatch request
+	MessageTypeDispatchResult MessageType = 9  // Phase 2 S4: remote harness dispatch result
+	MessageTypePong           MessageType = 10 // reply to Ping; MUST NOT itself provoke a reply (5 is reserved upstream in the Syncthing BEP lineage)
 )
 
 type MessageCompression int32
@@ -569,8 +570,17 @@ func (r *Response) Unmarshal(b []byte) error {
 
 type Ping struct{}
 
-func (p *Ping) Marshal() []byte    { return nil }
+func (p *Ping) Marshal() []byte        { return nil }
 func (p *Ping) Unmarshal([]byte) error { return nil }
+
+// Pong is the reply to a Ping. It carries no payload, same as Ping — but it
+// is a distinct wire type so a peer loop can tell "I was asked to reply"
+// apart from "this is the reply", instead of echoing MessageTypePing back
+// at the sender and volleying forever.
+type Pong struct{}
+
+func (p *Pong) Marshal() []byte        { return nil }
+func (p *Pong) Unmarshal([]byte) error { return nil }
 
 type Close struct {
 	Reason string // field 1
