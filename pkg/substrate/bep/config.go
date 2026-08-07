@@ -24,10 +24,20 @@ const DefaultListenPort = 6932
 
 // Peer represents a known peer node in the BEP cluster.
 type Peer struct {
-	DeviceID string    `json:"deviceId" yaml:"deviceId"`
-	Address  string    `json:"address" yaml:"address"` // host:port or tailscale address
-	Name     string    `json:"name" yaml:"name"`
-	Trusted  bool      `json:"trusted" yaml:"trusted"`
+	DeviceID string `json:"deviceId" yaml:"deviceId"`
+	Address  string `json:"address" yaml:"address"` // host:port or tailscale address
+	Name     string `json:"name" yaml:"name"`
+	Trusted  bool   `json:"trusted" yaml:"trusted"`
+
+	// NodeIdentityHash is the sha256 digest ("sha256:<hex>") of the peer's
+	// sealed node-identity cogdoc self_hash. Audit/provenance only: today's
+	// trust decision is DeviceID+Trusted (TLS client-cert match), not this
+	// field — see RFC-036's "neither is in the trust path" note. Optional;
+	// promotes what was previously a comment-only convention in
+	// cluster.yaml into schema so it round-trips instead of relying on an
+	// operator to keep prose in sync.
+	NodeIdentityHash string `json:"nodeIdentityHash,omitempty" yaml:"nodeIdentityHash,omitempty"`
+
 	LastSeen time.Time `json:"lastSeen,omitempty" yaml:"lastSeen,omitempty"`
 }
 
