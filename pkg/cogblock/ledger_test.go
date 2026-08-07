@@ -2,6 +2,7 @@ package cogblock
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -322,6 +323,107 @@ func TestVerifyLedger_DetectsTampering(t *testing.T) {
 	err = VerifyLedger(tmpDir, sessionID)
 	if err == nil {
 		t.Error("Verification should have detected tampering")
+	}
+}
+
+// TestGetLastEvent_LineOverBufioDefault_TokenCapRaised covers the
+// GetLastEvent scanner-buffer regression: bufio.Scanner defaults to a
+// 64 KiB MaxScanTokenSize and, before GetLastEvent called scanner.Buffer(),
+// a single events.jsonl line over that size made scanner.Err() return
+// bufio.ErrTooLong. AppendEvent (the canonical write path) calls
+// GetLastEvent unconditionally to compute the next seq and prior_hash, so
+// this was not a read-only edge case -- it could make every future append
+// to an affected session fail. Real workspace ledgers have held lines up to
+// 253,902 bytes; this test writes a line comfortably past bufio's 64 KiB
+// default (but still within ledgerScanMaxBufSize) directly into a
+// t.TempDir() ledger fixture and confirms GetLastEvent both reads it and
+// that a subsequent AppendEvent chains correctly off it.
+func TestGetLastEvent_LineOverBufioDefault_TokenCapRaised(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionID := "test-session-oversized-line"
+
+	ledgerDir := filepath.Join(tmpDir, ".cog", "ledger", sessionID)
+	if err := os.MkdirAll(ledgerDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	// Build an oversized event: a data field padded past 64 KiB. The whole
+	// marshaled line comfortably exceeds bufio's 64 KiB default and stays
+	// well under ledgerScanMaxBufSize (1 MiB).
+	bigEvent := NewEventEnvelope("test.event", sessionID)
+	bigEvent.WithData("padding", strings.Repeat("x", 200*1024)) // 200 KiB payload
+	bigEvent.Metadata.Seq = 1
+	bigEvent.Metadata.Hash = "deadbeef"
+
+	line, err := json.Marshal(bigEvent)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if len(line) <= 64*1024 {
+		t.Fatalf("test fixture line is only %d bytes; must exceed bufio's 64 KiB default to exercise the regression", len(line))
+	}
+
+	eventsFile := filepath.Join(ledgerDir, "events.jsonl")
+	if err := os.WriteFile(eventsFile, append(line, '\n'), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	last, err := GetLastEvent(tmpDir, sessionID)
+	if err != nil {
+		t.Fatalf("GetLastEvent failed on a %d-byte line (bufio.ErrTooLong regression): %v", len(line), err)
+	}
+	if last == nil {
+		t.Fatal("GetLastEvent returned nil event for a ledger with one oversized line")
+	}
+	if last.Metadata.Seq != 1 {
+		t.Errorf("Seq = %d; want 1", last.Metadata.Seq)
+	}
+
+	// AppendEvent must also succeed: it calls GetLastEvent internally to
+	// compute the next seq/prior_hash, so this is the actual failure path
+	// the review finding traced (step 5's EmitMigratedEvent -> AppendEvent
+	// -> GetLastEvent).
+	next := NewEventEnvelope("test.event.next", sessionID)
+	if err := AppendEvent(tmpDir, sessionID, next); err != nil {
+		t.Fatalf("AppendEvent after oversized prior line: %v", err)
+	}
+	if next.Metadata.Seq != 2 {
+		t.Errorf("next.Metadata.Seq = %d; want 2 (chained off the oversized event)", next.Metadata.Seq)
+	}
+	if next.HashedPayload.PriorHash != "deadbeef" {
+		t.Errorf("next.HashedPayload.PriorHash = %q; want %q (chained off the oversized event's hash)", next.HashedPayload.PriorHash, "deadbeef")
+	}
+}
+
+// TestGetLastEvent_LineExceedsMaxBuf_ReturnsFatalError verifies the other
+// bound: a line that exceeds even the raised ledgerScanMaxBufSize ceiling
+// must surface as an error, never be swallowed into "no prior event"
+// (which would corrupt AppendEvent's seq/prior_hash chaining -- see
+// GetLastEvent's scanner.Err() comment).
+func TestGetLastEvent_LineExceedsMaxBuf_ReturnsFatalError(t *testing.T) {
+	tmpDir := t.TempDir()
+	sessionID := "test-session-way-too-big"
+
+	ledgerDir := filepath.Join(tmpDir, ".cog", "ledger", sessionID)
+	if err := os.MkdirAll(ledgerDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	// A line bigger than ledgerScanMaxBufSize (1 MiB) even after the raised
+	// buffer -- this must still fail, not silently resolve to "no events".
+	tooBig := []byte(`{"hashed_payload":{"type":"test","data":{"padding":"` + strings.Repeat("y", 2<<20) + `"}}}`)
+
+	eventsFile := filepath.Join(ledgerDir, "events.jsonl")
+	if err := os.WriteFile(eventsFile, append(tooBig, '\n'), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := GetLastEvent(tmpDir, sessionID)
+	if err == nil {
+		t.Fatal("GetLastEvent returned no error for a line exceeding ledgerScanMaxBufSize; a genuine scan failure must be fatal, not treated as os.ErrNotExist")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("GetLastEvent returned os.ErrNotExist for a scan failure; this would make AppendEvent treat a session with existing history as brand-new (seq=1, empty prior_hash), corrupting the chain: %v", err)
 	}
 }
 

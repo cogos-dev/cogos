@@ -182,6 +182,31 @@ func HashEvent(canonicalBytes []byte, algorithm string) (string, error) {
 
 // === LEDGER OPERATIONS ===
 
+// Scanner buffer bounds for GetLastEvent's line-by-line JSONL scan.
+//
+// bufio.Scanner's MaxScanTokenSize defaults to 64 KiB with no way to grow it
+// unless Buffer() is called explicitly (its default initial allocation,
+// startBufSize, is a separate, smaller 4 KiB) -- a real session ledger line
+// over 64 KiB makes scanner.Err() return bufio.ErrTooLong.
+//
+// Bounds chosen to match internal/engine/ledger_query.go's ledgerScanBufSize
+// (64 KiB initial / 1 MiB max), not internal/engine/consolidate.go's larger
+// 1 MiB-initial/16 MiB-max bound: GetLastEvent scans a single session's
+// events.jsonl, the same file shape and same EventEnvelope unmarshal both
+// of those already scan, so the choice here is between two existing
+// conventions in this codebase rather than a difference in what is being
+// read. ledger_query.go's smaller 1 MiB ceiling already leaves ~4x headroom
+// over the largest real ledger line observed to date (253,902 bytes), so
+// there's no need to reach for consolidate.go's larger one. GetLastEvent
+// also runs on every single AppendEvent call, so matching
+// ledger_query.go's 64 KiB initial allocation (rather than pre-allocating
+// 1 MiB up front) avoids adding overhead to that hot path; the buffer only
+// grows toward the 1 MiB ceiling when a line actually requires it.
+const (
+	ledgerScanInitBufSize = 64 * 1024
+	ledgerScanMaxBufSize  = 1 << 20
+)
+
 // AppendEvent appends an event to a session ledger with hash chaining.
 // This is the canonical write path for all events.
 //
@@ -265,6 +290,7 @@ func GetLastEvent(workspaceRoot, sessionID string) (*EventEnvelope, error) {
 
 	var lastEvent *EventEnvelope
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, ledgerScanInitBufSize), ledgerScanMaxBufSize)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -279,6 +305,18 @@ func GetLastEvent(workspaceRoot, sessionID string) (*EventEnvelope, error) {
 		lastEvent = &event
 	}
 
+	// A genuine scan failure (e.g. bufio.ErrTooLong if a line still exceeds
+	// ledgerScanMaxBufSize) must stay fatal here, not collapse into "no prior
+	// event". AppendEvent (this function's primary caller) uses a nil
+	// lastEvent to mean "this session has no history yet" and assigns seq=1
+	// with an empty prior_hash on that basis. Swallowing a scan error into
+	// the same nil-return path would make AppendEvent mint a false genesis
+	// record (seq=1, prior_hash="") for a session that already has history,
+	// corrupting the seq/prior_hash chain -- strictly worse than surfacing
+	// the error and refusing to append. AppendEvent already treats any
+	// non-os.IsNotExist error from this function as fatal
+	// (`if err != nil && !os.IsNotExist(err)`), so returning the error here
+	// is sufficient; no change needed on the caller side.
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}

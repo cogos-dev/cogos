@@ -342,15 +342,25 @@ func migratedEventForHash(workspaceRoot, oldNodeHash string) (*cogblock.EventEnv
 // (pkg/cogblock/ledger.go) rather than failing the whole scan on one bad
 // line.
 //
-// The scanner's token buffer is raised to the same 1 MiB-initial/16 MiB-max
-// bounds internal/engine/ledger_query.go and internal/engine/consolidate.go
-// already use when scanning these same .cog/ledger/*/events.jsonl files
-// ("raise token cap: ledger events can hold large payloads"). bufio's
-// default 64 KiB cap is not just a theoretical concern here: real workspace
-// ledgers hold JSONL lines in the hundreds of KB, and this scan -- unlike a
-// single-session read -- walks every session directory, so one oversized
-// line in any unrelated session would otherwise abort the entire idempotency
-// check before Migrate ever reaches step 4.
+// The scanner's token buffer is raised to 1 MiB-initial/16 MiB-max, the
+// same bound internal/engine/consolidate.go uses at both of its own scan
+// sites (readLedgerEvents and ArchivedSessions) when scanning these same
+// .cog/ledger/*/events.jsonl files ("raise token cap: ledger events can
+// hold large payloads"). This is NOT the same bound
+// internal/engine/ledger_query.go uses for its own scan of these files --
+// ledger_query.go's ledgerScanBufSize caps out smaller, at 64 KiB-initial/
+// 1 MiB-max. That split is not a single-session-vs-every-session split:
+// ledger_query.go's smaller bound backs both single-session and
+// multi-session queries there, and consolidate.go's larger bound backs
+// both its every-session sweep (readLedgerEvents) and its single-session
+// read (ArchivedSessions). This function takes the larger of the two
+// existing bounds because migratedEventForHash's caller walks every
+// session directory in one call, and a scanner.Err() on any single line
+// aborts that entire idempotency check before Migrate ever reaches step 4
+// -- real workspace ledgers hold JSONL lines in the hundreds of KB, well
+// past bufio's own 64 KiB MaxScanTokenSize default, so the extra headroom
+// over ledger_query.go's 1 MiB ceiling is deliberate margin for a scan that
+// cannot afford to abort partway through.
 //
 // A genuine scan error (scanner.Err(), including bufio.ErrTooLong if a line
 // still exceeds the raised cap) is deliberately still propagated as fatal by
