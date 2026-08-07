@@ -157,6 +157,51 @@ Scoping authority for the change itself is RFC-036's 2026-07-29 operator ruling
 
 ---
 
+## Addendum (2026-08-07): Open Question #1 re-checked, first precondition cleared
+
+Open Question #1 asked when the cogos kernel could import
+`github.com/myrgic/constellation`, gated on "constellation's public API
+surface being stable enough for a go.mod dependency." That framing was
+accurate on 2026-05-18 and was never re-checked afterward. Re-measured on
+2026-08-07:
+
+- `github.com/myrgic/constellation` is tagged `v0.1.0` (2026-04-14) and
+  `v0.2.0` (2026-05-08) — ten days before this ADR's own acceptance date.
+- `identity.go` is byte-identical between `v0.2.0` and the current `main`
+  tip (same git blob SHA, `8b6d86f`).
+- Three commits have landed on constellation's `main` since `v0.2.0`:
+  `acc3456` (2026-05-27, `docs/PAPER.md`), `2d08506` (2026-08-03,
+  `CHANGELOG.md` and `README.md`), and `c47074f` (2026-08-03,
+  `CONTRIBUTING.md`). All three are docs-only; none touches a `.go` file.
+- `go get github.com/myrgic/constellation@v0.2.0` resolves cleanly through
+  the standard module proxy, and a scratch module built and compiled
+  cleanly against its exported identity surface (`NodeIdentity`,
+  `GenerateIdentity`, `LoadIdentity`, `SaveIdentity`).
+
+The public API surface has been frozen since `v0.2.0`, predating this ADR
+by ten days. The precondition in Open Question #1 was therefore already
+satisfied on the day this ADR was accepted; the "blocked" label persisted
+only because nothing re-checked it until now.
+
+This clears only the first of ADR-099's three gating preconditions for
+Layer 2 retirement (dependency stability). The other two — an
+`IdentityProvider` that projects an L2 spec onto an L1 node binding, and a
+written-and-tested `cogos node migrate-identity` CLI command — remain
+unmet on `main`. Clearing precondition one does not by itself authorize
+retiring Layer 2, and no existing `.cog/identity.json` should be touched
+until all three preconditions are met and an operator decides to run the
+migration.
+
+A prototype implementation of the six-step procedure from "Migration
+guidance for Layer 2 (future wave)" above (`internal/l2migration`, plus
+the corresponding `go.mod` dependency addition) exists on the closed
+branch `feat/adr099-l2-identity-migration` (PR #538, closed without
+merging on 2026-08-07). It is unmerged and is not part of this change; a
+future attempt at the second and third preconditions does not need to
+start from zero.
+
+---
+
 ## References
 
 - Three-layer identity model (L1/L2/L3) — (internal reference omitted)
