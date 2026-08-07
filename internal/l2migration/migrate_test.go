@@ -1,6 +1,8 @@
 package l2migration
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,14 +123,63 @@ func TestEnsureL1Identity_NodeIDMatchesDerivation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalPublicKey: %v", err)
 	}
-	// Re-derive independently via constellation's own PublicKeyFromDER +
-	// FormatNodeID-adjacent check: parse back and confirm it's the same key.
+
+	// Independently re-derive NodeID = hex(sha256(DER(pubkey))) -- ADR-099
+	// step 3's exact formula -- and compare against id.NodeID. This is the
+	// assertion the test name promises; a prior version of this test only
+	// round-tripped the DER through x509 and never computed a hash, so it
+	// would have passed even if constellation's derivation formula changed
+	// underneath it.
+	sum := sha256.Sum256(der)
+	wantNodeID := hex.EncodeToString(sum[:])
+	if id.NodeID != wantNodeID {
+		t.Errorf("NodeID = %q, want hex(sha256(DER(pubkey))) = %q", id.NodeID, wantNodeID)
+	}
+
+	// Also confirm the DER round-trips to the same public key, as a sanity
+	// check on MarshalPublicKey itself.
 	pub, err := constellation.PublicKeyFromDER(der)
 	if err != nil {
 		t.Fatalf("PublicKeyFromDER: %v", err)
 	}
 	if pub.X.Cmp(id.PublicKey.X) != 0 || pub.Y.Cmp(id.PublicKey.Y) != 0 {
 		t.Fatal("round-tripped public key does not match original")
+	}
+}
+
+// TestEnsureL1Identity_ExistingUnloadableKeyIsNotDestroyed is the regression
+// test for the destroy-on-any-load-error bug: EnsureL1Identity must not fall
+// through to GenerateIdentity+SaveIdentity (which truncates node-key.pem)
+// just because LoadIdentity failed. It must distinguish "absent" (generate)
+// from "present but broken" (hard error, key left untouched).
+func TestEnsureL1Identity_ExistingUnloadableKeyIsNotDestroyed(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "identity")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	keyPath := filepath.Join(dir, "node-key.pem")
+
+	// Simulate a crash mid-write: a partial, non-PEM file sitting at the
+	// exact path constellation.LoadIdentity/SaveIdentity use. No real key
+	// material anywhere in this fixture.
+	corrupt := []byte("-----BEGIN EC PRIVATE KEY-----\ntruncated-not-real-pem-data")
+	if err := os.WriteFile(keyPath, corrupt, 0o600); err != nil {
+		t.Fatalf("write corrupt fixture key: %v", err)
+	}
+
+	_, err := EnsureL1Identity(dir)
+	if err == nil {
+		t.Fatal("EnsureL1Identity: expected an error for an existing-but-unloadable key, got nil")
+	}
+
+	// The load-bearing assertion: the broken file must be untouched, not
+	// silently truncated and replaced by a freshly generated key.
+	got, readErr := os.ReadFile(keyPath)
+	if readErr != nil {
+		t.Fatalf("key file vanished after failed EnsureL1Identity: %v", readErr)
+	}
+	if string(got) != string(corrupt) {
+		t.Errorf("existing key file was modified; EnsureL1Identity must never overwrite a present-but-unloadable key.\n got: %q\nwant: %q", got, corrupt)
 	}
 }
 
@@ -166,9 +217,36 @@ func TestWriteNodeCRD(t *testing.T) {
 		t.Errorf("Spec.MigrationTS = %q, want 2026-08-07T12:00:00Z", crd.Spec.MigrationTS)
 	}
 
-	wantPath := filepath.Join(root, ".cog", "config", "nodes", "sha256:oldhash.yaml")
+	wantPath := filepath.Join(root, ".cog", "config", "nodes", "sha256%3Aoldhash.yaml")
 	if path != wantPath {
 		t.Errorf("path = %q, want %q", path, wantPath)
+	}
+}
+
+// TestWriteNodeCRD_PathTraversal is the regression test for treating
+// oldNodeHash as trusted input: it is read verbatim from a file
+// (LoadLegacyIdentity only checks non-empty), so a traversal payload there
+// must not escape .cog/config/nodes/.
+func TestWriteNodeCRD_PathTraversal(t *testing.T) {
+	root := t.TempDir()
+	ts := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+
+	path, err := WriteNodeCRD(root, "../../../../etc/pwned", "newhexid", ts)
+	if err != nil {
+		t.Fatalf("WriteNodeCRD: %v", err)
+	}
+
+	// The sanitized name may legitimately CONTAIN literal ".." characters
+	// (SanitizeComponent percent-escapes the "/" separators but leaves "."
+	// alone, so "../.." becomes the single safe component "..%2F.."). What
+	// must never happen is the result resolving to a DIFFERENT directory
+	// than nodesDir -- i.e. it must be exactly one path component below it.
+	nodesDir := filepath.Join(root, ".cog", "config", "nodes")
+	if gotDir := filepath.Dir(path); gotDir != nodesDir {
+		t.Errorf("WriteNodeCRD escaped %s: wrote to directory %s instead", nodesDir, gotDir)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("expected CRD written inside nodesDir, stat failed: %v", statErr)
 	}
 }
 
@@ -240,6 +318,9 @@ func TestMigrate_EndToEnd(t *testing.T) {
 	if result.NewNodeID == "" {
 		t.Error("NewNodeID is empty")
 	}
+	if len(result.Warnings) == 0 {
+		t.Error("Warnings is empty; the L1-identity-scope gap must be surfaced on every run")
+	}
 
 	// Step 4: CRD YAML exists and round-trips.
 	crdData, err := os.ReadFile(result.CRDPath)
@@ -274,12 +355,32 @@ func TestMigrate_EndToEnd(t *testing.T) {
 	// (load, not regenerate) -- migration is idempotent on the L1 side.
 	// Read-only permissions from step 6 don't block LoadLegacyIdentity (a
 	// read), so no chmod is needed before this second run.
+	preRunEvents, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read ledger events before re-run: %v", err)
+	}
+
 	second, err := Migrate(root, identityDir, "identity-migration")
 	if err != nil {
 		t.Fatalf("Migrate (second run): %v", err)
 	}
 	if second.NewNodeID != result.NewNodeID {
 		t.Errorf("NewNodeID changed on re-run: %q != %q", second.NewNodeID, result.NewNodeID)
+	}
+
+	// Re-running must NOT append a second node.identity.migrated event to
+	// the append-only ledger -- that would be an indistinguishable duplicate
+	// provenance record with no way to tell it apart from a genuine second
+	// migration. Steps 4-5 must be skipped when the CRD already exists.
+	postRunEvents, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read ledger events after re-run: %v", err)
+	}
+	if string(postRunEvents) != string(preRunEvents) {
+		t.Errorf("ledger events changed on re-run; expected steps 4-5 to be skipped as a no-op.\nbefore: %s\nafter:  %s", preRunEvents, postRunEvents)
+	}
+	if strings.Count(string(postRunEvents), `"type":"node.identity.migrated"`) != 1 {
+		t.Errorf("expected exactly one node.identity.migrated event after two Migrate calls, got: %s", postRunEvents)
 	}
 }
 

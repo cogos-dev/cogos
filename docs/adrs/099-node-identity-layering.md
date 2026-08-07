@@ -204,6 +204,29 @@ Layer 2; no existing `.cog/identity.json` was touched, read-written, or
 migrated by this change, and none should be until preconditions two and
 three are also met and an operator decides to run the migration.
 
+**A fourth precondition surfaced by re-checking Open Question #1, and it
+belongs here rather than staying implicit in code comments alone:** this
+ADR's migration steps 2–3 (the ECDSA P-256 identity `internal/l2migration`
+finds-or-generates, and its `hex(sha256(DER(pubkey)))` NodeID) were written
+on 2026-05-18 and implemented verbatim on 2026-08-07 without re-checking
+whether the L1 *value* itself had moved in the interim. It has. The
+"Conflict log" section immediately above this addendum already records
+that node identity became machine-scoped and BEP-device-cert-anchored
+under RFC-036's 2026-07-29 operator ruling
+(`internal/engine/node_identity.go`), which is the kernel's actual,
+operative NodeID today. `internal/l2migration` mints/loads a *different*
+ECDSA keypair and a different derivation than that resolver uses, and
+nothing in this PR reconciles the two. The `spec.new_node_id` field the
+migration package writes into its `kind: Node` CRD is therefore provenance
+for "the L1 identity ADR-099 originally specified," not a proven binding
+to what the kernel stamps as `SourceIdentity` on the wire. `internal/
+l2migration.Migrate`'s `Result.Warnings` now says so explicitly on every
+call, and `EnsureL1Identity`'s doc comment carries the same caveat, so this
+does not have to be rediscovered by whoever eventually writes
+`cogos node migrate-identity`. Reconciling the two NodeID schemes — or
+deciding one supersedes the other — is an operator decision, same as the
+Conflict log's other open items, not something this addendum resolves.
+
 ---
 
 ## References
