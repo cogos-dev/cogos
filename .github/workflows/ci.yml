@@ -68,6 +68,28 @@ jobs:
       - name: Unit tests
         run: go test -race -count=1 ./...
 
+      # Root `./...` only expands the root module's own packages (verified:
+      # `go list ./...` from repo root returns 35 packages, none under
+      # pkg/substrate or the other go.work submodules) — workspace mode
+      # affects dependency resolution, not what `./...` matches from a given
+      # directory. So every submodule listed in go.work has its test suite
+      # sitting dead in CI unless walked explicitly. Read the module list
+      # from go.work itself (not hardcoded) so this doesn't drift when
+      # submodules are added/removed.
+      - name: Unit tests (workspace submodules)
+        run: |
+          set -euo pipefail
+          mods=$(go work edit -json | jq -r '.Use[].DiskPath | select(. != ".")')
+          failed=0
+          for mod in $mods; do
+            echo "::group::go test $mod/..."
+            if ! (cd "$mod" && go build ./... && go vet ./... && go test -race -count=1 ./...); then
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
   lint:
     runs-on: ubuntu-latest
     steps:
