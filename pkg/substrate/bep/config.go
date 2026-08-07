@@ -30,12 +30,27 @@ type Peer struct {
 	Trusted  bool   `json:"trusted" yaml:"trusted"`
 
 	// NodeIdentityHash is the sha256 digest ("sha256:<hex>") of the peer's
-	// sealed node-identity cogdoc self_hash. Audit/provenance only: today's
-	// trust decision is DeviceID+Trusted (TLS client-cert match), not this
-	// field — see RFC-036's "neither is in the trust path" note. Optional;
-	// promotes what was previously a comment-only convention in
+	// sealed node-identity cogdoc self_hash. It is structurally
+	// audit/provenance only, not a step toward a future trust binding: it's
+	// a content digest of a document, with no key material and no BEP
+	// handshake step that presents anything derived from it, so it cannot
+	// support a challenge-response and rotates silently whenever the source
+	// cogdoc is re-sealed. Today's (and any near-term) trust decision is
+	// DeviceID+Trusted (TLS client-cert match) — see RFC-036 §11.5's
+	// "neither is in the trust path" note. A real deviceId-to-L1-identity
+	// binding, if built, would need the peer's L1 NodeID or a signature
+	// over it, not this hash; that is a distinct, larger piece of work
+	// (constellation L1 import, ADR-099), not this field maturing.
+	//
+	// Note this is a second, independent seam from #474 (RFC-036 Seam B),
+	// which already anchors this kernel's own process.NodeID to its BEP
+	// DeviceID on mint (internal/engine/process.go). That anchors *this
+	// node's* kernel identity to its own device cert; it says nothing about
+	// a *peer's* identity, which is what this field carries provenance for.
+	//
+	// Promotes what was previously a comment-only convention in
 	// cluster.yaml into schema so it round-trips instead of relying on an
-	// operator to keep prose in sync.
+	// operator to keep prose in sync (myrgic/cogos#536).
 	NodeIdentityHash string `json:"nodeIdentityHash,omitempty" yaml:"nodeIdentityHash,omitempty"`
 
 	LastSeen time.Time `json:"lastSeen,omitempty" yaml:"lastSeen,omitempty"`
