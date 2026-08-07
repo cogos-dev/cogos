@@ -157,6 +157,55 @@ Scoping authority for the change itself is RFC-036's 2026-07-29 operator ruling
 
 ---
 
+## Addendum (2026-08-07): Open Question #1 re-checked, first precondition cleared
+
+Open Question #1 asked when the cogos kernel could import
+`github.com/myrgic/constellation`, and framed the gate as "blocked on
+constellation's public API surface being stable enough for a go.mod
+dependency." That framing was accurate on 2026-05-18 but was never
+re-checked afterward. Re-measured on 2026-08-07:
+
+- `github.com/myrgic/constellation` is public on GitHub, tagged `v0.1.0`
+  and `v0.2.0`.
+- Exactly one commit has landed since this ADR's 2026-05-18 acceptance
+  (`f4a775b`, 2026-05-27, docs-only — `PAPER.md`, zero `.go` files
+  touched). `identity.go` is byte-identical to what `v0.2.0` shipped.
+- `go get github.com/myrgic/constellation@v0.2.0` resolves cleanly through
+  the standard module proxy; a scratch module built and compiled against
+  its exported identity surface (`GenerateIdentity`, `LoadIdentity`,
+  `SaveIdentity`, `NodeIdentity`) without incident.
+
+The surface has been frozen since `v0.2.0` (2026-05-08), predating this
+ADR. The precondition in Open Question #1 was already satisfied; the
+"blocked" label persisted only because nothing re-checked it.
+
+What landed as a result, in a PR against this repo:
+
+- A normal versioned `require github.com/myrgic/constellation v0.2.0` in
+  `cogos/go.mod` — **not** a `go.work` `use` entry. `go.work` is
+  git-committed and every existing entry in its `use (...)` block is an
+  intra-repo relative path; a sibling-checkout path
+  (`../constellation`) would have broken CI and any checkout not sharing
+  this machine's directory layout.
+- `internal/l2migration` — the six-step migration procedure from
+  "Migration guidance for Layer 2 (future wave)" above, implemented as
+  tested, callable Go code. It is deliberately **not** wired into any
+  automatic path: no startup hook, no service, no CLI command runs it by
+  default. Tests run against generated throwaway keys in a temp dir only;
+  no real identity file or key material is touched by this change.
+
+This addendum clears only the first of ADR-099's three gating
+preconditions for Layer 2 retirement (dependency stability). The other
+two — an `IdentityProvider` projection from an L2 spec onto an L1 node
+binding, and a written-and-tested `cogos node migrate-identity` CLI
+command that actually invokes `internal/l2migration.Migrate` — remain
+open. Clearing precondition one does not by itself authorize retiring
+Layer 2; no existing `.cog/identity.json` was touched, read-written, or
+migrated by this change, and none should be until preconditions two and
+three are also met and an operator decides to run the migration.
+
+---
+
 ## References
 
 - Three-layer identity model (L1/L2/L3) — (internal reference omitted)

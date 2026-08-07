@@ -22,6 +22,7 @@ require (
 	github.com/myrgic/cogos/pkg/modality v0.0.0-00010101000000-000000000000
 	github.com/myrgic/cogos/pkg/reconcile v0.0.0-00010101000000-000000000000
 	github.com/myrgic/cogos/sdk v0.0.0
+	github.com/myrgic/constellation v0.2.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
