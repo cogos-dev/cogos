@@ -3,12 +3,14 @@ package l2migration
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/myrgic/cogos/pkg/cogblock"
 	"github.com/myrgic/constellation"
 	"gopkg.in/yaml.v3"
 )
@@ -384,6 +386,77 @@ func TestMigrate_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestMigrate_RetryAfterEventEmitFailureStillEmitsEvent is the regression
+// test for the CRD-as-proxy idempotency bug: if step 4 (WriteNodeCRD)
+// succeeded on a prior attempt but step 5 (EmitMigratedEvent) never
+// completed -- the run crashed, or hit a disk-full/permission error between
+// the two steps -- a retry must still emit the ledger event. The original
+// bug used the CRD file's mere existence as proof the whole migration
+// (including the event) already happened, so a retry from exactly this
+// state would return err == nil while silently never writing the event.
+func TestMigrate_RetryAfterEventEmitFailureStillEmitsEvent(t *testing.T) {
+	root := t.TempDir()
+	identityDir := filepath.Join(t.TempDir(), "l1-identity")
+	writeFixtureLegacyIdentity(t, root, "sha256:interleavefixture")
+
+	// Establish the L1 identity the same way Migrate's steps 2-3 would, so
+	// the CRD hand-written below records the same NewNodeID Migrate itself
+	// will derive.
+	l1, err := EnsureL1Identity(identityDir)
+	if err != nil {
+		t.Fatalf("EnsureL1Identity: %v", err)
+	}
+
+	// Simulate the exact interleaving under test: step 4 ran and succeeded
+	// on a prior attempt, but step 5 never ran -- no ledger anywhere in this
+	// fresh root.
+	if _, err := WriteNodeCRD(root, "sha256:interleavefixture", l1.NodeID, time.Now().UTC()); err != nil {
+		t.Fatalf("WriteNodeCRD (simulating completed step 4): %v", err)
+	}
+	ledgerDir := filepath.Join(root, ".cog", "ledger")
+	if _, statErr := os.Stat(ledgerDir); !os.IsNotExist(statErr) {
+		t.Fatalf("test setup invariant violated: ledger dir already exists before Migrate runs")
+	}
+
+	result, err := Migrate(root, identityDir, "identity-migration")
+	if err != nil {
+		t.Fatalf("Migrate (retry after simulated step-5 failure): %v", err)
+	}
+
+	// The load-bearing assertion: the event must actually be there. The
+	// original bug returned err == nil here too, with the event silently
+	// never written -- checking only the returned error would not have
+	// caught it.
+	eventsPath := filepath.Join(ledgerDir, "identity-migration", "events.jsonl")
+	data, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("expected ledger events file after retry, got: %v", err)
+	}
+	got := string(data)
+	if strings.Count(got, `"type":"node.identity.migrated"`) != 1 {
+		t.Fatalf("expected exactly one node.identity.migrated event after retry, got: %s", got)
+	}
+	if !strings.Contains(got, `"old_node_hash":"sha256:interleavefixture"`) {
+		t.Errorf("event missing old_node_hash; got %s", got)
+	}
+	if result.NewNodeID != l1.NodeID {
+		t.Errorf("NewNodeID = %q, want %q", result.NewNodeID, l1.NodeID)
+	}
+
+	// A second retry, now that the event genuinely exists, must be a true
+	// no-op: still exactly one event, not a duplicate.
+	if _, err := Migrate(root, identityDir, "identity-migration"); err != nil {
+		t.Fatalf("Migrate (second retry, event now exists): %v", err)
+	}
+	data2, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read ledger events after second retry: %v", err)
+	}
+	if strings.Count(string(data2), `"type":"node.identity.migrated"`) != 1 {
+		t.Errorf("expected exactly one node.identity.migrated event after two genuine runs, got: %s", data2)
+	}
+}
+
 func TestMigrate_MissingLegacyIdentity(t *testing.T) {
 	root := t.TempDir()
 	identityDir := filepath.Join(t.TempDir(), "l1-identity")
@@ -391,4 +464,178 @@ func TestMigrate_MissingLegacyIdentity(t *testing.T) {
 	if _, err := Migrate(root, identityDir, "identity-migration"); err == nil {
 		t.Fatal("Migrate: expected error when no legacy identity.json exists, got nil")
 	}
+}
+
+// writeRawLedgerLine writes a single JSONL line directly into
+// <root>/.cog/ledger/<sessionID>/events.jsonl, bypassing cogblock.AppendEvent
+// so the tests below can control line size precisely without depending on
+// cogblock's own hash-chaining reads.
+func writeRawLedgerLine(t *testing.T, root, sessionID string, envelope *cogblock.EventEnvelope) {
+	t.Helper()
+	line, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal fixture ledger line: %v", err)
+	}
+	dir := filepath.Join(root, ".cog", "ledger", sessionID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	path := filepath.Join(dir, "events.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// migratedEventEnvelope builds a node.identity.migrated event envelope for
+// test fixtures. paddingBytes inflates an unrelated data field so the
+// marshaled JSONL line reaches a target size, without affecting the fields
+// scanForMigratedEvent actually reads.
+func migratedEventEnvelope(oldNodeHash, newNodeID string, paddingBytes int) *cogblock.EventEnvelope {
+	env := &cogblock.EventEnvelope{
+		HashedPayload: cogblock.EventPayload{
+			Type:      EventType,
+			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			SessionID: "identity-migration",
+			Data: map[string]interface{}{
+				"old_node_hash": oldNodeHash,
+				"new_node_id":   newNodeID,
+			},
+		},
+	}
+	if paddingBytes > 0 {
+		env.HashedPayload.Data["padding"] = strings.Repeat("x", paddingBytes)
+	}
+	return env
+}
+
+// TestScanForMigratedEvent_LineOverDefaultBufSizeIsFound is the lower-bound
+// regression test for the idempotency scan's token-cap bug: a real
+// node.identity.migrated ledger line over bufio's default 64 KiB
+// MaxScanTokenSize -- observed on the operator's live workspace at up to
+// 253,902 bytes -- must still be found, not fail with bufio.ErrTooLong.
+func TestScanForMigratedEvent_LineOverDefaultBufSizeIsFound(t *testing.T) {
+	env := migratedEventEnvelope("sha256:largelinefixture", "newid-fixture", 100*1024)
+	line, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	if len(line) <= 64*1024 {
+		t.Fatalf("test fixture line is %d bytes, want > 64KiB to exercise the raised cap", len(line))
+	}
+
+	found, err := scanForMigratedEvent(strings.NewReader(string(line)+"\n"), "sha256:largelinefixture")
+	if err != nil {
+		t.Fatalf("scanForMigratedEvent: %v", err)
+	}
+	if found == nil {
+		t.Fatal("scanForMigratedEvent: expected event to be found, got nil")
+	}
+	if got, _ := found.HashedPayload.Data["old_node_hash"].(string); got != "sha256:largelinefixture" {
+		t.Errorf("old_node_hash = %q, want sha256:largelinefixture", got)
+	}
+}
+
+// TestMigratedEventForHash_UnrelatedOversizedLineDoesNotAbortScan reproduces
+// the exact real-workspace failure mode: os.ReadDir returns session
+// directories in lexical order, and a single oversized line in an unrelated
+// session anywhere in that order must not prevent the scan from reaching a
+// later session that holds the real match.
+func TestMigratedEventForHash_UnrelatedOversizedLineDoesNotAbortScan(t *testing.T) {
+	root := t.TempDir()
+
+	// "aaa-unrelated" sorts before "zzz-target" -- ReadDir hits the oversized,
+	// non-matching line first.
+	unrelated := migratedEventEnvelope("sha256:someoneelse", "someone-elses-id", 200*1024)
+	if len(mustMarshal(t, unrelated)) <= 64*1024 {
+		t.Fatal("unrelated fixture line is not actually oversized")
+	}
+	writeRawLedgerLine(t, root, "aaa-unrelated", unrelated)
+
+	target := migratedEventEnvelope("sha256:target", "target-newid", 0)
+	writeRawLedgerLine(t, root, "zzz-target", target)
+
+	found, err := migratedEventForHash(root, "sha256:target")
+	if err != nil {
+		t.Fatalf("migratedEventForHash: %v", err)
+	}
+	if found == nil {
+		t.Fatal("migratedEventForHash: expected match in zzz-target, got nil")
+	}
+}
+
+// TestMigrate_SucceedsWithLargeUnrelatedLedgerLine is the end-to-end
+// regression test for the blocking review finding: Migrate must complete
+// against a workspace whose ledger contains an oversized JSONL line in some
+// unrelated session, exactly as the operator's live workspace does. Before
+// the scanner.Buffer fix, this failed with "bufio.Scanner: token too long"
+// before Migrate ever reached step 4.
+func TestMigrate_SucceedsWithLargeUnrelatedLedgerLine(t *testing.T) {
+	root := t.TempDir()
+	identityDir := filepath.Join(t.TempDir(), "l1-identity")
+	writeFixtureLegacyIdentity(t, root, "sha256:largeledgerfixture")
+
+	// Lexically before "identity-migration", so ReadDir walks it first.
+	unrelated := migratedEventEnvelope("sha256:unrelated-elsewhere", "unrelated-newid", 200*1024)
+	writeRawLedgerLine(t, root, "aaa-unrelated-session", unrelated)
+
+	result, err := Migrate(root, identityDir, "identity-migration")
+	if err != nil {
+		t.Fatalf("Migrate: %v (an oversized unrelated ledger line must not block migration)", err)
+	}
+	if result.OldNodeHash != "sha256:largeledgerfixture" {
+		t.Errorf("OldNodeHash = %q, want sha256:largeledgerfixture", result.OldNodeHash)
+	}
+	if _, err := os.Stat(result.CRDPath); err != nil {
+		t.Fatalf("CRD not written: %v", err)
+	}
+}
+
+// TestScanForMigratedEvent_LineExceedingRaisedCapStillErrors is the
+// upper-bound counterpart: a line that exceeds even the raised 16 MiB cap
+// must still surface a hard error rather than being silently treated as "no
+// match found". Swallowing this error would let Migrate conclude the
+// migration never happened and re-emit a duplicate node.identity.migrated
+// event.
+func TestScanForMigratedEvent_LineExceedingRaisedCapStillErrors(t *testing.T) {
+	env := migratedEventEnvelope("sha256:toolarge", "toolarge-newid", 16*1024*1024+1024)
+
+	found, err := scanForMigratedEvent(strings.NewReader(string(mustMarshal(t, env))+"\n"), "sha256:toolarge")
+	if err == nil {
+		t.Fatal("scanForMigratedEvent: expected an error for a line exceeding the raised cap, got nil")
+	}
+	if found != nil {
+		t.Errorf("scanForMigratedEvent: expected nil event alongside the error, got %+v", found)
+	}
+}
+
+// TestMigratedEventForHash_LineExceedingRaisedCapIsFatal confirms the error
+// from the scan above propagates out of migratedEventForHash as an error,
+// not as a (nil, nil) "not found" result -- the distinction the false-
+// positive-duplicate-event bound depends on.
+func TestMigratedEventForHash_LineExceedingRaisedCapIsFatal(t *testing.T) {
+	root := t.TempDir()
+	env := migratedEventEnvelope("sha256:toolarge", "toolarge-newid", 16*1024*1024+1024)
+	writeRawLedgerLine(t, root, "identity-migration", env)
+
+	found, err := migratedEventForHash(root, "sha256:toolarge")
+	if err == nil {
+		t.Fatal("migratedEventForHash: expected an error for a line exceeding the raised cap, got nil")
+	}
+	if found != nil {
+		t.Errorf("migratedEventForHash: expected nil event alongside the error, got %+v", found)
+	}
+}
+
+func mustMarshal(t *testing.T, envelope *cogblock.EventEnvelope) []byte {
+	t.Helper()
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return data
 }

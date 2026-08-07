@@ -35,12 +35,15 @@
 package l2migration
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/myrgic/cogos/pkg/cogblock"
@@ -279,6 +282,108 @@ type Result struct {
 // can paper over.
 const l1IdentityScopeWarning = "L1 NodeID minted/loaded here (constellation ECDSA-P256-DER) is not confirmed to match the kernel's live BEP-anchored NodeID (RFC-036, 2026-07-29 ruling); resolving that is an open operator decision, see ADR-099's Conflict log"
 
+// migratedEventForHash searches every session's ledger under
+// <workspaceRoot>/.cog/ledger/ for an existing node.identity.migrated event
+// recording oldNodeHash, and returns it if found.
+//
+// This is deliberately what Migrate's idempotency decision keys on. The
+// step-4 CRD file is written strictly before the step-5 ledger event, so the
+// CRD's mere presence cannot prove step 5 ran -- a prior run that wrote the
+// CRD and then failed to emit the event would look, to a CRD-only check,
+// identical to a fully completed migration, and a retry would then skip the
+// event forever. The ledger event is the actual thing steps 4-5 need to be
+// idempotent on, so it is the thing checked directly, mirroring
+// GetHashAlgorithm's existing pattern of scanning every session dir under
+// .cog/ledger/ (pkg/cogblock/ledger.go) rather than trusting a single
+// session's file.
+func migratedEventForHash(workspaceRoot, oldNodeHash string) (*cogblock.EventEnvelope, error) {
+	ledgerDir := filepath.Join(workspaceRoot, ".cog", "ledger")
+
+	entries, err := os.ReadDir(ledgerDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// No ledger has ever been written in this workspace -- nothing to
+			// find, not an error (this is the normal first-ever-run state).
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read ledger dir %q: %w", ledgerDir, err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		eventsPath := filepath.Join(ledgerDir, entry.Name(), "events.jsonl")
+		f, err := os.Open(eventsPath)
+		if err != nil {
+			// Matches GetHashAlgorithm's existing tolerance for a session dir
+			// with no events.jsonl (or one that vanished mid-scan) -- just
+			// not this session's ledger.
+			continue
+		}
+
+		found, scanErr := scanForMigratedEvent(f, oldNodeHash)
+		f.Close()
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan ledger events %q: %w", eventsPath, scanErr)
+		}
+		if found != nil {
+			return found, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// scanForMigratedEvent reads a JSONL ledger stream looking for a
+// node.identity.migrated event whose data.old_node_hash matches oldNodeHash.
+// Malformed lines are skipped, matching GetLastEvent's existing tolerance
+// (pkg/cogblock/ledger.go) rather than failing the whole scan on one bad
+// line.
+//
+// The scanner's token buffer is raised to the same 1 MiB-initial/16 MiB-max
+// bounds internal/engine/ledger_query.go and internal/engine/consolidate.go
+// already use when scanning these same .cog/ledger/*/events.jsonl files
+// ("raise token cap: ledger events can hold large payloads"). bufio's
+// default 64 KiB cap is not just a theoretical concern here: real workspace
+// ledgers hold JSONL lines in the hundreds of KB, and this scan -- unlike a
+// single-session read -- walks every session directory, so one oversized
+// line in any unrelated session would otherwise abort the entire idempotency
+// check before Migrate ever reaches step 4.
+//
+// A genuine scan error (scanner.Err(), including bufio.ErrTooLong if a line
+// still exceeds the raised cap) is deliberately still propagated as fatal by
+// the caller (migratedEventForHash) rather than treated as "event not
+// found": swallowing it would let Migrate conclude the migration never
+// happened and re-run steps 4-5, appending a second, indistinguishable
+// node.identity.migrated record to the append-only ledger. A scan that
+// cannot complete must not be treated as equivalent to a scan that found
+// nothing.
+func scanForMigratedEvent(r io.Reader, oldNodeHash string) (*cogblock.EventEnvelope, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024) // raise token cap: ledger events can hold large payloads
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var event cogblock.EventEnvelope
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		if event.HashedPayload.Type != EventType {
+			continue
+		}
+		if got, _ := event.HashedPayload.Data["old_node_hash"].(string); got == oldNodeHash {
+			e := event
+			return &e, nil
+		}
+	}
+	return nil, scanner.Err()
+}
+
 // Migrate runs ADR-099's six-step Layer-2 retirement procedure end to end
 // against workspaceRoot, using identityDir as the ECDSA P-256 identity
 // directory (ADR-099 step 2: "~/.cog/node/identity/" in production; a
@@ -299,31 +404,62 @@ func Migrate(workspaceRoot, identityDir, sessionID string) (*Result, error) {
 		return nil, fmt.Errorf("steps 2-3 (ensure L1 identity): %w", err)
 	}
 
-	// Steps 4-5 are made idempotent on re-run: if a CRD for this legacy hash
-	// was already written by a prior Migrate call, re-emitting the CRD write
-	// and the ledger event would append a second, indistinguishable
-	// node.identity.migrated record to the hash-chained (append-only, no
-	// dedup) ledger -- a false "migrated twice" signal with no way to tell
-	// it apart from a real second migration. Detect the existing CRD and
-	// skip straight to returning the already-recorded mapping.
-	crdPath := nodeCRDPath(workspaceRoot, legacy.NodeHash)
-	migratedAt := time.Now().UTC()
+	// Steps 4-5 are made idempotent on re-run: re-emitting the ledger event
+	// would append a second, indistinguishable node.identity.migrated record
+	// to the hash-chained (append-only, no dedup) ledger -- a false "migrated
+	// twice" signal with no way to tell it apart from a real second
+	// migration. But the two steps are NOT atomic together (step 4 writes the
+	// CRD file, step 5 then emits the event), so the two failure modes this
+	// check must avoid are symmetric and cannot both be resolved by looking
+	// at only one of the two artifacts:
+	//
+	//   - false positive (duplicate event): re-running after a fully
+	//     successful prior run must not re-emit the event.
+	//   - false negative (skipped event): re-running after step 4 succeeded
+	//     but step 5 failed (disk full, permission error on
+	//     .cog/ledger/<sessionID>) must still emit the event -- it has never
+	//     actually been recorded.
+	//
+	// Keying on the step-4 CRD file's existence (the prior version of this
+	// check) gets the false-negative case wrong: the CRD is written before
+	// the event, so a step-5 failure leaves the CRD in place, and a retry's
+	// CRD-only check would wrongly conclude the whole migration already
+	// completed and skip re-emitting the event forever. Keying on the ledger
+	// event itself (migratedEventForHash) is correct at both bounds: the
+	// event is the one artifact that is present if and only if step 5
+	// actually completed, so "does the event already exist" is exactly the
+	// question idempotency needs answered, with no cross-step inference.
 	warnings := []string{l1IdentityScopeWarning}
 
-	if existing, statErr := os.Stat(crdPath); statErr == nil && !existing.IsDir() {
+	existingEvent, err := migratedEventForHash(workspaceRoot, legacy.NodeHash)
+	if err != nil {
+		return nil, fmt.Errorf("check ledger for existing %s event: %w", EventType, err)
+	}
+	if existingEvent != nil {
 		if err := MakeLegacyIdentityReadOnly(workspaceRoot); err != nil {
 			return nil, fmt.Errorf("step 6 (preserve legacy identity read-only): %w", err)
+		}
+		// The event's own timestamp -- not a filesystem mtime -- is the
+		// authoritative record of when the migration actually completed.
+		// EmitMigratedEvent's only caller (this function, via
+		// cogblock.NewEventEnvelope) always writes RFC3339Nano, so a parse
+		// failure here means ledger corruption, not a normal condition to
+		// paper over with a fallback timestamp.
+		migratedAt, parseErr := time.Parse(time.RFC3339Nano, existingEvent.HashedPayload.Timestamp)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse timestamp on existing %s event: %w", EventType, parseErr)
 		}
 		return &Result{
 			OldNodeHash: legacy.NodeHash,
 			NewNodeID:   l1.NodeID,
-			CRDPath:     crdPath,
-			MigratedAt:  existing.ModTime().UTC(),
-			Warnings:    append(warnings, "CRD for this legacy hash already existed; steps 4-5 were skipped on this run to avoid a duplicate ledger event"),
+			CRDPath:     nodeCRDPath(workspaceRoot, legacy.NodeHash),
+			MigratedAt:  migratedAt,
+			Warnings:    append(warnings, fmt.Sprintf("%s event for this legacy hash already existed in the ledger; steps 4-5 were skipped on this run to avoid a duplicate ledger event", EventType)),
 		}, nil
 	}
 
-	crdPath, err = WriteNodeCRD(workspaceRoot, legacy.NodeHash, l1.NodeID, migratedAt)
+	migratedAt := time.Now().UTC()
+	crdPath, err := WriteNodeCRD(workspaceRoot, legacy.NodeHash, l1.NodeID, migratedAt)
 	if err != nil {
 		return nil, fmt.Errorf("step 4 (write node CRD): %w", err)
 	}
