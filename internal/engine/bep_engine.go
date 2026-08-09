@@ -68,6 +68,69 @@ type PeerConnection struct {
 	LastPong  time.Time
 	closeCh   chan struct{}
 	closeOnce sync.Once
+
+	// pingLimiter bounds outbound Ping/Pong frames on this connection.
+	// Defense-in-depth against a reflection storm (see bep_ping_pong_test.go
+	// and MessageTypePong docs in pkg/substrate/bep/proto.go): the Pong wire
+	// type already stops a *correctly implemented* peer from re-triggering a
+	// reply, but a misbehaving or malicious peer could still flood us with
+	// Ping frames and force unbounded Pong output, or a future regression
+	// could reopen the echo. Nil is treated as "unlimited" so tests that
+	// construct a PeerConnection directly (without going through
+	// handleConnection) are unaffected unless they opt in.
+	pingLimiter *pingLimiter
+}
+
+// ─── Outbound ping/pong rate limiting ────────────────────────────────────────────
+
+// defaultPingLimiterBurst/Interval size the production token bucket: enough
+// burst to absorb a legitimate Ping/Pong pair plus some slack, refilling well
+// below the rate a reflection storm would demand (the observed storm ran at
+// ~985 KB/s bidirectional — thousands of frames/sec — versus one legitimate
+// Ping every 90s).
+const (
+	defaultPingLimiterBurst    = 5
+	defaultPingLimiterInterval = 15 * time.Second
+)
+
+// pingLimiter is a simple token bucket: up to `max` outbound ping-type
+// frames (Ping or Pong) may be sent back-to-back, refilling one token every
+// `interval`. It has no dependency beyond time.Time so it needs no extra
+// module.
+type pingLimiter struct {
+	mu       sync.Mutex
+	tokens   int
+	max      int
+	last     time.Time
+	interval time.Duration
+}
+
+func newPingLimiter(max int, interval time.Duration) *pingLimiter {
+	return &pingLimiter{tokens: max, max: max, last: time.Now(), interval: interval}
+}
+
+// allow reports whether an outbound ping-type frame may be sent now,
+// consuming a token if so. Tokens refill lazily based on elapsed wall time,
+// so an idle connection is never starved by a burst hours earlier.
+func (l *pingLimiter) allow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	if elapsed := now.Sub(l.last); elapsed >= l.interval {
+		refill := int(elapsed / l.interval)
+		l.tokens += refill
+		if l.tokens > l.max {
+			l.tokens = l.max
+		}
+		l.last = l.last.Add(time.Duration(refill) * l.interval)
+	}
+
+	if l.tokens <= 0 {
+		return false
+	}
+	l.tokens--
+	return true
 }
 
 // ─── Constructor ────────────────────────────────────────────────────────────────
@@ -384,13 +447,14 @@ func (e *BEPEngine) handleConnection(conn net.Conn, inbound bool) {
 
 	// 3. Register peer connection.
 	pc := &PeerConnection{
-		DeviceID:  peerID,
-		Name:      peerHello.DeviceName,
-		Address:   conn.RemoteAddr().String(),
-		Wire:      wire,
-		Connected: true,
-		LastPing:  time.Now(),
-		closeCh:   make(chan struct{}),
+		DeviceID:    peerID,
+		Name:        peerHello.DeviceName,
+		Address:     conn.RemoteAddr().String(),
+		Wire:        wire,
+		Connected:   true,
+		LastPing:    time.Now(),
+		closeCh:     make(chan struct{}),
+		pingLimiter: newPingLimiter(defaultPingLimiterBurst, defaultPingLimiterInterval),
 	}
 
 	e.peersMu.Lock()
@@ -469,6 +533,10 @@ func (e *BEPEngine) runPeerLoop(pc *PeerConnection, peerID bep.DeviceID) {
 			return
 
 		case <-pingTicker.C:
+			if pc.pingLimiter != nil && !pc.pingLimiter.allow() {
+				log.Printf("[bep-engine] outbound ping to %s rate-limited, skipping this tick", peerShort)
+				continue
+			}
 			ping := &bep.Ping{}
 			if err := pc.Wire.WriteMessage(bep.MessageTypePing, ping.Marshal()); err != nil {
 				log.Printf("[bep-engine] ping to %s failed: %v", peerShort, err)
@@ -523,6 +591,19 @@ func (e *BEPEngine) runPeerLoop(pc *PeerConnection, peerID bep.DeviceID) {
 				// Reply with Pong. Pong must never itself trigger a reply,
 				// or two peers volley Ping frames forever (see
 				// MessageTypePong docs in pkg/substrate/bep/proto.go).
+				//
+				// Defense-in-depth: the rate limiter bounds how many Pongs
+				// we'll send this peer regardless of how fast it floods us
+				// with Ping frames, so a misbehaving or malicious peer (or a
+				// future regression that reopens the echo) can't force
+				// unbounded reply traffic. A dropped Pong is silent by
+				// design — the peer's own liveness detection (if any) times
+				// out on the missing reply rather than us tearing down an
+				// otherwise-healthy connection over one skipped keepalive.
+				if pc.pingLimiter != nil && !pc.pingLimiter.allow() {
+					log.Printf("[bep-engine] outbound pong to %s rate-limited, dropping reply", peerShort)
+					continue
+				}
 				pong := &bep.Pong{}
 				if err := pc.Wire.WriteMessage(bep.MessageTypePong, pong.Marshal()); err != nil {
 					log.Printf("[bep-engine] pong to %s failed: %v", peerShort, err)
