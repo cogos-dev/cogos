@@ -2245,6 +2245,55 @@ func (m *MCPServer) dispatchToHarnessAsync(ctx context.Context, dr DispatchReque
 // starts. Both ids end up in the ledger (harness.dispatch.job.issued carries
 // this job's CycleID; harness.dispatch.start/end carry the dispatcher's) so
 // either can be used to locate the other via time-window correlation.
+// dispatchOutcome is the batch-derived verdict for an async dispatch. It
+// exists because a nil error from DispatchToHarness says only that the batch
+// ran — every per-slot failure, including a timeout, is reported inside the
+// batch (DispatchResult.Success / .Error), never as a returned error.
+type dispatchOutcome struct {
+	ok       bool
+	timedOut bool
+	failed   int
+	total    int
+	errMsg   string
+}
+
+// summarizeDispatchOutcome derives the terminal verdict from batch contents.
+// A nil or empty batch is NOT treated as success: a dispatch that produced no
+// slot produced no work, and silently recording it as done is the same class
+// of bug as recording a timeout as done.
+func summarizeDispatchOutcome(batch *DispatchBatchResult) dispatchOutcome {
+	if batch == nil {
+		return dispatchOutcome{errMsg: "dispatch returned no batch"}
+	}
+	out := dispatchOutcome{total: len(batch.Results)}
+	if out.total == 0 {
+		out.errMsg = "dispatch produced no slots"
+		return out
+	}
+	var reasons []string
+	for _, r := range batch.Results {
+		if r.Success {
+			continue
+		}
+		out.failed++
+		reason := r.Error
+		if reason == "" {
+			reason = "unknown error"
+		}
+		if reason == "timeout" {
+			out.timedOut = true
+		}
+		reasons = append(reasons, fmt.Sprintf("slot %d: %s", r.Index, reason))
+	}
+	if out.failed == 0 {
+		out.ok = true
+		return out
+	}
+	out.errMsg = fmt.Sprintf("%d/%d slots failed (%s)",
+		out.failed, out.total, strings.Join(reasons, "; "))
+	return out
+}
+
 func (m *MCPServer) startAsyncDispatch(ctx context.Context, dr DispatchRequest) dispatchJobReceipt {
 	// Mint the registry's own correlation id up front. This is NOT the same
 	// id as the harness-internal cycleID DispatchToHarness mints later
@@ -2291,13 +2340,38 @@ func (m *MCPServer) startAsyncDispatch(ctx context.Context, dr DispatchRequest) 
 			})
 			return
 		}
+		// A nil error means the BATCH ran, not that the work succeeded.
+		// DispatchToHarness's contract is explicit: it "returns once every
+		// slot has either completed, errored, or timed out" and the batch is
+		// non-nil whenever err is nil. Per-slot failures — including a
+		// deadline-exceeded slot, which sets Error="timeout" and leaves
+		// Success=false (local_agent_harness.go, dispatchSlot) — live in the
+		// batch, never in err. Reading only err reported a fully-timed-out
+		// dispatch as status:"done" in both the ledger and the job registry.
+		if summary := summarizeDispatchOutcome(result); !summary.ok {
+			registry.Fail(jobID, summary.errMsg)
+			_ = EmitLedgerEvent(cfg, map[string]any{
+				"type":   "harness.dispatch.job.completed",
+				"source": "mcp-dispatch-async",
+				"payload": map[string]any{
+					"job_id":       jobID,
+					"status":       "failed",
+					"error":        summary.errMsg,
+					"timed_out":    summary.timedOut,
+					"failed_slots": summary.failed,
+					"total_slots":  summary.total,
+				},
+			})
+			return
+		}
 		registry.Complete(jobID, result)
 		_ = EmitLedgerEvent(cfg, map[string]any{
 			"type":   "harness.dispatch.job.completed",
 			"source": "mcp-dispatch-async",
 			"payload": map[string]any{
-				"job_id": jobID,
-				"status": "done",
+				"job_id":      jobID,
+				"status":      "done",
+				"total_slots": summarizeDispatchOutcome(result).total,
 			},
 		})
 	}()

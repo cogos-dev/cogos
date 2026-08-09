@@ -621,3 +621,120 @@ func (b *blockingDispatcher) DispatchToHarness(ctx context.Context, req Dispatch
 
 // decodeMCPJSONForAgentTests is defined in agent_state_query_test.go (same
 // package) and reused here rather than duplicated.
+
+// TestStartAsyncDispatch_TimedOutSlotIsNotRecordedAsDone is the regression
+// test for a live correctness bug found by adversarial review of the L2
+// lifecycle design (2026-08-08).
+//
+// DispatchToHarness's contract is that it returns once every slot has
+// "completed, errored, or timed out", with a non-nil batch whenever err is
+// nil — so per-slot failures live in the BATCH, never in the returned error.
+// A deadline-exceeded slot sets Error="timeout" and leaves Success=false
+// (dispatchSlot, local_agent_harness.go). startAsyncDispatch used to branch
+// only on `err != nil`, so a fully-timed-out dispatch took the success path
+// and was recorded as status:"done" in BOTH the ledger and the job registry.
+//
+// The old code cannot pass this test: it called registry.Complete and emitted
+// "done" for exactly this input.
+func TestStartAsyncDispatch_TimedOutSlotIsNotRecordedAsDone(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
+
+	block := make(chan struct{})
+	// The shape DispatchToHarness actually returns on a slot timeout:
+	// a non-nil batch, a nil error, and a slot that did not succeed.
+	disp := &blockingDispatcher{
+		release: block,
+		canned: &DispatchBatchResult{Results: []DispatchResult{
+			{Index: 0, Success: false, Error: "timeout"},
+		}},
+	}
+	server := NewMCPServerWithAgentController(cfg, makeNucleus("Cog", "tester"), process, disp)
+
+	result, _, err := server.toolDispatchToHarness(context.Background(), nil, dispatchToHarnessInput{
+		Task:  "a task that times out",
+		Async: true,
+	})
+	if err != nil {
+		t.Fatalf("toolDispatchToHarness (async): %v", err)
+	}
+	var receipt dispatchJobReceipt
+	decodeMCPJSONForAgentTests(t, result, &receipt)
+
+	close(block)
+	waitForTerminalJob(t, server, receipt.JobID)
+	waitForLedgerEvent(t, root, "harness.dispatch.job.completed", receipt.JobID)
+
+	// 1. The job registry — what GET /v1/dispatch-jobs/{id} and
+	//    cog_poll_dispatch report to a caller.
+	rec, ok := server.dispatchJobs.Get(receipt.JobID)
+	if !ok {
+		t.Fatalf("job %q not found in registry", receipt.JobID)
+	}
+	if rec.State != DispatchJobFailed {
+		t.Fatalf("registry state = %q, want %q — a timed-out dispatch must not be reported as succeeded",
+			rec.State, DispatchJobFailed)
+	}
+
+	// 2. The ledger — the durable record.
+	ledgerResult, qerr := QueryLedger(root, LedgerQuery{EventType: "harness.dispatch.job.completed", Limit: 20})
+	if qerr != nil {
+		t.Fatalf("QueryLedger: %v", qerr)
+	}
+	found := false
+	for _, ev := range ledgerResult.Events {
+		payload, _ := ev.Data["payload"].(map[string]any)
+		if jobID, _ := payload["job_id"].(string); jobID != receipt.JobID {
+			continue
+		}
+		found = true
+		if status, _ := payload["status"].(string); status != "failed" {
+			t.Fatalf("ledger status = %q, want \"failed\" — a fully-timed-out dispatch was recorded as succeeded", status)
+		}
+		if timedOut, _ := payload["timed_out"].(bool); !timedOut {
+			t.Error("ledger payload timed_out = false, want true — the timeout cause was not distinguishable")
+		}
+	}
+	if !found {
+		t.Fatalf("no harness.dispatch.job.completed ledger event for job %q", receipt.JobID)
+	}
+}
+
+// TestSummarizeDispatchOutcome covers the verdict function directly, including
+// the degenerate batches that must NOT read as success.
+func TestSummarizeDispatchOutcome(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		batch    *DispatchBatchResult
+		wantOK   bool
+		wantTime bool
+	}{
+		{"nil batch is not success", nil, false, false},
+		{"empty batch is not success", &DispatchBatchResult{}, false, false},
+		{"all slots ok", &DispatchBatchResult{Results: []DispatchResult{
+			{Index: 0, Success: true}, {Index: 1, Success: true}}}, true, false},
+		{"timeout slot", &DispatchBatchResult{Results: []DispatchResult{
+			{Index: 0, Success: false, Error: "timeout"}}}, false, true},
+		{"partial failure", &DispatchBatchResult{Results: []DispatchResult{
+			{Index: 0, Success: true}, {Index: 1, Success: false, Error: "boom"}}}, false, false},
+		{"failure with no message", &DispatchBatchResult{Results: []DispatchResult{
+			{Index: 0, Success: false}}}, false, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := summarizeDispatchOutcome(tc.batch)
+			if got.ok != tc.wantOK {
+				t.Errorf("ok = %v, want %v (errMsg=%q)", got.ok, tc.wantOK, got.errMsg)
+			}
+			if got.timedOut != tc.wantTime {
+				t.Errorf("timedOut = %v, want %v", got.timedOut, tc.wantTime)
+			}
+			if !got.ok && got.errMsg == "" {
+				t.Error("a non-ok outcome must carry a non-empty errMsg")
+			}
+		})
+	}
+}
