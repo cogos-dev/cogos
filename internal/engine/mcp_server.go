@@ -2349,7 +2349,10 @@ func (m *MCPServer) startAsyncDispatch(ctx context.Context, dr DispatchRequest) 
 		// batch, never in err. Reading only err reported a fully-timed-out
 		// dispatch as status:"done" in both the ledger and the job registry.
 		if summary := summarizeDispatchOutcome(result); !summary.ok {
-			registry.Fail(jobID, summary.errMsg)
+			// FailWithResult, not Fail: a partially-failed batch still holds
+			// the output of the slots that succeeded, and a poller must be
+			// able to retrieve it. Fail() records only the error string.
+			registry.FailWithResult(jobID, summary.errMsg, result)
 			_ = EmitLedgerEvent(cfg, map[string]any{
 				"type":   "harness.dispatch.job.completed",
 				"source": "mcp-dispatch-async",

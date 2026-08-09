@@ -738,3 +738,109 @@ func TestSummarizeDispatchOutcome(t *testing.T) {
 		})
 	}
 }
+
+// TestStartAsyncDispatch_PartialFailurePreservesSucceededSlots pins the
+// regression that cog-review caught on the first cut of the timeout fix.
+//
+// Routing batch-derived failures through registry.Fail() marked the job
+// "failed" correctly but stored ONLY the error string — Fail() never assigns
+// rec.Result. On a partial failure (slots 0 and 1 succeed, slot 2 times out)
+// that silently discarded the output of the slots that genuinely completed.
+// The pre-fix bug at least kept the batch retrievable, mislabelled as "done";
+// trading a wrong status for data loss is not a fix.
+//
+// The failure path must therefore use FailWithResult: correct status AND the
+// batch preserved.
+func TestStartAsyncDispatch_PartialFailurePreservesSucceededSlots(t *testing.T) {
+	t.Parallel()
+	root := makeWorkspace(t)
+	cfg := makeConfig(t, root)
+	process := NewProcess(cfg, makeNucleus("Cog", "tester"))
+
+	block := make(chan struct{})
+	disp := &blockingDispatcher{
+		release: block,
+		canned: &DispatchBatchResult{Results: []DispatchResult{
+			{Index: 0, Success: true, Content: "slot zero real output"},
+			{Index: 1, Success: true, Content: "slot one real output"},
+			{Index: 2, Success: false, Error: "timeout"},
+		}},
+	}
+	server := NewMCPServerWithAgentController(cfg, makeNucleus("Cog", "tester"), process, disp)
+
+	result, _, err := server.toolDispatchToHarness(context.Background(), nil, dispatchToHarnessInput{
+		Task:  "three slots, one times out",
+		Async: true,
+	})
+	if err != nil {
+		t.Fatalf("toolDispatchToHarness (async): %v", err)
+	}
+	var receipt dispatchJobReceipt
+	decodeMCPJSONForAgentTests(t, result, &receipt)
+
+	close(block)
+	waitForTerminalJob(t, server, receipt.JobID)
+	waitForLedgerEvent(t, root, "harness.dispatch.job.completed", receipt.JobID)
+
+	rec, ok := server.dispatchJobs.Get(receipt.JobID)
+	if !ok {
+		t.Fatalf("job %q not found in registry", receipt.JobID)
+	}
+	// Correct verdict...
+	if rec.State != DispatchJobFailed {
+		t.Fatalf("state = %q, want %q", rec.State, DispatchJobFailed)
+	}
+	// ...AND the work is not lost.
+	if rec.Result == nil {
+		t.Fatal("rec.Result is nil — the batch was discarded on the failure path, losing the output of the slots that succeeded")
+	}
+	if got := len(rec.Result.Results); got != 3 {
+		t.Fatalf("rec.Result carries %d slots, want 3", got)
+	}
+	for _, idx := range []int{0, 1} {
+		slot := rec.Result.Results[idx]
+		if !slot.Success || slot.Content == "" {
+			t.Errorf("slot %d lost its output on the failure path: success=%v content=%q",
+				idx, slot.Success, slot.Content)
+		}
+	}
+	if rec.Err == "" {
+		t.Error("rec.Err is empty — the failure reason must still be recorded alongside the batch")
+	}
+}
+
+// TestDispatchJobRegistry_FailWithResultKeepsBatch covers the registry method
+// directly, including that it still records the error.
+func TestDispatchJobRegistry_FailWithResultKeepsBatch(t *testing.T) {
+	t.Parallel()
+	reg := NewDispatchJobRegistry()
+	jobID := reg.Create("cycle-1")
+	batch := &DispatchBatchResult{Results: []DispatchResult{
+		{Index: 0, Success: true, Content: "kept"},
+		{Index: 1, Success: false, Error: "timeout"},
+	}}
+	reg.FailWithResult(jobID, "1/2 slots failed", batch)
+
+	rec, ok := reg.Get(jobID)
+	if !ok {
+		t.Fatal("job not found")
+	}
+	if rec.State != DispatchJobFailed {
+		t.Fatalf("state = %q, want %q", rec.State, DispatchJobFailed)
+	}
+	if rec.Err != "1/2 slots failed" {
+		t.Fatalf("Err = %q, want %q", rec.Err, "1/2 slots failed")
+	}
+	if rec.Result == nil || len(rec.Result.Results) != 2 {
+		t.Fatal("FailWithResult did not preserve the batch")
+	}
+	if rec.Result.Results[0].Content != "kept" {
+		t.Errorf("succeeded slot content lost: %q", rec.Result.Results[0].Content)
+	}
+	// The defensive-copy contract must still hold on this path.
+	rec.Result.Results[0].Content = "mutated"
+	again, _ := reg.Get(jobID)
+	if again.Result.Results[0].Content != "kept" {
+		t.Error("Get() returned an aliased batch — mutating the caller's copy corrupted the registry")
+	}
+}
