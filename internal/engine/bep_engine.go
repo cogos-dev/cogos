@@ -82,6 +82,12 @@ type PeerConnection struct {
 	// PeerConnection directly (without going through handleConnection) are
 	// unaffected unless they opt in.
 	pingLimiter *pingLimiter
+
+	// pingDropStreak counts consecutive Pong-reply drops since the last
+	// logged transition (see the MessageTypePing case in runPeerLoop). Only
+	// runPeerLoop's own goroutine touches this field, so it needs no lock —
+	// same single-writer discipline as LastPing/LastPong above.
+	pingDropStreak int
 }
 
 // ─── Outbound pong-reply rate limiting ───────────────────────────────────────────
@@ -604,15 +610,27 @@ func (e *BEPEngine) runPeerLoop(pc *PeerConnection, peerID bep.DeviceID) {
 				// we'll send this peer regardless of how fast it floods us
 				// with Ping frames, so a misbehaving or malicious peer (or a
 				// future regression that reopens the echo) can't force
-				// unbounded reply traffic. A dropped Pong is silent by
-				// design — nothing in this codebase currently reads
-				// LastPing/LastPong for dead-peer detection, so a skipped
-				// reply has no observable liveness consequence today; if a
-				// future dead-peer check is built on those fields, a
-				// dropped-Pong log line here is the trail to follow.
+				// unbounded reply traffic. A dropped Pong is invisible on
+				// the wire to the peer — nothing in this codebase currently
+				// reads LastPing/LastPong for dead-peer detection, so a
+				// skipped reply has no observable liveness consequence
+				// today — but it IS recorded locally: see the
+				// pingDropStreak logging below, which logs only on the
+				// exhausted<->allowed transition (not per dropped frame),
+				// so the drop is never silent yet a flood can't turn the
+				// wire amplification into unbounded local log growth
+				// either. If a future dead-peer check is built on
+				// LastPing/LastPong, this is the trail to follow.
 				if pc.pingLimiter != nil && !pc.pingLimiter.allow() {
-					log.Printf("[bep-engine] outbound pong to %s rate-limited, dropping reply", peerShort)
+					pc.pingDropStreak++
+					if pc.pingDropStreak == 1 {
+						log.Printf("[bep-engine] outbound pong to %s rate-limited, dropping replies", peerShort)
+					}
 					continue
+				}
+				if pc.pingDropStreak > 0 {
+					log.Printf("[bep-engine] outbound pong to %s no longer rate-limited, resuming after dropping %d repl(ies)", peerShort, pc.pingDropStreak)
+					pc.pingDropStreak = 0
 				}
 				pong := &bep.Pong{}
 				if err := pc.Wire.WriteMessage(bep.MessageTypePong, pong.Marshal()); err != nil {
