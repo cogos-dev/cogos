@@ -69,34 +69,37 @@ type PeerConnection struct {
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
-	// pingLimiter bounds outbound Ping/Pong frames on this connection.
-	// Defense-in-depth against a reflection storm (see bep_ping_pong_test.go
-	// and MessageTypePong docs in pkg/substrate/bep/proto.go): the Pong wire
-	// type already stops a *correctly implemented* peer from re-triggering a
-	// reply, but a misbehaving or malicious peer could still flood us with
-	// Ping frames and force unbounded Pong output, or a future regression
-	// could reopen the echo. Nil is treated as "unlimited" so tests that
-	// construct a PeerConnection directly (without going through
-	// handleConnection) are unaffected unless they opt in.
+	// pingLimiter bounds outbound Pong *replies* on this connection (the
+	// pingTicker's self-clocked, non-reply-triggered outbound Ping is
+	// deliberately NOT gated by this — see the pingTicker.C case in
+	// runPeerLoop for why). Defense-in-depth against a reflection storm (see
+	// bep_ping_pong_test.go and MessageTypePong docs in
+	// pkg/substrate/bep/proto.go): the Pong wire type already stops a
+	// *correctly implemented* peer from re-triggering a reply, but a
+	// misbehaving or malicious peer could still flood us with Ping frames
+	// and force unbounded Pong output, or a future regression could reopen
+	// the echo. Nil is treated as "unlimited" so tests that construct a
+	// PeerConnection directly (without going through handleConnection) are
+	// unaffected unless they opt in.
 	pingLimiter *pingLimiter
 }
 
-// ─── Outbound ping/pong rate limiting ────────────────────────────────────────────
+// ─── Outbound pong-reply rate limiting ───────────────────────────────────────────
 
 // defaultPingLimiterBurst/Interval size the production token bucket: enough
 // burst to absorb a legitimate Ping/Pong pair plus some slack, refilling well
 // below the rate a reflection storm would demand (the observed storm ran at
 // ~985 KB/s bidirectional — thousands of frames/sec — versus one legitimate
-// Ping every 90s).
+// Ping every 90s). This bucket gates only the outbound Pong-reply path (see
+// runPeerLoop); the self-clocked pingTicker path is deliberately ungated.
 const (
 	defaultPingLimiterBurst    = 5
 	defaultPingLimiterInterval = 15 * time.Second
 )
 
-// pingLimiter is a simple token bucket: up to `max` outbound ping-type
-// frames (Ping or Pong) may be sent back-to-back, refilling one token every
-// `interval`. It has no dependency beyond time.Time so it needs no extra
-// module.
+// pingLimiter is a simple token bucket: up to `max` outbound frames may be
+// sent back-to-back, refilling one token every `interval`. It has no
+// dependency beyond time.Time so it needs no extra module.
 type pingLimiter struct {
 	mu       sync.Mutex
 	tokens   int
@@ -533,10 +536,15 @@ func (e *BEPEngine) runPeerLoop(pc *PeerConnection, peerID bep.DeviceID) {
 			return
 
 		case <-pingTicker.C:
-			if pc.pingLimiter != nil && !pc.pingLimiter.allow() {
-				log.Printf("[bep-engine] outbound ping to %s rate-limited, skipping this tick", peerShort)
-				continue
-			}
+			// Not limiter-gated: this tick is self-clocked at 90s (see
+			// pingTicker above), never reply-triggered, and therefore cannot
+			// participate in a reflection storm. Gating it on the same
+			// bucket as the Pong-reply path (below) would let an incoming
+			// Ping flood drain the shared bucket and hold our own outbound
+			// Ping suppressed indefinitely — and this write is the only
+			// message on the steady-state path, so its error return is the
+			// only way a half-open/dead connection gets detected and torn
+			// down. See pingLimiter docs on PeerConnection.
 			ping := &bep.Ping{}
 			if err := pc.Wire.WriteMessage(bep.MessageTypePing, ping.Marshal()); err != nil {
 				log.Printf("[bep-engine] ping to %s failed: %v", peerShort, err)
@@ -597,9 +605,11 @@ func (e *BEPEngine) runPeerLoop(pc *PeerConnection, peerID bep.DeviceID) {
 				// with Ping frames, so a misbehaving or malicious peer (or a
 				// future regression that reopens the echo) can't force
 				// unbounded reply traffic. A dropped Pong is silent by
-				// design — the peer's own liveness detection (if any) times
-				// out on the missing reply rather than us tearing down an
-				// otherwise-healthy connection over one skipped keepalive.
+				// design — nothing in this codebase currently reads
+				// LastPing/LastPong for dead-peer detection, so a skipped
+				// reply has no observable liveness consequence today; if a
+				// future dead-peer check is built on those fields, a
+				// dropped-Pong log line here is the trail to follow.
 				if pc.pingLimiter != nil && !pc.pingLimiter.allow() {
 					log.Printf("[bep-engine] outbound pong to %s rate-limited, dropping reply", peerShort)
 					continue
