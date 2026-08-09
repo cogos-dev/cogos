@@ -194,6 +194,28 @@ func (reg *DispatchJobRegistry) Fail(jobID string, errMsg string) {
 	rec.UpdatedAt = reg.now()
 }
 
+// FailWithResult transitions a job to failed while PRESERVING the batch.
+//
+// A batch can fail partially: with n=3, slots 0 and 1 may return real content
+// while slot 2 times out. The job is genuinely failed, but the two successful
+// slots did useful work and a caller polling GET /v1/dispatch-jobs/{id} or
+// cog_poll_dispatch must still be able to retrieve it. Fail() alone records
+// only the error string, which would discard that output — so any failure
+// derived from batch CONTENTS (as opposed to a hard error, where there is no
+// batch) must use this instead.
+func (reg *DispatchJobRegistry) FailWithResult(jobID string, errMsg string, result *DispatchBatchResult) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	rec, ok := reg.jobs[jobID]
+	if !ok {
+		return
+	}
+	rec.State = DispatchJobFailed
+	rec.Err = errMsg
+	rec.Result = result
+	rec.UpdatedAt = reg.now()
+}
+
 // Get returns a defensive copy of the job record, or (nil, false) when the
 // id is unknown (never registered, or already GC'd past its TTL).
 func (reg *DispatchJobRegistry) Get(jobID string) (*DispatchJobRecord, bool) {
