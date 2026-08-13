@@ -264,9 +264,212 @@ func TestGrantAuth_IdentityVerify_ExemptEvenWithoutHeader(t *testing.T) {
 	}
 }
 
-// POST /v1/identity/grants (mint) stays reachable with no grant — the
-// bootstrap exemption — but is rate-limited.
-func TestGrantAuth_IdentityGrantsMint_BootstrapExemptButRateLimited(t *testing.T) {
+// ── POST /v1/identity/grants (mint): bootstrap exemption removed, round 2 ──
+//
+// cog-review (PR #551, head 00bc7b2) confirmed the bootstrap exemption's
+// confidentiality-only analysis missed integrity/availability: an
+// unauthenticated blind cross-origin CSRF POST could mint a superseding
+// grant for surface="node-root" and invalidate the live one for every other
+// local consumer. The fix removed the exemption entirely (mint is gated like
+// every other write route) and added a surface-match rule on top (mint and
+// revoke require the presented grant to be node-root or match the target
+// surface). The tests below replace the retired
+// TestGrantAuth_IdentityGrantsMint_BootstrapExemptButRateLimited, which
+// asserted the now-removed exempt behavior.
+
+// (a) unauthenticated POST /v1/identity/grants -> 401, same as any other
+// write route now that the bootstrap exemption is gone.
+func TestGrantAuth_IdentityGrantsMint_UnauthenticatedIs401(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/identity/grants", "application/json",
+		bytes.NewBufferString(`{"surface":"node-root"}`))
+	if err != nil {
+		t.Fatalf("POST /v1/identity/grants: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want 401 (mint is no longer bootstrap-exempt)", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["type"] != "missing_grant" {
+		t.Errorf("error.type = %v; want missing_grant", errObj["type"])
+	}
+}
+
+// (b) the exact CSRF shape the review confirmed: a CORS-simple POST
+// (Content-Type: text/plain, no custom header — so no preflight, and no
+// X-Cogos-Grant) targeting surface="node-root" with a different scope than
+// the live grant. Before the fix this reached MintOrReuse and superseded the
+// live node-root grant, invalidating it for every other cached consumer.
+// Now it must die at the gate (401) BEFORE ever reaching the handler, and
+// the live node-root grant's token must still verify unchanged afterward.
+func TestGrantAuth_IdentityGrantsMint_BlindCSRFMintDoesNotSupersedeNodeRoot(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	liveToken := mintTestGrant(t, srv, nodeRootSurface)
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/identity/grants",
+		strings.NewReader(`{"surface":"node-root","scope":["attacker-scope"]}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	// CORS-simple: Content-Type: text/plain, no X-Cogos-Grant. This is the
+	// shape a cross-origin page can send with no preflight at all.
+	req.Header.Set("Content-Type", "text/plain")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/identity/grants (blind CSRF shape): %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want 401 — the blind CSRF mint must never reach MintOrReuse", resp.StatusCode)
+	}
+
+	// The live node-root grant must be entirely unchanged: same token still
+	// verifies. If the attack had reached MintOrReuse, this would fail
+	// (the scope mismatch would have superseded it).
+	verify := identityPostJSON(t, ts.URL+"/v1/identity/verify", map[string]any{
+		"surface": nodeRootSurface,
+		"token":   liveToken,
+	})
+	var verifyOut identityVerifyResponse
+	identityDecodeBody(t, verify, &verifyOut)
+	if !verifyOut.Valid {
+		t.Fatalf("expected the live node-root grant to still verify after the blocked blind-CSRF mint attempt")
+	}
+}
+
+// (c) mint of a NEW surface, presenting the node-root grant -> 200. This is
+// the real bootstrap path now: a consumer fetches node-root's token via the
+// gate-exempt GET /v1/identity/grants/current?surface=node-root, then uses
+// it to mint its own surface-scoped grant.
+func TestGrantAuth_IdentityGrantsMint_WithNodeRootGrant_Succeeds(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	nodeRootToken := mintTestGrant(t, srv, nodeRootSurface)
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/identity/grants",
+		bytes.NewBufferString(`{"surface":"constellation-chat","scope":["chat:post"]}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(GrantHeaderName, nodeRootToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/identity/grants: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; want 200 when presenting the node-root grant", resp.StatusCode)
+	}
+	var out identityGrantMintResponse
+	identityDecodeBody(t, resp, &out)
+	if out.Token == "" {
+		t.Fatalf("expected a non-empty token in the mint response")
+	}
+}
+
+// (d) revoke of node-root's grant, presented with a throwaway-surface
+// grant -> 403 (surface_mismatch). Closes the unverified-note attack chain:
+// without this, any authenticated-but-unrelated grant holder could revoke
+// node-root outright (its grant_id is visible via the gate-exempt
+// GET /v1/identity/grants).
+func TestGrantAuth_IdentityGrantsRevoke_ThrowawaySurfaceCannotRevokeNodeRoot(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	nodeRootGrant, err := srv.identityGrants.MintOrReuse(nodeRootSurface, []string{nodeRootScope}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint node-root: %v", err)
+	}
+	throwawayToken := mintTestGrant(t, srv, "throwaway-surface")
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/identity/grants/"+nodeRootGrant.GrantID+"/revoke", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set(GrantHeaderName, throwawayToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST revoke: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d; want 403 surface_mismatch (a throwaway-surface grant must not revoke node-root)", resp.StatusCode)
+	}
+
+	// node-root's grant must still be live.
+	verify := identityPostJSON(t, ts.URL+"/v1/identity/verify", map[string]any{
+		"surface": nodeRootSurface,
+		"token":   nodeRootGrant.Token,
+	})
+	var verifyOut identityVerifyResponse
+	identityDecodeBody(t, verify, &verifyOut)
+	if !verifyOut.Valid {
+		t.Fatalf("expected node-root's grant to still verify after the rejected cross-surface revoke attempt")
+	}
+}
+
+// (e) revoke of node-root's OWN grant, presented with the node-root grant
+// itself -> succeeds. The admin surface can revoke anything, including
+// itself (rotation's second half: mint new, then revoke old).
+func TestGrantAuth_IdentityGrantsRevoke_WithNodeRootGrant_Succeeds(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	nodeRootGrant, err := srv.identityGrants.MintOrReuse(nodeRootSurface, []string{nodeRootScope}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint node-root: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/identity/grants/"+nodeRootGrant.GrantID+"/revoke", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set(GrantHeaderName, nodeRootGrant.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST revoke: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; want 200 — node-root presenting its own grant must be able to revoke it", resp.StatusCode)
+	}
+}
+
+// (f) the rate limiter still applies to the now-gated mint route, as
+// defense-in-depth against an AUTHENTICATED caller minting excessively
+// (every request below presents a valid node-root grant, unlike the retired
+// bootstrap-exempt version of this test).
+func TestGrantAuth_IdentityGrantsMint_StillRateLimitedWhenAuthenticated(t *testing.T) {
 	t.Parallel()
 	srv := newGrantAuthTestServer(t)
 	// Tighten the limiter so the test doesn't need 20+ requests to observe
@@ -275,9 +478,17 @@ func TestGrantAuth_IdentityGrantsMint_BootstrapExemptButRateLimited(t *testing.T
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
+	nodeRootToken := mintTestGrant(t, srv, nodeRootSurface)
+
 	mint := func(surface string) int {
 		body := `{"surface":"` + surface + `"}`
-		resp, err := http.Post(ts.URL+"/v1/identity/grants", "application/json", bytes.NewBufferString(body))
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/identity/grants", bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(GrantHeaderName, nodeRootToken)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("POST /v1/identity/grants: %v", err)
 		}
@@ -285,14 +496,15 @@ func TestGrantAuth_IdentityGrantsMint_BootstrapExemptButRateLimited(t *testing.T
 		return resp.StatusCode
 	}
 
-	if code := mint("s1"); code == http.StatusUnauthorized {
-		t.Fatalf("first mint got 401; bootstrap mint must be exempt from the grant gate")
+	if code := mint("s1"); code != http.StatusOK {
+		t.Fatalf("first mint = %d; want 200 (authenticated as node-root)", code)
 	}
-	if code := mint("s2"); code == http.StatusUnauthorized {
-		t.Fatalf("second mint got 401; bootstrap mint must be exempt from the grant gate")
+	if code := mint("s2"); code != http.StatusOK {
+		t.Fatalf("second mint = %d; want 200 (authenticated as node-root)", code)
 	}
-	// Third request in the same window should be rate-limited, not gated by
-	// the grant check (still no X-Cogos-Grant header on any of these calls).
+	// Third request in the same window should be rate-limited even though
+	// the caller is fully authenticated — the limiter is defense-in-depth,
+	// not the primary guard anymore.
 	if code := mint("s3"); code != http.StatusTooManyRequests {
 		t.Errorf("third mint in window = %d; want 429 rate_limited", code)
 	}

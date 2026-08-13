@@ -521,6 +521,20 @@ func (r *IdentityGrantRegistry) Current(surface string) (*IdentityGrant, bool) {
 // already dead while it kept working, the same error-masking class
 // MintOrReuse's supersession fix closed (cog-review finding, PR #472 second
 // pass, serve_identity_grants.go:444 as of commit 280aa1a).
+// GrantByID returns the live grant identified by grantID, if any — a
+// read-only lookup used by handleIdentityGrantRevoke's surface-match check
+// (serve_grant_auth.go's file header, "SURFACE-MATCH" section) to learn the
+// TARGET grant's surface before deciding whether the presented caller may
+// revoke it. Deliberately separate from Revoke itself: the caller needs to
+// inspect the target without mutating anything if the surface check is
+// going to reject the request.
+func (r *IdentityGrantRegistry) GrantByID(grantID string) (*IdentityGrant, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	g, ok := r.byGrantID[grantID]
+	return g, ok
+}
+
 func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, error) {
 	if grantID == "" {
 		return nil, ErrGrantNotFound
@@ -1010,6 +1024,18 @@ type identityVerifyResponse struct {
 // requested surface. The response never echoes back a broader scope than
 // the caller requested (design §4 verify-tooth #1) — scope is stored
 // exactly as requested, no server-side widening.
+//
+// Surface-match hardening (cog-review finding, PR #551 round 2; see
+// serve_grant_auth.go's file header "SURFACE-MATCH" section): this route is
+// no longer bootstrap-exempt — grantAuthMiddleware already requires a valid
+// presented grant to reach here at all — but VerifyAny alone would still let
+// ANY live grant mint for ANY surface, including a throwaway surface an
+// attacker minted for itself and then used to supersede node-root's grant.
+// The presented grant (grantFromContext) must therefore be the node-root
+// admin grant, or already belong to the SAME surface being minted
+// (self-service rotation of a surface's own credential). Minimal rule, not a
+// full scope model — Wave 6b is where per-surface authorization gets
+// designed properly.
 func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request) {
 	var req identityGrantMintRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1018,6 +1044,12 @@ func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request)
 	}
 	if req.Surface == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "surface is required")
+		return
+	}
+	presented, ok := grantFromContext(r.Context())
+	if !ok || (presented.Surface != nodeRootSurface && presented.Surface != req.Surface) {
+		writeJSONError(w, http.StatusForbidden, "surface_mismatch",
+			"the presented grant may not mint a grant for surface "+req.Surface)
 		return
 	}
 	ttl := time.Duration(0)
@@ -1145,11 +1177,33 @@ type identityGrantRevokeResponse struct {
 // verifying, and telling the caller 404 ("already gone") would mask a failed
 // revoke of a possibly-leaked credential (cog-review finding, PR #472 second
 // pass, serve_identity_grants.go:444 as of commit 280aa1a).
+//
+// Surface-match hardening (cog-review unverified note, PR #551 round 2; see
+// serve_grant_auth.go's file header "SURFACE-MATCH" section): VerifyAny
+// accepts any live grant regardless of surface, so without an additional
+// check here a caller holding a grant for an unrelated, throwaway surface
+// could revoke node-root's grant outright (its grant_id is visible via the
+// gate-exempt GET /v1/identity/grants). Before mutating anything, this looks
+// up the TARGET grant by id (GrantByID, read-only) and requires the
+// presented grant (grantFromContext) to be node-root or to already match the
+// target's own surface (self-service: a surface may revoke/rotate its own
+// grant). A grantID that names no live grant skips the check entirely and
+// falls through to Revoke's own ErrGrantNotFound → 404, same as before —
+// this hardening only ever narrows an outcome that would otherwise succeed,
+// never changes a not-found into something else.
 func (s *Server) handleIdentityGrantRevoke(w http.ResponseWriter, r *http.Request) {
 	grantID := r.PathValue("id")
 	if grantID == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "grant id is required")
 		return
+	}
+	if target, found := s.identityGrants.GrantByID(grantID); found {
+		presented, ok := grantFromContext(r.Context())
+		if !ok || (presented.Surface != nodeRootSurface && presented.Surface != target.Surface) {
+			writeJSONError(w, http.StatusForbidden, "surface_mismatch",
+				"the presented grant may not revoke a grant for surface "+target.Surface)
+			return
+		}
 	}
 	grant, err := s.identityGrants.Revoke(grantID)
 	if err != nil {

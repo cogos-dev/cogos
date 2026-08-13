@@ -24,9 +24,35 @@ func newIdentityGrantServer(t *testing.T) (*Server, *httptest.Server) {
 	s := &Server{identityGrants: NewIdentityGrantRegistry()}
 	mux := http.NewServeMux()
 	s.registerIdentityGrantRoutes(mux)
-	front := httptest.NewServer(mux)
+	front := httptest.NewServer(withPresentedNodeRootGrant(t, s, mux))
 	t.Cleanup(func() { front.Close() })
 	return s, front
+}
+
+// withPresentedNodeRootGrant wraps mux so every request handled by it
+// behaves as an already-authenticated node-root caller. This file's tests
+// exercise MintOrReuse/Revoke/ledger semantics and the mint/revoke HANDLERS
+// directly — they wire only registerIdentityGrantRoutes onto a bare mux,
+// never grantAuthMiddleware (that gate's own behavior is
+// serve_grant_auth_test.go's job). But handleIdentityGrantMint and
+// handleIdentityGrantRevoke now read the presented grant from request
+// context (grantFromContext, serve_grant_auth.go) and reject a request with
+// none — the surface-match hardening added alongside the removal of the
+// mint route's bootstrap exemption (cog-review, PR #551 round 2). Minting a
+// real node-root-surface grant on the same registry and stamping it onto
+// every request's context here keeps that check meaningfully exercised
+// (node-root may mint/revoke any surface) rather than special-cased away,
+// while leaving every existing assertion in this file about registry/ledger
+// behavior unchanged.
+func withPresentedNodeRootGrant(t *testing.T, s *Server, mux http.Handler) http.Handler {
+	t.Helper()
+	grant, err := s.identityGrants.MintOrReuse(nodeRootSurface, []string{nodeRootScope}, time.Hour)
+	if err != nil {
+		t.Fatalf("withPresentedNodeRootGrant: mint: %v", err)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(contextWithGrant(r.Context(), grant)))
+	})
 }
 
 func identityPostJSON(t *testing.T, url string, body any) *http.Response {
@@ -285,7 +311,7 @@ func TestIdentityGrantMint_CapacityErrorMapsTo429(t *testing.T) {
 	s := &Server{identityGrants: NewIdentityGrantRegistry()}
 	mux := http.NewServeMux()
 	s.registerIdentityGrantRoutes(mux)
-	front := httptest.NewServer(mux)
+	front := httptest.NewServer(withPresentedNodeRootGrant(t, s, mux))
 	defer front.Close()
 
 	var lastResp *http.Response
@@ -853,7 +879,7 @@ func newLedgerBackedIdentityGrantServer(t *testing.T, workspaceRoot string) (*Se
 	s := &Server{identityGrants: NewIdentityGrantRegistryWithLedger(workspaceRoot)}
 	mux := http.NewServeMux()
 	s.registerIdentityGrantRoutes(mux)
-	front := httptest.NewServer(mux)
+	front := httptest.NewServer(withPresentedNodeRootGrant(t, s, mux))
 	t.Cleanup(func() { front.Close() })
 	return s, front
 }

@@ -35,21 +35,43 @@
 //     /health, and POST /v1/identity/verify (the verification authority
 //     itself — gating it would be circular: a caller with no grant could
 //     never learn whether ITS token is valid).
-//   - BOOTSTRAP EXEMPTION: POST /v1/identity/grants (mint) stays reachable
-//     without a grant — a brand-new local consumer has no token yet and this
-//     is how it gets its first one. This is not an open door: the kernel
-//     binds loopback-only by default, so any caller here is already a local
-//     process; and corsLoopbackOnly (serve_cors.go) withholds
-//     Access-Control-Allow-Origin from a remote origin's response to this
-//     path, so a cross-origin CSRF POST can blind-mint a grant but can never
-//     read the response body back — the minted token cannot be exfiltrated
-//     that way. What a blind mint CAN still do is grow the ledger (every
-//     mint is a write-ahead ledger append, serve_identity_grants.go's
-//     MintOrReuse) — grantMintLimiter below caps that throughput so a script
-//     hammering this route cannot flood the identity-grants ledger file.
-//     HMAC request-signing for this route is deferred until it needs to
-//     leave loopback (design step 5, per the plan doc); the cluster channel
-//     is already separately authenticated and out of scope here.
+//   - NO bootstrap exemption for POST /v1/identity/grants (mint). An earlier
+//     version of this file left the mint route reachable without a grant,
+//     reasoning that a brand-new local consumer has no token yet and needs
+//     some way to get its first one. That reasoning only ever covered
+//     CONFIDENTIALITY (corsLoopbackOnly hides the response body from a
+//     cross-origin reader) and missed integrity/availability: an
+//     unauthenticated caller — including a blind cross-origin CSRF POST that
+//     never reads the response — could mint a superseding grant for
+//     surface="node-root" with a different scope than the live one, which
+//     invalidates that grant for every OTHER local consumer already caching
+//     it (cog-review finding, PR #551, this file:160 as of commit
+//     00bc7b2 — see also VerifyAny's doc comment). The exemption was never
+//     actually necessary: ensureNodeRootGrant (boot_node_root_grant.go)
+//     mints the node-root credential IN-PROCESS at boot, with no HTTP call
+//     involved, and every local consumer acquires it over the gate-exempt
+//     GET /v1/identity/grants/current?surface=node-root (a read, so no
+//     chicken-and-egg problem). So POST /v1/identity/grants is gated exactly
+//     like every other write route below: it requires a valid presented
+//     grant. What used to be the "bootstrap" case is now just "present the
+//     node-root token you already fetched via that GET" — indistinguishable
+//     from any other authenticated write. grantMintLimiter still runs on
+//     this route as defense-in-depth against a script that mints excessively
+//     once it does hold a valid grant (cheap to keep, harmless now that the
+//     route requires authentication to reach at all).
+//   - SURFACE-MATCH on the two admin-shaped routes (mint, revoke): even with
+//     the bootstrap exemption gone, VerifyAny alone would let ANY live grant
+//     — including one for an unrelated, throwaway surface an authenticated
+//     caller minted for itself — mint a grant for a DIFFERENT surface, or
+//     revoke node-root's own grant outright (its grant_id is visible via the
+//     gate-exempt GET /v1/identity/grants). Closing that residual (cog-review
+//     unverified note, PR #551) means handleIdentityGrantMint and
+//     handleIdentityGrantRevoke (serve_identity_grants.go) additionally
+//     require the presented grant's surface to be "node-root" (the admin
+//     surface) or to match the target surface (self-service rotation of a
+//     surface's own grant). This is a minimal rule, not a full scope model —
+//     Wave 6b is where per-surface authorization gets designed properly; see
+//     each handler's doc comment for the exact check.
 //
 // CSRF threat model: a custom header (X-Cogos-Grant) is not one of the
 // Fetch spec's CORS-safelisted headers, so any browser request carrying it
@@ -67,10 +89,39 @@
 package engine
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
 )
+
+// grantContextKey is the unexported context-value key grantAuthMiddleware
+// uses to hand the presented (already-verified) *IdentityGrant down to
+// handlers that need to know WHO is calling, not just THAT the call is
+// authenticated — currently handleIdentityGrantMint and
+// handleIdentityGrantRevoke's surface-match check (see the file header's
+// "SURFACE-MATCH" section). A struct{} key type (rather than a string) so no
+// other package can collide with it by accident.
+type grantContextKey struct{}
+
+// contextWithGrant returns a copy of ctx carrying grant as the presented,
+// verified identity for this request. Called only from grantAuthMiddleware
+// once VerifyAny has already succeeded — never set speculatively or before
+// verification.
+func contextWithGrant(ctx context.Context, grant *IdentityGrant) context.Context {
+	return context.WithValue(ctx, grantContextKey{}, grant)
+}
+
+// grantFromContext returns the *IdentityGrant grantAuthMiddleware verified
+// for this request, if any. Returns (nil, false) for a request that never
+// passed through the middleware (e.g. an exempt route, or a unit test that
+// wires handlers onto a bare mux without the middleware) — callers must
+// treat that the same as "no grant presented," never assume "so anything is
+// allowed."
+func grantFromContext(ctx context.Context) (*IdentityGrant, bool) {
+	grant, ok := ctx.Value(grantContextKey{}).(*IdentityGrant)
+	return grant, ok && grant != nil
+}
 
 // GrantHeaderName is the header a caller presents a kernel-issued identity
 // grant token in. Exported so hook scripts, the dashboard, and tests share
@@ -157,16 +208,6 @@ func (s *Server) grantAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if r.Method == http.MethodPost && r.URL.Path == grantMintRequestPath {
-			if s.grantMintLimiter != nil && !s.grantMintLimiter.Allow() {
-				writeJSONError(w, http.StatusTooManyRequests, "rate_limited",
-					"too many grant mint requests; see grantMintLimiter in serve_grant_auth.go")
-				return
-			}
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		token := r.Header.Get(GrantHeaderName)
 		if token == "" {
 			writeJSONError(w, http.StatusUnauthorized, "missing_grant",
@@ -180,12 +221,30 @@ func (s *Server) grantAuthMiddleware(next http.Handler) http.Handler {
 			writeJSONError(w, http.StatusUnauthorized, "invalid_grant", "no identity grant registry available")
 			return
 		}
-		if _, ok := s.identityGrants.VerifyAny(token); !ok {
+		grant, ok := s.identityGrants.VerifyAny(token)
+		if !ok {
 			writeJSONError(w, http.StatusUnauthorized, "invalid_grant",
 				"grant token is missing, expired, or revoked")
 			return
 		}
-		next.ServeHTTP(w, r)
+
+		// The mint route (see the file header's "NO bootstrap exemption"
+		// section) is no longer reachable without a valid grant, so the rate
+		// limiter here is defense-in-depth against an authenticated caller
+		// minting excessively — not the primary guard it used to stand in
+		// for.
+		if r.Method == http.MethodPost && r.URL.Path == grantMintRequestPath {
+			if s.grantMintLimiter != nil && !s.grantMintLimiter.Allow() {
+				writeJSONError(w, http.StatusTooManyRequests, "rate_limited",
+					"too many grant mint requests; see grantMintLimiter in serve_grant_auth.go")
+				return
+			}
+		}
+
+		// Hand the verified grant down to handlers that need to know WHO is
+		// calling (the surface-match check in handleIdentityGrantMint /
+		// handleIdentityGrantRevoke) — see grantFromContext's doc comment.
+		next.ServeHTTP(w, r.WithContext(contextWithGrant(r.Context(), grant)))
 	})
 }
 
