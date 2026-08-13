@@ -422,6 +422,26 @@ func (c *Constellation) IndexFile(path string) error {
 	indexMu.Lock()
 	defer indexMu.Unlock()
 
+	// Resolve symlinks before indexing, matching IndexWorkspace's walk loop.
+	// fsnotify callers (mem_watcher.go) pass the raw, unresolved event path,
+	// which for a symlink alias (e.g. .cog/mem/semantic/foo-alias.cog.md ->
+	// ../../../architecture/foo.cog.md, the migration pattern this package's
+	// widened walkRoots exists to support) differs from the path a later
+	// IndexWorkspace walk will derive for the same real file. Without this
+	// resolution, parseCogdoc's auto-ID fallback (keyed off the literal path
+	// string) can mint two different IDs for one real file — the alias path
+	// contains ".cog/" and the resolved target path does not — producing two
+	// permanent documents rows for a single file that neither the id PRIMARY
+	// KEY nor the path UNIQUE constraint would catch.
+	realPath, rerr := filepath.EvalSymlinks(path)
+	if rerr != nil {
+		// Resolution failure (e.g. a broken symlink, or the file was removed
+		// between the fsnotify event and this call) — fall back to the raw
+		// path; indexCogdoc's os.ReadFile will surface the real error if the
+		// file truly can't be read.
+		realPath = path
+	}
+
 	tx, err := c.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -436,14 +456,14 @@ func (c *Constellation) IndexFile(path string) error {
 		}
 	}()
 
-	if err := c.indexCogdoc(tx, path); err != nil {
+	if err := c.indexCogdoc(tx, realPath); err != nil {
 		return err
 	}
 
 	// Look up the doc id inside the transaction so we get the row even if it
 	// was just inserted (not yet committed to the reader connection).
 	var docID string
-	idErr := tx.QueryRow("SELECT id FROM documents WHERE path = ?", path).Scan(&docID)
+	idErr := tx.QueryRow("SELECT id FROM documents WHERE path = ?", realPath).Scan(&docID)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
