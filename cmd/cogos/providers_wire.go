@@ -49,4 +49,12 @@ func init() {
 		}
 		s.SetConstellationIndexer(c)
 	}
+
+	// Wire the extra-cogdoc-roots resolver so Boot's live mem_watcher wiring
+	// and the lazy drift-repair sampling in mcp_stubs.go can discover the
+	// same workspace-root cogdoc directories (declared via
+	// .cog/config/cogdocs.yaml requiredPaths) that IndexWorkspace's batch
+	// walk covers, without internal/engine importing sdk/constellation
+	// directly (package-boundary guard).
+	engine.ExtraCogdocRootsFunc = constellation.ExtraCogdocRoots
 }

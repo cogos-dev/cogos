@@ -37,7 +37,6 @@ import (
 
 	bep "github.com/myrgic/cogos/pkg/substrate/bep"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
-	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // BootOption is a functional option passed to Boot.
@@ -430,8 +429,16 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 		// sync with what a full reindex sees: edits under a widened root
 		// would be invisible to search/FTS until someone manually triggers a
 		// rebuild.
+		//
+		// Resolved via ExtraCogdocRootsFunc rather than an sdk/constellation
+		// import: Boot is on the long-lived daemon path, which must stay free
+		// of that import per the package-boundary guard (cogdoc_service.go,
+		// cli_reindex.go). Nil func means degraded mode (only .cog/mem is
+		// live-watched); a manual `cogos reindex` still covers widened roots.
 		watchDirs := []string{filepath.Join(cfg.WorkspaceRoot, ".cog", "mem")}
-		watchDirs = append(watchDirs, constellation.ExtraCogdocRoots(cfg.WorkspaceRoot)...)
+		if ExtraCogdocRootsFunc != nil {
+			watchDirs = append(watchDirs, ExtraCogdocRootsFunc(cfg.WorkspaceRoot)...)
+		}
 
 		for _, dir := range watchDirs {
 			mw := NewMemWatcher(dir, pkgFTSRepairIndexer)

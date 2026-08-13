@@ -104,3 +104,17 @@ var RegisterHTTPExtensions func(s *Server, mux *http.ServeMux)
 // Set by cmd/cogos/providers_wire.go with the concrete *constellation.Constellation.
 // Nil means eager upsert and drift repair are disabled (degraded mode; safe).
 var WireConstellationIndexer func(s *Server)
+
+// ExtraCogdocRootsFunc resolves the workspace-root cogdoc directories declared
+// via .cog/config/cogdocs.yaml requiredPaths that fall OUTSIDE .cog/ (the same
+// extra roots sdk/constellation's IndexWorkspace walk covers). Both Boot's
+// live mem_watcher wiring and the lazy drift-repair sampling in
+// mcp_stubs.go use this so incremental/live indexing stays consistent with
+// what a full reindex covers — without internal/engine importing
+// sdk/constellation directly (package-boundary guard: only cli_*.go files in
+// this package may import sdk/constellation; the daemon path Boot→MCPServer
+// must not).
+// Set by cmd/cogos/providers_wire.go to sdk/constellation.ExtraCogdocRoots.
+// Nil means no extra roots are considered (degraded mode: only .cog/mem is
+// live-watched/repaired; a full `cogos reindex` still covers widened roots).
+var ExtraCogdocRootsFunc func(workspaceRoot string) []string
