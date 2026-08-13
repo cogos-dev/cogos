@@ -130,13 +130,37 @@ check_output "context has nucleus"       '"nucleus":"CogOS"'   "http://localhost
 # initialize → tools/list → one tools/call. Catches dead wiring (a tool
 # registered in source but absent from the live daemon) and transport
 # regressions that direct-method unit tests structurally cannot see.
+#
+# /mcp is gated on every method by the write-route grant-auth middleware
+# (serve_grant_auth.go) — the daemon mints/recovers its own node-root
+# identity grant at boot (ensureNodeRootGrant, boot_node_root_grant.go) as
+# the zero-paste bootstrap credential for exactly this case. This probe does
+# the REAL bootstrap a live consumer (Claude Code, THESEUS, the dashboard)
+# would do: GET the node-root grant's current token (itself exempt from the
+# gate — it's a GET) and attach it as X-Cogos-Grant on every /mcp call below.
+# Mirrors internal/testkernel/testkernel.go's NodeRootGrantToken/ListTools —
+# keep the two consistent if either changes.
 
 echo "Phase 3b: MCP transport"
 MCP_URL="http://localhost:$PORT/mcp"
 MCP_H_CT='Content-Type: application/json'
 MCP_H_ACC='Accept: application/json, text/event-stream'
 
-MCP_SID=$(curl -s -D - -o /dev/null -m 10 -X POST "$MCP_URL" -H "$MCP_H_CT" -H "$MCP_H_ACC"     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}'     | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}')
+GRANT_JSON=$(curl -s -m 10 "http://localhost:$PORT/v1/identity/grants/current?surface=node-root" || echo "")
+GRANT_TOKEN=$(echo "$GRANT_JSON" | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4)
+if [ -n "${GRANT_TOKEN:-}" ]; then
+    echo "  PASS  node-root grant token acquired"
+    pass=$((pass + 1))
+else
+    echo "  FAIL  node-root grant token acquired (got: $GRANT_JSON)"
+    fail=$((fail + 1))
+fi
+GRANT_HEADER_ARG=""
+if [ -n "${GRANT_TOKEN:-}" ]; then
+    GRANT_HEADER_ARG="X-Cogos-Grant: ${GRANT_TOKEN}"
+fi
+
+MCP_SID=$(curl -s -D - -o /dev/null -m 10 -X POST "$MCP_URL" -H "$MCP_H_CT" -H "$MCP_H_ACC" ${GRANT_HEADER_ARG:+-H "$GRANT_HEADER_ARG"}     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}'     | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}')
 if [ -n "${MCP_SID:-}" ]; then
     echo "  PASS  mcp initialize (session $MCP_SID)"
     pass=$((pass + 1))
@@ -147,7 +171,8 @@ fi
 
 mcp_post() {
     curl -s -m 15 -X POST "$MCP_URL" -H "$MCP_H_CT" -H "$MCP_H_ACC" \
-        ${MCP_SID:+-H "Mcp-Session-Id: ${MCP_SID}"} -d "$1"
+        ${MCP_SID:+-H "Mcp-Session-Id: ${MCP_SID}"} \
+        ${GRANT_HEADER_ARG:+-H "$GRANT_HEADER_ARG"} -d "$1"
 }
 mcp_post '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1 || true
 
