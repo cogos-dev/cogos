@@ -71,7 +71,13 @@
 //     surface) or to match the target surface (self-service rotation of a
 //     surface's own grant). This is a minimal rule, not a full scope model —
 //     Wave 6b is where per-surface authorization gets designed properly; see
-//     each handler's doc comment for the exact check.
+//     each handler's doc comment for the exact check. The check applies ONLY
+//     while grantAuthDisabled() reports false — an earlier version enforced
+//     it unconditionally, which meant Config.WriteRouteGrantAuthDisabled
+//     could not actually restore mint/revoke to their pre-gate behavior (the
+//     context grant it reads is only ever populated when this middleware
+//     runs the real check below), contradicting the disable knob's own
+//     contract (cog-review finding, PR #551 round 3).
 //
 // CSRF threat model: a custom header (X-Cogos-Grant) is not one of the
 // Fetch spec's CORS-safelisted headers, so any browser request carrying it
@@ -196,9 +202,30 @@ func (l *grantMintLimiter) Allow() bool {
 // in NewServer — so CORS still owns the OPTIONS preflight short-circuit and
 // this middleware never has to special-case OPTIONS itself (corsMiddleware
 // never calls next for that method).
+// grantAuthDisabled reports whether the write-route grant-auth gate is
+// turned off (Config.WriteRouteGrantAuthDisabled — see that field's doc
+// comment for the default-ON / fail-safe rationale). This is the single
+// source of truth grantAuthMiddleware and the surface-match checks in
+// handleIdentityGrantMint/handleIdentityGrantRevoke (serve_identity_grants.go)
+// both consult, rather than each re-deriving "is the gate on" from s.cfg
+// independently — the two had drifted apart once already (cog-review
+// finding, PR #551 round 3): the surface-match check required a
+// context-attached grant unconditionally, but grantAuthMiddleware only ever
+// populates that context when the gate is ENABLED, so with the knob flipped
+// the mint/revoke handlers 403'd every request instead of the disable knob's
+// documented "restores pre-grant-auth behavior on every write route"
+// contract. A shared accessor makes that class of drift structurally harder:
+// there is exactly one place that decides "is the gate on," and everything
+// else calls it instead of reading s.cfg directly. s.cfg == nil (test paths
+// that construct a bare *Server) counts as "not disabled" — same fail-safe
+// default the field's own doc comment describes.
+func (s *Server) grantAuthDisabled() bool {
+	return s.cfg != nil && s.cfg.WriteRouteGrantAuthDisabled
+}
+
 func (s *Server) grantAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg != nil && s.cfg.WriteRouteGrantAuthDisabled {
+		if s.grantAuthDisabled() {
 			next.ServeHTTP(w, r)
 			return
 		}

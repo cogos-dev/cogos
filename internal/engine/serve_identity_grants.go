@@ -1036,6 +1036,17 @@ type identityVerifyResponse struct {
 // (self-service rotation of a surface's own credential). Minimal rule, not a
 // full scope model — Wave 6b is where per-surface authorization gets
 // designed properly.
+//
+// This check applies ONLY when the gate itself is enabled (round 3 fix,
+// cog-review finding, PR #551 round 3): grantAuthMiddleware only populates
+// the context grant when it actually ran the VerifyAny check, so when
+// Config.WriteRouteGrantAuthDisabled is true the middleware short-circuits
+// before ever setting one, and grantFromContext always returns (nil, false)
+// — enforcing surface-match unconditionally would 403 every mint while the
+// operator's own disable knob is supposed to restore pre-grant-auth
+// behavior on every write route (see the field's doc comment). Deferring to
+// grantAuthDisabled (the same accessor grantAuthMiddleware itself consults)
+// keeps the two in agreement structurally instead of by convention.
 func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request) {
 	var req identityGrantMintRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1046,11 +1057,13 @@ func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request)
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "surface is required")
 		return
 	}
-	presented, ok := grantFromContext(r.Context())
-	if !ok || (presented.Surface != nodeRootSurface && presented.Surface != req.Surface) {
-		writeJSONError(w, http.StatusForbidden, "surface_mismatch",
-			"the presented grant may not mint a grant for surface "+req.Surface)
-		return
+	if !s.grantAuthDisabled() {
+		presented, ok := grantFromContext(r.Context())
+		if !ok || (presented.Surface != nodeRootSurface && presented.Surface != req.Surface) {
+			writeJSONError(w, http.StatusForbidden, "surface_mismatch",
+				"the presented grant may not mint a grant for surface "+req.Surface)
+			return
+		}
 	}
 	ttl := time.Duration(0)
 	if req.TTLHours > 0 {
@@ -1197,12 +1210,20 @@ func (s *Server) handleIdentityGrantRevoke(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "grant id is required")
 		return
 	}
-	if target, found := s.identityGrants.GrantByID(grantID); found {
-		presented, ok := grantFromContext(r.Context())
-		if !ok || (presented.Surface != nodeRootSurface && presented.Surface != target.Surface) {
-			writeJSONError(w, http.StatusForbidden, "surface_mismatch",
-				"the presented grant may not revoke a grant for surface "+target.Surface)
-			return
+	// Surface-match check applies only while the gate is enabled — see
+	// handleIdentityGrantMint's doc comment for why (round 3 fix, cog-review
+	// finding, PR #551 round 3): with Config.WriteRouteGrantAuthDisabled true,
+	// grantAuthMiddleware never populates a context grant, so enforcing this
+	// unconditionally would 403 every revoke while the disable knob is
+	// supposed to restore pre-grant-auth behavior.
+	if !s.grantAuthDisabled() {
+		if target, found := s.identityGrants.GrantByID(grantID); found {
+			presented, ok := grantFromContext(r.Context())
+			if !ok || (presented.Surface != nodeRootSurface && presented.Surface != target.Surface) {
+				writeJSONError(w, http.StatusForbidden, "surface_mismatch",
+					"the presented grant may not revoke a grant for surface "+target.Surface)
+				return
+			}
 		}
 	}
 	grant, err := s.identityGrants.Revoke(grantID)

@@ -529,6 +529,69 @@ func TestGrantAuth_DisabledKnob_RestoresUngatedBehavior(t *testing.T) {
 	}
 }
 
+// TestGrantAuth_DisabledKnob_MintWorksWithoutHeader is the round-3 regression
+// test (cog-review, PR #551 round 3): the surface-match hardening added in
+// round 2 read the presented grant from request context unconditionally, but
+// grantAuthMiddleware only ever populates that context when the gate is
+// enabled — with the disable knob flipped, mint 403'd every request instead
+// of restoring its pre-grant-auth 200 behavior. Mirrors
+// TestGrantAuth_DisabledKnob_RestoresUngatedBehavior but targets the mint
+// route specifically, with no X-Cogos-Grant header at all.
+func TestGrantAuth_DisabledKnob_MintWorksWithoutHeader(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+	srv.cfg.WriteRouteGrantAuthDisabled = true
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/v1/identity/grants", "application/json",
+		bytes.NewBufferString(`{"surface":"any-surface"}`))
+	if err != nil {
+		t.Fatalf("POST /v1/identity/grants: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; want 200 with WriteRouteGrantAuthDisabled=true and no header — "+
+			"the disable knob must restore mint to its pre-gate behavior, not 403 on the surface-match check", resp.StatusCode)
+	}
+	var out identityGrantMintResponse
+	identityDecodeBody(t, resp, &out)
+	if out.Token == "" {
+		t.Fatalf("expected a non-empty token when the gate is disabled")
+	}
+}
+
+// TestGrantAuth_DisabledKnob_RevokeWorksWithoutHeader is revoke's half of the
+// same round-3 regression: with the gate disabled, revoking a live grant
+// with no X-Cogos-Grant header at all must succeed, not 403 on the
+// surface-match check.
+func TestGrantAuth_DisabledKnob_RevokeWorksWithoutHeader(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+	srv.cfg.WriteRouteGrantAuthDisabled = true
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Mint directly on the registry (bypassing HTTP) so the test doesn't
+	// depend on the mint route's own behavior to set up its fixture.
+	grant, err := srv.identityGrants.MintOrReuse("revoke-me", []string{"test"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	resp, err := http.Post(ts.URL+"/v1/identity/grants/"+grant.GrantID+"/revoke", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST revoke: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; want 200 with WriteRouteGrantAuthDisabled=true and no header — "+
+			"the disable knob must restore revoke to its pre-gate behavior, not 403 on the surface-match check", resp.StatusCode)
+	}
+}
+
 // grantMintLimiter unit coverage — window reset + limit enforcement in
 // isolation from the HTTP layer.
 func TestGrantMintLimiter_AllowsUpToLimitThenBlocks(t *testing.T) {
