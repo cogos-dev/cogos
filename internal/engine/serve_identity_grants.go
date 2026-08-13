@@ -425,6 +425,63 @@ func (r *IdentityGrantRegistry) Verify(surface, token string) (*IdentityGrant, b
 	return g, true
 }
 
+// VerifyAny checks a presented token against every live grant regardless of
+// surface, returning the first match. This is the primitive the write-route
+// grant-auth middleware (serve_grant_auth.go) verifies against: that
+// middleware's question is "is the caller holding SOME live kernel-issued
+// grant", not "is the caller the node-root surface specifically" — a
+// dashboard-scoped or mod3-scoped grant satisfies it exactly as well as
+// node-root's own. Same hash-based comparison as Verify, so it is equally
+// restart-safe (works against ledger-reconstructed grants with no cached raw
+// Token). Read-locked, safe for concurrent use on the request hot path;
+// maxLiveGrantSurfaces (256) bounds the scan cost.
+func (r *IdentityGrantRegistry) VerifyAny(token string) (*IdentityGrant, bool) {
+	if token == "" {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := time.Now().UTC()
+	hash := sha256Hex(token)
+	for _, g := range r.bySurface {
+		if g.expired(now) {
+			continue
+		}
+		if constantTimeEqual(g.IntegrityHash, hash) {
+			return g, true
+		}
+	}
+	return nil, false
+}
+
+// RecoverToken re-populates the in-memory raw-token cache for a live,
+// ledger-reconstructed grant when the presented token's hash matches the
+// grant's IntegrityHash. Used only at boot (ensureNodeRootGrant, see
+// boot_node_root_grant.go) to recover a grant whose raw value survived in the
+// vault-file fallback without re-minting — re-minting would supersede the
+// grant and invalidate it for every OTHER local consumer that already cached
+// the previous token, which a routine kernel restart should not do. Returns
+// (grant, true) on success; (nil, false) when surface has no live grant, it
+// is expired, or the token's hash does not match (vault file stale/corrupt —
+// caller should mint fresh in that case, exactly as MintOrReuse would after
+// a lost-raw-token restart).
+func (r *IdentityGrantRegistry) RecoverToken(surface, token string) (*IdentityGrant, bool) {
+	if surface == "" || token == "" {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, ok := r.bySurface[surface]
+	if !ok || g.expired(time.Now().UTC()) {
+		return nil, false
+	}
+	if !constantTimeEqual(g.IntegrityHash, sha256Hex(token)) {
+		return nil, false
+	}
+	g.Token = token
+	return g, true
+}
+
 // Current returns the live grant for a surface (including its raw token) —
 // the zero-paste primitive: a surface's own page can ask the kernel "what do
 // I currently hold" instead of the operator pasting anything. Returns

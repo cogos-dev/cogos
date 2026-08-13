@@ -279,6 +279,43 @@ func (k *Kernel) Stop() error {
 	return k.kernel.Stop()
 }
 
+// NodeRootGrantToken fetches this kernel's boot-minted node-root identity
+// grant token via GET /v1/identity/grants/current?surface=node-root — the
+// zero-paste bootstrap primitive (serve_identity_grants.go) that ensureNodeRootGrant
+// (boot_node_root_grant.go) mints/recovers on every Boot, and the same
+// credential local consumers use to satisfy the write-route grant-auth gate
+// (serve_grant_auth.go). This is a GET request, so it is itself exempt from
+// that gate — no chicken-and-egg problem.
+//
+// Returns "" if no live node-root grant exists (e.g. ensureNodeRootGrant
+// failed at boot, which Boot logs a warning for but does not fail on) —
+// callers should treat that the same as "grant-auth is effectively
+// unreachable for this process", matching the gate's own fail-open posture
+// rather than failing the test outright.
+func (k *Kernel) NodeRootGrantToken(ctx context.Context, t *testing.T) string {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		k.endpoint+"/v1/identity/grants/current?surface=node-root", nil)
+	if err != nil {
+		t.Fatalf("NodeRootGrantToken: build request: %v", err)
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("NodeRootGrantToken: request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("NodeRootGrantToken: decode response: %v", err)
+	}
+	return body.Token
+}
+
 // ListTools performs an MCP initialize→notifications/initialized→tools/list
 // sequence over HTTP and returns the sorted list of tool names registered on
 // this kernel's MCP server.
@@ -286,6 +323,12 @@ func (k *Kernel) Stop() error {
 // This is a Phase-3 helper that exercises the actual MCP wire protocol rather
 // than going through internal Go types, so it catches registration gaps that
 // only show up on the live surface (the category-C gap that motivated ADR-101).
+//
+// Every request attaches X-Cogos-Grant using this kernel's own boot-minted
+// node-root token (see NodeRootGrantToken) — /mcp is gated on every method by
+// serve_grant_auth.go, so ListTools exercises the same bootstrap path a real
+// local MCP consumer (Claude Code, THESEUS, ...) would use, rather than
+// working around the gate.
 //
 // CallTool is the natural follow-up (ADR-101 Phase 3b); this minimal addition
 // provides the assertion surface needed for TestDaemonWiring without wiring
@@ -295,6 +338,7 @@ func (k *Kernel) ListTools(ctx context.Context, t *testing.T) ([]string, error) 
 
 	mcpURL := k.endpoint + "/mcp"
 	client := &http.Client{Timeout: 10 * time.Second}
+	grantToken := k.NodeRootGrantToken(ctx, t)
 
 	doPost := func(body string, extraHeaders map[string]string) ([]byte, http.Header, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, mcpURL, strings.NewReader(body))
@@ -303,6 +347,9 @@ func (k *Kernel) ListTools(ctx context.Context, t *testing.T) ([]string, error) 
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
+		if grantToken != "" {
+			req.Header.Set("X-Cogos-Grant", grantToken)
+		}
 		for k, v := range extraHeaders {
 			req.Header.Set(k, v)
 		}

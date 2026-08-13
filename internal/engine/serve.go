@@ -108,6 +108,11 @@ type Server struct {
 	// (rebuilt from .cog/ledger/identity-grants/ on boot) and added revoke.
 	identityGrants *IdentityGrantRegistry
 
+	// grantMintLimiter bounds POST /v1/identity/grants throughput on the
+	// bootstrap-exempt path of the write-route grant-auth gate (see
+	// serve_grant_auth.go). Always non-nil after NewServer.
+	grantMintLimiter *grantMintLimiter
+
 	// mod3Client is the HTTP client used to forward channel-session calls
 	// to mod3. Nil in production (falls back to the package-level
 	// mod3HTTPClient); tests set this to an httptest-backed client.
@@ -196,6 +201,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 		identityGrants = NewIdentityGrantRegistryWithLedger(cfg.WorkspaceRoot)
 	}
 	s.identityGrants = identityGrants
+	s.grantMintLimiter = newGrantMintLimiter(defaultGrantMintRateLimit, defaultGrantMintRateWindow)
 
 	mux := http.NewServeMux()
 	s.routeH(mux, "GET /", dashboard.Handler())
@@ -321,11 +327,17 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	if bindAddr == "" {
 		bindAddr = "127.0.0.1"
 	}
-	// Wrap the mux with CORS middleware so browser origins (e.g. the mod3
-	// dashboard at http://localhost:7860) can POST to /v1/* without the
-	// preflight failing. See serve_cors.go for the policy rationale —
-	// loopback origins are echoed, everything else gets "*".
-	handler := corsMiddleware(mux)
+	// Wrap the mux with the write-route grant-auth gate (serve_grant_auth.go
+	// — closes the CSRF gap serve_cors.go's file header documents at
+	// length), then with CORS middleware so browser origins (e.g. the mod3
+	// dashboard at http://localhost:7860) can still POST to /v1/* without
+	// the preflight failing. Order matters: CORS stays outermost so it keeps
+	// owning the OPTIONS preflight short-circuit (a custom X-Cogos-Grant
+	// header forces that preflight in the first place — see
+	// serve_grant_auth.go's CSRF threat-model note for why that's the actual
+	// fix) and grant-auth only ever sees requests CORS has already decided
+	// to forward past OPTIONS handling.
+	handler := corsMiddleware(s.grantAuthMiddleware(mux))
 
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", bindAddr, cfg.Port),

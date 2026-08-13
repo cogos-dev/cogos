@@ -241,10 +241,11 @@ func TestRenderPeersBlockContent_NonEmptyPacket(t *testing.T) {
 func TestFoveatedContext_IncludesPeersBlock(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := &Config{
-		WorkspaceRoot:      tmp,
-		CogDir:             tmp + "/.cog",
-		Port:               0,
-		SalienceDaysWindow: 90,
+		WorkspaceRoot:               tmp,
+		CogDir:                      tmp + "/.cog",
+		Port:                        0,
+		SalienceDaysWindow:          90,
+		WriteRouteGrantAuthDisabled: true,
 	}
 	nucleus := &Nucleus{Name: "test-peers", Card: "peers integration"}
 	process := NewProcess(cfg, nucleus)
@@ -318,10 +319,11 @@ func TestFoveatedContext_IncludesPeersBlock(t *testing.T) {
 func TestFoveatedContext_NoPeersBlockWhenNoSessionID(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := &Config{
-		WorkspaceRoot:      tmp,
-		CogDir:             tmp + "/.cog",
-		Port:               0,
-		SalienceDaysWindow: 90,
+		WorkspaceRoot:               tmp,
+		CogDir:                      tmp + "/.cog",
+		Port:                        0,
+		SalienceDaysWindow:          90,
+		WriteRouteGrantAuthDisabled: true,
 	}
 	nucleus := &Nucleus{Name: "no-sid-test", Card: "no sid"}
 	process := NewProcess(cfg, nucleus)

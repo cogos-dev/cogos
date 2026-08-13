@@ -263,6 +263,33 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	server := NewServer(cfg, nucleus, process)
 	server.SetRouter(router)
 
+	// L5-HTTP-AUTHZ follow-up (board 75): the write-route grant-auth gate
+	// (serve_grant_auth.go) is on by default; log loudly if the operator
+	// turned it off, same "never block, always be visible in logs" posture
+	// as warnIfUnauthenticatedNonLoopback above.
+	if cfg.WriteRouteGrantAuthDisabled {
+		slog.Warn("SECURITY: kernel HTTP write-route grant authentication is DISABLED " +
+			"(disable_write_route_grant_auth: true) — every POST/PUT/PATCH/DELETE route " +
+			"and /mcp (including cog_write_cogdoc and every other MCP tool call) accepts " +
+			"requests with no X-Cogos-Grant token; this reopens the write-route CSRF gap " +
+			"that gate exists to close and should only be set for local development")
+	}
+
+	// Mint (or recover) the kernel's own node-root identity grant so local
+	// consumers have a zero-paste bootstrap credential for the gate above.
+	// Best-effort: a failure here does not block boot — it degrades to "no
+	// consumer can satisfy the gate until it mints its own grant via
+	// POST /v1/identity/grants", which is the same bootstrap path every
+	// other surface already uses.
+	if nodeRootGrant, err := ensureNodeRootGrant(server); err != nil {
+		slog.Warn("boot: node-root identity grant mint/recover failed; "+
+			"local consumers of the write-route grant-auth gate must self-mint via "+
+			"POST /v1/identity/grants", "err", err)
+	} else {
+		slog.Info("boot: node-root identity grant ready", "grant_id", nodeRootGrant.GrantID,
+			"expires_at", nodeRootGrant.ExpiresAt.Format(time.RFC3339))
+	}
+
 	// G0(b): wire the RBAC harness-binding layer so cog_register_session can
 	// create HarnessBindingCRDs for sessions that supply an optional "subject"
 	// field. WireHarnessBackend is set by cmd/cogos/providers_wire.go; nil

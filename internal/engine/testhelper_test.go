@@ -56,16 +56,25 @@ func makeWorkspace(t *testing.T) string {
 // makeConfig returns a Config pointing at root with safe test defaults.
 // Ticker intervals are set very long so they don't fire during short tests.
 // Port is set to 0 (assign dynamically where needed).
+//
+// WriteRouteGrantAuthDisabled is true here: the grant-auth gate
+// (serve_grant_auth.go) defaults ON in production, but the overwhelming
+// majority of this package's HTTP-layer tests predate that gate and
+// exercise routes it now covers with no X-Cogos-Grant header — the gate's
+// own behavior is covered separately and explicitly by
+// serve_grant_auth_test.go, which builds its own Server and turns the gate
+// back on (or mints a real grant) exactly where it wants to assert on it.
 func makeConfig(t *testing.T, root string) *Config {
 	t.Helper()
 	return &Config{
-		WorkspaceRoot:             root,
-		CogDir:                    filepath.Join(root, ".cog"),
-		Port:                      0,
-		ConsolidationInterval:     99999,
-		HeartbeatInterval:         99999,
-		SalienceDaysWindow:        90,
-		ToolCallValidationEnabled: true,
+		WorkspaceRoot:               root,
+		CogDir:                      filepath.Join(root, ".cog"),
+		Port:                        0,
+		ConsolidationInterval:       99999,
+		HeartbeatInterval:           99999,
+		SalienceDaysWindow:          90,
+		ToolCallValidationEnabled:   true,
+		WriteRouteGrantAuthDisabled: true,
 	}
 }
 
