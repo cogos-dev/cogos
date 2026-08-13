@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1026,5 +1027,92 @@ func TestExtendGrant_ReplayHonorsExtendedExpiry(t *testing.T) {
 	}
 	if _, ok := afterSupersede.Verify("node-root", reMinted.Token); !ok {
 		t.Fatalf("expected the superseding grant's token to verify")
+	}
+}
+
+// TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace is the targeted
+// regression test for the round-5 data race (cog-review, PR #551 round 5):
+// ExtendGrant used to mutate a live *IdentityGrant's ExpiresAt field in
+// place while Verify/Current/VerifyAny hand that same pointer to callers who
+// read its fields after releasing the registry lock — exactly what
+// handleIdentityVerify and handleIdentityGrantCurrent do on every request,
+// and exactly what the round-4 renewal ticker made concurrent with live
+// traffic for the first time. The fix (ExtendGrant now allocates a new
+// struct and replaces the map entry instead of mutating in place) doesn't
+// change any single-goroutine assertion — it's only observable under
+// -race with true concurrency, which is what this test provides.
+//
+// Bounded and fast by design: a short, fixed iteration count per goroutine
+// rather than a wall-clock duration, so this stays quick under `go test
+// -race` (which itself already slows execution significantly) without
+// becoming a source of CI flakiness.
+func TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace(t *testing.T) {
+	t.Parallel()
+	reg := NewIdentityGrantRegistry()
+	grant, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	token := grant.Token
+
+	const iterations = 200
+	var wg sync.WaitGroup
+
+	// Writer: repeatedly extends the same live grant — the exact operation
+	// the renewal ticker performs against a live registry.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			if _, err := reg.ExtendGrant("node-root", time.Hour); err != nil {
+				t.Errorf("ExtendGrant: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Reader #1: Verify, the path handleIdentityVerify's gate-exempt
+	// POST /v1/identity/verify exercises on every call.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			g, ok := reg.Verify("node-root", token)
+			if !ok {
+				t.Errorf("Verify: expected the token to keep verifying throughout concurrent extension")
+				return
+			}
+			_ = g.ExpiresAt.Format(time.RFC3339) // the exact field access the finding named
+		}
+	}()
+
+	// Reader #2: Current, the zero-paste-bootstrap path
+	// GET /v1/identity/grants/current exercises on every call.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			g, ok := reg.Current("node-root")
+			if !ok {
+				t.Errorf("Current: expected a live node-root grant throughout concurrent extension")
+				return
+			}
+			_ = g.ExpiresAt.Format(time.RFC3339)
+			_ = g.Token
+		}
+	}()
+
+	wg.Wait()
+
+	// Sanity check on final state: still the same credential, just extended.
+	final, ok := reg.Current("node-root")
+	if !ok {
+		t.Fatalf("expected a live node-root grant after the concurrent run")
+	}
+	if final.Token != token {
+		t.Errorf("Token changed across concurrent extension: got %q, want %q", final.Token, token)
+	}
+	if final.GrantID != grant.GrantID {
+		t.Errorf("GrantID changed across concurrent extension: got %q, want %q", final.GrantID, grant.GrantID)
 	}
 }

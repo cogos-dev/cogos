@@ -155,6 +155,29 @@ const defaultGrantTTL = 30 * 24 * time.Hour
 // Callers must check Token != "" before treating a grant as
 // bootstrap-usable (see Current/handleIdentityGrantCurrent); Verify never
 // needs Token, only IntegrityHash.
+//
+// IMMUTABLE AFTER PUBLICATION (registry invariant, cog-review finding, PR
+// #551 round 5): once a *IdentityGrant is stored in the registry's
+// bySurface/byGrantID maps, its fields must never be mutated in place.
+// Verify, VerifyAny, and Current all return that same pointer to callers
+// (handleIdentityVerify, handleIdentityGrantCurrent, ...) who read its
+// fields AFTER releasing the registry's lock — mutating a published grant
+// concurrently with those unsynchronized reads is a data race, caught by
+// go test -race, and undefined per the Go memory model regardless. Every
+// method that changes a grant's state (ExtendGrant's ExpiresAt bump,
+// RecoverToken's Token cache-fill, MintOrReuse's supersession, the ledger
+// replay path in applyIdentityGrantLedgerEvent) must instead allocate a NEW
+// *IdentityGrant with the updated field(s) and REPLACE the map entries
+// under the lock, exactly like MintOrReuse's supersession path already did
+// before this note existed. This held accidentally-but-safely before this
+// PR because grants were immutable after mint in practice (Revoke deletes
+// map entries outright; the old MintOrReuse supersession path already
+// allocated fresh); the TTL-renewal ticker this PR adds was what first made
+// a mutation-in-place path (the original ExtendGrant) run concurrently with
+// live HTTP reads, which is what turned an implicit convention into a
+// finding. Next contributor: if you're about to write `grant.SomeField =
+// newValue` anywhere in this file, don't — copy the struct, change the
+// field on the copy, and store the copy's pointer instead.
 type IdentityGrant struct {
 	GrantID       string    `json:"grant_id"`
 	Surface       string    `json:"surface"`
@@ -471,6 +494,13 @@ func (r *IdentityGrantRegistry) VerifyAny(token string) (*IdentityGrant, bool) {
 // is expired, or the token's hash does not match (vault file stale/corrupt —
 // caller should mint fresh in that case, exactly as MintOrReuse would after
 // a lost-raw-token restart).
+//
+// Allocates a NEW *IdentityGrant carrying the recovered token rather than
+// mutating the existing one in place — see IdentityGrant's doc comment,
+// "IMMUTABLE AFTER PUBLICATION." No ledger write here (recovery isn't a
+// state change the ledger needs to know about — the grant's durable record
+// already carries this IntegrityHash from its original mint), so this is
+// just a map-entry replacement, not a new appendXEventLocked call.
 func (r *IdentityGrantRegistry) RecoverToken(surface, token string) (*IdentityGrant, bool) {
 	if surface == "" || token == "" {
 		return nil, false
@@ -484,8 +514,18 @@ func (r *IdentityGrantRegistry) RecoverToken(surface, token string) (*IdentityGr
 	if !constantTimeEqual(g.IntegrityHash, sha256Hex(token)) {
 		return nil, false
 	}
-	g.Token = token
-	return g, true
+	recovered := &IdentityGrant{
+		GrantID:       g.GrantID,
+		Surface:       g.Surface,
+		Scope:         g.Scope,
+		Token:         token,
+		IntegrityHash: g.IntegrityHash,
+		IssuedAt:      g.IssuedAt,
+		ExpiresAt:     g.ExpiresAt,
+	}
+	r.bySurface[surface] = recovered
+	r.byGrantID[recovered.GrantID] = recovered
+	return recovered, true
 }
 
 // Current returns the live grant for a surface (including its raw token) —
@@ -585,7 +625,7 @@ func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, error) {
 
 // ExtendGrant extends the live grant for surface by ttl (from now), appending
 // an identity.grant.extended ledger event (write-ahead, same discipline as
-// MintOrReuse/Revoke) before mutating ExpiresAt in the live index. GrantID,
+// MintOrReuse/Revoke) before replacing the live index entry. GrantID,
 // Token, and IntegrityHash are left completely unchanged — this is the
 // mechanism for board-task-60-followup's node-root TTL renewal
 // (boot_node_root_grant.go's background ticker): consumers of a long-lived
@@ -594,6 +634,15 @@ func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, error) {
 // replacement — a replacement would silently invalidate every cached copy
 // the moment it superseded the old grant_id, exactly the churn MintOrReuse's
 // own doc comment already documents avoiding on ordinary restarts.
+//
+// Allocates a NEW *IdentityGrant with the bumped ExpiresAt and REPLACES the
+// map entries, rather than mutating the live grant's ExpiresAt field in
+// place — see IdentityGrant's doc comment, "IMMUTABLE AFTER PUBLICATION."
+// Verify/VerifyAny/Current hand the previous pointer to callers who read its
+// fields after this lock is released; mutating it here concurrently with
+// those reads was a data race (cog-review finding, PR #551 round 5) that
+// only became reachable once this ticker started running against a live
+// HTTP server.
 //
 // ttl <= 0 falls back to defaultGrantTTL, matching MintOrReuse's own
 // zero-means-default convention.
@@ -628,8 +677,18 @@ func (r *IdentityGrantRegistry) ExtendGrant(surface string, ttl time.Duration) (
 	if err := r.appendExtendEventLocked(g, newExpiresAt, now); err != nil {
 		return nil, fmt.Errorf("%w: ledger extend: %w", ErrGrantLedgerAppendFailed, err)
 	}
-	g.ExpiresAt = newExpiresAt
-	return g, nil
+	extended := &IdentityGrant{
+		GrantID:       g.GrantID,
+		Surface:       g.Surface,
+		Scope:         g.Scope,
+		Token:         g.Token,
+		IntegrityHash: g.IntegrityHash,
+		IssuedAt:      g.IssuedAt,
+		ExpiresAt:     newExpiresAt,
+	}
+	r.bySurface[surface] = extended
+	r.byGrantID[extended.GrantID] = extended
+	return extended, nil
 }
 
 // appendExtendEventLocked writes one identity.grant.extended ledger event for
@@ -888,15 +947,36 @@ func applyIdentityGrantLedgerEvent(reg *IdentityGrantRegistry, env *EventEnvelop
 		reg.bySurface[surface] = grant
 		reg.byGrantID[grantID] = grant
 	case "identity.grant.extended":
-		// Update ExpiresAt in place on the already-reconstructed grant —
-		// GrantID/Scope/IntegrityHash are unchanged by construction (see
+		// Advance ExpiresAt on the already-reconstructed grant — GrantID/
+		// Scope/IntegrityHash are unchanged by construction (see
 		// ExtendGrant's doc comment), so replay only needs to advance the
 		// expiry. Guarded by "is this still the CURRENT live grant for its
 		// surface" the same way identity.grant.revoked is, so an extend event
 		// for a since-superseded grant_id cannot resurrect stale state into
 		// bySurface.
+		//
+		// Allocates a NEW *IdentityGrant and replaces both map entries rather
+		// than mutating the existing one's ExpiresAt field in place — see
+		// IdentityGrant's doc comment, "IMMUTABLE AFTER PUBLICATION." This
+		// specific call site runs only during RebuildIdentityGrantRegistryFromLedger,
+		// before reg is published to any concurrent reader (see this
+		// function's own doc comment), so an in-place mutation here was never
+		// actually racy — but the invariant is a registry-wide rule, not a
+		// per-call-site risk assessment, so this follows the same allocate-
+		// and-replace pattern as every other mutation site rather than being
+		// the one exception a future refactor could copy-paste from.
 		if current, ok := reg.byGrantID[grantID]; ok && current.Surface == surface {
-			current.ExpiresAt = parseRFC3339Lenient(data["expires_at"])
+			extended := &IdentityGrant{
+				GrantID:       current.GrantID,
+				Surface:       current.Surface,
+				Scope:         current.Scope,
+				Token:         current.Token, // "" during replay — never persisted, see file header
+				IntegrityHash: current.IntegrityHash,
+				IssuedAt:      current.IssuedAt,
+				ExpiresAt:     parseRFC3339Lenient(data["expires_at"]),
+			}
+			reg.bySurface[surface] = extended
+			reg.byGrantID[grantID] = extended
 		}
 	}
 }
