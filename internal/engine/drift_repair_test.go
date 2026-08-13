@@ -257,3 +257,76 @@ func TestDriftRepair_NoIndexerIsNoOp(t *testing.T) {
 	// A workspace with no DB at all.
 	searchMemoryFTSDriftRepair(t.TempDir())
 }
+
+// withExtraCogdocRootsFunc swaps the package-level ExtraCogdocRootsFunc for
+// the duration of a test and restores it afterward. Tests using this must NOT
+// run in parallel (the var is package-global).
+func withExtraCogdocRootsFunc(t *testing.T, fn func(string) []string) {
+	t.Helper()
+	prev := ExtraCogdocRootsFunc
+	ExtraCogdocRootsFunc = fn
+	t.Cleanup(func() { ExtraCogdocRootsFunc = prev })
+}
+
+// TestDriftRepair_WidenedRootRepaired: a drifted row under an extra
+// cogdocs.yaml-declared root (outside .cog/mem/) IS sampled and repaired when
+// ExtraCogdocRootsFunc reports that root — symmetric with mem_watcher's live
+// coverage of the same roots (boot.go).
+func TestDriftRepair_WidenedRootRepaired(t *testing.T) {
+	var absPath string
+	var extraRoot string
+	root := driftFixture(t, func(db *sql.DB, root string) {
+		extraRoot = filepath.Join(root, "architecture")
+		if err := os.MkdirAll(filepath.Join(extraRoot, "adrs"), 0o755); err != nil {
+			t.Fatalf("mkdir architecture: %v", err)
+		}
+		absPath = filepath.Join(extraRoot, "adrs", "001-foo.cog.md")
+		content := "---\nid: foo\ntype: adr\ntitle: Foo\ncreated: 2026-01-01\n---\n\nbody content"
+		if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		// Stored mtime deliberately in the past → differs from the fresh file.
+		insertDoc(t, db, "foo", absPath, bodyHash("body content"), "2020-01-01T00:00:00Z")
+	})
+
+	idx := &recordingIndexer{}
+	withRepairIndexer(t, idx)
+	withExtraCogdocRootsFunc(t, func(workspaceRoot string) []string {
+		return []string{filepath.Join(workspaceRoot, "architecture")}
+	})
+
+	searchMemoryFTSDriftRepair(root)
+
+	calls := idx.got()
+	if len(calls) != 1 || calls[0] != absPath {
+		t.Fatalf("expected exactly one repair of %s (under widened root %s), got %v", absPath, extraRoot, calls)
+	}
+}
+
+// TestDriftRepair_ScopedToMemCorpus_WithNilExtraRootsFunc: a drifted row
+// outside .cog/mem/ is still NOT repaired when ExtraCogdocRootsFunc is nil
+// (degraded mode, e.g. test/CLI paths where cmd/cogos's wiring did not run) —
+// widening the scope is opt-in, not automatic.
+func TestDriftRepair_ScopedToMemCorpus_WithNilExtraRootsFunc(t *testing.T) {
+	root := driftFixture(t, func(db *sql.DB, root string) {
+		outsideDir := filepath.Join(root, "architecture")
+		if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+			t.Fatalf("mkdir architecture: %v", err)
+		}
+		outside := filepath.Join(outsideDir, "adr.cog.md")
+		if err := os.WriteFile(outside, []byte("adr body"), 0o644); err != nil {
+			t.Fatalf("write outside: %v", err)
+		}
+		insertDoc(t, db, "adr", outside, "hash", "2020-01-01T00:00:00Z")
+	})
+
+	idx := &recordingIndexer{}
+	withRepairIndexer(t, idx)
+	withExtraCogdocRootsFunc(t, nil)
+
+	searchMemoryFTSDriftRepair(root)
+
+	if calls := idx.got(); len(calls) != 0 {
+		t.Fatalf("expected no repair for out-of-scope row with nil ExtraCogdocRootsFunc, got %v", calls)
+	}
+}

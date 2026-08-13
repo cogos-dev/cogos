@@ -421,18 +421,38 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// WireConstellationIndexer ran above).  In tests and CLI paths where
 	// pkgFTSRepairIndexer is nil, this block is a no-op.
 	if pkgFTSRepairIndexer != nil {
-		memDir := filepath.Join(cfg.WorkspaceRoot, ".cog", "mem")
-		mw := NewMemWatcher(memDir, pkgFTSRepairIndexer)
-		if err := mw.Start(); err != nil {
-			slog.Debug("mem_watcher: not started (mem dir absent or fsnotify unavailable)",
-				"mem_dir", memDir, "err", err)
-		} else {
-			slog.Info("mem_watcher: started", "mem_dir", memDir)
+		// watchDirs covers .cog/mem (always) plus any workspace-root cogdoc
+		// directories declared via .cog/config/cogdocs.yaml requiredPaths
+		// (e.g. architecture/) — the same roots IndexWorkspace's batch walk
+		// now covers per the widened walkRoots(). Without also watching
+		// these here, a live daemon's incremental indexing would fall out of
+		// sync with what a full reindex sees: edits under a widened root
+		// would be invisible to search/FTS until someone manually triggers a
+		// rebuild.
+		//
+		// Resolved via ExtraCogdocRootsFunc rather than an sdk/constellation
+		// import: Boot is on the long-lived daemon path, which must stay free
+		// of that import per the package-boundary guard (cogdoc_service.go,
+		// cli_reindex.go). Nil func means degraded mode (only .cog/mem is
+		// live-watched); a manual `cogos reindex` still covers widened roots.
+		watchDirs := []string{filepath.Join(cfg.WorkspaceRoot, ".cog", "mem")}
+		if ExtraCogdocRootsFunc != nil {
+			watchDirs = append(watchDirs, ExtraCogdocRootsFunc(cfg.WorkspaceRoot)...)
+		}
+
+		for _, dir := range watchDirs {
+			mw := NewMemWatcher(dir, pkgFTSRepairIndexer)
+			if err := mw.Start(); err != nil {
+				slog.Debug("mem_watcher: not started (dir absent or fsnotify unavailable)",
+					"dir", dir, "err", err)
+				continue
+			}
+			slog.Info("mem_watcher: started", "dir", dir)
 			// Stop the watcher when the kernel context is cancelled.
-			go func() {
+			go func(w *MemWatcher) {
 				<-kernelCtx.Done()
-				mw.Stop()
-			}()
+				w.Stop()
+			}(mw)
 		}
 	}
 

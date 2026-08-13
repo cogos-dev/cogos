@@ -27,7 +27,7 @@ func TestParseCogdocMemorySectorAlias(t *testing.T) {
 	)
 	doc, err := parseCogdoc([]byte(
 		"---\nmemory_sector: episodic\ntitle: Test\ncreated: 2026-01-01\ntype: note\n---\n\nbody content",
-	), path)
+	), path, "")
 	if err != nil {
 		t.Fatalf("parseCogdoc failed: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestParseCogdocMemorySectorNoOverride(t *testing.T) {
 	path := writeTempCogdoc(t, "", "")
 	doc, err := parseCogdoc([]byte(
 		"---\nsector: semantic\nmemory_sector: episodic\ntitle: Test\ncreated: 2026-01-01\ntype: note\n---\n\nbody",
-	), path)
+	), path, "")
 	if err != nil {
 		t.Fatalf("parseCogdoc failed: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestParseCogdocCogSubmap(t *testing.T) {
 	path := writeTempCogdoc(t, "", "")
 	doc, err := parseCogdoc([]byte(
 		"---\ncog:\n  type: rfc\n  id: RFC-030\ntitle: Identity Contract\ncreated: 2026-04-30\n---\n\nbody",
-	), path)
+	), path, "")
 	if err != nil {
 		t.Fatalf("parseCogdoc failed: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestParseCogdocCogSubmapNoOverride(t *testing.T) {
 	path := writeTempCogdoc(t, "", "")
 	doc, err := parseCogdoc([]byte(
 		"---\ntype: spec\nid: my-spec\ncog:\n  type: rfc\n  id: RFC-999\ntitle: Test\ncreated: 2026-04-30\n---\n\nbody",
-	), path)
+	), path, "")
 	if err != nil {
 		t.Fatalf("parseCogdoc failed: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestParseCogdocStatusLowercase(t *testing.T) {
 		path := writeTempCogdoc(t, "", "")
 		doc, err := parseCogdoc([]byte(
 			"---\ntype: note\ntitle: Test\ncreated: 2026-01-01\nstatus: "+tc.input+"\n---\n\nbody",
-		), path)
+		), path, "")
 		if err != nil {
 			t.Fatalf("parseCogdoc failed for status=%q: %v", tc.input, err)
 		}
@@ -117,7 +117,7 @@ func TestParseCogdocUpdatedAliases(t *testing.T) {
 	// modified alias
 	doc, err := parseCogdoc([]byte(
 		"---\ntype: note\ntitle: T\ncreated: 2026-01-01\nmodified: 2026-04-30\n---\n\nbody",
-	), path)
+	), path, "")
 	if err != nil {
 		t.Fatalf("parseCogdoc failed: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestParseCogdocUpdatedAliases(t *testing.T) {
 	// revised alias
 	doc, err = parseCogdoc([]byte(
 		"---\ntype: note\ntitle: T\ncreated: 2026-01-01\nrevised: 2026-05-01\n---\n\nbody",
-	), path)
+	), path, "")
 	if err != nil {
 		t.Fatalf("parseCogdoc failed: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestParseCogdocCanonicalFields(t *testing.T) {
 	path := writeTempCogdoc(t, "", "")
 	doc, err := parseCogdoc([]byte(
 		"---\ntype: insight\ntitle: Test\ncreated: 2026-01-01\nsalience: high\nconfidence: empirical\ningested: 2026-05-01T00:00:00Z\n---\n\nbody",
-	), path)
+	), path, "")
 	if err != nil {
 		t.Fatalf("parseCogdoc failed: %v", err)
 	}

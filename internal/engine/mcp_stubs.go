@@ -58,6 +58,27 @@ func SearchMemory(workspaceRoot, query string, limit int, sector string) (any, e
 // wiring did not run — drift repair is silently skipped (safe degraded mode).
 // This keeps internal/engine free of any import of sdk/constellation
 // (package-boundary guard #2 in cogdoc_service.go:22).
+// driftRepairScopeClause builds the SQL WHERE clause (and its bind args) that
+// scopes the drift-repair sample to the managed corpus: the always-present
+// .cog/mem/ tree, plus any extra workspace-root cogdoc roots declared via
+// .cog/config/cogdocs.yaml (resolved through ExtraCogdocRootsFunc — see the
+// package-boundary note on that var). This keeps the lazy repair path
+// symmetric with what Boot's mem_watcher live-watches; a row outside every
+// one of these roots falls out of scope for both.
+func driftRepairScopeClause(workspaceRoot string) (string, []any) {
+	clauses := []string{"path LIKE ?"}
+	args := []any{"%/.cog/mem/%"}
+
+	if ExtraCogdocRootsFunc != nil {
+		for _, root := range ExtraCogdocRootsFunc(workspaceRoot) {
+			clauses = append(clauses, "path LIKE ?")
+			args = append(args, root+string(filepath.Separator)+"%")
+		}
+	}
+
+	return "(" + strings.Join(clauses, " OR ") + ")", args
+}
+
 func searchMemoryFTSDriftRepair(workspaceRoot string) {
 	// No indexer wired — skip repair silently.
 	indexer := pkgFTSRepairIndexer
@@ -86,15 +107,18 @@ func searchMemoryFTSDriftRepair(workspaceRoot string) {
 	defer db.Close()
 
 	// Sample recent documents, fetching path + stored mtime + stored content
-	// hash. Scope the sample to the managed memory corpus ('%/.cog/mem/%') so
-	// it is symmetric with the mem_watcher (which only watches .cog/mem/) — a
-	// row indexed from outside the corpus is not something this lazy path can
-	// or should repair. content_hash is fetched for the equal-second tiebreak
-	// below.
+	// hash. Scope the sample to the managed corpus: '%/.cog/mem/%' plus any
+	// extra workspace-root cogdoc roots declared via cogdocs.yaml
+	// (ExtraCogdocRootsFunc) — the same roots mem_watcher now live-watches
+	// (Boot, see boot.go) — so this lazy path stays symmetric with what live
+	// indexing covers. A row indexed from outside all of those roots is not
+	// something this lazy path can or should repair. content_hash is fetched
+	// for the equal-second tiebreak below.
+	scopeClause, scopeArgs := driftRepairScopeClause(workspaceRoot)
 	rows, err := db.Query(
 		`SELECT path, file_mtime, content_hash FROM documents
-		 WHERE path LIKE '%/.cog/mem/%'
-		 ORDER BY indexed_at DESC LIMIT ?`, sampleLimit,
+		 WHERE `+scopeClause+`
+		 ORDER BY indexed_at DESC LIMIT ?`, append(scopeArgs, sampleLimit)...,
 	)
 	if err != nil {
 		return
