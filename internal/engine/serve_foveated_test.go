@@ -56,7 +56,7 @@ This paper introduces the Transformer architecture based on self-attention mecha
 		t.Fatal("git commit:", err)
 	}
 
-	cfg := &Config{WorkspaceRoot: tmp, CogDir: filepath.Join(tmp, ".cog"), Port: 0, SalienceDaysWindow: 90}
+	cfg := &Config{WorkspaceRoot: tmp, CogDir: filepath.Join(tmp, ".cog"), Port: 0, SalienceDaysWindow: 90, WriteRouteGrantAuthDisabled: true}
 	nucleus := &Nucleus{Name: "test", Card: "test identity"}
 	process := NewProcess(cfg, nucleus)
 	if err := process.Field().Update(); err != nil {

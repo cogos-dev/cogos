@@ -24,7 +24,7 @@ import (
 func newEventsTestServer(t *testing.T) (http.Handler, *Process, string) {
 	t.Helper()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	nucleus := &Nucleus{Name: "test"}
 	proc := NewProcess(cfg, nucleus)
 	srv := NewServer(cfg, nucleus, proc)

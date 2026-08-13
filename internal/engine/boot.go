@@ -263,6 +263,33 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	server := NewServer(cfg, nucleus, process)
 	server.SetRouter(router)
 
+	// L5-HTTP-AUTHZ follow-up (board 75): the write-route grant-auth gate
+	// (serve_grant_auth.go) is on by default; log loudly if the operator
+	// turned it off, same "never block, always be visible in logs" posture
+	// as warnIfUnauthenticatedNonLoopback above.
+	if cfg.WriteRouteGrantAuthDisabled {
+		slog.Warn("SECURITY: kernel HTTP write-route grant authentication is DISABLED " +
+			"(disable_write_route_grant_auth: true) — every POST/PUT/PATCH/DELETE route " +
+			"and /mcp (including cog_write_cogdoc and every other MCP tool call) accepts " +
+			"requests with no X-Cogos-Grant token; this reopens the write-route CSRF gap " +
+			"that gate exists to close and should only be set for local development")
+	}
+
+	// Mint (or recover) the kernel's own node-root identity grant so local
+	// consumers have a zero-paste bootstrap credential for the gate above.
+	// Best-effort: a failure here does not block boot — it degrades to "no
+	// consumer can satisfy the gate until it mints its own grant via
+	// POST /v1/identity/grants", which is the same bootstrap path every
+	// other surface already uses.
+	if nodeRootGrant, err := ensureNodeRootGrant(server); err != nil {
+		slog.Warn("boot: node-root identity grant mint/recover failed; "+
+			"local consumers of the write-route grant-auth gate must self-mint via "+
+			"POST /v1/identity/grants", "err", err)
+	} else {
+		slog.Info("boot: node-root identity grant ready", "grant_id", nodeRootGrant.GrantID,
+			"expires_at", nodeRootGrant.ExpiresAt.Format(time.RFC3339))
+	}
+
 	// G0(b): wire the RBAC harness-binding layer so cog_register_session can
 	// create HarnessBindingCRDs for sessions that supply an optional "subject"
 	// field. WireHarnessBackend is set by cmd/cogos/providers_wire.go; nil
@@ -300,6 +327,21 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 
 	// Derived context the kernel owns; caller's ctx cancellation also stops it.
 	kernelCtx, cancel := context.WithCancel(ctx)
+
+	// Start the node-root grant's TTL renewal ticker (board-task-60 followup):
+	// ensureNodeRootGrant above mints/recovers via the package-default 30-day
+	// TTL and nothing renews it on its own, so a kernel with >30d uptime would
+	// otherwise start 401ing every local consumer of the write-route
+	// grant-auth gate until restart. Runs an immediate threshold-based check
+	// before ever waiting on its own ticker, so a restart that recovers a
+	// grant close to its existing expiry is caught right away instead of
+	// waiting up to a full renewal interval (round 4 cold-start fix — see
+	// startNodeRootGrantRenewal's doc comment). Owned by kernelCtx so it
+	// stops with every other kernel goroutine on Stop(); started
+	// unconditionally (not gated on the ensureNodeRootGrant error above)
+	// since maybeRenewNodeRootGrant degrades safely to a fresh mint/recover
+	// attempt on its own if no grant exists yet.
+	startNodeRootGrantRenewal(kernelCtx, server)
 
 	// Wire LocalHarnessController if an MCP server is present, unless the
 	// caller opted out via WithoutLocalHarness (First Instruments A4 — this

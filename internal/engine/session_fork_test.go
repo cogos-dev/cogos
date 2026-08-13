@@ -573,7 +573,7 @@ func TestKindSessionFork_DuplicateRegistrationPanics(t *testing.T) {
 func TestMCP_ForkSession_RoundTrip(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	proc := NewProcess(cfg, &Nucleus{Name: "test"})
 	mcpSrv := NewMCPServer(cfg, &Nucleus{Name: "test"}, proc)
 	bus := NewBusSessionManager(root)
@@ -653,7 +653,7 @@ func TestMCP_ForkSession_RoundTrip(t *testing.T) {
 func TestReplayOnStartup_ForkSurvivesRestart(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	nucleus := &Nucleus{Name: "test"}
 	proc := NewProcess(cfg, nucleus)
 	srv1 := NewServer(cfg, nucleus, proc)
@@ -744,7 +744,7 @@ func TestReplayOnStartup_ForkSurvivesRestart(t *testing.T) {
 func TestReplayOnStartup_ForkPinnedUntilSurvivesRestart(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	nucleus := &Nucleus{Name: "test"}
 	proc := NewProcess(cfg, nucleus)
 	srv1 := NewServer(cfg, nucleus, proc)

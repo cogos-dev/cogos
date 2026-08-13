@@ -160,6 +160,25 @@ type Config struct {
 	// / EnableConfigMutation.
 	EnableReconcileControl bool
 
+	// WriteRouteGrantAuthDisabled is the escape hatch for
+	// serve_grant_auth.go's X-Cogos-Grant middleware (board 75 / the kernel
+	// HTTP write-route CSRF close). Deliberately inverted polarity versus the
+	// Enable* gates above: those default OFF (opt in to a risk), this one
+	// must default ON (the CSRF gate is live unless explicitly turned off),
+	// and Go's bool zero value is false — so "false" has to mean "auth
+	// enabled" for every caller that builds a Config without going through
+	// LoadConfig's explicit defaulting (tests, testkernel, any future
+	// programmatic boot). A caller that forgets to set this field gets the
+	// SAFE behavior (enforced), not the exposed one.
+	//
+	// Setting this true (disable_write_route_grant_auth: true in kernel.yaml)
+	// restores pre-grant-auth behavior on every POST/PUT/PATCH/DELETE route
+	// and /mcp — a broken/unavailable identity-grant registry or vault must
+	// never brick the kernel loop, so this knob exists as the operator's
+	// documented way out. Boot() logs a loud warning when this is true (see
+	// boot.go) so a disabled gate is visible in logs, not silent.
+	WriteRouteGrantAuthDisabled bool
+
 	// DigestPaths maps stream tailer adapter names to JSONL file/directory paths.
 	// Empty map means external digestion is disabled.
 	DigestPaths map[string]string
@@ -221,29 +240,30 @@ type Config struct {
 
 // kernelConfigSection holds settings that can appear at the top level or inside v3:.
 type kernelConfigSection struct {
-	Port                   int      `yaml:"port"`
-	BindAddr               string   `yaml:"bind_addr"`
-	ConsolidationInterval  int      `yaml:"consolidation_interval"`
-	HeartbeatInterval      int      `yaml:"heartbeat_interval"`
-	SalienceDaysWindow     int      `yaml:"salience_days_window"`
-	OutputReserve          int      `yaml:"output_reserve"`
-	MaxFovealDocs          int      `yaml:"max_foveal_docs"`
-	SalienceFloor          *float64 `yaml:"salience_floor"`
-	DefaultBudget          int      `yaml:"default_budget"`
-	ExcludeSubstrings      []string `yaml:"exclude_substrings"`
-	TRMWeightsPath         string   `yaml:"trm_weights_path"`
-	TRMEmbeddingsPath      string   `yaml:"trm_embeddings_path"`
-	TRMChunksPath          string   `yaml:"trm_chunks_path"`
-	OllamaEmbedEndpoint    string   `yaml:"ollama_embed_endpoint"`
-	OllamaEmbedModel       string   `yaml:"ollama_embed_model"`
-	ToolCallValidation     *bool    `yaml:"tool_call_validation_enabled"`
-	EnableSkillExec        *bool    `yaml:"enable_skill_exec"`
-	EnableServiceControl   *bool    `yaml:"enable_service_control"`
-	EnableConfigMutation   *bool    `yaml:"enable_config_mutation"`
-	EnableReconcileControl *bool    `yaml:"enable_reconcile_control"`
-	IdentityNakedDefault   *bool    `yaml:"identity_naked_default,omitempty"`
-	LocalModel             string   `yaml:"local_model"`
-	HarnessProvider        string   `yaml:"harness_provider"`
+	Port                        int      `yaml:"port"`
+	BindAddr                    string   `yaml:"bind_addr"`
+	ConsolidationInterval       int      `yaml:"consolidation_interval"`
+	HeartbeatInterval           int      `yaml:"heartbeat_interval"`
+	SalienceDaysWindow          int      `yaml:"salience_days_window"`
+	OutputReserve               int      `yaml:"output_reserve"`
+	MaxFovealDocs               int      `yaml:"max_foveal_docs"`
+	SalienceFloor               *float64 `yaml:"salience_floor"`
+	DefaultBudget               int      `yaml:"default_budget"`
+	ExcludeSubstrings           []string `yaml:"exclude_substrings"`
+	TRMWeightsPath              string   `yaml:"trm_weights_path"`
+	TRMEmbeddingsPath           string   `yaml:"trm_embeddings_path"`
+	TRMChunksPath               string   `yaml:"trm_chunks_path"`
+	OllamaEmbedEndpoint         string   `yaml:"ollama_embed_endpoint"`
+	OllamaEmbedModel            string   `yaml:"ollama_embed_model"`
+	ToolCallValidation          *bool    `yaml:"tool_call_validation_enabled"`
+	EnableSkillExec             *bool    `yaml:"enable_skill_exec"`
+	EnableServiceControl        *bool    `yaml:"enable_service_control"`
+	EnableConfigMutation        *bool    `yaml:"enable_config_mutation"`
+	EnableReconcileControl      *bool    `yaml:"enable_reconcile_control"`
+	WriteRouteGrantAuthDisabled *bool    `yaml:"disable_write_route_grant_auth"`
+	IdentityNakedDefault        *bool    `yaml:"identity_naked_default,omitempty"`
+	LocalModel                  string   `yaml:"local_model"`
+	HarnessProvider             string   `yaml:"harness_provider"`
 	// DispatchTimeoutCapSeconds caps dispatch timeout_seconds requests.
 	// 0 means use DefaultDispatchTimeoutCapSeconds (600).
 	DispatchTimeoutCapSeconds int               `yaml:"dispatch_timeout_cap_seconds,omitempty"`
@@ -396,6 +416,9 @@ func applyKernelSection(cfg *Config, s kernelConfigSection) {
 	}
 	if s.EnableReconcileControl != nil {
 		cfg.EnableReconcileControl = *s.EnableReconcileControl
+	}
+	if s.WriteRouteGrantAuthDisabled != nil {
+		cfg.WriteRouteGrantAuthDisabled = *s.WriteRouteGrantAuthDisabled
 	}
 	if s.IdentityNakedDefault != nil {
 		cfg.IdentityNakedDefault = *s.IdentityNakedDefault

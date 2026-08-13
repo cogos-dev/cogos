@@ -418,7 +418,7 @@ func TestBusEventsAfterSeq(t *testing.T) {
 func TestSessionsListAndDetail(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	nucleus := &Nucleus{Name: "test-sessions"}
 	proc := NewProcess(cfg, nucleus)
 	server := NewServer(cfg, nucleus, proc)

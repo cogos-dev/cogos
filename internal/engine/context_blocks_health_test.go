@@ -290,7 +290,7 @@ func TestFoveatedContext_IncludesSubstrateHealth(t *testing.T) {
 		// Minimal server — no git, no cogdocs. Health block depends only on
 		// the reconcile registry, which is what we want to exercise.
 		tmp := t.TempDir()
-		cfg := &Config{WorkspaceRoot: tmp, CogDir: tmp + "/.cog", Port: 0, SalienceDaysWindow: 90}
+		cfg := &Config{WorkspaceRoot: tmp, CogDir: tmp + "/.cog", Port: 0, SalienceDaysWindow: 90, WriteRouteGrantAuthDisabled: true}
 		nucleus := &Nucleus{Name: "test", Card: "proprio test"}
 		process := NewProcess(cfg, nucleus)
 		srv := NewServer(cfg, nucleus, process)

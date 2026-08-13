@@ -86,7 +86,13 @@
 // event carries {grant_id, surface, scope, integrity_hash, issued_at/
 // expires_at or revoked_at/superseded_at} — NEVER the raw token value
 // (ADR-091 §5; same verifyKeyIntegrity hash-not-value pattern
-// identity_provider.go already established). On kernel boot,
+// identity_provider.go already established). A fourth event,
+// identity.grant.extended (added for node-root TTL renewal — see
+// ExtendGrant and boot_node_root_grant.go's background ticker), advances an
+// already-tracked grant's expires_at WITHOUT touching its grant_id, scope, or
+// integrity_hash — unlike supersession, extension is not a new credential, it
+// is the same one living longer, which is exactly why it gets its own event
+// type instead of reusing identity.grant.superseded. On kernel boot,
 // RebuildIdentityGrantRegistryFromLedger replays every identity.grant.*
 // event in the dedicated "identity-grants" ledger session bucket to
 // reconstruct the live grant set — this is what makes a previously-issued
@@ -149,6 +155,29 @@ const defaultGrantTTL = 30 * 24 * time.Hour
 // Callers must check Token != "" before treating a grant as
 // bootstrap-usable (see Current/handleIdentityGrantCurrent); Verify never
 // needs Token, only IntegrityHash.
+//
+// IMMUTABLE AFTER PUBLICATION (registry invariant, cog-review finding, PR
+// #551 round 5): once a *IdentityGrant is stored in the registry's
+// bySurface/byGrantID maps, its fields must never be mutated in place.
+// Verify, VerifyAny, and Current all return that same pointer to callers
+// (handleIdentityVerify, handleIdentityGrantCurrent, ...) who read its
+// fields AFTER releasing the registry's lock — mutating a published grant
+// concurrently with those unsynchronized reads is a data race, caught by
+// go test -race, and undefined per the Go memory model regardless. Every
+// method that changes a grant's state (ExtendGrant's ExpiresAt bump,
+// RecoverToken's Token cache-fill, MintOrReuse's supersession, the ledger
+// replay path in applyIdentityGrantLedgerEvent) must instead allocate a NEW
+// *IdentityGrant with the updated field(s) and REPLACE the map entries
+// under the lock, exactly like MintOrReuse's supersession path already did
+// before this note existed. This held accidentally-but-safely before this
+// PR because grants were immutable after mint in practice (Revoke deletes
+// map entries outright; the old MintOrReuse supersession path already
+// allocated fresh); the TTL-renewal ticker this PR adds was what first made
+// a mutation-in-place path (the original ExtendGrant) run concurrently with
+// live HTTP reads, which is what turned an implicit convention into a
+// finding. Next contributor: if you're about to write `grant.SomeField =
+// newValue` anywhere in this file, don't — copy the struct, change the
+// field on the copy, and store the copy's pointer instead.
 type IdentityGrant struct {
 	GrantID       string    `json:"grant_id"`
 	Surface       string    `json:"surface"`
@@ -425,6 +454,80 @@ func (r *IdentityGrantRegistry) Verify(surface, token string) (*IdentityGrant, b
 	return g, true
 }
 
+// VerifyAny checks a presented token against every live grant regardless of
+// surface, returning the first match. This is the primitive the write-route
+// grant-auth middleware (serve_grant_auth.go) verifies against: that
+// middleware's question is "is the caller holding SOME live kernel-issued
+// grant", not "is the caller the node-root surface specifically" — a
+// dashboard-scoped or mod3-scoped grant satisfies it exactly as well as
+// node-root's own. Same hash-based comparison as Verify, so it is equally
+// restart-safe (works against ledger-reconstructed grants with no cached raw
+// Token). Read-locked, safe for concurrent use on the request hot path;
+// maxLiveGrantSurfaces (256) bounds the scan cost.
+func (r *IdentityGrantRegistry) VerifyAny(token string) (*IdentityGrant, bool) {
+	if token == "" {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := time.Now().UTC()
+	hash := sha256Hex(token)
+	for _, g := range r.bySurface {
+		if g.expired(now) {
+			continue
+		}
+		if constantTimeEqual(g.IntegrityHash, hash) {
+			return g, true
+		}
+	}
+	return nil, false
+}
+
+// RecoverToken re-populates the in-memory raw-token cache for a live,
+// ledger-reconstructed grant when the presented token's hash matches the
+// grant's IntegrityHash. Used only at boot (ensureNodeRootGrant, see
+// boot_node_root_grant.go) to recover a grant whose raw value survived in the
+// vault-file fallback without re-minting — re-minting would supersede the
+// grant and invalidate it for every OTHER local consumer that already cached
+// the previous token, which a routine kernel restart should not do. Returns
+// (grant, true) on success; (nil, false) when surface has no live grant, it
+// is expired, or the token's hash does not match (vault file stale/corrupt —
+// caller should mint fresh in that case, exactly as MintOrReuse would after
+// a lost-raw-token restart).
+//
+// Allocates a NEW *IdentityGrant carrying the recovered token rather than
+// mutating the existing one in place — see IdentityGrant's doc comment,
+// "IMMUTABLE AFTER PUBLICATION." No ledger write here (recovery isn't a
+// state change the ledger needs to know about — the grant's durable record
+// already carries this IntegrityHash from its original mint), so this is
+// just a map-entry replacement, not a new appendXEventLocked call.
+func (r *IdentityGrantRegistry) RecoverToken(surface, token string) (*IdentityGrant, bool) {
+	if surface == "" || token == "" {
+		return nil, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, ok := r.bySurface[surface]
+	if !ok || g.expired(time.Now().UTC()) {
+		return nil, false
+	}
+	if !constantTimeEqual(g.IntegrityHash, sha256Hex(token)) {
+		return nil, false
+	}
+	recovered := &IdentityGrant{
+		GrantID:       g.GrantID,
+		Surface:       g.Surface,
+		Scope:         g.Scope,
+		Token:         token,
+		IntegrityHash: g.IntegrityHash,
+		IssuedAt:      g.IssuedAt,
+		ExpiresAt:     g.ExpiresAt,
+	}
+	r.bySurface[surface] = recovered
+	r.byGrantID[recovered.GrantID] = recovered
+	return recovered, true
+}
+
 // Current returns the live grant for a surface (including its raw token) —
 // the zero-paste primitive: a surface's own page can ask the kernel "what do
 // I currently hold" instead of the operator pasting anything. Returns
@@ -445,6 +548,27 @@ func (r *IdentityGrantRegistry) Current(surface string) (*IdentityGrant, bool) {
 	return g, true
 }
 
+// GrantExpiry returns the live grant's ExpiresAt for surface, if any.
+// Unlike Current (the zero-paste-bootstrap primitive, which deliberately
+// reports "unavailable" whenever Token == "" for a ledger-reconstructed
+// grant — see its doc comment), this does not require the raw token to be
+// cached in memory: it exists for callers that only need to know WHEN a
+// live grant expires, not the token itself. The node-root renewal ticker
+// (boot_node_root_grant.go's maybeRenewNodeRootGrant) uses this to decide
+// whether a renewal is due — extending is conditional on remaining
+// lifetime, so it has to know the expiry before deciding whether to call
+// ExtendGrant at all. Returns (zero, false) if surface has no live,
+// unexpired grant (never minted, already expired, or revoked).
+func (r *IdentityGrantRegistry) GrantExpiry(surface string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	g, ok := r.bySurface[surface]
+	if !ok || g.expired(time.Now().UTC()) {
+		return time.Time{}, false
+	}
+	return g.ExpiresAt, true
+}
+
 // Revoke removes the live grant identified by grantID, appending an
 // identity.grant.revoked ledger event before mutating the in-memory index
 // (write-ahead, same discipline as MintOrReuse). Returns (grant, nil) on
@@ -458,6 +582,20 @@ func (r *IdentityGrantRegistry) Current(surface string) (*IdentityGrant, bool) {
 // already dead while it kept working, the same error-masking class
 // MintOrReuse's supersession fix closed (cog-review finding, PR #472 second
 // pass, serve_identity_grants.go:444 as of commit 280aa1a).
+// GrantByID returns the live grant identified by grantID, if any — a
+// read-only lookup used by handleIdentityGrantRevoke's surface-match check
+// (serve_grant_auth.go's file header, "SURFACE-MATCH" section) to learn the
+// TARGET grant's surface before deciding whether the presented caller may
+// revoke it. Deliberately separate from Revoke itself: the caller needs to
+// inspect the target without mutating anything if the surface check is
+// going to reject the request.
+func (r *IdentityGrantRegistry) GrantByID(grantID string) (*IdentityGrant, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	g, ok := r.byGrantID[grantID]
+	return g, ok
+}
+
 func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, error) {
 	if grantID == "" {
 		return nil, ErrGrantNotFound
@@ -483,6 +621,106 @@ func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, error) {
 		delete(r.bySurface, g.Surface)
 	}
 	return g, nil
+}
+
+// ExtendGrant extends the live grant for surface by ttl (from now), appending
+// an identity.grant.extended ledger event (write-ahead, same discipline as
+// MintOrReuse/Revoke) before replacing the live index entry. GrantID,
+// Token, and IntegrityHash are left completely unchanged — this is the
+// mechanism for board-task-60-followup's node-root TTL renewal
+// (boot_node_root_grant.go's background ticker): consumers of a long-lived
+// grant (the dashboard, canvas, THESEUS) cache the RAW TOKEN VALUE, so
+// renewal must EXTEND the existing credential's expiry rather than mint a
+// replacement — a replacement would silently invalidate every cached copy
+// the moment it superseded the old grant_id, exactly the churn MintOrReuse's
+// own doc comment already documents avoiding on ordinary restarts.
+//
+// Allocates a NEW *IdentityGrant with the bumped ExpiresAt and REPLACES the
+// map entries, rather than mutating the live grant's ExpiresAt field in
+// place — see IdentityGrant's doc comment, "IMMUTABLE AFTER PUBLICATION."
+// Verify/VerifyAny/Current hand the previous pointer to callers who read its
+// fields after this lock is released; mutating it here concurrently with
+// those reads was a data race (cog-review finding, PR #551 round 5) that
+// only became reachable once this ticker started running against a live
+// HTTP server.
+//
+// ttl <= 0 falls back to defaultGrantTTL, matching MintOrReuse's own
+// zero-means-default convention.
+//
+// If the grant is already expired, this is deliberately NOT a renewal:
+// ErrGrantNotFound is returned, same sentinel and same shape as Revoke's
+// "no live grant with that id" — an expired grant has already stopped
+// verifying, so every consumer holding its token is already 401ing, and
+// silently restoring its old expiry with the same token would un-expire a
+// credential the kernel itself no longer tracked as live. The documented
+// choice (per the build directive) is that the caller falls through to
+// MintOrReuse/ensureNodeRootGrant's ordinary mint-or-recover path instead,
+// establishing a genuinely fresh grant rather than resurrecting a stale one.
+func (r *IdentityGrantRegistry) ExtendGrant(surface string, ttl time.Duration) (*IdentityGrant, error) {
+	if surface == "" {
+		return nil, fmt.Errorf("surface is required")
+	}
+	now := time.Now().UTC()
+	if ttl <= 0 {
+		ttl = defaultGrantTTL
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	g, ok := r.bySurface[surface]
+	if !ok || g.expired(now) {
+		return nil, ErrGrantNotFound
+	}
+
+	newExpiresAt := now.Add(ttl)
+	if err := r.appendExtendEventLocked(g, newExpiresAt, now); err != nil {
+		return nil, fmt.Errorf("%w: ledger extend: %w", ErrGrantLedgerAppendFailed, err)
+	}
+	extended := &IdentityGrant{
+		GrantID:       g.GrantID,
+		Surface:       g.Surface,
+		Scope:         g.Scope,
+		Token:         g.Token,
+		IntegrityHash: g.IntegrityHash,
+		IssuedAt:      g.IssuedAt,
+		ExpiresAt:     newExpiresAt,
+	}
+	r.bySurface[surface] = extended
+	r.byGrantID[extended.GrantID] = extended
+	return extended, nil
+}
+
+// appendExtendEventLocked writes one identity.grant.extended ledger event for
+// grant, carrying its (unchanged) grant_id/surface/scope/integrity_hash plus
+// the new expires_at, mirroring appendGrantEventLocked's shape exactly so
+// RebuildIdentityGrantRegistryFromLedger's replay handling for this event
+// type stays trivial (see applyIdentityGrantLedgerEvent's "extended" case).
+// Caller must hold r.mu (for writing). No-op when r.workspaceRoot == "",
+// same ledger-less behavior as every other appendXEventLocked helper.
+func (r *IdentityGrantRegistry) appendExtendEventLocked(grant *IdentityGrant, newExpiresAt, now time.Time) error {
+	if r.workspaceRoot == "" {
+		return nil
+	}
+	data := map[string]interface{}{
+		"grant_id":       grant.GrantID,
+		"surface":        grant.Surface,
+		"scope":          grant.Scope,
+		"integrity_hash": grant.IntegrityHash,
+		"issued_at":      grant.IssuedAt.Format(time.RFC3339),
+		"expires_at":     newExpiresAt.Format(time.RFC3339),
+		"extended_at":    now.Format(time.RFC3339),
+	}
+	env := &EventEnvelope{
+		HashedPayload: EventPayload{
+			Type:      "identity.grant.extended",
+			Timestamp: now.Format(time.RFC3339),
+			SessionID: identityGrantsLedgerSession,
+			Data:      data,
+		},
+		Metadata: EventMetadata{Source: "identity-grants"},
+	}
+	return r.appendEvent(r.workspaceRoot, identityGrantsLedgerSession, env)
 }
 
 // Snapshot returns every live grant for the operator-facing inventory (GET
@@ -708,6 +946,38 @@ func applyIdentityGrantLedgerEvent(reg *IdentityGrantRegistry, env *EventEnvelop
 		}
 		reg.bySurface[surface] = grant
 		reg.byGrantID[grantID] = grant
+	case "identity.grant.extended":
+		// Advance ExpiresAt on the already-reconstructed grant — GrantID/
+		// Scope/IntegrityHash are unchanged by construction (see
+		// ExtendGrant's doc comment), so replay only needs to advance the
+		// expiry. Guarded by "is this still the CURRENT live grant for its
+		// surface" the same way identity.grant.revoked is, so an extend event
+		// for a since-superseded grant_id cannot resurrect stale state into
+		// bySurface.
+		//
+		// Allocates a NEW *IdentityGrant and replaces both map entries rather
+		// than mutating the existing one's ExpiresAt field in place — see
+		// IdentityGrant's doc comment, "IMMUTABLE AFTER PUBLICATION." This
+		// specific call site runs only during RebuildIdentityGrantRegistryFromLedger,
+		// before reg is published to any concurrent reader (see this
+		// function's own doc comment), so an in-place mutation here was never
+		// actually racy — but the invariant is a registry-wide rule, not a
+		// per-call-site risk assessment, so this follows the same allocate-
+		// and-replace pattern as every other mutation site rather than being
+		// the one exception a future refactor could copy-paste from.
+		if current, ok := reg.byGrantID[grantID]; ok && current.Surface == surface {
+			extended := &IdentityGrant{
+				GrantID:       current.GrantID,
+				Surface:       current.Surface,
+				Scope:         current.Scope,
+				Token:         current.Token, // "" during replay — never persisted, see file header
+				IntegrityHash: current.IntegrityHash,
+				IssuedAt:      current.IssuedAt,
+				ExpiresAt:     parseRFC3339Lenient(data["expires_at"]),
+			}
+			reg.bySurface[surface] = extended
+			reg.byGrantID[grantID] = extended
+		}
 	}
 }
 
@@ -855,6 +1125,29 @@ type identityVerifyResponse struct {
 // requested surface. The response never echoes back a broader scope than
 // the caller requested (design §4 verify-tooth #1) — scope is stored
 // exactly as requested, no server-side widening.
+//
+// Surface-match hardening (cog-review finding, PR #551 round 2; see
+// serve_grant_auth.go's file header "SURFACE-MATCH" section): this route is
+// no longer bootstrap-exempt — grantAuthMiddleware already requires a valid
+// presented grant to reach here at all — but VerifyAny alone would still let
+// ANY live grant mint for ANY surface, including a throwaway surface an
+// attacker minted for itself and then used to supersede node-root's grant.
+// The presented grant (grantFromContext) must therefore be the node-root
+// admin grant, or already belong to the SAME surface being minted
+// (self-service rotation of a surface's own credential). Minimal rule, not a
+// full scope model — Wave 6b is where per-surface authorization gets
+// designed properly.
+//
+// This check applies ONLY when the gate itself is enabled (round 3 fix,
+// cog-review finding, PR #551 round 3): grantAuthMiddleware only populates
+// the context grant when it actually ran the VerifyAny check, so when
+// Config.WriteRouteGrantAuthDisabled is true the middleware short-circuits
+// before ever setting one, and grantFromContext always returns (nil, false)
+// — enforcing surface-match unconditionally would 403 every mint while the
+// operator's own disable knob is supposed to restore pre-grant-auth
+// behavior on every write route (see the field's doc comment). Deferring to
+// grantAuthDisabled (the same accessor grantAuthMiddleware itself consults)
+// keeps the two in agreement structurally instead of by convention.
 func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request) {
 	var req identityGrantMintRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -864,6 +1157,14 @@ func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request)
 	if req.Surface == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "surface is required")
 		return
+	}
+	if !s.grantAuthDisabled() {
+		presented, ok := grantFromContext(r.Context())
+		if !ok || (presented.Surface != nodeRootSurface && presented.Surface != req.Surface) {
+			writeJSONError(w, http.StatusForbidden, "surface_mismatch",
+				"the presented grant may not mint a grant for surface "+req.Surface)
+			return
+		}
 	}
 	ttl := time.Duration(0)
 	if req.TTLHours > 0 {
@@ -990,11 +1291,41 @@ type identityGrantRevokeResponse struct {
 // verifying, and telling the caller 404 ("already gone") would mask a failed
 // revoke of a possibly-leaked credential (cog-review finding, PR #472 second
 // pass, serve_identity_grants.go:444 as of commit 280aa1a).
+//
+// Surface-match hardening (cog-review unverified note, PR #551 round 2; see
+// serve_grant_auth.go's file header "SURFACE-MATCH" section): VerifyAny
+// accepts any live grant regardless of surface, so without an additional
+// check here a caller holding a grant for an unrelated, throwaway surface
+// could revoke node-root's grant outright (its grant_id is visible via the
+// gate-exempt GET /v1/identity/grants). Before mutating anything, this looks
+// up the TARGET grant by id (GrantByID, read-only) and requires the
+// presented grant (grantFromContext) to be node-root or to already match the
+// target's own surface (self-service: a surface may revoke/rotate its own
+// grant). A grantID that names no live grant skips the check entirely and
+// falls through to Revoke's own ErrGrantNotFound → 404, same as before —
+// this hardening only ever narrows an outcome that would otherwise succeed,
+// never changes a not-found into something else.
 func (s *Server) handleIdentityGrantRevoke(w http.ResponseWriter, r *http.Request) {
 	grantID := r.PathValue("id")
 	if grantID == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "grant id is required")
 		return
+	}
+	// Surface-match check applies only while the gate is enabled — see
+	// handleIdentityGrantMint's doc comment for why (round 3 fix, cog-review
+	// finding, PR #551 round 3): with Config.WriteRouteGrantAuthDisabled true,
+	// grantAuthMiddleware never populates a context grant, so enforcing this
+	// unconditionally would 403 every revoke while the disable knob is
+	// supposed to restore pre-grant-auth behavior.
+	if !s.grantAuthDisabled() {
+		if target, found := s.identityGrants.GrantByID(grantID); found {
+			presented, ok := grantFromContext(r.Context())
+			if !ok || (presented.Surface != nodeRootSurface && presented.Surface != target.Surface) {
+				writeJSONError(w, http.StatusForbidden, "surface_mismatch",
+					"the presented grant may not revoke a grant for surface "+target.Surface)
+				return
+			}
+		}
 	}
 	grant, err := s.identityGrants.Revoke(grantID)
 	if err != nil {

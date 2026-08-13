@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,9 +25,35 @@ func newIdentityGrantServer(t *testing.T) (*Server, *httptest.Server) {
 	s := &Server{identityGrants: NewIdentityGrantRegistry()}
 	mux := http.NewServeMux()
 	s.registerIdentityGrantRoutes(mux)
-	front := httptest.NewServer(mux)
+	front := httptest.NewServer(withPresentedNodeRootGrant(t, s, mux))
 	t.Cleanup(func() { front.Close() })
 	return s, front
+}
+
+// withPresentedNodeRootGrant wraps mux so every request handled by it
+// behaves as an already-authenticated node-root caller. This file's tests
+// exercise MintOrReuse/Revoke/ledger semantics and the mint/revoke HANDLERS
+// directly — they wire only registerIdentityGrantRoutes onto a bare mux,
+// never grantAuthMiddleware (that gate's own behavior is
+// serve_grant_auth_test.go's job). But handleIdentityGrantMint and
+// handleIdentityGrantRevoke now read the presented grant from request
+// context (grantFromContext, serve_grant_auth.go) and reject a request with
+// none — the surface-match hardening added alongside the removal of the
+// mint route's bootstrap exemption (cog-review, PR #551 round 2). Minting a
+// real node-root-surface grant on the same registry and stamping it onto
+// every request's context here keeps that check meaningfully exercised
+// (node-root may mint/revoke any surface) rather than special-cased away,
+// while leaving every existing assertion in this file about registry/ledger
+// behavior unchanged.
+func withPresentedNodeRootGrant(t *testing.T, s *Server, mux http.Handler) http.Handler {
+	t.Helper()
+	grant, err := s.identityGrants.MintOrReuse(nodeRootSurface, []string{nodeRootScope}, time.Hour)
+	if err != nil {
+		t.Fatalf("withPresentedNodeRootGrant: mint: %v", err)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(contextWithGrant(r.Context(), grant)))
+	})
 }
 
 func identityPostJSON(t *testing.T, url string, body any) *http.Response {
@@ -285,7 +312,7 @@ func TestIdentityGrantMint_CapacityErrorMapsTo429(t *testing.T) {
 	s := &Server{identityGrants: NewIdentityGrantRegistry()}
 	mux := http.NewServeMux()
 	s.registerIdentityGrantRoutes(mux)
-	front := httptest.NewServer(mux)
+	front := httptest.NewServer(withPresentedNodeRootGrant(t, s, mux))
 	defer front.Close()
 
 	var lastResp *http.Response
@@ -853,7 +880,239 @@ func newLedgerBackedIdentityGrantServer(t *testing.T, workspaceRoot string) (*Se
 	s := &Server{identityGrants: NewIdentityGrantRegistryWithLedger(workspaceRoot)}
 	mux := http.NewServeMux()
 	s.registerIdentityGrantRoutes(mux)
-	front := httptest.NewServer(mux)
+	front := httptest.NewServer(withPresentedNodeRootGrant(t, s, mux))
 	t.Cleanup(func() { front.Close() })
 	return s, front
+}
+
+// ── ExtendGrant: node-root TTL renewal (boot_node_root_grant.go followup) ──
+
+// TestExtendGrant_ExtendsWithoutChangingTokenHash is the core renewal tooth:
+// consumers of a long-lived grant (the dashboard, canvas, THESEUS) cache the
+// RAW TOKEN VALUE, so a renewal must extend the existing credential's expiry
+// rather than mint a replacement — minting a replacement would change
+// GrantID/Token/IntegrityHash and silently invalidate every cached copy.
+func TestExtendGrant_ExtendsWithoutChangingTokenHash(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+	grant, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	originalGrantID := grant.GrantID
+	originalToken := grant.Token
+	originalHash := grant.IntegrityHash
+	originalExpiresAt := grant.ExpiresAt
+
+	extended, err := reg.ExtendGrant("node-root", 2*time.Hour)
+	if err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+
+	if extended.GrantID != originalGrantID {
+		t.Errorf("GrantID changed on extend: got %q, want %q", extended.GrantID, originalGrantID)
+	}
+	if extended.Token != originalToken {
+		t.Errorf("Token changed on extend: got %q, want %q — consumers cache this raw value", extended.Token, originalToken)
+	}
+	if extended.IntegrityHash != originalHash {
+		t.Errorf("IntegrityHash changed on extend: got %q, want %q", extended.IntegrityHash, originalHash)
+	}
+	if !extended.ExpiresAt.After(originalExpiresAt) {
+		t.Errorf("ExpiresAt did not advance: got %v, want after %v", extended.ExpiresAt, originalExpiresAt)
+	}
+
+	// The original token must still verify post-extend — extension is not a
+	// supersession, so the pre-extend token is not invalidated.
+	if _, ok := reg.Verify("node-root", originalToken); !ok {
+		t.Fatalf("expected the original token to still verify after extend")
+	}
+}
+
+// TestExtendGrant_UnknownSurfaceReturnsErrGrantNotFound covers ExtendGrant's
+// contract for a surface with no live grant at all (never minted).
+func TestExtendGrant_UnknownSurfaceReturnsErrGrantNotFound(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+	if _, err := reg.ExtendGrant("node-root", time.Hour); !errors.Is(err, ErrGrantNotFound) {
+		t.Fatalf("expected ErrGrantNotFound for an unknown surface, got %v", err)
+	}
+}
+
+// TestExtendGrant_ExpiredGrantMintsFreshInstead is the documented edge case:
+// extending an already-expired grant is NOT a renewal (see ExtendGrant's doc
+// comment) — it returns ErrGrantNotFound so the caller (maybeRenewNodeRootGrant in
+// boot_node_root_grant.go) falls through to mint-or-recover a genuinely fresh
+// grant instead of silently un-expiring a stale one with the same token.
+func TestExtendGrant_ExpiredGrantMintsFreshInstead(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+	if _, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Millisecond); err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond) // let the short TTL lapse
+
+	if _, err := reg.ExtendGrant("node-root", time.Hour); !errors.Is(err, ErrGrantNotFound) {
+		t.Fatalf("expected ErrGrantNotFound for an expired grant (not a renewal target), got %v", err)
+	}
+
+	// The documented fallback: mint-or-recover establishes a fresh grant, as
+	// maybeRenewNodeRootGrant does on this exact error.
+	fresh, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("fallback mint: %v", err)
+	}
+	if fresh.Token == "" {
+		t.Fatalf("expected a fresh mint to produce a usable token")
+	}
+}
+
+// TestExtendGrant_ReplayHonorsExtendedExpiry is the restart tooth for
+// renewal: an identity.grant.extended event appended before a simulated
+// kernel restart must leave the rebuilt grant's ExpiresAt at the EXTENDED
+// value, not the original mint's expires_at — otherwise a renewed grant
+// would silently revert to its pre-renewal (possibly already-past) expiry
+// the moment the kernel restarted.
+func TestExtendGrant_ReplayHonorsExtendedExpiry(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+
+	before := NewIdentityGrantRegistryWithLedger(workspaceRoot)
+	grant, err := before.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	token := grant.Token
+
+	extended, err := before.ExtendGrant("node-root", 48*time.Hour)
+	if err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	// RFC3339 (the ledger's on-disk timestamp format) is second-precision, so
+	// round-trip through it here to match what replay will actually produce.
+	extendedExpiresAt, err := time.Parse(time.RFC3339, extended.ExpiresAt.Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("parse extended.ExpiresAt: %v", err)
+	}
+
+	// Simulate a kernel restart: throw away `before`, rebuild from the ledger
+	// alone (mint event + extend event, replayed in file order).
+	after, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	g, ok := after.Verify("node-root", token)
+	if !ok {
+		t.Fatalf("expected the pre-restart token to still verify after ledger rebuild")
+	}
+	if !g.ExpiresAt.Equal(extendedExpiresAt) {
+		t.Fatalf("rebuilt grant's ExpiresAt = %v, want the extended value %v (replay must honor the extend, not just the original issue)",
+			g.ExpiresAt, extendedExpiresAt)
+	}
+
+	// A stale extend event for a since-superseded grant_id must not resurrect
+	// into bySurface — belt-and-suspenders on the "current live grant" guard
+	// in applyIdentityGrantLedgerEvent's "extended" case. Re-mint with a
+	// different scope to supersede, then confirm the surface now serves the
+	// superseding grant, not something an old extend event could revive.
+	reMinted, err := before.MintOrReuse("node-root", []string{"node-root", "extra-scope"}, time.Hour)
+	if err != nil {
+		t.Fatalf("re-mint (supersede): %v", err)
+	}
+	afterSupersede, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild after supersede: %v", err)
+	}
+	if _, ok := afterSupersede.Verify("node-root", token); ok {
+		t.Fatalf("expected the superseded (pre-supersession) token to no longer verify")
+	}
+	if _, ok := afterSupersede.Verify("node-root", reMinted.Token); !ok {
+		t.Fatalf("expected the superseding grant's token to verify")
+	}
+}
+
+// TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace is the targeted
+// regression test for the round-5 data race (cog-review, PR #551 round 5):
+// ExtendGrant used to mutate a live *IdentityGrant's ExpiresAt field in
+// place while Verify/Current/VerifyAny hand that same pointer to callers who
+// read its fields after releasing the registry lock — exactly what
+// handleIdentityVerify and handleIdentityGrantCurrent do on every request,
+// and exactly what the round-4 renewal ticker made concurrent with live
+// traffic for the first time. The fix (ExtendGrant now allocates a new
+// struct and replaces the map entry instead of mutating in place) doesn't
+// change any single-goroutine assertion — it's only observable under
+// -race with true concurrency, which is what this test provides.
+//
+// Bounded and fast by design: a short, fixed iteration count per goroutine
+// rather than a wall-clock duration, so this stays quick under `go test
+// -race` (which itself already slows execution significantly) without
+// becoming a source of CI flakiness.
+func TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace(t *testing.T) {
+	t.Parallel()
+	reg := NewIdentityGrantRegistry()
+	grant, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	token := grant.Token
+
+	const iterations = 200
+	var wg sync.WaitGroup
+
+	// Writer: repeatedly extends the same live grant — the exact operation
+	// the renewal ticker performs against a live registry.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			if _, err := reg.ExtendGrant("node-root", time.Hour); err != nil {
+				t.Errorf("ExtendGrant: %v", err)
+				return
+			}
+		}
+	}()
+
+	// Reader #1: Verify, the path handleIdentityVerify's gate-exempt
+	// POST /v1/identity/verify exercises on every call.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			g, ok := reg.Verify("node-root", token)
+			if !ok {
+				t.Errorf("Verify: expected the token to keep verifying throughout concurrent extension")
+				return
+			}
+			_ = g.ExpiresAt.Format(time.RFC3339) // the exact field access the finding named
+		}
+	}()
+
+	// Reader #2: Current, the zero-paste-bootstrap path
+	// GET /v1/identity/grants/current exercises on every call.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			g, ok := reg.Current("node-root")
+			if !ok {
+				t.Errorf("Current: expected a live node-root grant throughout concurrent extension")
+				return
+			}
+			_ = g.ExpiresAt.Format(time.RFC3339)
+			_ = g.Token
+		}
+	}()
+
+	wg.Wait()
+
+	// Sanity check on final state: still the same credential, just extended.
+	final, ok := reg.Current("node-root")
+	if !ok {
+		t.Fatalf("expected a live node-root grant after the concurrent run")
+	}
+	if final.Token != token {
+		t.Errorf("Token changed across concurrent extension: got %q, want %q", final.Token, token)
+	}
+	if final.GrantID != grant.GrantID {
+		t.Errorf("GrantID changed across concurrent extension: got %q, want %q", final.GrantID, grant.GrantID)
+	}
 }

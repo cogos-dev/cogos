@@ -59,7 +59,7 @@ import (
 func newSessionsTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	nucleus := &Nucleus{Name: "test"}
 	proc := NewProcess(cfg, nucleus)
 	srv := NewServer(cfg, nucleus, proc)
@@ -497,7 +497,7 @@ func TestHandoffComplete_WithoutClaim(t *testing.T) {
 func TestReplayOnStartup(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	nucleus := &Nucleus{Name: "test"}
 	proc := NewProcess(cfg, nucleus)
 	srv1 := NewServer(cfg, nucleus, proc)
@@ -622,7 +622,7 @@ func TestClaimRejectedEventEmitted(t *testing.T) {
 func TestMCP_HandoffRoundTrip(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0}
+	cfg := &Config{WorkspaceRoot: root, CogDir: root + "/.cog", Port: 0, WriteRouteGrantAuthDisabled: true}
 	proc := NewProcess(cfg, &Nucleus{Name: "test"})
 	mcpSrv := NewMCPServer(cfg, &Nucleus{Name: "test"}, proc)
 	bus := NewBusSessionManager(root)

@@ -280,12 +280,16 @@ import (
 // The allowed method/header set is intentionally broad: GET/POST are the
 // common cases, PATCH/PUT/DELETE are permitted for future REST-ful
 // endpoints, and the accepted headers cover Content-Type, the MCP session
-// identifier, the Claude Code workspace root override, and Authorization
-// so downstream authenticated clients can send bearer tokens without
-// another round-trip of configuration.
+// identifier, the Claude Code workspace root override, Authorization so
+// downstream authenticated clients can send bearer tokens without another
+// round-trip of configuration, and X-Cogos-Grant — serve_grant_auth.go's
+// write-route grant-auth gate requires this header on every non-exempt
+// request, so a cross-origin loopback consumer (the mod3 dashboard on
+// :7860, canvas, THESEUS) attaching it must be allowed through preflight or
+// the browser blocks the real request before it ever reaches the gate.
 func corsMiddleware(next http.Handler) http.Handler {
 	const allowMethods = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
-	const allowHeaders = "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization"
+	const allowHeaders = "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization, X-Cogos-Grant"
 	const maxAge = "86400"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
