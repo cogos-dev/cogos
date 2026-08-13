@@ -3,6 +3,8 @@ package constellation
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -282,5 +284,268 @@ func TestIndexWorkspacePrunesGhostCogdocs(t *testing.T) {
 	}
 	if keepFound != 1 {
 		t.Errorf("expected keep-doc still searchable after prune, got %d", keepFound)
+	}
+}
+
+// writeFileAt writes an arbitrary cogdoc under c.root at the given
+// workspace-relative path, creating parent directories as needed. Unlike
+// writeCogdocInWorkspace (which is hardcoded to .cog/mem/), this lets tests
+// place a doc anywhere in the workspace tree — e.g. a workspace-root
+// cogdoc directory declared via cogdocs.yaml requiredPaths.
+func writeFileAt(t *testing.T, c *Constellation, relPath, frontmatter, body string) string {
+	t.Helper()
+	absPath := filepath.Join(c.root, relPath)
+	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(absPath), err)
+	}
+	content := "---\n" + frontmatter + "\n---\n\n" + body
+	if err := os.WriteFile(absPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write cogdoc %s: %v", absPath, err)
+	}
+	return absPath
+}
+
+// writeCogdocsYaml writes a minimal .cog/config/cogdocs.yaml declaring the
+// given requiredPaths, following the workspace's real cogdocs.yaml shape
+// (see .cog/config/cogdocs.yaml's requiredPaths list).
+func writeCogdocsYaml(t *testing.T, c *Constellation, requiredPaths []string) {
+	t.Helper()
+	configDir := filepath.Join(c.root, ".cog", "config")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", configDir, err)
+	}
+	var sb strings.Builder
+	sb.WriteString("version: \"1.0\"\nrequiredPaths:\n")
+	for _, p := range requiredPaths {
+		sb.WriteString("  - " + p + "\n")
+	}
+	path := filepath.Join(configDir, "cogdocs.yaml")
+	if err := os.WriteFile(path, []byte(sb.String()), 0644); err != nil {
+		t.Fatalf("write cogdocs.yaml: %v", err)
+	}
+}
+
+// TestWalkRootsDerivesExtraRootsFromCogdocsYaml verifies walkRoots reads
+// requiredPaths from .cog/config/cogdocs.yaml to add workspace-root roots
+// beyond .cog/, and skips declared paths that are already nested under .cog/
+// (the base walk covers those already).
+func TestWalkRootsDerivesExtraRootsFromCogdocsYaml(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	archDir := filepath.Join(c.root, "architecture")
+	if err := os.MkdirAll(archDir, 0755); err != nil {
+		t.Fatalf("mkdir architecture: %v", err)
+	}
+	memSemanticDir := filepath.Join(c.root, ".cog", "mem", "semantic")
+	if err := os.MkdirAll(memSemanticDir, 0755); err != nil {
+		t.Fatalf("mkdir .cog/mem/semantic: %v", err)
+	}
+
+	writeCogdocsYaml(t, c, []string{"architecture/", ".cog/mem/semantic/"})
+
+	resolvedArch, err := filepath.EvalSymlinks(archDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(architecture): %v", err)
+	}
+	resolvedCog, err := filepath.EvalSymlinks(filepath.Join(c.root, ".cog"))
+	if err != nil {
+		t.Fatalf("EvalSymlinks(.cog): %v", err)
+	}
+
+	roots := c.walkRoots()
+
+	foundArch := false
+	nestedCount := 0
+	for _, r := range roots {
+		if r == resolvedArch {
+			foundArch = true
+		}
+		if r != resolvedCog && strings.HasPrefix(r, resolvedCog+string(filepath.Separator)) {
+			nestedCount++
+		}
+	}
+	if !foundArch {
+		t.Errorf("expected walkRoots to include workspace-root architecture/ dir %q, got %v", resolvedArch, roots)
+	}
+	if nestedCount != 0 {
+		t.Errorf("expected requiredPaths nested under .cog/ to be skipped (already covered by base walk), got %d extra nested roots in %v", nestedCount, roots)
+	}
+}
+
+// TestWalkRootsSkipsDeclaredPathThatDoesNotExist verifies a requiredPaths
+// entry with no backing directory on disk is silently skipped rather than
+// producing a walk error — a config declaration is not a guarantee.
+func TestWalkRootsSkipsDeclaredPathThatDoesNotExist(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(filepath.Join(c.root, ".cog"), 0755); err != nil {
+		t.Fatalf("mkdir .cog: %v", err)
+	}
+	writeCogdocsYaml(t, c, []string{"nonexistent-dir/"})
+
+	roots := c.walkRoots()
+	if len(roots) != 1 {
+		t.Errorf("expected only the base .cog/ root when the declared path doesn't exist, got %v", roots)
+	}
+}
+
+// TestIndexWorkspaceWidensRootsToWorkspaceRootCogdocDir is the regression test
+// for the reindex-widening half of this change: a cogdoc living under a
+// workspace-root directory declared in cogdocs.yaml's requiredPaths (e.g.
+// architecture/, per the v2 migration moving the ADR/RFC corpus out of
+// .cog/adr) must be indexed by IndexWorkspace even though it sits entirely
+// outside .cog/.
+func TestIndexWorkspaceWidensRootsToWorkspaceRootCogdocDir(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(filepath.Join(c.root, ".cog"), 0755); err != nil {
+		t.Fatalf("mkdir .cog: %v", err)
+	}
+	writeCogdocsYaml(t, c, []string{"architecture/"})
+
+	writeFileAt(t, c, "architecture/adrs/001-widen-roots.cog.md",
+		"id: adr-001-widen-roots\ntype: adr\ntitle: Widen Roots\ncreated: 2026-01-01",
+		"Body with unique token archroottoken.",
+	)
+
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("IndexWorkspace: %v", err)
+	}
+
+	var count int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = 'adr-001-widen-roots'`).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected workspace-root architecture/ cogdoc indexed, got %d rows", count)
+	}
+
+	var ftsCount int
+	if err := c.DB().QueryRow(
+		`SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'archroottoken'`,
+	).Scan(&ftsCount); err != nil {
+		t.Fatalf("FTS query: %v", err)
+	}
+	if ftsCount == 0 {
+		t.Error("expected workspace-root architecture/ cogdoc to be FTS-searchable, got 0 matches")
+	}
+}
+
+// TestIndexWorkspaceSymlinkAliasNoDuplicateRow is the regression test for the
+// symlink-resolved-path half of this change: the same real file reached via
+// two different literal path strings — a symlink under .cog/mem/ and its
+// target under the widened workspace-root architecture/ root — must produce
+// exactly one documents row, not two. Before symlink resolution, the two
+// alias paths would compute different auto-generated IDs (the ID derivation
+// in parseCogdoc keys off finding ".cog/" in the path) and neither the `id`
+// PRIMARY KEY nor the `path` UNIQUE constraint would catch the resulting
+// duplicate.
+func TestIndexWorkspaceSymlinkAliasNoDuplicateRow(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	writeCogdocsYaml(t, c, []string{"architecture/"})
+
+	realPath := writeFileAt(t, c, "architecture/foo.cog.md",
+		"id: arch-foo\ntype: adr\ntitle: Arch Foo\ncreated: 2026-01-01",
+		"Body with unique token symlinktoken.",
+	)
+
+	memSemanticDir := filepath.Join(c.root, ".cog", "mem", "semantic")
+	if err := os.MkdirAll(memSemanticDir, 0755); err != nil {
+		t.Fatalf("mkdir .cog/mem/semantic: %v", err)
+	}
+	aliasPath := filepath.Join(memSemanticDir, "foo-alias.cog.md")
+	if err := os.Symlink(realPath, aliasPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("IndexWorkspace: %v", err)
+	}
+
+	// Exactly one row for the doc's ID, regardless of which alias path
+	// discovered it first.
+	var docCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = 'arch-foo'`).Scan(&docCount); err != nil {
+		t.Fatalf("documents count: %v", err)
+	}
+	if docCount != 1 {
+		t.Errorf("expected exactly 1 documents row for the doc reached via both a symlink and its real path, got %d", docCount)
+	}
+
+	// And no stray second row under the alias's own (unresolved) path or any
+	// other id — total .cog.md rows in the workspace should be exactly 1.
+	var totalCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE path LIKE '%.cog.md'`).Scan(&totalCount); err != nil {
+		t.Fatalf("total count: %v", err)
+	}
+	if totalCount != 1 {
+		t.Errorf("expected exactly 1 total cogdoc row (symlink alias must not produce a second), got %d", totalCount)
+	}
+}
+
+// TestIndexWorkspacePrunesWholesaleDeletedDirectoryOutsideMem is the
+// regression test for issue #552: the previous ghost-prune pass scoped
+// candidates to '%/.cog/mem/%.cog.md' only, so deleting an entire non-mem
+// managed directory (e.g. .cog/adr/, before it moved to architecture/adrs/)
+// left every row under it behind forever — the walk simply never visited
+// those rows again (the directory is gone) and the old prune query never even
+// considered them, because they weren't under .cog/mem/. After the fix, a
+// from-scratch rebuild drops every documents row not visited this run,
+// regardless of which managed directory it lived under.
+func TestIndexWorkspacePrunesWholesaleDeletedDirectoryOutsideMem(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	adrDir := filepath.Join(c.root, ".cog", "adr")
+	writeFileAt(t, c, ".cog/adr/001-example.cog.md",
+		"id: adr-001-example\ntype: adr\ntitle: Example ADR\ncreated: 2026-01-01",
+		"Body that will be removed wholesale. Token wholesaletoken.",
+	)
+	writeFileAt(t, c, ".cog/mem/semantic/keep.cog.md",
+		"id: mem-keep\ntype: note\ntitle: Keep\ncreated: 2026-01-01",
+		"Body that survives.",
+	)
+
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("first IndexWorkspace: %v", err)
+	}
+	for _, id := range []string{"adr-001-example", "mem-keep"} {
+		var n int
+		if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = ?`, id).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", id, err)
+		}
+		if n != 1 {
+			t.Fatalf("expected %s indexed after first pass, got %d", id, n)
+		}
+	}
+
+	// Remove the whole .cog/adr/ directory, not just the one file inside it.
+	if err := os.RemoveAll(adrDir); err != nil {
+		t.Fatalf("remove adr dir: %v", err)
+	}
+
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("second IndexWorkspace: %v", err)
+	}
+
+	var adrCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = 'adr-001-example'`).Scan(&adrCount); err != nil {
+		t.Fatalf("adr count: %v", err)
+	}
+	if adrCount != 0 {
+		t.Errorf("expected adr-001-example pruned after its whole directory was removed, got %d rows", adrCount)
+	}
+
+	var keepCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = 'mem-keep'`).Scan(&keepCount); err != nil {
+		t.Fatalf("keep count: %v", err)
+	}
+	if keepCount != 1 {
+		t.Errorf("expected mem-keep to survive the prune, got %d rows", keepCount)
 	}
 }

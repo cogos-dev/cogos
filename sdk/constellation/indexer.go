@@ -96,43 +96,79 @@ func (c *Constellation) IndexWorkspace() error {
 	// rows whose underlying file no longer exists) belongs in a dedicated stat-based sweep,
 	// not a path-prefix DELETE; re-indexing below is idempotent and does not require it.
 
-	// Walk .cog directory for cogdocs
-	err = filepath.WalkDir(filepath.Join(c.root, ".cog"), func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip .state directory
-		if d.IsDir() && d.Name() == ".state" {
-			return fs.SkipDir
-		}
-
-		// Index *.cog.md files
-		if !d.IsDir() && strings.HasSuffix(d.Name(), ".cog.md") {
-			if err := c.indexCogdoc(tx, path); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to index %s: %v\n", path, err)
-				skipped++
-			} else {
-				indexed++
+	// Walk roots: the workspace .cog/ directory, plus any workspace-root cogdoc
+	// directories declared in .cog/config/cogdocs.yaml's requiredPaths (e.g.
+	// architecture/, introduced by the v2 migration moving the ADR/RFC corpus
+	// out of .cog/adr into architecture/adrs/ — see walkRoots for the derivation
+	// and issue #552's "Related" note on the transitional .cog/architecture
+	// symlink). visited tracks every *.cog.md file actually encountered this
+	// run, keyed by its symlink-RESOLVED real path, so:
+	//   - the same real file reached via two different literal path strings
+	//     (a symlink alias and its target, e.g. .cog/architecture/foo.cog.md
+	//     and architecture/foo.cog.md) is indexed exactly once instead of
+	//     producing two documents rows for one file (both id and path would
+	//     differ between the aliases, so neither UNIQUE constraint would catch
+	//     it); and
+	//   - pruneGhostCogdocs below can tell "not visited" apart from "failed to
+	//     parse" (a malformed-but-still-present doc must keep its stale row,
+	//     not be treated as a ghost — see TestIndexWorkspaceToleratesMalformedFrontmatter).
+	roots := c.walkRoots()
+	visited := make(map[string]bool)
+	for _, walkRoot := range roots {
+		err = filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
 			}
+
+			// Skip .state directory
+			if d.IsDir() && d.Name() == ".state" {
+				return fs.SkipDir
+			}
+
+			// Index *.cog.md files
+			if !d.IsDir() && strings.HasSuffix(d.Name(), ".cog.md") {
+				realPath, rerr := filepath.EvalSymlinks(path)
+				if rerr != nil {
+					// Resolution failure (e.g. a broken symlink) — fall back to the
+					// walked path; indexCogdoc's os.ReadFile will surface the real
+					// error if the file truly can't be read.
+					realPath = path
+				}
+				if visited[realPath] {
+					// Already indexed via another walk root or a different alias
+					// path for the same real file this run.
+					return nil
+				}
+				visited[realPath] = true
+				if err := c.indexCogdoc(tx, realPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to index %s: %v\n", realPath, err)
+					skipped++
+				} else {
+					indexed++
+				}
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to walk workspace root %s: %w", walkRoot, err)
 		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to walk workspace: %w", err)
 	}
 
-	// Prune ghost rows: cogdoc rows under .cog/mem/ whose backing file no longer
-	// exists on disk. Re-indexing is additive (INSERT OR REPLACE) and never
-	// removes rows for deleted files, so without this sweep a deleted cogdoc's
-	// row (and its FTS entry, tags, refs) persist forever. Scope the sweep to
-	// managed cogdoc paths ('%/.cog/mem/%.cog.md') so non-cogdoc rows indexed
-	// from outside the memory corpus (e.g. conversation/session documents) are
-	// never touched. tags / doc_references / backlinks cascade on delete;
-	// documents_fts is rebuilt from documents below.
-	pruned, err := c.pruneGhostCogdocs(tx)
+	// Prune ghost rows: cogdoc rows under any walked root whose backing file was
+	// not visited this run — either because the individual file was deleted, or
+	// because a whole directory was removed wholesale (issue #552: deleting
+	// .cog/adr/ entirely left 93 rows behind because the old sweep only scoped
+	// to '%/.cog/mem/%.cog.md' and only ever considered rows the walk revisited).
+	// Re-indexing is additive (INSERT OR REPLACE) and never removes rows for
+	// deleted files, so without this sweep a deleted cogdoc's row (and its FTS
+	// entry, tags, refs) persist forever. Scope is derived from the same roots
+	// list the walk just used, so rows indexed from outside the workspace's
+	// managed cogdoc directories (e.g. conversation/session documents) are never
+	// touched. tags / doc_references / backlinks cascade on delete; documents_fts
+	// is rebuilt from documents below.
+	pruned, err := c.pruneGhostCogdocs(tx, roots, visited)
 	if err != nil {
 		return fmt.Errorf("failed to prune ghost cogdocs: %w", err)
 	}
@@ -190,20 +226,32 @@ func (c *Constellation) IndexWorkspace() error {
 	return nil
 }
 
-// pruneGhostCogdocs removes documents rows for managed cogdocs whose backing
-// file no longer exists on disk. It is the stat-based orphan sweep referenced in
-// IndexWorkspace's design note: re-indexing is additive and never deletes rows,
-// so deleted cogdocs would otherwise leave permanent ghost rows in the index.
+// pruneGhostCogdocs removes documents rows for managed cogdocs that this run's
+// walk did not visit — i.e. their backing file no longer exists, whether
+// because the individual file was deleted or because an entire directory was
+// removed wholesale. It is the orphan sweep referenced in IndexWorkspace's
+// design note: re-indexing is additive and never deletes rows, so deleted
+// cogdocs would otherwise leave permanent ghost rows in the index.
 //
-// Scope is intentionally narrow: only rows whose path matches
-// '%/.cog/mem/%.cog.md' are candidates, so rows indexed from outside the memory
-// corpus are never removed. Deletes cascade to tags / doc_references / backlinks
-// (schema FKs, ON DELETE CASCADE); the caller rebuilds documents_fts from
-// documents afterward, so no explicit FTS delete is needed here. Returns the
-// number of rows pruned.
-func (c *Constellation) pruneGhostCogdocs(tx *sql.Tx) (int, error) {
+// Scope: a row is a ghost candidate only if its path falls under one of the
+// roots this run walked (isUnderAnyRoot) AND ends in ".cog.md" — the exact set
+// of files the walk claims to own. Rows indexed from outside that scope (e.g.
+// conversation/session documents under ~/.claude) never match a root prefix
+// and are left untouched. Fix for issue #552: the previous version scoped
+// candidates to the SQL pattern '%/.cog/mem/%.cog.md' only, so rows under any
+// other managed directory (.cog/adr/, the newly-widened workspace-root roots)
+// were never even considered — deleting .cog/adr/ wholesale left 93 ghost rows
+// behind. Membership in `visited` (populated by the walk in IndexWorkspace,
+// keyed by symlink-resolved real path) replaces the old per-row os.Stat call:
+// a row not visited this run is a ghost by definition, whether the underlying
+// file was individually deleted or its whole parent directory is gone.
+//
+// Deletes cascade to tags / doc_references / backlinks (schema FKs, ON DELETE
+// CASCADE); the caller rebuilds documents_fts from documents afterward, so no
+// explicit FTS delete is needed here. Returns the number of rows pruned.
+func (c *Constellation) pruneGhostCogdocs(tx *sql.Tx, roots []string, visited map[string]bool) (int, error) {
 	rows, err := tx.Query(
-		`SELECT id, path FROM documents WHERE path LIKE '%/.cog/mem/%.cog.md'`,
+		`SELECT id, path FROM documents WHERE path LIKE '%.cog.md'`,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("select cogdoc rows: %w", err)
@@ -220,7 +268,12 @@ func (c *Constellation) pruneGhostCogdocs(tx *sql.Tx) (int, error) {
 			rows.Close()
 			return 0, fmt.Errorf("scan cogdoc row: %w", err)
 		}
-		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		if !isUnderAnyRoot(path, roots) {
+			// Not a managed cogdoc under any root this run walked (e.g. an
+			// out-of-workspace row) — never a ghost candidate.
+			continue
+		}
+		if !visited[path] {
 			ghosts = append(ghosts, ghost{id: id, path: path})
 		}
 	}
@@ -240,6 +293,120 @@ func (c *Constellation) pruneGhostCogdocs(tx *sql.Tx) (int, error) {
 		pruned++
 	}
 	return pruned, nil
+}
+
+// isUnderAnyRoot reports whether path is exactly one of roots, or nested
+// under one of them. roots are expected to already be absolute, cleaned
+// (filepath.Join / filepath.EvalSymlinks output), matching how documents.path
+// is stored (see indexCogdoc, which writes the walk-encountered — and now
+// symlink-resolved — path verbatim).
+func isUnderAnyRoot(path string, roots []string) bool {
+	for _, root := range roots {
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// cogdocsConfig is the declared shape of .cog/config/cogdocs.yaml relevant to
+// indexing. The file also carries exemptPatterns / conventionalFiles /
+// validTypes for cogdoc *validation*, which indexing has no use for and does
+// not parse.
+type cogdocsConfig struct {
+	// RequiredPaths lists workspace-relative cogdoc directories the workspace
+	// declares as canonical (e.g. "architecture/", ".cog/mem/semantic/") — see
+	// e.g. .cog/config/cogdocs.yaml's requiredPaths. walkRoots uses this to
+	// derive extra walk roots outside .cog/ rather than hardcoding them.
+	RequiredPaths []string `yaml:"requiredPaths"`
+}
+
+// loadCogdocsConfig reads the optional .cog/config/cogdocs.yaml declaration,
+// following the .cog/config/<name>.yaml convention used elsewhere in this
+// codebase (see internal/providers/vitalsretention.LoadConfig for the sibling
+// pattern: missing file → zero value, not an error). A workspace with no
+// cogdocs.yaml simply declares no extra required paths.
+func loadCogdocsConfig(workspaceRoot string) (cogdocsConfig, error) {
+	path := filepath.Join(workspaceRoot, ".cog", "config", "cogdocs.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cogdocsConfig{}, nil
+		}
+		return cogdocsConfig{}, err
+	}
+	var cfg cogdocsConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cogdocsConfig{}, err
+	}
+	return cfg, nil
+}
+
+// walkRoots returns the absolute, symlink-resolved directories IndexWorkspace
+// should walk: the workspace's .cog/ directory (always — indexing has always
+// required this to exist), plus any cogdocs.yaml requiredPaths entries that
+// fall OUTSIDE .cog/ — e.g. the workspace-root architecture/ directory the v2
+// migration moved the ADR/RFC corpus into (issue #552's "Related" note: the
+// walker previously covered only .cog/, so a corpus living at the workspace
+// root was invisible to it once the transitional .cog/architecture symlink
+// retires).
+//
+// requiredPaths entries already nested under .cog/ (e.g. ".cog/mem/semantic/")
+// are skipped: the base .cog/ walk already covers them, and adding them again
+// would just be wasted work (each root is walked once; recall indexCogdoc is
+// idempotent per real path, so it wouldn't be incorrect — just redundant).
+//
+// Every returned root is passed through filepath.EvalSymlinks so a root that
+// is itself reached via a symlink resolves to the same canonical form
+// indexCogdoc will store for files under it, keeping pruneGhostCogdocs'
+// root-prefix membership check (isUnderAnyRoot) consistent with what's
+// actually in the documents table.
+//
+// A missing or unreadable cogdocs.yaml is not an error — it just means no
+// extra roots are declared; the walk still covers .cog/.
+func (c *Constellation) walkRoots() []string {
+	cogRoot := filepath.Join(c.root, ".cog")
+	resolvedCogRoot, err := filepath.EvalSymlinks(cogRoot)
+	if err != nil {
+		// .cog/ doesn't exist yet (e.g. a brand-new workspace) — the walk below
+		// will simply find nothing there; fall back to the unresolved form so
+		// there's still a root to attempt (and a meaningful error if it's
+		// genuinely absent, matching pre-existing behavior).
+		resolvedCogRoot = cogRoot
+	}
+
+	roots := []string{resolvedCogRoot}
+	seen := map[string]bool{resolvedCogRoot: true}
+
+	cfg, err := loadCogdocsConfig(c.root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to read .cog/config/cogdocs.yaml: %v\n", err)
+		return roots
+	}
+
+	for _, rel := range cfg.RequiredPaths {
+		abs := rel
+		if !filepath.IsAbs(rel) {
+			abs = filepath.Join(c.root, rel)
+		}
+		resolved, evalErr := filepath.EvalSymlinks(abs)
+		if evalErr != nil {
+			// Declared path doesn't exist on disk (not yet created, or since
+			// removed) — a config declaration is not a guarantee, and a missing
+			// directory here is not a walk error.
+			continue
+		}
+		if seen[resolved] {
+			continue
+		}
+		if resolved == resolvedCogRoot || strings.HasPrefix(resolved, resolvedCogRoot+string(filepath.Separator)) {
+			// Already covered by the base .cog/ walk.
+			continue
+		}
+		seen[resolved] = true
+		roots = append(roots, resolved)
+	}
+	return roots
 }
 
 // IndexFile indexes a single cogdoc file into the constellation.
