@@ -43,11 +43,14 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // nodeRootSurface is the identity-grant surface name the kernel mints its
@@ -131,6 +134,90 @@ func ensureNodeRootGrant(s *Server) (*IdentityGrant, error) {
 			"path", vaultPath, "err", err)
 	}
 	return grant, nil
+}
+
+// nodeRootGrantRenewalInterval is the cadence startNodeRootGrantRenewal ticks
+// at: half of defaultGrantTTL (serve_identity_grants.go), not "just before
+// expiry", so a single missed or failed tick (kernel under load, a transient
+// ledger append failure) still leaves a full TTL/2 window before the grant
+// would actually lapse. This is the fix for the finding that
+// ensureNodeRootGrant mints via MintOrReuse(..., 0) — the package-default
+// 30-day TTL — with nothing renewing it, so a kernel with >30d uptime started
+// 401ing every local consumer of the write-route grant-auth gate until
+// restart.
+func nodeRootGrantRenewalInterval() time.Duration {
+	return defaultGrantTTL / 2
+}
+
+// startNodeRootGrantRenewal starts a background ticker, owned by the kernel
+// lifecycle exactly like LocalHarnessController.runTicker
+// (local_agent_harness.go) and ReconcileDaemon's own loop: it stops the
+// instant ctx is cancelled, no separate Stop() method needed. Called from
+// Boot() after kernelCtx exists, so Kernel.Stop's context cancellation is
+// sufficient to tear this down along with every other kernel goroutine.
+//
+// Each tick extends the node-root grant's expiry via
+// IdentityGrantRegistry.ExtendGrant, which — critically — leaves GrantID,
+// Token, and IntegrityHash untouched: local consumers (the dashboard, canvas,
+// Claude Code hooks, THESEUS) cache the RAW TOKEN VALUE from their own boot,
+// and a renewal that minted a replacement token instead of extending the
+// existing one would silently 401 every one of those cached copies the
+// moment it superseded the old grant_id — the exact failure mode this ticker
+// exists to prevent, just moved earlier in time.
+func startNodeRootGrantRenewal(ctx context.Context, s *Server) {
+	interval := nodeRootGrantRenewalInterval()
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				renewNodeRootGrant(s)
+			}
+		}
+	}()
+}
+
+// renewNodeRootGrant performs one renewal tick. Logged at debug on the
+// ordinary-extend path (once per renewal, not per health-check-style poll —
+// the ticker itself only fires at half-TTL intervals, so there is no
+// per-check spam to worry about) and at warn/info on the two edge paths.
+//
+// Expired-then-extended edge (documented choice, per the build directive):
+// if ExtendGrant reports ErrGrantNotFound — the node-root grant expired
+// before this tick ran (kernel was suspended/asleep past a tick, or the very
+// first ensureNodeRootGrant mint somehow already lapsed) — extending it would
+// silently un-expire a credential the kernel no longer trusts having tracked
+// continuously (see ExtendGrant's doc comment). Instead this falls through to
+// ensureNodeRootGrant's ordinary mint-or-recover path, establishing a
+// genuinely fresh grant. That IS a real credential change every consumer
+// must re-fetch via GET /v1/identity/grants/current?surface=node-root, so it
+// logs at Info rather than Debug.
+func renewNodeRootGrant(s *Server) {
+	if s == nil || s.identityGrants == nil {
+		return
+	}
+	grant, err := s.identityGrants.ExtendGrant(nodeRootSurface, defaultGrantTTL)
+	if err != nil {
+		if errors.Is(err, ErrGrantNotFound) {
+			fresh, mintErr := ensureNodeRootGrant(s)
+			if mintErr != nil {
+				slog.Warn("node-root grant renewal: prior grant had expired and mint/recover failed; "+
+					"local consumers must self-mint via POST /v1/identity/grants until the next tick",
+					"err", mintErr)
+				return
+			}
+			slog.Info("node-root grant renewal: prior grant had already expired; minted/recovered a fresh one "+
+				"(this is a real credential change — consumers must re-fetch via GET /v1/identity/grants/current?surface=node-root)",
+				"grant_id", fresh.GrantID, "expires_at", fresh.ExpiresAt.Format(time.RFC3339))
+			return
+		}
+		slog.Warn("node-root grant renewal: extend failed; will retry on the next tick", "err", err)
+		return
+	}
+	slog.Debug("node-root grant renewal: extended", "grant_id", grant.GrantID, "expires_at", grant.ExpiresAt.Format(time.RFC3339))
 }
 
 // persistNodeRootGrant writes token to path with 0600 permissions, creating

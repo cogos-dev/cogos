@@ -857,3 +857,148 @@ func newLedgerBackedIdentityGrantServer(t *testing.T, workspaceRoot string) (*Se
 	t.Cleanup(func() { front.Close() })
 	return s, front
 }
+
+// ── ExtendGrant: node-root TTL renewal (boot_node_root_grant.go followup) ──
+
+// TestExtendGrant_ExtendsWithoutChangingTokenHash is the core renewal tooth:
+// consumers of a long-lived grant (the dashboard, canvas, THESEUS) cache the
+// RAW TOKEN VALUE, so a renewal must extend the existing credential's expiry
+// rather than mint a replacement — minting a replacement would change
+// GrantID/Token/IntegrityHash and silently invalidate every cached copy.
+func TestExtendGrant_ExtendsWithoutChangingTokenHash(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+	grant, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	originalGrantID := grant.GrantID
+	originalToken := grant.Token
+	originalHash := grant.IntegrityHash
+	originalExpiresAt := grant.ExpiresAt
+
+	extended, err := reg.ExtendGrant("node-root", 2*time.Hour)
+	if err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+
+	if extended.GrantID != originalGrantID {
+		t.Errorf("GrantID changed on extend: got %q, want %q", extended.GrantID, originalGrantID)
+	}
+	if extended.Token != originalToken {
+		t.Errorf("Token changed on extend: got %q, want %q — consumers cache this raw value", extended.Token, originalToken)
+	}
+	if extended.IntegrityHash != originalHash {
+		t.Errorf("IntegrityHash changed on extend: got %q, want %q", extended.IntegrityHash, originalHash)
+	}
+	if !extended.ExpiresAt.After(originalExpiresAt) {
+		t.Errorf("ExpiresAt did not advance: got %v, want after %v", extended.ExpiresAt, originalExpiresAt)
+	}
+
+	// The original token must still verify post-extend — extension is not a
+	// supersession, so the pre-extend token is not invalidated.
+	if _, ok := reg.Verify("node-root", originalToken); !ok {
+		t.Fatalf("expected the original token to still verify after extend")
+	}
+}
+
+// TestExtendGrant_UnknownSurfaceReturnsErrGrantNotFound covers ExtendGrant's
+// contract for a surface with no live grant at all (never minted).
+func TestExtendGrant_UnknownSurfaceReturnsErrGrantNotFound(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+	if _, err := reg.ExtendGrant("node-root", time.Hour); !errors.Is(err, ErrGrantNotFound) {
+		t.Fatalf("expected ErrGrantNotFound for an unknown surface, got %v", err)
+	}
+}
+
+// TestExtendGrant_ExpiredGrantMintsFreshInstead is the documented edge case:
+// extending an already-expired grant is NOT a renewal (see ExtendGrant's doc
+// comment) — it returns ErrGrantNotFound so the caller (renewNodeRootGrant in
+// boot_node_root_grant.go) falls through to mint-or-recover a genuinely fresh
+// grant instead of silently un-expiring a stale one with the same token.
+func TestExtendGrant_ExpiredGrantMintsFreshInstead(t *testing.T) {
+	reg := NewIdentityGrantRegistry()
+	if _, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Millisecond); err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond) // let the short TTL lapse
+
+	if _, err := reg.ExtendGrant("node-root", time.Hour); !errors.Is(err, ErrGrantNotFound) {
+		t.Fatalf("expected ErrGrantNotFound for an expired grant (not a renewal target), got %v", err)
+	}
+
+	// The documented fallback: mint-or-recover establishes a fresh grant, as
+	// renewNodeRootGrant does on this exact error.
+	fresh, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("fallback mint: %v", err)
+	}
+	if fresh.Token == "" {
+		t.Fatalf("expected a fresh mint to produce a usable token")
+	}
+}
+
+// TestExtendGrant_ReplayHonorsExtendedExpiry is the restart tooth for
+// renewal: an identity.grant.extended event appended before a simulated
+// kernel restart must leave the rebuilt grant's ExpiresAt at the EXTENDED
+// value, not the original mint's expires_at — otherwise a renewed grant
+// would silently revert to its pre-renewal (possibly already-past) expiry
+// the moment the kernel restarted.
+func TestExtendGrant_ReplayHonorsExtendedExpiry(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	t.Cleanup(resetLedgerCacheForTest)
+	resetLedgerCacheForTest()
+
+	before := NewIdentityGrantRegistryWithLedger(workspaceRoot)
+	grant, err := before.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	token := grant.Token
+
+	extended, err := before.ExtendGrant("node-root", 48*time.Hour)
+	if err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	// RFC3339 (the ledger's on-disk timestamp format) is second-precision, so
+	// round-trip through it here to match what replay will actually produce.
+	extendedExpiresAt, err := time.Parse(time.RFC3339, extended.ExpiresAt.Format(time.RFC3339))
+	if err != nil {
+		t.Fatalf("parse extended.ExpiresAt: %v", err)
+	}
+
+	// Simulate a kernel restart: throw away `before`, rebuild from the ledger
+	// alone (mint event + extend event, replayed in file order).
+	after, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	g, ok := after.Verify("node-root", token)
+	if !ok {
+		t.Fatalf("expected the pre-restart token to still verify after ledger rebuild")
+	}
+	if !g.ExpiresAt.Equal(extendedExpiresAt) {
+		t.Fatalf("rebuilt grant's ExpiresAt = %v, want the extended value %v (replay must honor the extend, not just the original issue)",
+			g.ExpiresAt, extendedExpiresAt)
+	}
+
+	// A stale extend event for a since-superseded grant_id must not resurrect
+	// into bySurface — belt-and-suspenders on the "current live grant" guard
+	// in applyIdentityGrantLedgerEvent's "extended" case. Re-mint with a
+	// different scope to supersede, then confirm the surface now serves the
+	// superseding grant, not something an old extend event could revive.
+	reMinted, err := before.MintOrReuse("node-root", []string{"node-root", "extra-scope"}, time.Hour)
+	if err != nil {
+		t.Fatalf("re-mint (supersede): %v", err)
+	}
+	afterSupersede, err := RebuildIdentityGrantRegistryFromLedger(workspaceRoot)
+	if err != nil {
+		t.Fatalf("rebuild after supersede: %v", err)
+	}
+	if _, ok := afterSupersede.Verify("node-root", token); ok {
+		t.Fatalf("expected the superseded (pre-supersession) token to no longer verify")
+	}
+	if _, ok := afterSupersede.Verify("node-root", reMinted.Token); !ok {
+		t.Fatalf("expected the superseding grant's token to verify")
+	}
+}

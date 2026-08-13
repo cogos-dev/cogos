@@ -86,7 +86,13 @@
 // event carries {grant_id, surface, scope, integrity_hash, issued_at/
 // expires_at or revoked_at/superseded_at} — NEVER the raw token value
 // (ADR-091 §5; same verifyKeyIntegrity hash-not-value pattern
-// identity_provider.go already established). On kernel boot,
+// identity_provider.go already established). A fourth event,
+// identity.grant.extended (added for node-root TTL renewal — see
+// ExtendGrant and boot_node_root_grant.go's background ticker), advances an
+// already-tracked grant's expires_at WITHOUT touching its grant_id, scope, or
+// integrity_hash — unlike supersession, extension is not a new credential, it
+// is the same one living longer, which is exactly why it gets its own event
+// type instead of reusing identity.grant.superseded. On kernel boot,
 // RebuildIdentityGrantRegistryFromLedger replays every identity.grant.*
 // event in the dedicated "identity-grants" ledger session bucket to
 // reconstruct the live grant set — this is what makes a previously-issued
@@ -542,6 +548,87 @@ func (r *IdentityGrantRegistry) Revoke(grantID string) (*IdentityGrant, error) {
 	return g, nil
 }
 
+// ExtendGrant extends the live grant for surface by ttl (from now), appending
+// an identity.grant.extended ledger event (write-ahead, same discipline as
+// MintOrReuse/Revoke) before mutating ExpiresAt in the live index. GrantID,
+// Token, and IntegrityHash are left completely unchanged — this is the
+// mechanism for board-task-60-followup's node-root TTL renewal
+// (boot_node_root_grant.go's background ticker): consumers of a long-lived
+// grant (the dashboard, canvas, THESEUS) cache the RAW TOKEN VALUE, so
+// renewal must EXTEND the existing credential's expiry rather than mint a
+// replacement — a replacement would silently invalidate every cached copy
+// the moment it superseded the old grant_id, exactly the churn MintOrReuse's
+// own doc comment already documents avoiding on ordinary restarts.
+//
+// ttl <= 0 falls back to defaultGrantTTL, matching MintOrReuse's own
+// zero-means-default convention.
+//
+// If the grant is already expired, this is deliberately NOT a renewal:
+// ErrGrantNotFound is returned, same sentinel and same shape as Revoke's
+// "no live grant with that id" — an expired grant has already stopped
+// verifying, so every consumer holding its token is already 401ing, and
+// silently restoring its old expiry with the same token would un-expire a
+// credential the kernel itself no longer tracked as live. The documented
+// choice (per the build directive) is that the caller falls through to
+// MintOrReuse/ensureNodeRootGrant's ordinary mint-or-recover path instead,
+// establishing a genuinely fresh grant rather than resurrecting a stale one.
+func (r *IdentityGrantRegistry) ExtendGrant(surface string, ttl time.Duration) (*IdentityGrant, error) {
+	if surface == "" {
+		return nil, fmt.Errorf("surface is required")
+	}
+	now := time.Now().UTC()
+	if ttl <= 0 {
+		ttl = defaultGrantTTL
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	g, ok := r.bySurface[surface]
+	if !ok || g.expired(now) {
+		return nil, ErrGrantNotFound
+	}
+
+	newExpiresAt := now.Add(ttl)
+	if err := r.appendExtendEventLocked(g, newExpiresAt, now); err != nil {
+		return nil, fmt.Errorf("%w: ledger extend: %w", ErrGrantLedgerAppendFailed, err)
+	}
+	g.ExpiresAt = newExpiresAt
+	return g, nil
+}
+
+// appendExtendEventLocked writes one identity.grant.extended ledger event for
+// grant, carrying its (unchanged) grant_id/surface/scope/integrity_hash plus
+// the new expires_at, mirroring appendGrantEventLocked's shape exactly so
+// RebuildIdentityGrantRegistryFromLedger's replay handling for this event
+// type stays trivial (see applyIdentityGrantLedgerEvent's "extended" case).
+// Caller must hold r.mu (for writing). No-op when r.workspaceRoot == "",
+// same ledger-less behavior as every other appendXEventLocked helper.
+func (r *IdentityGrantRegistry) appendExtendEventLocked(grant *IdentityGrant, newExpiresAt, now time.Time) error {
+	if r.workspaceRoot == "" {
+		return nil
+	}
+	data := map[string]interface{}{
+		"grant_id":       grant.GrantID,
+		"surface":        grant.Surface,
+		"scope":          grant.Scope,
+		"integrity_hash": grant.IntegrityHash,
+		"issued_at":      grant.IssuedAt.Format(time.RFC3339),
+		"expires_at":     newExpiresAt.Format(time.RFC3339),
+		"extended_at":    now.Format(time.RFC3339),
+	}
+	env := &EventEnvelope{
+		HashedPayload: EventPayload{
+			Type:      "identity.grant.extended",
+			Timestamp: now.Format(time.RFC3339),
+			SessionID: identityGrantsLedgerSession,
+			Data:      data,
+		},
+		Metadata: EventMetadata{Source: "identity-grants"},
+	}
+	return r.appendEvent(r.workspaceRoot, identityGrantsLedgerSession, env)
+}
+
 // Snapshot returns every live grant for the operator-facing inventory (GET
 // /v1/identity/grants) — never includes Token (design §3.1: "NEVER the
 // token value").
@@ -765,6 +852,17 @@ func applyIdentityGrantLedgerEvent(reg *IdentityGrantRegistry, env *EventEnvelop
 		}
 		reg.bySurface[surface] = grant
 		reg.byGrantID[grantID] = grant
+	case "identity.grant.extended":
+		// Update ExpiresAt in place on the already-reconstructed grant —
+		// GrantID/Scope/IntegrityHash are unchanged by construction (see
+		// ExtendGrant's doc comment), so replay only needs to advance the
+		// expiry. Guarded by "is this still the CURRENT live grant for its
+		// surface" the same way identity.grant.revoked is, so an extend event
+		// for a since-superseded grant_id cannot resurrect stale state into
+		// bySurface.
+		if current, ok := reg.byGrantID[grantID]; ok && current.Surface == surface {
+			current.ExpiresAt = parseRFC3339Lenient(data["expires_at"])
+		}
 	}
 }
 

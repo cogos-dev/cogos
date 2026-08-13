@@ -328,6 +328,16 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// Derived context the kernel owns; caller's ctx cancellation also stops it.
 	kernelCtx, cancel := context.WithCancel(ctx)
 
+	// Start the node-root grant's TTL renewal ticker (board-task-60 followup):
+	// ensureNodeRootGrant above mints/recovers via the package-default 30-day
+	// TTL and nothing renews it on its own, so a kernel with >30d uptime would
+	// otherwise start 401ing every local consumer of the write-route
+	// grant-auth gate until restart. Owned by kernelCtx so it stops with every
+	// other kernel goroutine on Stop(); started unconditionally (not gated on
+	// the ensureNodeRootGrant error above) since renewNodeRootGrant degrades
+	// safely to a fresh mint/recover attempt on its own if no grant exists yet.
+	startNodeRootGrantRenewal(kernelCtx, server)
+
 	// Wire LocalHarnessController if an MCP server is present, unless the
 	// caller opted out via WithoutLocalHarness (First Instruments A4 — this
 	// controller runs its own ticker, independent of the ReconcileDaemon, and
