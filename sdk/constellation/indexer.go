@@ -140,8 +140,31 @@ func (c *Constellation) IndexWorkspace() error {
 					return nil
 				}
 				visited[realPath] = true
-				if err := c.indexCogdoc(tx, realPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to index %s: %v\n", realPath, err)
+
+				// Storage path: normally the symlink-resolved realPath, so two
+				// alias paths reaching the same real file (both under a walked
+				// root) collapse to one row — the dedup this PR's widened roots
+				// depend on. But when realPath resolves OUTSIDE every walked
+				// root (an alias under a managed root pointing at an external
+				// file), storing the external realPath would make the row
+				// permanently invisible to pruneGhostCogdocs's isUnderAnyRoot
+				// scoping: if this alias is later removed, no root reaches that
+				// external path again, visited[] would never contain it on a
+				// later run, yet isUnderAnyRoot(realPath, roots) is false so
+				// the ghost sweep would skip it as "not managed" rather than
+				// pruning it -- a permanent ghost row, the exact defect class
+				// this PR exists to eliminate. Store the walked alias path
+				// instead in that case: it IS under a root, so removing the
+				// alias correctly makes the row a prunable ghost on the next
+				// run, same as any other deleted in-root file.
+				storagePath := realPath
+				if !isUnderAnyRoot(realPath, roots) {
+					storagePath = path
+				}
+				visited[storagePath] = true
+
+				if err := c.indexCogdoc(tx, storagePath); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to index %s: %v\n", storagePath, err)
 					skipped++
 				} else {
 					indexed++
@@ -269,8 +292,22 @@ func (c *Constellation) pruneGhostCogdocs(tx *sql.Tx, roots []string, visited ma
 			return 0, fmt.Errorf("scan cogdoc row: %w", err)
 		}
 		if !isUnderAnyRoot(path, roots) {
-			// Not a managed cogdoc under any root this run walked (e.g. an
-			// out-of-workspace row) — never a ghost candidate.
+			// Not a managed cogdoc under any root this run walked. Usually
+			// this is a legitimate out-of-workspace row (e.g. conversation/
+			// session documents) that isUnderAnyRoot correctly leaves alone.
+			// But a row can also land here because it was indexed through a
+			// symlink alias inside a walked root whose target resolves
+			// OUTSIDE every root (documents.path stores the symlink-resolved
+			// real path, per IndexFile/IndexWorkspace) — if that alias is
+			// later removed, the row is permanently invisible to
+			// isUnderAnyRoot and would never be pruned, even though its
+			// backing file access path is gone. Distinguish the two cases
+			// with a direct stat: only a row whose file no longer exists at
+			// all is a ghost here — a legitimate out-of-workspace row whose
+			// file is still present is left untouched, same as before.
+			if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+				ghosts = append(ghosts, ghost{id: id, path: path})
+			}
 			continue
 		}
 		if !visited[path] {
@@ -467,6 +504,15 @@ func (c *Constellation) IndexFile(path string) error {
 		realPath = path
 	}
 
+	// Storage path: see the matching comment in IndexWorkspace's walk loop.
+	// When realPath resolves outside every managed root, store the walked
+	// alias path instead so pruneGhostCogdocs's root-scoping can still
+	// recognize and prune the row once the alias is removed.
+	storagePath := realPath
+	if !isUnderAnyRoot(realPath, c.walkRoots()) {
+		storagePath = path
+	}
+
 	tx, err := c.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -481,14 +527,14 @@ func (c *Constellation) IndexFile(path string) error {
 		}
 	}()
 
-	if err := c.indexCogdoc(tx, realPath); err != nil {
+	if err := c.indexCogdoc(tx, storagePath); err != nil {
 		return err
 	}
 
 	// Look up the doc id inside the transaction so we get the row even if it
 	// was just inserted (not yet committed to the reader connection).
 	var docID string
-	idErr := tx.QueryRow("SELECT id FROM documents WHERE path = ?", realPath).Scan(&docID)
+	idErr := tx.QueryRow("SELECT id FROM documents WHERE path = ?", storagePath).Scan(&docID)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
@@ -783,7 +829,23 @@ func parseCogdoc(data []byte, path string, workspaceRoot string) (*Cogdoc, error
 			// dedup this same walk-widening depends on. Derive the ID from
 			// the path relative to the workspace root instead, which is
 			// portable across checkouts.
-			if rel, rerr := filepath.Rel(workspaceRoot, path); rerr == nil && !strings.HasPrefix(rel, "..") {
+			//
+			// path has already been through filepath.EvalSymlinks (both
+			// IndexWorkspace's walk loop and IndexFile resolve it before
+			// calling indexCogdoc), but workspaceRoot (c.root, stored
+			// verbatim by Open) has not. On any workspace whose root
+			// involves a symlink component (macOS /tmp, a Nix store path,
+			// a symlinked checkout or bind mount) that mismatch makes
+			// filepath.Rel return a ".."-prefixed string, which silently
+			// falls through below and bakes the raw resolved absolute path
+			// into the ID anyway — exactly the non-portable outcome this
+			// fallback exists to avoid. Resolve workspaceRoot the same way
+			// before comparing so both sides refer to the same real path.
+			relRoot := workspaceRoot
+			if resolvedRoot, rrErr := filepath.EvalSymlinks(workspaceRoot); rrErr == nil {
+				relRoot = resolvedRoot
+			}
+			if rel, rerr := filepath.Rel(relRoot, path); rerr == nil && !strings.HasPrefix(rel, "..") {
 				relPath = rel
 			}
 		}

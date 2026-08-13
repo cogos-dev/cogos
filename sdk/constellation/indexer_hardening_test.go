@@ -549,3 +549,137 @@ func TestIndexWorkspacePrunesWholesaleDeletedDirectoryOutsideMem(t *testing.T) {
 		t.Errorf("expected mem-keep to survive the prune, got %d rows", keepCount)
 	}
 }
+
+// TestParseCogdocAutoIDPortableUnderSymlinkedWorkspaceRoot is the regression
+// test for the cog-review finding on parseCogdoc's auto-generated-ID
+// fallback: it computed filepath.Rel against the unresolved workspace root
+// (c.root, stored verbatim by Open) while every path actually reaching
+// parseCogdoc from the walk is symlink-RESOLVED. On any workspace whose root
+// itself sits behind a symlink (a very ordinary situation — macOS temp dirs,
+// Nix store paths, symlinked checkouts/bind mounts), filepath.Rel returned a
+// ".."-prefixed string, the portability guard rejected it, and the code
+// silently fell back to baking the raw resolved absolute path into the ID —
+// exactly the non-portable outcome the fallback exists to prevent. Re-running
+// IndexWorkspace from a different absolute checkout location must produce the
+// same ID for the same logical file.
+func TestParseCogdocAutoIDPortableUnderSymlinkedWorkspaceRoot(t *testing.T) {
+	parent := t.TempDir()
+	realRoot := filepath.Join(parent, "real-workspace")
+	if err := os.MkdirAll(realRoot, 0755); err != nil {
+		t.Fatalf("mkdir real workspace root: %v", err)
+	}
+	linkRoot := filepath.Join(parent, "workspace-link")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatalf("symlink workspace root: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(linkRoot, ".cog", ".state"), 0755); err != nil {
+		t.Fatalf("mkdir .cog/.state: %v", err)
+	}
+	c, err := Open(linkRoot)
+	if err != nil {
+		if err.Error() == "failed to initialize schema: no such module: fts5" {
+			t.Skip("FTS5 not available (build with -tags fts5)")
+		}
+		t.Fatalf("Open(symlinked root): %v", err)
+	}
+	defer c.Close()
+
+	writeCogdocsYaml(t, c, []string{"architecture/"})
+
+	// No `id:` field — exercises the auto-generated-ID fallback.
+	writeFileAt(t, c, "architecture/adrs/002-foo.cog.md",
+		"type: adr\ntitle: Foo\ncreated: 2026-01-01",
+		"Body with unique token symlinkedroottoken.",
+	)
+
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("IndexWorkspace: %v", err)
+	}
+
+	// The ID must be derived from the path relative to the workspace root
+	// ("architecture-adrs-002-foo"), not from the raw absolute filesystem
+	// path (which would embed the symlink-resolved parent-dir segments and
+	// differ across checkouts/CI runners).
+	const wantID = "architecture-adrs-002-foo"
+	var count int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = ?`, wantID).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		var allIDs []string
+		rows, qerr := c.DB().Query(`SELECT id FROM documents`)
+		if qerr == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				if rows.Scan(&id) == nil {
+					allIDs = append(allIDs, id)
+				}
+			}
+		}
+		t.Errorf("expected exactly 1 row with portable id %q, got %d (all ids: %v)", wantID, count, allIDs)
+	}
+}
+
+// TestIndexWorkspacePrunesGhostRowAfterExternalSymlinkAliasRemoved is the
+// regression test for the cog-review finding on pruneGhostCogdocs's
+// root-scoping: a cogdoc reached only through a symlink alias (under a
+// walked root) whose target resolves OUTSIDE every walked root must still be
+// recognized and pruned once that alias is removed. Before the fix,
+// documents.path stored the symlink-resolved EXTERNAL path (outside every
+// root), so isUnderAnyRoot rejected the row as "not a managed cogdoc" and it
+// became a permanent ghost — even though its only access path from within
+// the workspace no longer existed.
+func TestIndexWorkspacePrunesGhostRowAfterExternalSymlinkAliasRemoved(t *testing.T) {
+	c, cleanup := openTestDB(t)
+	defer cleanup()
+
+	externalDir := t.TempDir()
+	externalPath := filepath.Join(externalDir, "external.cog.md")
+	if err := os.WriteFile(externalPath,
+		[]byte("---\nid: external-doc\ntype: note\ntitle: External\ncreated: 2026-01-01\n---\n\nBody outside the workspace entirely."),
+		0644,
+	); err != nil {
+		t.Fatalf("write external file: %v", err)
+	}
+
+	memSemanticDir := filepath.Join(c.root, ".cog", "mem", "semantic")
+	if err := os.MkdirAll(memSemanticDir, 0755); err != nil {
+		t.Fatalf("mkdir .cog/mem/semantic: %v", err)
+	}
+	aliasPath := filepath.Join(memSemanticDir, "external-alias.cog.md")
+	if err := os.Symlink(externalPath, aliasPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("first IndexWorkspace: %v", err)
+	}
+	var firstCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = 'external-doc'`).Scan(&firstCount); err != nil {
+		t.Fatalf("count after first index: %v", err)
+	}
+	if firstCount != 1 {
+		t.Fatalf("expected external-doc indexed via the alias, got %d rows", firstCount)
+	}
+
+	// Remove only the alias. The external target file at externalPath still
+	// exists on disk, but it is no longer reachable through any root this
+	// workspace walks.
+	if err := os.Remove(aliasPath); err != nil {
+		t.Fatalf("remove alias: %v", err)
+	}
+
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("second IndexWorkspace: %v", err)
+	}
+
+	var secondCount int
+	if err := c.DB().QueryRow(`SELECT COUNT(*) FROM documents WHERE id = 'external-doc'`).Scan(&secondCount); err != nil {
+		t.Fatalf("count after second index: %v", err)
+	}
+	if secondCount != 0 {
+		t.Errorf("expected external-doc pruned as a ghost after its only alias was removed, got %d rows (permanent ghost row)", secondCount)
+	}
+}
