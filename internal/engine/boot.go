@@ -37,6 +37,7 @@ import (
 
 	bep "github.com/myrgic/cogos/pkg/substrate/bep"
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
+	"github.com/myrgic/cogos/sdk/constellation"
 )
 
 // BootOption is a functional option passed to Boot.
@@ -421,18 +422,30 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// WireConstellationIndexer ran above).  In tests and CLI paths where
 	// pkgFTSRepairIndexer is nil, this block is a no-op.
 	if pkgFTSRepairIndexer != nil {
-		memDir := filepath.Join(cfg.WorkspaceRoot, ".cog", "mem")
-		mw := NewMemWatcher(memDir, pkgFTSRepairIndexer)
-		if err := mw.Start(); err != nil {
-			slog.Debug("mem_watcher: not started (mem dir absent or fsnotify unavailable)",
-				"mem_dir", memDir, "err", err)
-		} else {
-			slog.Info("mem_watcher: started", "mem_dir", memDir)
+		// watchDirs covers .cog/mem (always) plus any workspace-root cogdoc
+		// directories declared via .cog/config/cogdocs.yaml requiredPaths
+		// (e.g. architecture/) — the same roots IndexWorkspace's batch walk
+		// now covers per the widened walkRoots(). Without also watching
+		// these here, a live daemon's incremental indexing would fall out of
+		// sync with what a full reindex sees: edits under a widened root
+		// would be invisible to search/FTS until someone manually triggers a
+		// rebuild.
+		watchDirs := []string{filepath.Join(cfg.WorkspaceRoot, ".cog", "mem")}
+		watchDirs = append(watchDirs, constellation.ExtraCogdocRoots(cfg.WorkspaceRoot)...)
+
+		for _, dir := range watchDirs {
+			mw := NewMemWatcher(dir, pkgFTSRepairIndexer)
+			if err := mw.Start(); err != nil {
+				slog.Debug("mem_watcher: not started (dir absent or fsnotify unavailable)",
+					"dir", dir, "err", err)
+				continue
+			}
+			slog.Info("mem_watcher: started", "dir", dir)
 			// Stop the watcher when the kernel context is cancelled.
-			go func() {
+			go func(w *MemWatcher) {
 				<-kernelCtx.Done()
-				mw.Stop()
-			}()
+				w.Stop()
+			}(mw)
 		}
 	}
 

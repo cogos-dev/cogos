@@ -409,6 +409,31 @@ func (c *Constellation) walkRoots() []string {
 	return roots
 }
 
+// ExtraCogdocRoots returns the workspace-root cogdoc directories declared via
+// .cog/config/cogdocs.yaml requiredPaths that fall OUTSIDE .cog/ — the same
+// extra roots walkRoots() adds to the batch IndexWorkspace walk, minus the
+// always-present .cog/ base root. Exported so live incremental watchers
+// (internal/engine's MemWatcher, which only observes .cog/mem by default)
+// can also watch these declared roots, keeping live indexing consistent with
+// what a full reindex covers. Does not require an open database — only reads
+// cogdocs.yaml from disk — so callers need not go through Open().
+func ExtraCogdocRoots(workspaceRoot string) []string {
+	c := &Constellation{root: workspaceRoot}
+	cogRoot := filepath.Join(workspaceRoot, ".cog")
+	resolvedCogRoot, err := filepath.EvalSymlinks(cogRoot)
+	if err != nil {
+		resolvedCogRoot = cogRoot
+	}
+	var extra []string
+	for _, root := range c.walkRoots() {
+		if root == resolvedCogRoot {
+			continue
+		}
+		extra = append(extra, root)
+	}
+	return extra
+}
+
 // IndexFile indexes a single cogdoc file into the constellation.
 // This is the public entry point for incremental indexing (e.g., after
 // a decomposition stores a new CogDoc). It handles its own transaction,
@@ -511,7 +536,7 @@ func (c *Constellation) indexCogdoc(tx *sql.Tx, path string) error {
 	mtime := info.ModTime().Format(time.RFC3339)
 
 	// Parse cogdoc
-	doc, err := parseCogdoc(data, path)
+	doc, err := parseCogdoc(data, path, c.root)
 	if err != nil {
 		return err
 	}
@@ -624,8 +649,13 @@ func (c *Constellation) indexCogdoc(tx *sql.Tx, path string) error {
 	return nil
 }
 
-// parseCogdoc parses frontmatter and content from a cogdoc file.
-func parseCogdoc(data []byte, path string) (*Cogdoc, error) {
+// parseCogdoc parses frontmatter and content from a cogdoc file. workspaceRoot
+// is used only for the auto-generated-ID fallback below (a path outside
+// .cog/, e.g. a widened cogdocs.yaml requiredPaths root, has no ".cog/"
+// substring to key off) — pass "" when no workspace root is known (e.g. unit
+// tests exercising parsing in isolation), which preserves the pre-existing
+// filename-derived fallback for that case.
+func parseCogdoc(data []byte, path string, workspaceRoot string) (*Cogdoc, error) {
 	// Split frontmatter and content
 	parts := strings.SplitN(string(data), "---", 3)
 	if len(parts) < 3 {
@@ -737,12 +767,25 @@ func parseCogdoc(data []byte, path string) (*Cogdoc, error) {
 	// Fix 10: Auto-generate ID from path if missing
 	// This prevents all files without IDs from colliding on empty string
 	if fm.ID == "" {
-		// Generate ID from path relative to .cog/
+		// Generate ID from path relative to .cog/ (the common case).
 		// Example: /path/to/.cog/mem/semantic/foo.cog.md → mem-semantic-foo
 		relPath := path
-		// Find .cog/ in path and take everything after it
 		if idx := strings.Index(path, ".cog/"); idx != -1 {
+			// Find .cog/ in path and take everything after it.
 			relPath = path[idx+5:] // Skip ".cog/"
+		} else if workspaceRoot != "" {
+			// Widened walkRoots (cogdocs.yaml requiredPaths, e.g.
+			// architecture/) puts files outside .cog/ with no ".cog/"
+			// substring to key off. Falling back to the raw absolute path
+			// would bake the checkout location into the ID — a different
+			// clone or CI runner produces a different ID for the same
+			// logical file, breaking cog: URI resolution and the id-keyed
+			// dedup this same walk-widening depends on. Derive the ID from
+			// the path relative to the workspace root instead, which is
+			// portable across checkouts.
+			if rel, rerr := filepath.Rel(workspaceRoot, path); rerr == nil && !strings.HasPrefix(rel, "..") {
+				relPath = rel
+			}
 		}
 		relPath = strings.TrimSuffix(relPath, ".cog.md")
 		// Replace slashes and dots with dashes for a valid ID
