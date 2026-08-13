@@ -332,10 +332,15 @@ func Boot(ctx context.Context, cfg *Config, opts ...BootOption) (*Kernel, error)
 	// ensureNodeRootGrant above mints/recovers via the package-default 30-day
 	// TTL and nothing renews it on its own, so a kernel with >30d uptime would
 	// otherwise start 401ing every local consumer of the write-route
-	// grant-auth gate until restart. Owned by kernelCtx so it stops with every
-	// other kernel goroutine on Stop(); started unconditionally (not gated on
-	// the ensureNodeRootGrant error above) since renewNodeRootGrant degrades
-	// safely to a fresh mint/recover attempt on its own if no grant exists yet.
+	// grant-auth gate until restart. Runs an immediate threshold-based check
+	// before ever waiting on its own ticker, so a restart that recovers a
+	// grant close to its existing expiry is caught right away instead of
+	// waiting up to a full renewal interval (round 4 cold-start fix — see
+	// startNodeRootGrantRenewal's doc comment). Owned by kernelCtx so it
+	// stops with every other kernel goroutine on Stop(); started
+	// unconditionally (not gated on the ensureNodeRootGrant error above)
+	// since maybeRenewNodeRootGrant degrades safely to a fresh mint/recover
+	// attempt on its own if no grant exists yet.
 	startNodeRootGrantRenewal(kernelCtx, server)
 
 	// Wire LocalHarnessController if an MCP server is present, unless the

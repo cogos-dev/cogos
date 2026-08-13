@@ -938,7 +938,7 @@ func TestExtendGrant_UnknownSurfaceReturnsErrGrantNotFound(t *testing.T) {
 
 // TestExtendGrant_ExpiredGrantMintsFreshInstead is the documented edge case:
 // extending an already-expired grant is NOT a renewal (see ExtendGrant's doc
-// comment) — it returns ErrGrantNotFound so the caller (renewNodeRootGrant in
+// comment) — it returns ErrGrantNotFound so the caller (maybeRenewNodeRootGrant in
 // boot_node_root_grant.go) falls through to mint-or-recover a genuinely fresh
 // grant instead of silently un-expiring a stale one with the same token.
 func TestExtendGrant_ExpiredGrantMintsFreshInstead(t *testing.T) {
@@ -953,7 +953,7 @@ func TestExtendGrant_ExpiredGrantMintsFreshInstead(t *testing.T) {
 	}
 
 	// The documented fallback: mint-or-recover establishes a fresh grant, as
-	// renewNodeRootGrant does on this exact error.
+	// maybeRenewNodeRootGrant does on this exact error.
 	fresh, err := reg.MintOrReuse("node-root", []string{"node-root"}, time.Hour)
 	if err != nil {
 		t.Fatalf("fallback mint: %v", err)

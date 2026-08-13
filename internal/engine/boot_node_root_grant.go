@@ -156,68 +156,114 @@ func nodeRootGrantRenewalInterval() time.Duration {
 // Boot() after kernelCtx exists, so Kernel.Stop's context cancellation is
 // sufficient to tear this down along with every other kernel goroutine.
 //
-// Each tick extends the node-root grant's expiry via
-// IdentityGrantRegistry.ExtendGrant, which — critically — leaves GrantID,
-// Token, and IntegrityHash untouched: local consumers (the dashboard, canvas,
-// Claude Code hooks, THESEUS) cache the RAW TOKEN VALUE from their own boot,
-// and a renewal that minted a replacement token instead of extending the
-// existing one would silently 401 every one of those cached copies the
-// moment it superseded the old grant_id — the exact failure mode this ticker
-// exists to prevent, just moved earlier in time.
+// Runs maybeRenewNodeRootGrant ONCE IMMEDIATELY, before ever waiting on the
+// ticker — this closes the cold-start gap a review round confirmed (PR #551
+// round 4): ensureNodeRootGrant's RecoverToken path preserves a recovered
+// grant's ExpiresAt unchanged on an ordinary restart, so a kernel restarted
+// shortly before the grant's original expiry would otherwise recover an
+// almost-dead token and then wait a FULL nodeRootGrantRenewalInterval (15
+// days) before the first tick even checked it — well past expiry, a
+// multi-day all-consumers-401 window triggered purely by restart timing.
+// Running the same check immediately at startup means restart timing can no
+// longer create a renewal gap the ticker cadence doesn't cover, and every
+// subsequent tick runs the identical check — see maybeRenewNodeRootGrant's
+// doc comment for why that's safe to call at an arbitrary time rather than
+// only right after a tick.
 func startNodeRootGrantRenewal(ctx context.Context, s *Server) {
 	interval := nodeRootGrantRenewalInterval()
 	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
+		maybeRenewNodeRootGrant(s)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				renewNodeRootGrant(s)
+				maybeRenewNodeRootGrant(s)
 			}
 		}
 	}()
 }
 
-// renewNodeRootGrant performs one renewal tick. Logged at debug on the
-// ordinary-extend path (once per renewal, not per health-check-style poll —
-// the ticker itself only fires at half-TTL intervals, so there is no
-// per-check spam to worry about) and at warn/info on the two edge paths.
+// maybeRenewNodeRootGrant is the renewal check: THRESHOLD-based, not
+// fire-blind. It renews (via ExtendGrant) only when the live node-root
+// grant's remaining lifetime has dropped below nodeRootGrantRenewalInterval;
+// otherwise it no-ops. That threshold is what makes the check idempotent and
+// safe to call from anywhere at any time — the immediate call at startup
+// (startNodeRootGrantRenewal) and every half-TTL tick both call this exact
+// same function, and neither can ever renew a grant that isn't actually due,
+// so there's no risk of the immediate call thrashing a freshly-minted grant
+// or drifting the tick phase away from the expiry phase over repeated
+// restarts.
 //
-// Expired-then-extended edge (documented choice, per the build directive):
-// if ExtendGrant reports ErrGrantNotFound — the node-root grant expired
-// before this tick ran (kernel was suspended/asleep past a tick, or the very
-// first ensureNodeRootGrant mint somehow already lapsed) — extending it would
-// silently un-expire a credential the kernel no longer trusts having tracked
-// continuously (see ExtendGrant's doc comment). Instead this falls through to
-// ensureNodeRootGrant's ordinary mint-or-recover path, establishing a
-// genuinely fresh grant. That IS a real credential change every consumer
-// must re-fetch via GET /v1/identity/grants/current?surface=node-root, so it
-// logs at Info rather than Debug.
-func renewNodeRootGrant(s *Server) {
+// Three outcomes:
+//
+//   - No live grant at all (GrantExpiry reports not-found: never minted, or
+//     already expired) — establish one via the ordinary mint-or-recover
+//     path (ensureNodeRootGrant), same as boot's own bootstrap. Logged at
+//     Info: this is a real credential change every consumer must re-fetch.
+//   - A live grant exists but its remaining lifetime is still comfortably
+//     above the renewal threshold — no-op. This is the common case on every
+//     tick once the ticker's own cadence has caught up, and now also the
+//     common case on an ordinary restart that happens nowhere near expiry.
+//   - A live grant exists and is due (remaining lifetime <= the renewal
+//     interval, which covers both the "kernel has been up a while" case the
+//     ticker was originally built for AND the "recovered a nearly-expired
+//     grant after a restart" case round 4 found) — extend it via
+//     ExtendGrant, which leaves GrantID/Token/IntegrityHash untouched so
+//     every consumer's cached raw token value keeps working. If ExtendGrant
+//     itself reports ErrGrantNotFound (a narrow race: the grant expired
+//     between the GrantExpiry check above and this call), fall through to
+//     the same mint-or-recover path as the not-found case.
+func maybeRenewNodeRootGrant(s *Server) {
 	if s == nil || s.identityGrants == nil {
 		return
 	}
+
+	expiresAt, ok := s.identityGrants.GrantExpiry(nodeRootSurface)
+	if !ok {
+		establishFreshNodeRootGrant(s, "no live node-root grant found")
+		return
+	}
+
+	remaining := time.Until(expiresAt)
+	if remaining > nodeRootGrantRenewalInterval() {
+		slog.Debug("node-root grant renewal: not due yet", "remaining", remaining.String())
+		return
+	}
+
 	grant, err := s.identityGrants.ExtendGrant(nodeRootSurface, defaultGrantTTL)
 	if err != nil {
 		if errors.Is(err, ErrGrantNotFound) {
-			fresh, mintErr := ensureNodeRootGrant(s)
-			if mintErr != nil {
-				slog.Warn("node-root grant renewal: prior grant had expired and mint/recover failed; "+
-					"local consumers must self-mint via POST /v1/identity/grants until the next tick",
-					"err", mintErr)
-				return
-			}
-			slog.Info("node-root grant renewal: prior grant had already expired; minted/recovered a fresh one "+
-				"(this is a real credential change — consumers must re-fetch via GET /v1/identity/grants/current?surface=node-root)",
-				"grant_id", fresh.GrantID, "expires_at", fresh.ExpiresAt.Format(time.RFC3339))
+			establishFreshNodeRootGrant(s, "grant expired between the due-check and the extend attempt")
 			return
 		}
-		slog.Warn("node-root grant renewal: extend failed; will retry on the next tick", "err", err)
+		slog.Warn("node-root grant renewal: extend failed; will retry on the next check", "err", err)
 		return
 	}
 	slog.Debug("node-root grant renewal: extended", "grant_id", grant.GrantID, "expires_at", grant.ExpiresAt.Format(time.RFC3339))
+}
+
+// establishFreshNodeRootGrant runs ensureNodeRootGrant's ordinary
+// mint-or-recover path from within a renewal check (either because no live
+// grant exists, or because ExtendGrant lost a narrow race against expiry —
+// see maybeRenewNodeRootGrant's doc comment for both call sites). This IS a
+// real credential change every local consumer must re-fetch via
+// GET /v1/identity/grants/current?surface=node-root, so success logs at Info
+// rather than Debug; reason is a short, call-site-specific description for
+// the log line.
+func establishFreshNodeRootGrant(s *Server, reason string) {
+	fresh, err := ensureNodeRootGrant(s)
+	if err != nil {
+		slog.Warn("node-root grant renewal: "+reason+", and mint/recover failed; "+
+			"local consumers must self-mint via POST /v1/identity/grants until the next check",
+			"err", err)
+		return
+	}
+	slog.Info("node-root grant renewal: "+reason+"; minted/recovered a fresh grant "+
+		"(this is a real credential change — consumers must re-fetch via GET /v1/identity/grants/current?surface=node-root)",
+		"grant_id", fresh.GrantID, "expires_at", fresh.ExpiresAt.Format(time.RFC3339))
 }
 
 // persistNodeRootGrant writes token to path with 0600 permissions, creating

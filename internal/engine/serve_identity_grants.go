@@ -508,6 +508,27 @@ func (r *IdentityGrantRegistry) Current(surface string) (*IdentityGrant, bool) {
 	return g, true
 }
 
+// GrantExpiry returns the live grant's ExpiresAt for surface, if any.
+// Unlike Current (the zero-paste-bootstrap primitive, which deliberately
+// reports "unavailable" whenever Token == "" for a ledger-reconstructed
+// grant — see its doc comment), this does not require the raw token to be
+// cached in memory: it exists for callers that only need to know WHEN a
+// live grant expires, not the token itself. The node-root renewal ticker
+// (boot_node_root_grant.go's maybeRenewNodeRootGrant) uses this to decide
+// whether a renewal is due — extending is conditional on remaining
+// lifetime, so it has to know the expiry before deciding whether to call
+// ExtendGrant at all. Returns (zero, false) if surface has no live,
+// unexpired grant (never minted, already expired, or revoked).
+func (r *IdentityGrantRegistry) GrantExpiry(surface string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	g, ok := r.bySurface[surface]
+	if !ok || g.expired(time.Now().UTC()) {
+		return time.Time{}, false
+	}
+	return g.ExpiresAt, true
+}
+
 // Revoke removes the live grant identified by grantID, appending an
 // identity.grant.revoked ledger event before mutating the in-memory index
 // (write-ahead, same discipline as MintOrReuse). Returns (grant, nil) on
