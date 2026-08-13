@@ -28,13 +28,44 @@ func TestCORSPreflight_OKStatus(t *testing.T) {
 	// All allow-* headers should be present on the preflight response.
 	wantHeaders := map[string]string{
 		"Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
-		"Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization",
+		"Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization, X-Cogos-Grant",
 		"Access-Control-Max-Age":       "86400",
 	}
 	for h, want := range wantHeaders {
 		if got := w.Header().Get(h); got != want {
 			t.Errorf("%s = %q; want %q", h, got, want)
 		}
+	}
+}
+
+// TestCORSPreflight_AllowsGrantHeader is the regression test for the
+// write-route grant-auth gate (serve_grant_auth.go): a legitimate
+// cross-origin loopback consumer (mod3 dashboard on :7860, canvas, THESEUS)
+// that attaches X-Cogos-Grant to a write request first triggers a browser
+// preflight asking whether that header is allowed. Before this fix the
+// static Access-Control-Allow-Headers list did not include it, so the
+// preflight failed at the browser and the real write never left the client.
+func TestCORSPreflight_AllowsGrantHeader(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/identity/grants", nil)
+	req.Header.Set("Origin", "http://localhost:7860")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	req.Header.Set("Access-Control-Request-Headers", "content-type, x-cogos-grant")
+
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d; want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:7860" {
+		t.Errorf("Allow-Origin = %q; want the echoed loopback origin", got)
+	}
+	allowHeaders := w.Header().Get("Access-Control-Allow-Headers")
+	if !strings.Contains(strings.ToLower(allowHeaders), "x-cogos-grant") {
+		t.Errorf("Access-Control-Allow-Headers = %q; want it to include X-Cogos-Grant so the preflight for a grant-bearing write succeeds", allowHeaders)
 	}
 }
 
