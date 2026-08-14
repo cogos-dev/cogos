@@ -64,7 +64,42 @@ var maxReadCacheBuses = 256
 // the entry is dropped after answering the current call — see
 // ReadEventsSince. Exposed as a var for the same reason as
 // maxReadCacheBuses.
+//
+// This is a COUNT bound, not a memory bound, and does not by itself prevent
+// unbounded cache growth: a single oversized event is count=1, sits far
+// under this cap, and stays resident indefinitely (myrgic/cogos#561 review).
+// Kept anyway, alongside maxReadCacheBytesPerBus below, as a cheap guard on
+// the seen map's growth under high EVENT VOLUME (many small events), which
+// the byte cap doesn't directly limit — a large number of tiny events could
+// stay under the byte cap while still growing seen unboundedly. The byte cap
+// is what actually bounds retained memory; this one bounds entry count in
+// the dedup map. Nothing on the write path bounds a single event's payload
+// size — that's myrgic/cogos#565, not this cache.
 var maxReadCacheEventsPerBus = 50_000
+
+// maxReadCacheBytesPerBus bounds the approximate retained size, in bytes, of
+// a single bus's busReadCache.events. maxReadCacheEventsPerBus above counts
+// EVENTS, not bytes: a single event with an oversized payload is count=1,
+// far under that cap, and would sit resident in the cache indefinitely with
+// no path ever reclaiming it (myrgic/cogos#561 review). This cap closes that
+// gap by tracking the sum of each retained line's raw byte length (the
+// length already in hand during the scan in ReadEventsSince, not a deep
+// measurement of the parsed struct's heap footprint) as events are folded
+// into the cache, and resetting the entry — same as the count cap — once the
+// running total would exceed this bound.
+//
+// Default matches eventsFileMaxBytes (64 MB): a bus's cache is normally kept
+// bounded by rotation at that same threshold (rotation clears the cache — see
+// the file-identity check in ReadEventsSince), so capping the cache at the
+// same size means it can never retain meaningfully more parsed data than an
+// un-rotated live file already would, whether that data arrived as many
+// small events or one event that alone crosses the line. Exposed as a var
+// for the same reason as maxReadCacheBuses.
+//
+// Ingress-side bounding of a single event's payload size is deliberately out
+// of scope here — that is myrgic/cogos#565. This cap only bounds what the
+// READ cache retains after the fact.
+var maxReadCacheBytesPerBus int64 = 64 * 1024 * 1024
 
 // busArchiveRetention declares, per bus, how many rotated events.<ts>.jsonl
 // archives to keep.  Rotation without retention grows without bound: on one
@@ -291,6 +326,16 @@ type busReadCache struct {
 	offset int64 // bytes of events.jsonl already folded into events; always a line boundary
 	events []BusBlock
 	seen   map[int]bool // seq -> true, same dedup semantics ReadEvents documents
+
+	// bytes is the running sum of raw line length (pre-JSON-Unmarshal, the
+	// length already in hand during ReadEventsSince's scan) for every event
+	// currently folded into events. An approximation of retained memory, not
+	// an exact heap measurement of the parsed BusBlock — see
+	// maxReadCacheBytesPerBus's doc comment for why that's the deliberately
+	// simple, correct-enough source. Reset to 0 wherever events/seen/offset
+	// are reset (rotation, missing file, or the bound check in
+	// ReadEventsSince), so it never drifts from what events actually holds.
+	bytes int64
 
 	// fi is the os.FileInfo captured from the last events.jsonl this cache
 	// was built against — the file-identity check ReadEventsSince uses to
@@ -1136,11 +1181,13 @@ func (m *BusSessionManager) evictReadCacheLocked(busID string) {
 // is kept as a cheap secondary signal, not the primary one.
 //
 // Bounding: readCache is capped at maxReadCacheBuses distinct buses (LRU
-// eviction, touchReadCacheLRU) and at maxReadCacheEventsPerBus parsed
-// events per bus (checked below) — see maxReadCacheBuses's doc comment for
-// why an unbounded cache is the same class of bug #561 fixes, just in
-// memory instead of CPU. Evicting a cache entry is always safe: see
-// evictReadCacheLocked.
+// eviction, touchReadCacheLRU), at maxReadCacheEventsPerBus parsed events
+// per bus, and at maxReadCacheBytesPerBus retained bytes per bus (all
+// checked below) — see maxReadCacheBuses's doc comment for why an unbounded
+// cache is the same class of bug #561 fixes, just in memory instead of CPU,
+// and maxReadCacheBytesPerBus's doc comment for why the count cap alone
+// doesn't close it (a single oversized event is count=1). Evicting a cache
+// entry is always safe: see evictReadCacheLocked.
 //
 // Aliasing (deliberately NOT deep-copied, see #561 review's unverified
 // note): the returned []BusBlock is a fresh slice (copy() below), but each
@@ -1190,6 +1237,7 @@ func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBl
 			cache.offset = 0
 			cache.events = nil
 			cache.seen = make(map[int]bool)
+			cache.bytes = 0
 			cache.fi = nil
 			return nil, nil
 		}
@@ -1223,6 +1271,7 @@ func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBl
 		cache.offset = 0
 		cache.events = nil
 		cache.seen = make(map[int]bool)
+		cache.bytes = 0
 	}
 	cache.fi = fi
 
@@ -1242,6 +1291,7 @@ func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBl
 						if !cache.seen[block.Seq] {
 							cache.seen[block.Seq] = true
 							cache.events = append(cache.events, block)
+							cache.bytes += int64(len(line))
 						}
 					}
 					// Malformed lines are silently skipped — same as the
@@ -1285,22 +1335,32 @@ func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBl
 		copy(result, cache.events[start:])
 	}
 
-	// Per-bus event-count bound (#561 follow-up, maxReadCacheEventsPerBus):
-	// a bus normally stays bounded by eventsFileMaxBytes (rotation clears
-	// its cache — see the identity check above), but a very high volume of
-	// small events can accumulate a large parsed slice before that
-	// byte-size threshold is ever crossed. Once this bus's cache would
-	// exceed the cap, drop it so the NEXT read starts clean and re-parses
-	// from offset 0. Safe to do after result is already computed: this
-	// call's answer was built from the cache as it stood a moment ago, so
-	// resetting it now cannot change what's returned here (see
-	// evictReadCacheLocked's doc comment for the same argument in the LRU
-	// case — this is the identical invariant, applied per-bus instead of
-	// across buses).
-	if len(cache.events) > maxReadCacheEventsPerBus {
+	// Per-bus event-count and byte bounds (#561 follow-up). A bus normally
+	// stays bounded by eventsFileMaxBytes (rotation clears its cache — see
+	// the identity check above), but two failure modes slip past that:
+	//
+	//   - a very high volume of small events can accumulate a large parsed
+	//     slice (and a large seen map) before the byte-size threshold is
+	//     ever crossed on the underlying file — bounded by
+	//     maxReadCacheEventsPerBus, a cheap guard on entry/seen-map count.
+	//   - a single oversized event's payload sits at count=1, far under the
+	//     count cap, and would otherwise stay resident indefinitely — this
+	//     is what maxReadCacheBytesPerBus closes (myrgic/cogos#561 review).
+	//     Ingress-side bounding of a single event's payload size is a
+	//     separate concern, not fixed here — see myrgic/cogos#565.
+	//
+	// Either bound tripping drops the entry so the NEXT read starts clean
+	// and re-parses from offset 0. Safe to do after result is already
+	// computed: this call's answer was built from the cache as it stood a
+	// moment ago, so resetting it now cannot change what's returned here
+	// (see evictReadCacheLocked's doc comment for the same argument in the
+	// LRU case — this is the identical invariant, applied per-bus instead
+	// of across buses).
+	if len(cache.events) > maxReadCacheEventsPerBus || cache.bytes > maxReadCacheBytesPerBus {
 		cache.offset = 0
 		cache.events = nil
 		cache.seen = make(map[int]bool)
+		cache.bytes = 0
 	}
 
 	return result, nil

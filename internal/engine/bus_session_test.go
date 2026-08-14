@@ -1400,3 +1400,79 @@ func TestReadEventsSince_CacheBoundedByEventsPerBus(t *testing.T) {
 		t.Fatalf("len(again) = %d, want 8", len(again))
 	}
 }
+
+// TestReadEventsSince_CacheBoundedByBytesPerBus verifies a single bus's
+// cache entry is dropped once its retained BYTE size crosses
+// maxReadCacheBytesPerBus, closing the gap the event-count cap alone leaves
+// open: a small number of oversized events stays far under
+// maxReadCacheEventsPerBus (raised here so it cannot itself fire) while
+// still exhausting memory the byte cap is meant to bound (myrgic/cogos#561
+// review). The CALL that crosses the byte threshold must still return every
+// event, and the next read must still return correct data via a fresh
+// re-parse from offset 0.
+func TestReadEventsSince_CacheBoundedByBytesPerBus(t *testing.T) {
+	// Not parallel: mutates package-level maxReadCacheBytesPerBus /
+	// maxReadCacheEventsPerBus.
+	root := t.TempDir()
+	originalBytes := maxReadCacheBytesPerBus
+	originalEvents := maxReadCacheEventsPerBus
+	maxReadCacheBytesPerBus = 1000 // small bound, easily crossed by a few large payloads
+	maxReadCacheEventsPerBus = 1_000_000 // effectively disabled, so only the byte cap can fire
+	t.Cleanup(func() {
+		maxReadCacheBytesPerBus = originalBytes
+		maxReadCacheEventsPerBus = originalEvents
+	})
+
+	mgr := NewBusSessionManager(root)
+	busID := "big-payload-bus"
+
+	// Each event's payload alone is ~600 bytes, and only 3 of them are
+	// written — count=3 stays far under both the raised event cap and the
+	// bus's own default event cap, but 3 * ~600B well exceeds the 1000-byte
+	// bound above, so only the byte accounting can be what trips eviction.
+	bigValue := strings.Repeat("x", 600)
+	const numEvents = 3
+	for i := 0; i < numEvents; i++ {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": i, "blob": bigValue}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+	}
+
+	events, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince: %v", err)
+	}
+	if len(events) != numEvents {
+		t.Fatalf("len(events) = %d, want %d — the byte cap bounds cached MEMORY, not what a single call returns", len(events), numEvents)
+	}
+	for i, e := range events {
+		if e.Seq != i+1 {
+			t.Errorf("events[%d].Seq = %d, want %d", i, e.Seq, i+1)
+		}
+	}
+
+	mgr.readCacheMetaMu.Lock()
+	cache := mgr.readCache[busID]
+	mgr.readCacheMetaMu.Unlock()
+	if cache == nil {
+		t.Fatal("expected a cache entry for busID")
+	}
+	if len(cache.events) != 0 || cache.offset != 0 || cache.bytes != 0 {
+		t.Errorf("cache = {offset:%d, events:%d, bytes:%d}, want it dropped (all zero) once it crossed maxReadCacheBytesPerBus", cache.offset, len(cache.events), cache.bytes)
+	}
+
+	// A dropped cache must still produce byte-identical results on the next
+	// call, via a full re-parse from offset 0 — no events lost across reset.
+	again, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (after drop): %v", err)
+	}
+	if len(again) != numEvents {
+		t.Fatalf("len(again) = %d, want %d", len(again), numEvents)
+	}
+	for i, e := range again {
+		if e.Seq != i+1 {
+			t.Errorf("again[%d].Seq = %d, want %d", i, e.Seq, i+1)
+		}
+	}
+}
