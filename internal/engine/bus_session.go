@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -230,6 +231,35 @@ type BusSessionManager struct {
 	// contention (the original #505 symptom: a continuous storm of
 	// "skipping registry seq update" lines).
 	registrySeqSkipCount atomic.Int64
+
+	// readCacheMetaMu guards readCache and readCacheLocks (the maps
+	// themselves, not their contents) — see ReadEventsSince. Held only for
+	// the map lookup/insert, never across file I/O.
+	readCacheMetaMu sync.Mutex
+	// readCache holds, per bus, the incrementally-extended parse state
+	// ReadEventsSince uses to avoid re-scanning a bus's entire history on
+	// every call. See busReadCache and ReadEventsSince's doc comment (#561).
+	readCache map[string]*busReadCache
+	// readCacheLocks holds one *sync.Mutex per bus, serializing concurrent
+	// ReadEventsSince/ReadEvents calls against the SAME bus's cache (so two
+	// pollers hitting the same busy bus at once don't double-scan the same
+	// delta) without serializing reads across DIFFERENT buses.
+	readCacheLocks map[string]*sync.Mutex
+}
+
+// busReadCache is one bus's incremental ReadEventsSince state: everything
+// parsed from events.jsonl so far, plus the byte offset that content ends
+// at, so the next call can Seek there and parse only what's new instead of
+// re-reading the file from byte 0.
+//
+// events is de-duped by Seq and kept in the order encountered (== Seq
+// order for a well-formed file, since AppendEvent hands out strictly
+// increasing per-file Seq values) — the exact contract ReadEvents has
+// always had, just built up across calls instead of rebuilt on every one.
+type busReadCache struct {
+	offset int64 // bytes of events.jsonl already folded into events; always a line boundary
+	events []BusBlock
+	seen   map[int]bool // seq -> true, same dedup semantics ReadEvents documents
 }
 
 // NewBusSessionManager constructs a manager rooted at workspaceRoot.
@@ -241,6 +271,8 @@ func NewBusSessionManager(workspaceRoot string) *BusSessionManager {
 		lastHash:         make(map[string]string),
 		generation:       make(map[string]int64),
 		registeredActive: make(map[string]bool),
+		readCache:        make(map[string]*busReadCache),
+		readCacheLocks:   make(map[string]*sync.Mutex),
 	}
 }
 
@@ -946,42 +978,164 @@ func (m *BusSessionManager) recordRegistrySeqSkip(busID, reason string) {
 	}
 }
 
-// ReadEvents reads all events from a bus. De-dups by seq (file may have
-// duplicates from crash recovery).
-func (m *BusSessionManager) ReadEvents(busID string) ([]BusBlock, error) {
+// readCacheLockFor returns the per-bus mutex that serializes
+// ReadEventsSince calls against busID's cache, creating it on first use.
+// Held only briefly (a map lookup) — the returned lock, not this one, is
+// what callers hold across the actual file I/O.
+func (m *BusSessionManager) readCacheLockFor(busID string) *sync.Mutex {
+	m.readCacheMetaMu.Lock()
+	defer m.readCacheMetaMu.Unlock()
+	lock, ok := m.readCacheLocks[busID]
+	if !ok {
+		lock = &sync.Mutex{}
+		m.readCacheLocks[busID] = lock
+	}
+	return lock
+}
+
+// ReadEventsSince returns busID's events with Seq > afterSeq, de-duped by
+// Seq, in Seq-ascending order. afterSeq <= 0 returns the full history —
+// the same contract ReadEvents(busID) has always had (it is now a thin
+// wrapper: ReadEventsSince(busID, 0)). A cursor at or beyond the bus's
+// current tip returns an empty, non-nil-error slice rather than erroring.
+//
+// Fixes #561: the naive implementation this replaced re-opened
+// events.jsonl and re-Unmarshal'd every line on every call — O(entire bus
+// history) per poll, measured at ~50% of kernel CPU against a 1.3 GB bus
+// store with ~30 live pollers (see the issue's pprof evidence). This
+// method instead maintains a per-bus busReadCache: the byte offset through
+// which the file has already been parsed, plus the de-duped events parsed
+// so far. Each call Seeks to that offset and only reads/Unmarshal's the
+// bytes appended since the LAST call against this manager for this bus —
+// so a steady-state poller pays for the handful of new events since its
+// last poll, not the whole file, regardless of which caller (or which
+// cursor value) triggers the read: ReadEvents(busID) and every
+// ReadEventsSince(busID, N) for this bus all share the same cache, so the
+// full-history callers benefit too, not just the cursor-aware ones.
+//
+// Concurrency: a per-bus lock (readCacheLockFor) serializes cache access
+// for the SAME bus without serializing reads across different buses, and
+// is held across the incremental file read — safe because it's a strict
+// subset of a single bus's read path, never nested with m.mu (the append
+// lock), so it cannot introduce a new deadlock ordering with AppendEvent.
+//
+// Rotation: if events.jsonl is ever smaller than the cached offset (a
+// size-based rotation replaced it with a fresh, empty file — see
+// AppendEvent), the cache is invalidated and rebuilt from the new file,
+// matching the per-file Seq semantics AppendEvent already documents
+// elsewhere (Seq resets to 1 after rotation; so does this cache).
+func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBlock, error) {
 	if !validPathComponent(busID) {
 		return nil, fmt.Errorf("invalid bus_id %q", busID)
 	}
 	eventsFile := m.EventsPath(busID)
+
+	lock := m.readCacheLockFor(busID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	m.readCacheMetaMu.Lock()
+	cache := m.readCache[busID]
+	if cache == nil {
+		cache = &busReadCache{seen: make(map[int]bool)}
+		m.readCache[busID] = cache
+	}
+	m.readCacheMetaMu.Unlock()
+
 	f, err := os.Open(eventsFile)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// No file yet — nothing to cache either (a stale cache here
+			// would mean the bus's events.jsonl was removed out from under
+			// us, which EnsureBus/AppendEvent never do apart from the
+			// rotation rename+recreate handled below).
+			cache.offset = 0
+			cache.events = nil
+			cache.seen = make(map[int]bool)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("open events file: %w", err)
 	}
 	defer f.Close()
 
-	var events []BusBlock
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
-	seen := make(map[int]bool)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-		var block BusBlock
-		if err := json.Unmarshal([]byte(line), &block); err != nil {
-			continue
-		}
-		if seen[block.Seq] {
-			continue
-		}
-		seen[block.Seq] = true
-		events = append(events, block)
+	fi, statErr := f.Stat()
+	if statErr != nil {
+		return nil, fmt.Errorf("stat events file: %w", statErr)
 	}
 
-	return events, nil
+	// The file is smaller than what we've already scanned — it isn't a
+	// continuation of what the cache holds (rotation replaced it). Rescan
+	// from scratch; this is the same cost the pre-cursor implementation
+	// always paid on every call, now paid once per rotation instead.
+	if fi.Size() < cache.offset {
+		cache.offset = 0
+		cache.events = nil
+		cache.seen = make(map[int]bool)
+	}
+
+	if fi.Size() > cache.offset {
+		if _, err := f.Seek(cache.offset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("seek events file: %w", err)
+		}
+		reader := bufio.NewReaderSize(f, 256*1024)
+		var consumed int64
+		for {
+			lineBytes, readErr := reader.ReadBytes('\n')
+			if n := len(lineBytes); n > 0 && lineBytes[n-1] == '\n' {
+				consumed += int64(n)
+				if line := lineBytes[:n-1]; len(line) > 0 {
+					var block BusBlock
+					if err := json.Unmarshal(line, &block); err == nil {
+						if !cache.seen[block.Seq] {
+							cache.seen[block.Seq] = true
+							cache.events = append(cache.events, block)
+						}
+					}
+					// Malformed lines are silently skipped — same as the
+					// scanner-based implementation this replaced.
+				}
+			}
+			if readErr != nil {
+				// EOF (almost always io.EOF) with no trailing newline on
+				// the final chunk means a concurrent AppendEvent's write is
+				// either in flight or was torn. Deliberately do NOT count
+				// those trailing bytes as consumed: the next call re-reads
+				// from the same offset and picks up the completed line
+				// once the writer finishes, exactly as a fresh full scan
+				// starting from byte 0 would have.
+				break
+			}
+		}
+		cache.offset += consumed
+	}
+
+	if afterSeq <= 0 {
+		out := make([]BusBlock, len(cache.events))
+		copy(out, cache.events)
+		return out, nil
+	}
+
+	// cache.events is Seq-ascending, so the wanted suffix starts at the
+	// first entry past afterSeq. Linear scan, not binary search: the
+	// steady-state caller (a poller) supplies a cursor near the tail, so
+	// this is typically a handful of comparisons, not a real search cost.
+	start := len(cache.events)
+	for i, e := range cache.events {
+		if e.Seq > afterSeq {
+			start = i
+			break
+		}
+	}
+	out := make([]BusBlock, len(cache.events)-start)
+	copy(out, cache.events[start:])
+	return out, nil
+}
+
+// ReadEvents reads all events from a bus. De-dups by seq (file may have
+// duplicates from crash recovery). Equivalent to ReadEventsSince(busID, 0)
+// — kept as its own name because most callers want "everything", and that
+// reads better at those call sites than a literal 0 cursor would. See
+// ReadEventsSince for the caching behaviour this now shares.
+func (m *BusSessionManager) ReadEvents(busID string) ([]BusBlock, error) {
+	return m.ReadEventsSince(busID, 0)
 }

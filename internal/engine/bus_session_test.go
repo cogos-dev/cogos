@@ -934,3 +934,262 @@ func TestPruneBusArchives_KeepAllIsNoop(t *testing.T) {
 		t.Errorf("undeclared bus must keep all archives, got %d want 2", archives)
 	}
 }
+
+// ─── ReadEventsSince (#561) ──────────────────────────────────────────────────
+
+// TestReadEventsSince_ReturnsOnlyNewer verifies the core cursor contract: a
+// non-zero afterSeq returns only events with Seq > afterSeq, in order.
+func TestReadEventsSince_ReturnsOnlyNewer(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "cursor-bus"
+
+	for i := 0; i < 5; i++ {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": i}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+	}
+
+	events, err := mgr.ReadEventsSince(busID, 3)
+	if err != nil {
+		t.Fatalf("ReadEventsSince: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2 (seq 4, 5)", len(events))
+	}
+	if events[0].Seq != 4 || events[1].Seq != 5 {
+		t.Errorf("events = seq %d, %d; want 4, 5", events[0].Seq, events[1].Seq)
+	}
+}
+
+// TestReadEventsSince_IncrementalPolling simulates the real polling pattern:
+// repeated calls with an advancing cursor, interleaved with new appends,
+// must each see exactly the events newer than their own cursor — proving the
+// incremental cache (offset + parsed suffix) stays correct across multiple
+// calls, not just a single one.
+func TestReadEventsSince_IncrementalPolling(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "poll-bus"
+
+	if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": 1}); err != nil {
+		t.Fatalf("AppendEvent 1: %v", err)
+	}
+	if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": 2}); err != nil {
+		t.Fatalf("AppendEvent 2: %v", err)
+	}
+
+	// First poll: cursor 0, sees everything so far.
+	first, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (poll 1): %v", err)
+	}
+	if len(first) != 2 {
+		t.Fatalf("poll 1: len = %d, want 2", len(first))
+	}
+	cursor := first[len(first)-1].Seq
+
+	// Second poll immediately after: nothing new since the cursor.
+	second, err := mgr.ReadEventsSince(busID, cursor)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (poll 2): %v", err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("poll 2: len = %d, want 0 (no new events)", len(second))
+	}
+
+	// A new event lands, then a third poll must see exactly that one event.
+	if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": 3}); err != nil {
+		t.Fatalf("AppendEvent 3: %v", err)
+	}
+	third, err := mgr.ReadEventsSince(busID, cursor)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (poll 3): %v", err)
+	}
+	if len(third) != 1 {
+		t.Fatalf("poll 3: len = %d, want 1", len(third))
+	}
+	if third[0].Seq != 3 {
+		t.Errorf("poll 3: seq = %d, want 3", third[0].Seq)
+	}
+}
+
+// TestReadEventsSince_DedupHolds verifies that a hand-crafted events.jsonl
+// containing a duplicated Seq (mirroring the crash-recovery duplication
+// ReadEvents' doc comment describes) still de-dups exactly like the
+// original full-scan implementation: only the first occurrence of a given
+// Seq is kept.
+func TestReadEventsSince_DedupHolds(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "dedup-bus"
+
+	if err := mgr.EnsureBus(busID); err != nil {
+		t.Fatalf("EnsureBus: %v", err)
+	}
+	eventsFile := mgr.EventsPath(busID)
+
+	lines := []string{
+		`{"v":2,"bus_id":"dedup-bus","seq":1,"ts":"2026-08-14T00:00:00Z","from":"a","type":"m","payload":{"i":1},"hash":"h1"}`,
+		`{"v":2,"bus_id":"dedup-bus","seq":2,"ts":"2026-08-14T00:00:01Z","from":"a","type":"m","payload":{"i":2},"hash":"h2"}`,
+		// Duplicate of seq 1, as crash recovery could produce.
+		`{"v":2,"bus_id":"dedup-bus","seq":1,"ts":"2026-08-14T00:00:00Z","from":"a","type":"m","payload":{"i":1},"hash":"h1"}`,
+		`{"v":2,"bus_id":"dedup-bus","seq":3,"ts":"2026-08-14T00:00:02Z","from":"a","type":"m","payload":{"i":3},"hash":"h3"}`,
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(eventsFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("write events.jsonl: %v", err)
+	}
+
+	events, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("len(events) = %d, want 3 (duplicate seq 1 dropped)", len(events))
+	}
+	for i, want := range []int{1, 2, 3} {
+		if events[i].Seq != want {
+			t.Errorf("events[%d].Seq = %d, want %d", i, events[i].Seq, want)
+		}
+	}
+
+	// Dedup must also hold across incremental calls: reading again (cache
+	// already warm) must not re-admit the duplicate from a fresh scan of
+	// bytes it has already folded in.
+	again, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (again): %v", err)
+	}
+	if len(again) != 3 {
+		t.Fatalf("second read: len(events) = %d, want 3", len(again))
+	}
+}
+
+// TestReadEventsSince_CursorBeyondTip verifies that a cursor past the
+// current highest Seq returns an empty slice, not an error.
+func TestReadEventsSince_CursorBeyondTip(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "tip-bus"
+
+	if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": 1}); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+
+	events, err := mgr.ReadEventsSince(busID, 999)
+	if err != nil {
+		t.Fatalf("ReadEventsSince: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("len(events) = %d, want 0", len(events))
+	}
+
+	// Same for a bus that has never been appended to at all.
+	events, err = mgr.ReadEventsSince("never-appended-bus", 5)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (nonexistent bus): %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("len(events) = %d, want 0 for a bus with no events.jsonl", len(events))
+	}
+}
+
+// TestReadEventsSince_ZeroCursorMatchesReadEvents verifies that a zero (or
+// absent) cursor preserves today's ReadEvents(busID) behaviour exactly —
+// ReadEvents is now a thin wrapper over ReadEventsSince(busID, 0), and
+// callers that never migrate to a cursor must see byte-identical results.
+func TestReadEventsSince_ZeroCursorMatchesReadEvents(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "compat-bus"
+
+	for i := 0; i < 4; i++ {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": i}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+	}
+
+	viaReadEvents, err := mgr.ReadEvents(busID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	viaCursor, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince(0): %v", err)
+	}
+	if len(viaReadEvents) != len(viaCursor) {
+		t.Fatalf("len mismatch: ReadEvents=%d ReadEventsSince(0)=%d", len(viaReadEvents), len(viaCursor))
+	}
+	for i := range viaReadEvents {
+		if viaReadEvents[i].Seq != viaCursor[i].Seq || viaReadEvents[i].Hash != viaCursor[i].Hash {
+			t.Errorf("event %d mismatch: ReadEvents=%+v ReadEventsSince(0)=%+v", i, viaReadEvents[i], viaCursor[i])
+		}
+	}
+}
+
+// TestReadEventsSince_SurvivesRotation verifies the cache correctly detects
+// a size-based rotation (the live events.jsonl replaced by a smaller, fresh
+// file) and rebuilds from the new file instead of returning stale or
+// mismatched data.
+func TestReadEventsSince_SurvivesRotation(t *testing.T) {
+	// Not parallel: mutates package-level eventsFileMaxBytes.
+	root := t.TempDir()
+	original := eventsFileMaxBytes
+	eventsFileMaxBytes = 512
+	t.Cleanup(func() { eventsFileMaxBytes = original })
+
+	mgr := NewBusSessionManager(root)
+	busID := "rotate-cursor-bus"
+
+	// Warm the cache pre-rotation.
+	if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": "seed"}); err != nil {
+		t.Fatalf("AppendEvent seed: %v", err)
+	}
+	if _, err := mgr.ReadEventsSince(busID, 0); err != nil {
+		t.Fatalf("ReadEventsSince (pre-rotation warm): %v", err)
+	}
+
+	// Force a rotation.
+	rotated := false
+	for i := 0; i < 200 && !rotated; i++ {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": strings.Repeat("x", 20)}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+		entries, _ := os.ReadDir(filepath.Join(mgr.BusesDir(), busID))
+		for _, e := range entries {
+			if e.Name() != "events.jsonl" && strings.HasPrefix(e.Name(), "events.") {
+				rotated = true
+			}
+		}
+	}
+	if !rotated {
+		t.Fatal("expected rotation, none occurred")
+	}
+
+	// The append that triggered rotation is the archived file's last entry
+	// — the fresh events.jsonl is empty at the moment rotation is detected.
+	// Append once more so there's something in the fresh file to read.
+	if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": "post-rotation"}); err != nil {
+		t.Fatalf("AppendEvent (post-rotation): %v", err)
+	}
+
+	// Post-rotation, the fresh file's own seq sequence starts at 1 again —
+	// ReadEventsSince(busID, 0) must reflect only the fresh file's content,
+	// not error and not silently return the pre-rotation cache.
+	events, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (post-rotation): %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected at least one event in the fresh post-rotation file")
+	}
+	if events[0].Seq != 1 {
+		t.Errorf("first event in fresh file: seq = %d, want 1", events[0].Seq)
+	}
+}
