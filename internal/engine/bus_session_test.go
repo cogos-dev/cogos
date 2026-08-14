@@ -1193,3 +1193,210 @@ func TestReadEventsSince_SurvivesRotation(t *testing.T) {
 		t.Errorf("first event in fresh file: seq = %d, want 1", events[0].Seq)
 	}
 }
+
+// TestReadEventsSince_RotationPastStaleOffset is the cog-review #564 finding
+// TestReadEventsSince_SurvivesRotation didn't catch: rotation detected by
+// SIZE (fi.Size() < cache.offset) is a false negative once the fresh
+// post-rotation file has grown back past the stale cached offset by the
+// time of the next read. Reproduces the reviewer's exact scenario — a small
+// early read warms the cache, the bus rotates with no further reads, and
+// enough events land in the fresh file to push its size past the stale
+// offset — then asserts NO events are lost, i.e. the fresh file's own seq-1
+// event is still present rather than silently Seek'd past.
+func TestReadEventsSince_RotationPastStaleOffset(t *testing.T) {
+	// Not parallel: mutates package-level eventsFileMaxBytes.
+	root := t.TempDir()
+	original := eventsFileMaxBytes
+	eventsFileMaxBytes = 512
+	t.Cleanup(func() { eventsFileMaxBytes = original })
+
+	mgr := NewBusSessionManager(root)
+	busID := "stale-offset-bus"
+	eventsFile := mgr.EventsPath(busID)
+
+	// Warm the cache with a single small early read — e.g. handleBusStream's
+	// since-validation call, or any one-off poll, landing while
+	// events.jsonl is still tiny.
+	if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": "seed"}); err != nil {
+		t.Fatalf("AppendEvent seed: %v", err)
+	}
+	if _, err := mgr.ReadEventsSince(busID, 0); err != nil {
+		t.Fatalf("ReadEventsSince (warm): %v", err)
+	}
+	staleFI, statErr := os.Stat(eventsFile)
+	if statErr != nil {
+		t.Fatalf("stat events file: %v", statErr)
+	}
+	staleOffsetBytes := staleFI.Size()
+	if staleOffsetBytes == 0 {
+		t.Fatal("expected a non-zero cached offset after the warm read")
+	}
+
+	// Force a rotation with NO intervening ReadEventsSince call — the cache
+	// stays stuck at staleOffsetBytes through the whole rotation, exactly
+	// as it would for a bus that gets one early read and then goes quiet
+	// while still being appended to.
+	rotated := false
+	for i := 0; i < 200 && !rotated; i++ {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": strings.Repeat("x", 20)}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+		entries, _ := os.ReadDir(filepath.Join(mgr.BusesDir(), busID))
+		for _, e := range entries {
+			if e.Name() != "events.jsonl" && strings.HasPrefix(e.Name(), "events.") {
+				rotated = true
+			}
+		}
+	}
+	if !rotated {
+		t.Fatal("expected rotation, none occurred")
+	}
+
+	// Keep appending into the FRESH file, without reading, until its own
+	// size has grown back past the stale cached offset — the exact window
+	// `fi.Size() < cache.offset` cannot detect as a rotation.
+	postRotationCount := 0
+	for {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"data": "post-rotation"}); err != nil {
+			t.Fatalf("AppendEvent (post-rotation): %v", err)
+		}
+		postRotationCount++
+		fi, statErr := os.Stat(eventsFile)
+		if statErr != nil {
+			t.Fatalf("stat events file: %v", statErr)
+		}
+		if fi.Size() > staleOffsetBytes {
+			break
+		}
+	}
+
+	events, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (post-rotation, past stale offset): %v", err)
+	}
+
+	// The false-negative bug seeks to the stale byte offset in the fresh
+	// file instead of detecting rotation, so it returns whatever was
+	// already in the cache from BEFORE rotation (the "seed" event) rather
+	// than the fresh file's real content — and by coincidence that stale
+	// leftover can also land on Seq 1 and a plausible-looking count, so
+	// assert on PAYLOAD content, not just Seq/length, to actually catch it.
+	if len(events) != postRotationCount {
+		t.Fatalf("len(events) = %d, want %d (one per post-rotation append) — got stale or partial data", len(events), postRotationCount)
+	}
+	for i, e := range events {
+		if e.Seq != i+1 {
+			t.Errorf("events[%d].Seq = %d, want %d — a gap here means events were lost", i, e.Seq, i+1)
+		}
+		data, _ := e.Payload["data"].(string)
+		if data != "post-rotation" {
+			t.Errorf("events[%d].Payload[\"data\"] = %q, want \"post-rotation\" — stale pre-rotation cache data leaked through instead of the fresh file's real content", i, data)
+		}
+	}
+}
+
+// TestReadEventsSince_CacheBoundedByBusCount verifies readCache is capped
+// at maxReadCacheBuses distinct buses via LRU eviction, and that eviction
+// never loses data — a dropped bus's next read must still return its full,
+// correct history via a fresh re-parse.
+func TestReadEventsSince_CacheBoundedByBusCount(t *testing.T) {
+	// Not parallel: mutates package-level maxReadCacheBuses.
+	root := t.TempDir()
+	original := maxReadCacheBuses
+	maxReadCacheBuses = 3
+	t.Cleanup(func() { maxReadCacheBuses = original })
+
+	mgr := NewBusSessionManager(root)
+	busIDs := []string{"bus-a", "bus-b", "bus-c", "bus-d", "bus-e"}
+	for _, id := range busIDs {
+		if _, err := mgr.AppendEvent(id, "m", "tester", map[string]interface{}{"i": 1}); err != nil {
+			t.Fatalf("AppendEvent(%s): %v", id, err)
+		}
+		if _, err := mgr.ReadEventsSince(id, 0); err != nil {
+			t.Fatalf("ReadEventsSince(%s): %v", id, err)
+		}
+	}
+
+	mgr.readCacheMetaMu.Lock()
+	cachedCount := len(mgr.readCache)
+	lruLen := mgr.readCacheLRU.Len()
+	_, lastStillCached := mgr.readCache[busIDs[len(busIDs)-1]]
+	_, firstStillCached := mgr.readCache[busIDs[0]]
+	mgr.readCacheMetaMu.Unlock()
+
+	if cachedCount > maxReadCacheBuses {
+		t.Fatalf("readCache holds %d entries, want <= %d (maxReadCacheBuses)", cachedCount, maxReadCacheBuses)
+	}
+	if lruLen != cachedCount {
+		t.Fatalf("readCacheLRU.Len() = %d, readCache has %d entries — bookkeeping out of sync", lruLen, cachedCount)
+	}
+	if !lastStillCached {
+		t.Error("most-recently-read bus was evicted; want LRU eviction to keep the most recent")
+	}
+	if firstStillCached {
+		t.Error("least-recently-read bus is still cached; want it evicted once the bound was exceeded")
+	}
+
+	// Eviction must never lose data: every bus, including evicted ones,
+	// must still read back correctly (full re-parse from disk).
+	for _, id := range busIDs {
+		events, err := mgr.ReadEventsSince(id, 0)
+		if err != nil {
+			t.Fatalf("ReadEventsSince(%s) after eviction: %v", id, err)
+		}
+		if len(events) != 1 || events[0].Seq != 1 {
+			t.Errorf("bus %s: events = %+v, want exactly one event at seq 1 (eviction must not lose data)", id, events)
+		}
+	}
+}
+
+// TestReadEventsSince_CacheBoundedByEventsPerBus verifies a single bus's
+// cache entry is dropped once its parsed event count crosses
+// maxReadCacheEventsPerBus — bounding a bus's cache memory independently of
+// eventsFileMaxBytes-triggered rotation — while the CALL that crosses the
+// threshold still returns every event, and the next read still returns
+// correct data via a fresh re-parse.
+func TestReadEventsSince_CacheBoundedByEventsPerBus(t *testing.T) {
+	// Not parallel: mutates package-level maxReadCacheEventsPerBus.
+	root := t.TempDir()
+	original := maxReadCacheEventsPerBus
+	maxReadCacheEventsPerBus = 5
+	t.Cleanup(func() { maxReadCacheEventsPerBus = original })
+
+	mgr := NewBusSessionManager(root)
+	busID := "big-bus"
+
+	for i := 0; i < 8; i++ {
+		if _, err := mgr.AppendEvent(busID, "m", "tester", map[string]interface{}{"i": i}); err != nil {
+			t.Fatalf("AppendEvent %d: %v", i, err)
+		}
+	}
+
+	events, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince: %v", err)
+	}
+	if len(events) != 8 {
+		t.Fatalf("len(events) = %d, want 8 — the per-bus cap bounds cached MEMORY, not what a single call returns", len(events))
+	}
+
+	mgr.readCacheMetaMu.Lock()
+	cache := mgr.readCache[busID]
+	mgr.readCacheMetaMu.Unlock()
+	if cache == nil {
+		t.Fatal("expected a cache entry for busID")
+	}
+	if len(cache.events) != 0 || cache.offset != 0 {
+		t.Errorf("cache = {offset:%d, events:%d}, want it dropped (offset 0, no retained events) once it crossed maxReadCacheEventsPerBus", cache.offset, len(cache.events))
+	}
+
+	// A dropped cache must still produce byte-identical results on the next
+	// call, via a full re-parse from offset 0.
+	again, err := mgr.ReadEventsSince(busID, 0)
+	if err != nil {
+		t.Fatalf("ReadEventsSince (after drop): %v", err)
+	}
+	if len(again) != 8 {
+		t.Fatalf("len(again) = %d, want 8", len(again))
+	}
+}
