@@ -65,6 +65,13 @@ func normalizeLocalLLMEndpoint(endpoint string) string {
 // that fail to parse as a URL, or have no host component, are returned
 // unchanged — this function only ever tightens a valid endpoint, never
 // invents one.
+//
+// #556 repair (round 4): this function is applied twice on some call paths
+// (buildLocalProvider's queueKey re-normalizes target.BaseURL, which
+// resolveLocalLLMEndpoint already normalized once — see its doc comment)
+// and is asserted idempotent by TestAdvR4_CanonicalizeIsIdempotent, so it
+// MUST be a true fixed point on its own output, not just correct on raw
+// config input.
 func canonicalizeLoopbackHost(endpoint string) string {
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Host == "" {
@@ -79,9 +86,26 @@ func canonicalizeLoopbackHost(endpoint string) string {
 	if (port == "80" && u.Scheme == "http") || (port == "443" && u.Scheme == "https") {
 		port = ""
 	}
-	if port != "" {
+	switch {
+	case port != "":
+		// net.JoinHostPort brackets an IPv6 literal for us.
 		u.Host = net.JoinHostPort(host, port)
-	} else {
+	case strings.Contains(host, ":"):
+		// #556 repair (round 4): u.Hostname() already stripped this
+		// host's brackets (Go's url.Hostname() unconditionally does so
+		// for a bracketed IPv6 host), so an IPv6 literal reaching here
+		// with no port must be re-bracketed before assigning back to
+		// u.Host — otherwise the result re-parses as hostname up to the
+		// first colon and port after it (net.JoinHostPort's own bracket
+		// logic only fires when it is actually called, i.e. only in the
+		// port != "" branch above). Without this, e.g.
+		// "https://[2001:db8::1]:443" (default HTTPS port dropped) came
+		// out as "https://2001:db8::1", which url.Parse re-reads as
+		// Hostname()=="2001:db8:" Port()=="1" — an unreachable dial
+		// target, not just a cosmetically wrong map key (Endpoint here
+		// IS the HTTP dial target for the openai/ollama providers).
+		u.Host = "[" + host + "]"
+	default:
 		u.Host = host
 	}
 	return u.String()
@@ -235,8 +259,13 @@ func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Pro
 		// through resolveLocalLLMEndpoint in detectLocalLLMTarget, so it is
 		// the same normalized form makeProvider/autoDiscoverOpenAICompat key
 		// their own queues on when they resolve to the same physical
-		// backend. #556 repair (round 2).
-		queueKey := normalizeLocalLLMEndpoint(target.BaseURL)
+		// backend. #556 repair (round 2). Used verbatim, NOT re-normalized
+		// — #556 repair (round 4): re-applying normalizeLocalLLMEndpoint
+		// here was redundant (target.BaseURL is already its own output)
+		// and, before canonicalizeLoopbackHost was made idempotent this
+		// round, could silently re-mangle an already-correct bracketed
+		// IPv6 endpoint on its second pass through the function.
+		queueKey := target.BaseURL
 		// Concurrency is passed as 0 ("unspecified"), not a hardcoded 1 —
 		// #556 repair (round 3): no providers.yaml entry exists on this path
 		// to declare options.model_state.parallel from, so it must never

@@ -876,13 +876,34 @@ func applyLocalModelConfig(cfg *Config, pcfg *ProvidersConfig) {
 	}
 }
 
+// providerTypeOf infers a ProviderConfig's effective type the same way
+// makeProvider does: pc.Type if set, else the provider's own config name.
+func providerTypeOf(name string, pc ProviderConfig) string {
+	if pc.Type != "" {
+		return pc.Type
+	}
+	return name
+}
+
+// isLocalBackendProviderType reports whether t is one of the local
+// OpenAI-compat backend types makeProvider fronts with a kernel-owned FIFO
+// queue (#556) — the same case list as makeProvider's switch below. Used
+// by autoDiscoverOpenAICompat to seed its dedup set for providers.yaml
+// entries that declare a local backend but no explicit Endpoint (#556
+// repair, round 4).
+func isLocalBackendProviderType(t string) bool {
+	switch t {
+	case "openai-compat", "openai", "lmstudio", "vllm", "llamacpp":
+		return true
+	default:
+		return false
+	}
+}
+
 // makeProvider instantiates a Provider from a ProviderConfig.
 // The provider type is inferred from the name if Type is empty.
 func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Provider, error) {
-	t := pc.Type
-	if t == "" {
-		t = name
-	}
+	t := providerTypeOf(name, pc)
 	switch t {
 	case "ollama":
 		return NewOllamaProvider(name, pc), nil
@@ -908,26 +929,41 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		// FIFO queue (provider_queue.go), sized to the backend's declared
 		// parallelism (options.model_state.parallel — parsed since #555 but
 		// until now purely advisory metadata; this is what makes it
-		// load-bearing for the first time). Unset/zero (concurrency stays 0
-		// here, deliberately NOT clamped to 1) is passed through to
-		// newQueuedProvider as "unspecified" — matching the #555 ruling
-		// that LMS itself runs parallel=1 as the enforcement backstop, a
-		// kernel-side default of 1 is still the safe assumption absent an
-		// explicit declaration, but newQueuedProvider is the one place that
-		// applies that default (on first creation only), so an unspecified
-		// value from THIS call site can never clobber a concurrency another
-		// call site already declared for the same queueKey. #556 repair
-		// (round 3): this call site is the one PROVIDERS.YAML-DECLARED path
-		// among the three that construct a queued provider for a local
-		// backend (the others — buildLocalProvider, autoDiscoverOpenAICompat
-		// — have no config to declare a value from); pre-clamping here to 1
-		// erased that distinction and let either of the other two, undeclared
-		// paths silently overwrite an operator's declared parallel=4 back
-		// down to 1 on their next load-hit. Cloud/remote providers
-		// (anthropic, claude-oauth, claude-code, codex) are untouched; this
-		// wrap is scoped to the local backend family per the issue's
-		// explicit "local backends" text.
+		// load-bearing for the first time). #556 repair (round 3): this call
+		// site is the one PROVIDERS.YAML-DECLARED path among the three that
+		// construct a queued provider for a local backend (the others —
+		// buildLocalProvider, autoDiscoverOpenAICompat — have no config to
+		// declare a value from); those two always pass 0 ("unspecified") so
+		// they can never clobber a concurrency this call site declared for
+		// the same queueKey — see newQueuedProvider's "loaded &&
+		// concurrency >= 1" guard.
+		//
+		// #556 repair (round 4): round 3 also deleted this call site's own
+		// `if concurrency < 1 { concurrency = 1 }` clamp, reasoning (per the
+		// paragraph above) that clamping erased the declared/undeclared
+		// distinction against the other two paths. It does not — an ABSENT
+		// options.model_state.parallel key on a providers.yaml entry that
+		// makeProvider is constructing IS a declaration (of the #555
+		// backstop default, 1), the same way an explicit `parallel: 1`
+		// would be. Only buildLocalProvider/autoDiscoverOpenAICompat are
+		// genuinely undeclared, because they have no providers.yaml entry
+		// to be silent about; makeProvider always has one. Without this
+		// clamp, removing a `parallel: 4` line from providers.yaml made
+		// concurrency 0 here too, which newQueuedProvider's
+		// "concurrency >= 1" guard then treats identically to the
+		// undeclared probe paths — silently leaving the queue pinned at its
+		// old declared value forever, with no way back to the backstop
+		// default short of restarting the process (verified:
+		// TestAdvR4_DeclarationRemovalCannotReturnToDefault). Restoring the
+		// clamp here — and ONLY here — closes that without reopening the
+		// round-3 precedence bug, because this path still always declares.
+		// Cloud/remote providers (anthropic, claude-oauth, claude-code,
+		// codex) are untouched; this wrap is scoped to the local backend
+		// family per the issue's explicit "local backends" text.
 		concurrency := parseModelStateOptions(pc.Options).Parallel
+		if concurrency < 1 {
+			concurrency = 1
+		}
 		// Registry key is the resolved, normalized endpoint (NOT name) —
 		// the same resolution NewOpenAICompatProvider itself just applied to
 		// pc.Endpoint above — so two differently-NAMED providers.yaml
@@ -1163,25 +1199,53 @@ var openaiCompatWellKnownEndpoints = []openaiCompatProbeEndpoint{
 	{name: "lmstudio", endpoint: "http://localhost:1234"},
 }
 
+// configuredLocalEndpoints builds the dedup sets autoDiscoverOpenAICompat
+// uses to skip a well-known probe target that a providers.yaml entry
+// already covers: configuredEndpoints (host-canonicalized endpoint ->
+// true) and configuredNames (provider name -> true). Split out from
+// autoDiscoverOpenAICompat so it can be unit-tested without depending on
+// a reachable local backend (the probe step that follows requires one;
+// this set-construction step does not).
+//
+// Endpoints are keyed on the same canonicalized form
+// normalizeLocalLLMEndpoint produces for the queue registry
+// (host-canonicalized, not just trailing-slash trimmed) — #556 repair
+// (round 3): a raw TrimRight comparison let a providers.yaml entry spelled
+// "http://127.0.0.1:1234" fail to dedup against a probe's
+// "http://localhost:1234", registering a second, independent queue for
+// the same physical backend.
+//
+// #556 repair (round 4): that host-canonicalization only ran for entries
+// with a non-empty pc.Endpoint. A local-backend-family entry (see
+// isLocalBackendProviderType) with NO endpoint configured resolves
+// through makeProvider's own queueKey = resolveLocalLLMEndpoint("") to
+// openaiCompatDefaultEndpoint ("http://localhost:1234") — exactly a
+// well-known probe's own target — so it was never added to
+// configuredEndpoints and the probe registered a second, differently-
+// NAMED provider for the same physical backend. The queue itself was
+// still correctly shared (both resolve to the same queueKey at
+// newQueuedProvider), so this was never a double-admission bug at LMS,
+// only a duplicate router entry. Seeding configuredEndpoints the same way
+// for endpointless local-family entries closes that residual half.
+func configuredLocalEndpoints(pcfg ProvidersConfig) (configuredEndpoints, configuredNames map[string]bool) {
+	configuredEndpoints = map[string]bool{}
+	configuredNames = map[string]bool{}
+	for name, pc := range pcfg.Providers {
+		if pc.Endpoint != "" {
+			configuredEndpoints[normalizeLocalLLMEndpoint(pc.Endpoint)] = true
+		} else if isLocalBackendProviderType(providerTypeOf(name, pc)) {
+			configuredEndpoints[resolveLocalLLMEndpoint("")] = true
+		}
+		configuredNames[name] = true
+	}
+	return configuredEndpoints, configuredNames
+}
+
 // autoDiscoverOpenAICompat probes well-known local ports for OpenAI-compatible
 // servers and registers any that respond. Skips endpoints already configured
 // in providers.yaml to avoid duplicates.
 func autoDiscoverOpenAICompat(router *SimpleRouter, pcfg ProvidersConfig) {
-	// Build a set of already-configured endpoints to avoid duplicates. Keyed
-	// on the same canonicalized form normalizeLocalLLMEndpoint produces for
-	// the queue registry (host-canonicalized, not just trailing-slash
-	// trimmed) — #556 repair (round 3): a raw TrimRight comparison let a
-	// providers.yaml entry spelled "http://127.0.0.1:1234" fail to dedup
-	// against this probe's "http://localhost:1234", registering a second,
-	// independent queue for the same physical backend.
-	configuredEndpoints := map[string]bool{}
-	configuredNames := map[string]bool{}
-	for name, pc := range pcfg.Providers {
-		if pc.Endpoint != "" {
-			configuredEndpoints[normalizeLocalLLMEndpoint(pc.Endpoint)] = true
-		}
-		configuredNames[name] = true
-	}
+	configuredEndpoints, configuredNames := configuredLocalEndpoints(pcfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

@@ -35,6 +35,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -254,23 +255,64 @@ type queueCallerSnapshot struct {
 // queueSnapshot is a point-in-time read of a backendQueue's state.
 type queueSnapshot struct {
 	Name string `json:"name"`
-	// Endpoint is the queue's stable registry identity — the canonical,
-	// host-canonicalized endpoint (backendQueues' map key; see
-	// newQueuedProvider) that this queue is actually shared and looked up
-	// by. #556 repair (round 3): Name is NOT stable — it is whichever
-	// call site's displayName happened to win newQueuedProvider's
-	// LoadOrStore race first (e.g. "agent-local" vs "lmstudio-darkstar"
-	// vs "lmstudio" for the exact same physical backend, depending on
-	// which of buildLocalProvider/makeProvider/autoDiscoverOpenAICompat
-	// ran first), so it is not a reliable identifier for a shared queue.
-	// Endpoint is. Omitted for queues constructed directly by tests via
-	// newBackendQueue (no queueKey to report).
+	// Endpoint is a REDACTED form of the queue's stable registry identity
+	// — host:port only, via redactQueueEndpoint — not the raw registry key
+	// (backendQueues' map key; see newQueuedProvider). #556 repair (round
+	// 3): Name is NOT stable — it is whichever call site's displayName
+	// happened to win newQueuedProvider's LoadOrStore race first (e.g.
+	// "agent-local" vs "lmstudio-darkstar" vs "lmstudio" for the exact
+	// same physical backend, depending on which of
+	// buildLocalProvider/makeProvider/autoDiscoverOpenAICompat ran
+	// first), so it is not a reliable identifier for a shared queue.
+	// Endpoint is, which is why round 3 added it here.
+	//
+	// #556 repair (round 4): round 3 shipped Endpoint as the RAW registry
+	// key (q.key verbatim) — a URL that can carry userinfo credentials
+	// (an operator-configured "http://svc:token@host:port/path" openai-
+	// compat endpoint) and a path. GET /v1/queue is grant-exempt like
+	// every other GET (isGrantExemptRequest, serve_grant_auth.go) —
+	// reachable with NO authentication at all — so that raw key was
+	// published to anyone who can reach the port, reopening (in the
+	// opposite direction) the exact disclosure round 3's
+	// queueCallerSnapshot doc comment says this route was hardened
+	// against. redactQueueEndpoint strips userinfo and path before this
+	// field is ever populated, publishing only host:port. Whether GET
+	// /v1/queue should additionally require auth is a separate, still-
+	// undecided question left to operator arbitration — this fix only
+	// makes the unauthenticated response strictly less disclosive than it
+	// was, it does not resolve that question.
+	// Omitted for queues constructed directly by tests via newBackendQueue
+	// (no queueKey to report).
 	Endpoint     string                `json:"endpoint,omitempty"`
 	Concurrency  int                   `json:"concurrency"`
 	InFlight     int                   `json:"in_flight"`
 	Waiting      int                   `json:"waiting"`
 	OldestWaitMs int64                 `json:"oldest_wait_ms"`
 	Callers      []queueCallerSnapshot `json:"callers,omitempty"`
+}
+
+// redactQueueEndpoint returns a redacted identity for a backend queue's
+// registry key, safe to publish on the unauthenticated GET /v1/queue
+// response: host:port only, with any URL userinfo (credentials) and path
+// stripped. #556 repair (round 4) — see queueSnapshot.Endpoint's doc
+// comment for the disclosure this closes.
+//
+// Registry keys are always produced by normalizeLocalLLMEndpoint /
+// canonicalizeLoopbackHost (scheme://[user:pass@]host[:port][/path]), so a
+// successful url.Parse with a non-empty Host is the expected case;
+// u.Host never includes userinfo (that lives in u.User) or path. An
+// endpoint that fails to parse, or has no host, redacts to "" rather than
+// falling back to the raw input — this function only ever narrows what is
+// disclosed, it never risks echoing something unredacted by accident.
+func redactQueueEndpoint(key string) string {
+	if key == "" {
+		return ""
+	}
+	u, err := url.Parse(key)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
 }
 
 // maxQueueSnapshotCallers bounds the per-backend caller list in a /v1/queue
@@ -285,7 +327,7 @@ func (q *backendQueue) Snapshot() queueSnapshot {
 
 	snap := queueSnapshot{
 		Name:        q.name,
-		Endpoint:    q.key,
+		Endpoint:    redactQueueEndpoint(q.key),
 		Concurrency: q.concurrency,
 		InFlight:    q.inFlight,
 		Waiting:     q.waiters.Len(),
@@ -495,20 +537,44 @@ type queuedProvider struct {
 // ("unspecified") — buildLocalProvider (local_llm.go) and
 // autoDiscoverOpenAICompat (router.go) both pass 0 for this reason, since
 // neither has a providers.yaml entry to read options.model_state.parallel
-// from. Only makeProvider's providers.yaml-declared path passes a real
-// value (which is itself 0 when the operator never set
-// options.model_state.parallel). newBackendQueue still clamps an
-// unspecified 0 to the #555 backstop default of 1 the FIRST time a given
-// queueKey is registered (a queue that admits nothing is a deadlock), but a
-// load-hit (an existing queue for this queueKey) only reconciles
-// concurrency when THIS call actually declared one (concurrency >= 1) —
-// #556 repair (round 3): unspecified must never win a reconciliation,
-// otherwise whichever of the three call sites happens to run next (all
-// three share the process-wide registry) silently clobbers an
-// operator-declared parallelism back down to the undeclared default,
-// flapping the whole kernel's local queue concurrency between 4 and 1 on
-// every autonomic tick / dispatch. This makes the declared value the
-// only thing that can EVER lower or raise concurrency on a shared queue.
+// from. makeProvider's providers.yaml-declared path always passes a real
+// value >= 1 (#556 repair round 4 restored its clamp — see router.go's
+// makeProvider doc comment — because an ABSENT
+// options.model_state.parallel key there is still a declaration, of the
+// #555 backstop default). newBackendQueue still clamps an unspecified 0 to
+// that same backstop the FIRST time a given queueKey is registered (a
+// queue that admits nothing is a deadlock), but a load-hit (an existing
+// queue for this queueKey) only reconciles concurrency when THIS call
+// actually declared one (concurrency >= 1) — #556 repair (round 3):
+// unspecified must never win a reconciliation, otherwise whichever of the
+// three call sites happens to run next (all three share the process-wide
+// registry) silently clobbers an operator-declared parallelism back down
+// to the undeclared default, flapping the whole kernel's local queue
+// concurrency between 4 and 1 on every autonomic tick / dispatch.
+//
+// #556 repair (round 4): a load-hit reconciliation used to overwrite
+// outright (last writer wins). Two differently-NAMED providers.yaml
+// entries can resolve to the same physical endpoint (the shared-queue-by-
+// endpoint design round 2 introduced) with two different declared
+// options.model_state.parallel values, and both go through this function
+// within a single BuildRouter pass; Go's map iteration order over
+// pcfg.Providers is randomized per process, so which declared value "won"
+// was non-deterministic across otherwise-identical runs of the same
+// config (verified: TestAdvR4_TwoDeclaredEntriesSameEndpointFlap — the
+// same two entries settled at 4 in one call order and 1 in the reverse
+// order). narrowConcurrencyTo takes the minimum instead of overwriting,
+// which is order-independent (both orders now settle at 1) and is also
+// the operationally safe choice: a single physical backend shared by two
+// disagreeing declarations can only actually sustain the smaller of the
+// two ceilings. Trade-off, and the reason this is a MIN and not a
+// symmetric reconcile: once a queue has narrowed to a lower declared
+// value it can only narrow further, never widen back up, without a
+// process restart (a fresh registry) — there is no way for this function
+// to tell "a second, still-currently-configured entry disagrees" apart
+// from "the operator edited the same entry's value upward since the
+// queue was created." Given #556's local backends already run parallel=1
+// almost everywhere (the #555 backstop) this is judged the safer default;
+// see narrowConcurrencyTo's own doc comment.
 func newQueuedProvider(displayName, queueKey string, inner Provider, concurrency int) *queuedProvider {
 	q := newBackendQueue(displayName, concurrency)
 	q.key = queueKey
@@ -516,10 +582,29 @@ func newQueuedProvider(displayName, queueKey string, inner Provider, concurrency
 	if shared, ok := actual.(*backendQueue); ok {
 		q = shared
 		if loaded && concurrency >= 1 {
-			q.setConcurrency(concurrency)
+			q.narrowConcurrencyTo(concurrency)
 		}
 	}
 	return &queuedProvider{Provider: inner, name: displayName, queue: q}
+}
+
+// narrowConcurrencyTo reconciles a second (or subsequent) DECLARED
+// concurrency value onto an already-registered queue by taking the
+// minimum of the queue's current concurrency and the newly-declared
+// value n, rather than overwriting outright. See newQueuedProvider's doc
+// comment (#556 repair, round 4) for why: this makes reconciliation
+// order-independent when two differently-named providers.yaml entries
+// declare different values for the same physical endpoint, at the cost of
+// concurrency only ever being able to narrow (not widen) across separate
+// declarations for a given queueKey within one process lifetime. No-op
+// when n is not strictly smaller than the current value.
+func (q *backendQueue) narrowConcurrencyTo(n int) {
+	q.mu.Lock()
+	current := q.concurrency
+	q.mu.Unlock()
+	if n < current {
+		q.setConcurrency(n)
+	}
 }
 
 // callerAttribution reads RequestMetadata.Attribution off req, falling back
