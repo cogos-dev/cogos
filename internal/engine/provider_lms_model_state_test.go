@@ -508,6 +508,59 @@ func TestComputePlanParallelActionDampedAfterApply(t *testing.T) {
 	}
 }
 
+// TestComputePlanParallelActionReArmsOnConvergence covers the fourth-round
+// reviewer's finding on cogos#555: the dampening gate must re-arm once the
+// drift it was damping against actually resolves, so a later re-drift to the
+// SAME observed value fires a fresh action instead of being permanently
+// shadowed by the pre-convergence record. Sequence: target=1; observed 4 (a
+// mismatch) fires the action; observed 1 (converged — e.g. a successful
+// reload) produces an empty Synced plan AND clears the dampening record;
+// observed 4 again (e.g. LM Studio or the operator reloading at the app
+// default, the single most likely recurrence since that default is a fixed
+// number) must fire the action again rather than being damped against the
+// stale pre-convergence record for (model, "4").
+func TestComputePlanParallelActionReArmsOnConvergence(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.Parallel = 1
+
+	rowsAtParallel := func(observed int) []lmsModelRow {
+		return []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: ip(observed)}}
+	}
+
+	// Cycle 1: observed 4, want 1 — mismatch, action fires.
+	plan1, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan1.Actions) != 1 || !strings.HasSuffix(plan1.Actions[0].Name, "/parallel") {
+		t.Fatalf("cycle 1: expected one /parallel action, got %#v", plan1.Actions)
+	}
+	if _, err := p.ApplyPlan(context.Background(), plan1); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	// Cycle 2: observed 1 — converged. Empty plan (Synced), and the
+	// dampening record for (model, "4") must be cleared as a side effect.
+	plan2, err := p.ComputePlan(&p.target, rowsAtParallel(1), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan2.Actions) != 0 {
+		t.Fatalf("cycle 2: expected an empty (Synced) plan on convergence, got %#v", plan2.Actions)
+	}
+
+	// Cycle 3: observed 4 again — the SAME value cycle 1 was damped against.
+	// Without the re-arm, parallelActionDamped(model, "4") would still be
+	// true from cycle 1 and this would wrongly stay empty forever.
+	plan3, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan3.Actions) != 1 || !strings.HasSuffix(plan3.Actions[0].Name, "/parallel") {
+		t.Fatalf("cycle 3: expected the action to fire again after re-drifting to a previously-damped value, got %#v", plan3.Actions)
+	}
+}
+
 // TestComputePlanParallelActionWithUnmanagedContext ports the third-round
 // reviewer's TestRR3_E_ParallelActionWithUnmanagedContext scenario (repair
 // item 3): target.ContextLength == 0 (context not being managed) and the

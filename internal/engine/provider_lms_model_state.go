@@ -169,7 +169,19 @@ type LMSModelStateProvider struct {
 	// requested --parallel exactly. Without this, a non-converging observed
 	// value (LM Studio clamping or rounding the request, or the reload
 	// simply not taking effect) would otherwise unload+reload the model on
-	// every autonomic tick forever. All three fields guarded by mu.
+	// every autonomic tick forever. ComputePlan also clears this record
+	// outright once the target row converges (loaded at the declared
+	// parallelism), so a later re-drift to the SAME observed value is not
+	// shadowed by a stale record from before convergence — see
+	// clearParallelDampening. All three fields guarded by mu.
+	//
+	// This state is process-local and non-persistent: it is not written into
+	// reconcile.State via BuildState, and maybeRegisterModelStateReconciler
+	// constructs a fresh LMSModelStateProvider on every BuildRouter call, so
+	// any router rebuild or kernel restart resets the gate to unarmed. Worst
+	// case that costs one extra unload+reload after a rebuild — not a thrash
+	// loop — and the `cogos reconcile` CLI's --dry-run path returns before
+	// ApplyPlan, so a preview can never falsely arm or clear it.
 	lastParallelAttempted bool   // has any "/parallel" action ever been attempted?
 	lastParallelTarget    string // target.Model at the time of that attempt
 	lastParallelObserved  string // parallelStr(targetRow.Parallel) at that time
@@ -482,6 +494,20 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 		return plan, nil
 	}
 
+	// Re-arm the dampening gate on convergence. Once the target row is loaded
+	// at the declared parallelism, any previously-recorded "/parallel" attempt
+	// is stale — the drift it was damping against has resolved. Without this,
+	// a converge-then-re-drift-to-the-SAME-value sequence (e.g. target=1,
+	// observed 4 -> action -> observed 1 (converged) -> observed 4 again, the
+	// LM Studio app default) would find parallelActionDamped still true for
+	// (model, "4") from before convergence and permanently suppress the
+	// action, leaving the reconciler Degraded/OutOfSync with an empty plan
+	// forever. Clearing here means the gate only ever damps a *live*,
+	// unresolved drift, never a resolved one that has recurred.
+	if target.Parallel > 0 && targetRow != nil && !parallelMismatch(targetRow, target.Parallel) {
+		p.clearParallelDampening()
+	}
+
 	// jit_evict FIRST: any eviction must precede the load so VRAM is actually
 	// freed before we load the target onto the card (otherwise ApplyPlan would
 	// load onto a still-crowded card and fail, deferring convergence a cycle).
@@ -546,6 +572,17 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 	// an empty plan, which re-triggered the LLM escalation path on every
 	// autonomic tick (shouldEscalate → escalateDegradedHealth) with nothing
 	// the deterministic self-heal could ever do about it.
+	//
+	// NOTE on the dampened terminal state: once parallelActionDamped suppresses
+	// re-emission for a non-converging observed value, this case is back to an
+	// empty plan while Health() (independent of the gate) still reports
+	// Degraded/OutOfSync — the exact state this comment says the action exists
+	// to avoid. That's accepted as a bounded, intentional trade: escalation is
+	// throttled to roughly once per idle-recheckin window by the
+	// stable-degradation fingerprint dedupe in local_agent_harness.go, not
+	// re-fired every tick, and the gate re-arms on convergence (see the
+	// clearParallelDampening call above the jit_evict section) so the terminal
+	// state only persists while the drift is genuinely unresolved.
 	case target.Parallel > 0 && parallelMismatch(targetRow, target.Parallel):
 		observed := parallelStr(targetRow.Parallel)
 
@@ -553,11 +590,16 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 		// observed value it has already been tried against. See the
 		// dampening fields' doc comment on the provider struct — this makes
 		// the actuator single-shot per observation regardless of whether the
-		// resulting reload actually moves the observed parallel value (never
-		// independently verified live; see the PR body's pre-merge
-		// checklist). Once FetchLive reports a DIFFERENT observed value —
-		// converged, still wrong but freshly so, or changed by other means —
-		// the gate lifts and a fresh attempt is allowed.
+		// resulting reload actually moves the observed parallel value. The
+		// live round trip (`lms load --parallel N` -> `lms ps --json`
+		// reporting N) was verified on Darkstar 2026-08-14: parallel 2 and
+		// parallel 1 both landed exactly as requested, context preserved,
+		// warm reloads ~12s. Once FetchLive reports a DIFFERENT observed
+		// value — converged, still wrong but freshly so, or changed by other
+		// means — the gate lifts and a fresh attempt is allowed; and once the
+		// target row converges, ComputePlan clears the gate outright (see the
+		// re-arm block above the jit_evict section) so a later re-drift to
+		// the same value isn't shadowed by a stale record.
 		if p.parallelActionDamped(target.Model, observed) {
 			break
 		}
@@ -1086,6 +1128,19 @@ func (p *LMSModelStateProvider) recordParallelAction(model, observed string) {
 	p.lastParallelAttempted = true
 	p.lastParallelTarget = model
 	p.lastParallelObserved = observed
+}
+
+// clearParallelDampening resets the "/parallel" dampening record so a future
+// drift to any observed value — including one identical to a prior, already-
+// resolved drift — is free to fire a fresh action. Called from ComputePlan
+// once the target row converges (loaded at the declared parallelism); see
+// the call site for the re-arm rationale.
+func (p *LMSModelStateProvider) clearParallelDampening() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastParallelAttempted = false
+	p.lastParallelTarget = ""
+	p.lastParallelObserved = ""
 }
 
 // parallelGapNote returns an informational suffix for Health() messages

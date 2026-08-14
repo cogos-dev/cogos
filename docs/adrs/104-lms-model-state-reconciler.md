@@ -79,13 +79,27 @@ context fix.
 second `<name>/parallel` action for the same target against an *unchanged*
 observed parallel value — it fires once, and only fires again once
 `FetchLive`'s next probe reports a *different* observed value (converged,
-still wrong but freshly so, or moved by other means). This exists because the
-round trip `lms load --parallel N` → `lms ps --json` reporting exactly `N`
-back has not been independently verified against a live LM Studio instance; if
-LM Studio ever clamps or otherwise reports the value differently, an
-un-dampened action would unload and reload the model on every autonomic tick
-forever. Verifying that round trip live is a pre-merge checklist item,
-tracked in the PR, not asserted here.
+still wrong but freshly so, or moved by other means), or once the target row
+converges (loaded at the declared parallelism), at which point `ComputePlan`
+clears the record outright so a later re-drift to the same observed value
+fires a fresh action rather than being shadowed by the pre-convergence
+record. This exists because a non-converging observed value (LM Studio
+clamping or rounding the request, or the reload simply not taking effect)
+would otherwise unload and reload the model on every autonomic tick forever.
+
+The round trip `lms load --parallel N` → `lms ps --json` reporting exactly
+`N` back was verified live on Darkstar 2026-08-14 against `ornith-1.0-35b`:
+`--parallel 2` landed as `"parallel": 2`, restoring `--parallel 1` landed as
+`"parallel": 1`, context length held at 262144 across both reloads, and warm
+reloads took roughly 12s. The dampening gate is kept regardless, as
+defense-in-depth for other backends and LM Studio versions where the round
+trip may not hold.
+
+The dampening state is process-local and non-persistent — it lives on the
+provider instance, not in `reconcile.State`, and a fresh provider is
+constructed on every router rebuild (including a kernel restart), so the gate
+resets to unarmed. Worst case that costs one extra unload+reload after a
+rebuild, not a thrash loop.
 
 ## Decision
 
