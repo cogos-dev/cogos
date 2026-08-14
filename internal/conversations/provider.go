@@ -15,6 +15,8 @@ package conversations
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1234,6 +1236,45 @@ func isDrift(meta SessionMeta, f sourceFileInfo) bool {
 	return diff > 2*time.Second
 }
 
+// tailFingerprintWindow is the number of bytes, immediately below a
+// watermark offset, that get hashed into SessionMeta.SourceTailHash. Kept
+// small and fixed so verifying it is O(tailFingerprintWindow) — a cheap,
+// constant-cost check — never O(session-size). 4096 bytes is comfortably
+// larger than a single CC JSONL record in the common case, so an in-place
+// rewrite of the record(s) nearest the watermark is caught even when the
+// rewrite also changes the file's total size.
+const tailFingerprintWindow = 4096
+
+// tailFingerprint hashes the up-to-tailFingerprintWindow bytes immediately
+// preceding offset in f, returning a hex-encoded sha256 digest. offset <= 0
+// (nothing below the watermark to fingerprint) returns the empty string.
+// Files shorter than the window are handled by clamping the start of the
+// read to byte 0, hashing whatever is actually there.
+//
+// This is deliberately a bounded-window check, not a whole-file hash: it
+// catches a rewrite that touches the bytes nearest the watermark (the
+// common case for an in-place rewrite, truncate+replace, or restore that
+// replaces a session file wholesale) at O(window) cost, not a rewrite
+// confined entirely to bytes further back in a large file than the window
+// reaches. That residual is the same class of trade CC session JSONLs
+// already accept elsewhere (see indexSessionIncremental's doc comment) in
+// exchange for keeping the per-cycle cost independent of session size.
+func tailFingerprint(f *os.File, offset int64) (string, error) {
+	if offset <= 0 {
+		return "", nil
+	}
+	start := offset - tailFingerprintWindow
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, offset-start)
+	if _, err := f.ReadAt(buf, start); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // indexSession opens sourcePath, streams turns from byte 0, and returns the
 // resulting SessionMeta and Turn slice. Does not hold the file open after
 // return. This is the full re-parse path: used for brand-new sessions
@@ -1274,6 +1315,15 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	// SessionMeta.SourceOffset and indexSessionIncremental.
 	meta.SourceOffset = fi.Size()
 
+	// Fingerprint the bytes below the new watermark so the next incremental
+	// cycle can verify they're unchanged before trusting the watermark. See
+	// SessionMeta.SourceTailHash.
+	tailHash, err := tailFingerprint(f, meta.SourceOffset)
+	if err != nil {
+		return meta, turns, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
+	}
+	meta.SourceTailHash = tailHash
+
 	return meta, turns, nil
 }
 
@@ -1286,36 +1336,48 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 // the appended bytes makes the PARSE step of a steady-state cycle O(delta)
 // instead of O(session-size).
 //
-// NOTE on scope: this only fixes the parse side. Index.UpsertSessions still
-// rewrites the whole per-session turns projection file every cycle
-// (writeTurnsFileLocked in index.go), so the end-to-end apply cost of a
-// cycle that has any new turns remains O(session-size) — a large,
-// steadily-growing session can still straddle CycleBudget even after this
-// change. That write-side cost is a separate, not-yet-addressed piece of
-// work; see index.go's writeTurnsFileLocked doc comment.
+// NOTE on scope: this only fixes the parse side, and only the parse side.
+// Index.UpsertSessions still rewrites the whole per-session turns
+// projection file every cycle (writeTurnsFileLocked in index.go), so the
+// end-to-end apply cost of a cycle that has any new turns remains
+// O(session-size) — a large, steadily-growing session can still straddle
+// CycleBudget even after this change. That write-side cost, along with
+// issue #558's other two items (a CycleBudget breach that only logs, with
+// no per-provider override or actuator; a provider-qualified anomaly tag
+// for the "over_budget" reason), is deliberately not addressed here — it is
+// severed into a follow-up so this change stays reviewable as one concern
+// (the parse-side data-loss and staleness gaps). #558 should stay open
+// until that follow-up lands.
 //
 // Returns (meta, turns, usedIncremental, err). usedIncremental is false
-// whenever the fast path isn't safe to take (no established watermark, the
-// file is smaller than the watermark — a truncation or rewrite, most
-// commonly a CC compaction that replaces the file wholesale — the recorded
-// turns don't match the recorded turn count, or the file was rewritten
-// in place at the same size) — the caller must fall back to indexSession (a
-// full re-parse) in that case.
+// whenever the fast path isn't safe to take: no established watermark; the
+// file is smaller than the watermark (a truncation or rewrite, most
+// commonly a CC compaction that replaces the file wholesale); the recorded
+// turns don't match the recorded turn count; no SourceTailHash was
+// recorded to verify against (prevMeta indexed before that field existed);
+// the bytes below the watermark no longer match SourceTailHash (an
+// in-place rewrite, whether or not it also changed the file's size — see
+// tailFingerprint); or the file was rewritten in place at the same size
+// with its mtime moved. The caller must fall back to indexSession (a full
+// re-parse) in that case.
 //
-// This is a size+mtime heuristic, not a content hash: it trusts that bytes
-// already consumed up to prevMeta.SourceOffset are unchanged whenever the
-// file has only grown since. That is the same trust boundary isDrift
-// already relies on for the source-changed decision one level up (mtime +
-// size, no hashing), so it introduces no new class of assumption — it just
-// applies the existing one at finer granularity. An in-place rewrite that
-// changes already-consumed bytes while leaving the file size unchanged is
-// caught below by comparing mtime against the watermark's recorded mtime
-// (the same signal isDrift uses to decide there's anything to reconcile at
-// all); a rewrite that also changes the size is caught by the shrink check
-// when it shrinks, and otherwise looks like ordinary growth and is not
-// distinguishable from a legitimate append without content hashing — CC
-// session JSONLs are append-only in practice, so that residual case is not
-// expected to occur, but a generic *.jsonl source is not guaranteed to be.
+// This is a size+mtime heuristic AND a bounded content fingerprint: it
+// trusts that bytes already consumed up to prevMeta.SourceOffset are
+// unchanged whenever the file has only grown since, but verifies that trust
+// against SourceTailHash (a hash of the tailFingerprintWindow bytes
+// immediately below the watermark, recorded at the last parse) rather than
+// taking it on faith. A same-size in-place rewrite is additionally caught
+// by comparing mtime against the watermark's recorded mtime (the same
+// signal isDrift uses to decide there's anything to reconcile at all); a
+// rewrite that shrinks the file is caught by the shrink check; a rewrite
+// that changes bytes within the fingerprint window — including one that
+// also grows the file, which looks like ordinary append-only growth to a
+// pure size/mtime check — is caught by the SourceTailHash mismatch below.
+// The one residual this still cannot see is a rewrite confined entirely to
+// bytes below the fingerprint window in a file larger than that window
+// (see tailFingerprint's doc comment): CC session JSONLs are append-only in
+// practice, so that narrower case is not expected to occur, but a generic
+// *.jsonl source is not guaranteed to be.
 func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevMeta SessionMeta, prevTurns []Turn) (SessionMeta, []Turn, bool, error) {
 	fi, err := os.Stat(sourcePath)
 	if err != nil {
@@ -1341,14 +1403,43 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 		return SessionMeta{}, nil, false, nil
 	}
 
-	// A same-size in-place rewrite (byte count unchanged, content
-	// different) can't be caught by the shrink check above, since fi.Size()
-	// still equals prevMeta.SourceOffset. Fall back to a full re-parse
-	// whenever the file's mtime moved (beyond the same 2s tolerance isDrift
-	// uses) without the size moving past the watermark — trusting "size
-	// didn't shrink" as sufficient safety would let a same-size rewrite
-	// resume from a watermark whose already-consumed bytes are no longer
-	// what was actually parsed.
+	f, err := os.Open(sourcePath)
+	if err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("open %s: %w", sourcePath, err)
+	}
+	defer f.Close()
+
+	// Verify the bytes below the watermark are still what they were at the
+	// last parse before trusting the watermark as a resume point. No
+	// recorded fingerprint (prevMeta indexed before SourceTailHash existed)
+	// can't be verified — decline so the caller falls back to a full
+	// re-parse, which also backfills the hash for subsequent cycles.
+	if prevMeta.SourceTailHash == "" {
+		return SessionMeta{}, nil, false, nil
+	}
+	tailHash, err := tailFingerprint(f, prevMeta.SourceOffset)
+	if err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
+	}
+	if tailHash != prevMeta.SourceTailHash {
+		// The bytes below the watermark no longer match what was
+		// fingerprinted at the last parse — an in-place rewrite, whether
+		// or not it also changed the file's size (a rewrite-then-grow is
+		// invisible to the size/mtime checks alone). Decline; the caller's
+		// full re-parse fallback self-heals.
+		return SessionMeta{}, nil, false, nil
+	}
+
+	// A same-size in-place rewrite that happens to leave the fingerprint
+	// window's bytes unchanged (e.g. the rewrite lands entirely below the
+	// window in a file larger than tailFingerprintWindow) can't be caught
+	// by the fingerprint or the shrink check above, since fi.Size() still
+	// equals prevMeta.SourceOffset. Fall back to a full re-parse whenever
+	// the file's mtime moved (beyond the same 2s tolerance isDrift uses)
+	// without the size moving past the watermark — trusting "size didn't
+	// shrink and the fingerprint matched" as sufficient safety would let
+	// such a rewrite resume from a watermark whose already-consumed bytes
+	// are no longer what was actually parsed.
 	if fi.Size() == prevMeta.SourceOffset {
 		mtimeDiff := fi.ModTime().Sub(prevMeta.SourceMtime)
 		if mtimeDiff < 0 {
@@ -1358,12 +1449,6 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 			return SessionMeta{}, nil, false, nil
 		}
 	}
-
-	f, err := os.Open(sourcePath)
-	if err != nil {
-		return SessionMeta{}, nil, false, fmt.Errorf("open %s: %w", sourcePath, err)
-	}
-	defer f.Close()
 
 	if _, err := f.Seek(prevMeta.SourceOffset, io.SeekStart); err != nil {
 		return SessionMeta{}, nil, false, fmt.Errorf("seek %s to %d: %w", sourcePath, prevMeta.SourceOffset, err)
@@ -1418,6 +1503,14 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 
 	meta.TurnCount = len(combined)
 	meta.SourceOffset = fi.Size()
+
+	// Re-fingerprint the (now larger) window below the new watermark so the
+	// next cycle can verify it. See SessionMeta.SourceTailHash.
+	newTailHash, err := tailFingerprint(f, meta.SourceOffset)
+	if err != nil {
+		return meta, combined, false, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
+	}
+	meta.SourceTailHash = newTailHash
 
 	return meta, combined, true, nil
 }
