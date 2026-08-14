@@ -83,9 +83,23 @@ type rawAITitle struct {
 // historical turns that are already present, causing the same uuid to appear
 // at two different turn_indexes.
 //
+// Returns the byte offset, relative to r's starting position, of the end of
+// the last COMPLETE line that was successfully unmarshaled as JSON — never
+// the total number of bytes read. A session file can have a
+// partially-written last line (the writer is still mid-append when a cycle
+// reads it); that line fails json.Unmarshal and is skipped below like any
+// other unparseable line, and its bytes must NOT be counted as consumed.
+// Callers (indexSession, indexSessionIncremental in provider.go) use this
+// return value as the new watermark instead of the stream's end-of-data
+// position: recording the watermark past a torn line would let the tail
+// fingerprint below it match again once the writer finishes the line,
+// taking the incremental fast path and permanently skipping content that
+// was never actually parsed, with no self-heal (issue #558 part 1, torn
+// last line finding).
+//
 // ParseSession is purely functional: no global state, no side effects beyond
 // the callbacks. Tests can supply a strings.Reader fixture.
-func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMeta, callback func(Turn) bool) error {
+func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMeta, callback func(Turn) bool) (int64, error) {
 	if maxTurnLen <= 0 {
 		maxTurnLen = 8192
 	}
@@ -93,19 +107,46 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, maxScannerTokenSize), maxScannerTokenSize)
 
+	// consumedOffset tracks the cumulative number of bytes bufio.ScanLines
+	// has advanced the stream by, across every token seen so far — the
+	// standard split function's own advance value, which (unlike
+	// len(scanner.Bytes())) includes the line terminator. Wrapping
+	// bufio.ScanLines instead of reimplementing line splitting keeps the
+	// existing tokenization behavior (including the maxScannerTokenSize
+	// buffer cap) byte-for-byte unchanged; this only observes it.
+	var consumedOffset int64
+	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		advance, token, err = bufio.ScanLines(data, atEOF)
+		if err == nil && advance > 0 {
+			consumedOffset += int64(advance)
+		}
+		return advance, token, err
+	})
+
+	// lastGoodOffset only advances past a line once it has been
+	// successfully unmarshaled as JSON — see the doc comment above.
+	var lastGoodOffset int64
+
 	seenUUIDs := make(map[string]struct{})
 	turnIndex := 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
+			// A zero-length line is complete by construction (it can't be a
+			// torn record), so it's safe to advance the watermark past it.
+			lastGoodOffset = consumedOffset
 			continue
 		}
 
 		var rec rawRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
-			// Skip unparseable lines — sessions may have partially-written last lines.
+			// Skip unparseable lines — sessions may have partially-written
+			// last lines. Deliberately do NOT advance lastGoodOffset: this
+			// may be exactly such a line, and the watermark must never move
+			// past bytes that were never actually parsed.
 			continue
 		}
+		lastGoodOffset = consumedOffset
 
 		// Populate session-level metadata from whichever record has it.
 		if rec.Entrypoint != "" && meta.Entrypoint == "" {
@@ -134,7 +175,7 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 			}
 			updateTimeBounds(meta, turn.Timestamp)
 			if !callback(turn) {
-				return nil
+				return lastGoodOffset, nil
 			}
 			turnIndex++
 			meta.TurnCount = turnIndex
@@ -153,14 +194,14 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 			}
 			updateTimeBounds(meta, turn.Timestamp)
 			if !callback(turn) {
-				return nil
+				return lastGoodOffset, nil
 			}
 			turnIndex++
 			meta.TurnCount = turnIndex
 		}
 	}
 
-	return scanner.Err()
+	return lastGoodOffset, scanner.Err()
 }
 
 // parseUserRecord extracts a Turn from a type="user" raw record.

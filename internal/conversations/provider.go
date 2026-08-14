@@ -1301,7 +1301,7 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	}
 
 	var turns []Turn
-	err = ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
+	parsedOffset, err := ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	})
@@ -1309,11 +1309,16 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 		return meta, turns, fmt.Errorf("parse %s: %w", sourcePath, err)
 	}
 
-	// The whole file, start to current EOF, was just consumed — record that
-	// as the watermark so the next update cycle (if the file has only grown)
-	// can resume from here instead of re-parsing from byte 0. See
-	// SessionMeta.SourceOffset and indexSessionIncremental.
-	meta.SourceOffset = fi.Size()
+	// Record the byte offset of the last COMPLETE, successfully-parsed line
+	// as the watermark — NOT fi.Size(). A session file can have a
+	// partially-written last line (the writer is still mid-append); using
+	// fi.Size() would advance the watermark past those unparsed bytes, and
+	// once the writer finishes the line the tail fingerprint below the
+	// watermark would still match, so the incremental fast path would take
+	// over and that completed line would never be (re-)read — a permanent,
+	// silent turn loss with no self-heal (issue #558 part 1). See
+	// ParseSession's doc comment.
+	meta.SourceOffset = parsedOffset
 
 	// Fingerprint the bytes below the new watermark so the next incremental
 	// cycle can verify they're unchanged before trusting the watermark. See
@@ -1377,7 +1382,13 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 // bytes below the fingerprint window in a file larger than that window
 // (see tailFingerprint's doc comment): CC session JSONLs are append-only in
 // practice, so that narrower case is not expected to occur, but a generic
-// *.jsonl source is not guaranteed to be.
+// *.jsonl source is not guaranteed to be. A partially-written last line (the
+// writer still mid-append when a cycle reads the file) is NOT a residual of
+// this mechanism: ParseSession only ever reports the offset of the last
+// COMPLETE, successfully-parsed line as the new watermark, so a torn line
+// is re-read — once the writer finishes it — on every subsequent cycle
+// until it parses, rather than being silently skipped forever. See
+// ParseSession's doc comment in parser.go.
 func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevMeta SessionMeta, prevTurns []Turn) (SessionMeta, []Turn, bool, error) {
 	fi, err := os.Stat(sourcePath)
 	if err != nil {
@@ -1419,6 +1430,14 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 	}
 	tailHash, err := tailFingerprint(f, prevMeta.SourceOffset)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			// TOCTOU: the file was truncated or replaced between the
+			// os.Stat above and this ReadAt (e.g. a concurrent compaction).
+			// Decline the fast path rather than surfacing a hard error —
+			// the caller's full re-parse fallback self-heals, and the next
+			// cycle re-observes the file in whatever state it settles into.
+			return SessionMeta{}, nil, false, nil
+		}
 		return SessionMeta{}, nil, false, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
 	}
 	if tailHash != prevMeta.SourceTailHash {
@@ -1478,7 +1497,7 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 	}
 
 	var newTurns []Turn
-	err = ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
+	parsedTailOffset, err := ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
 		if t.UUID != "" {
 			if _, dup := seen[t.UUID]; dup {
 				return true
@@ -1502,7 +1521,14 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 	}
 
 	meta.TurnCount = len(combined)
-	meta.SourceOffset = fi.Size()
+	// parsedTailOffset is relative to the seek point (prevMeta.SourceOffset),
+	// not absolute — add it back. Like indexSession, this is the offset of
+	// the last COMPLETE, successfully-parsed line in the tail, never
+	// fi.Size(): a torn last line here must not advance the watermark past
+	// it, or the next cycle's tail fingerprint would match once the writer
+	// completes it and the completed line would never be read. See
+	// ParseSession's doc comment.
+	meta.SourceOffset = prevMeta.SourceOffset + parsedTailOffset
 
 	// Re-fingerprint the (now larger) window below the new watermark so the
 	// next cycle can verify it. See SessionMeta.SourceTailHash.

@@ -763,7 +763,7 @@ func TestCCParserUUIDDedup(t *testing.T) {
 
 	var meta SessionMeta
 	var turns []Turn
-	err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool {
+	_, err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	})
@@ -816,7 +816,7 @@ func TestCCParserUUIDDedup_EmptyUUID(t *testing.T) {
 
 	var meta SessionMeta
 	var turns []Turn
-	_ = ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool {
+	_, _ = ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	})
