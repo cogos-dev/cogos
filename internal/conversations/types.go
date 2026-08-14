@@ -113,6 +113,57 @@ type SessionMeta struct {
 
 	// Title is the session AI-generated title when present.
 	Title string `json:"title,omitempty"`
+
+	// Threads is the DAG partition of this session's turns, computed by
+	// PartitionThreads (threads.go). Nil for sessions indexed before this
+	// field existed and not yet re-touched (ActionCreate/ActionUpdate) since —
+	// same lazy-migration posture as SourceOffset/SourceTailHash.
+	Threads []ThreadMeta `json:"threads,omitempty"`
+}
+
+// ThreadRole classifies a thread found by PartitionThreads.
+type ThreadRole string
+
+const (
+	// ThreadRoleMain is the thread containing the session's first turn
+	// (turn_index 0).
+	ThreadRoleMain ThreadRole = "main"
+
+	// ThreadRoleSubagentSidechain is a thread whose turns carry
+	// isSidechain:true — the verified subagent transcript mechanism (a
+	// separate <session-uuid>/subagents/agent-*.jsonl file sharing the
+	// parent's sessionId; see Phase 2 in the #557 plan for ingestion).
+	ThreadRoleSubagentSidechain ThreadRole = "subagent-sidechain"
+
+	// ThreadRoleUnknownFork is any other connected component: a fresh root
+	// with no isSidechain marker, or a branch point off an existing thread.
+	// Deliberately not "side-chat" — that provenance claim was retracted
+	// (see #557 comments) and would be false for anything this algorithm
+	// actually finds.
+	ThreadRoleUnknownFork ThreadRole = "unknown-fork"
+)
+
+// ThreadMeta summarizes one connected component of a session's parentUuid
+// DAG, as computed by PartitionThreads.
+type ThreadMeta struct {
+	// ThreadID is the UUID of the thread's root turn.
+	ThreadID string `json:"thread_id"`
+
+	// Role classifies the thread (see ThreadRole).
+	Role ThreadRole `json:"role"`
+
+	// MessageCount is the number of turns in this thread.
+	MessageCount int `json:"message_count"`
+
+	// StartedAt / EndedAt bound the thread in wall time (from member turns'
+	// timestamps; zero when no member turn has a parseable timestamp).
+	StartedAt time.Time `json:"started_at,omitempty"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+
+	// FirstUUID / LastUUID are the root turn's uuid and the last turn's uuid
+	// in turn_index order within this thread.
+	FirstUUID string `json:"first_uuid"`
+	LastUUID  string `json:"last_uuid"`
 }
 
 // Turn is one indexed turn from a session.
@@ -143,6 +194,27 @@ type Turn struct {
 
 	// ParentUUID links this turn to its parent in the conversation tree.
 	ParentUUID string `json:"parent_uuid,omitempty"`
+
+	// IsSidechain is true when the source record carried isSidechain:true —
+	// the CC subagent-transcript marker. Parsed from rawRecord.IsSidechain
+	// (parser.go), previously captured but silently dropped before this field
+	// existed.
+	IsSidechain bool `json:"is_sidechain,omitempty"`
+
+	// ThreadID is the root-turn UUID of the connected component (per the
+	// parentUuid DAG) this turn belongs to, as computed by PartitionThreads.
+	// Empty for turns not yet run through partitioning.
+	ThreadID string `json:"thread_id,omitempty"`
+
+	// Provenance declares how this turn's content was obtained, for records
+	// that did not come from a direct JSONL parse. Empty (the default) means
+	// "direct-jsonl" — parsed straight from a CC session or subagent
+	// transcript file. A future importer that recovers content by some other
+	// means (e.g. hand-carried from a side-chat panel export, or
+	// log-reconstructed) should set an explicit value here rather than
+	// impersonating a directly-parsed record. This is schema headroom only —
+	// no importer exists yet (see #557 plan Phase 3).
+	Provenance string `json:"provenance,omitempty"`
 
 	// Component is the L1 component class for this record (e.g. "session.turn").
 	// Set on newly-ingested L3 records; empty for records ingested before v0.2.

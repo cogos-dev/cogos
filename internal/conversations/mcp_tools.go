@@ -294,6 +294,17 @@ func makeGetConversationTurnHandler(p *Provider, maxBytes int) mcp.ToolHandlerFo
 			"text":         turn.Text,
 			"is_tool_call": turn.IsToolCall,
 		}
+		if turn.ThreadID != "" {
+			resp["thread_id"] = turn.ThreadID
+			if meta, ok := idx.sessions[turn.SessionID]; ok {
+				for _, tm := range meta.Threads {
+					if tm.ThreadID == turn.ThreadID {
+						resp["thread_role"] = string(tm.Role)
+						break
+					}
+				}
+			}
+		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
 		text := capConvOutput(string(b), maxBytes)
 		return &mcp.CallToolResult{
@@ -335,16 +346,22 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 			metas = metas[:limit]
 		}
 
+		type threadOut struct {
+			ThreadID     string `json:"thread_id"`
+			Role         string `json:"role"`
+			MessageCount int    `json:"message_count"`
+		}
 		type sessionOut struct {
-			SessionID   string `json:"session_id"`
-			Source      string `json:"source,omitempty"`
-			Title       string `json:"title,omitempty"`
-			TurnCount   int    `json:"turn_count"`
-			FirstTurnAt string `json:"first_turn_at,omitempty"`
-			LastTurnAt  string `json:"last_turn_at,omitempty"`
-			IndexedAt   string `json:"indexed_at,omitempty"`
-			Identity    string `json:"identity,omitempty"`
-			Entrypoint  string `json:"entrypoint,omitempty"`
+			SessionID   string      `json:"session_id"`
+			Source      string      `json:"source,omitempty"`
+			Title       string      `json:"title,omitempty"`
+			TurnCount   int         `json:"turn_count"`
+			FirstTurnAt string      `json:"first_turn_at,omitempty"`
+			LastTurnAt  string      `json:"last_turn_at,omitempty"`
+			IndexedAt   string      `json:"indexed_at,omitempty"`
+			Identity    string      `json:"identity,omitempty"`
+			Entrypoint  string      `json:"entrypoint,omitempty"`
+			Threads     []threadOut `json:"threads,omitempty"`
 		}
 		out := make([]sessionOut, 0, len(metas))
 		for _, m := range metas {
@@ -355,6 +372,13 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 				TurnCount:  m.TurnCount,
 				Identity:   m.Identity,
 				Entrypoint: m.Entrypoint,
+			}
+			for _, tm := range m.Threads {
+				so.Threads = append(so.Threads, threadOut{
+					ThreadID:     tm.ThreadID,
+					Role:         string(tm.Role),
+					MessageCount: tm.MessageCount,
+				})
 			}
 			if !m.FirstTurnAt.IsZero() {
 				so.FirstTurnAt = m.FirstTurnAt.Format(time.RFC3339)

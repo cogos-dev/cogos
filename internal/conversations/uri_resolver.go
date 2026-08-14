@@ -10,6 +10,7 @@
 //
 //	q=<terms>          — term-AND; double-quoted phrase = exact substring
 //	role=<csv>         — user,assistant,tool,system  (comma-list)
+//	thread_role=<csv>  — main,subagent-sidechain,unknown-fork  (comma-list)
 //	since=<RFC3339>    — lower timestamp bound
 //	until=<RFC3339>    — upper timestamp bound (also gates content_hash)
 //	limit=<int>        — default 20, server-capped at 200
@@ -81,13 +82,14 @@ type URIQuery struct {
 	SessionID string // empty = all sessions from Source
 
 	// Filters.
-	Query  string    // q=
-	Roles  []Role    // role= comma-list; nil = all roles
-	Since  time.Time // since= RFC3339
-	Until  time.Time // until= RFC3339; non-zero → bounded slice
-	Limit  int       // default 20, capped at 200
-	Offset int       // skip first N
-	Order  string    // "asc" | "desc"; default "asc"
+	Query       string       // q=
+	Roles       []Role       // role= comma-list; nil = all roles
+	ThreadRoles []ThreadRole // thread_role= comma-list; nil = all thread roles
+	Since       time.Time    // since= RFC3339
+	Until       time.Time    // until= RFC3339; non-zero → bounded slice
+	Limit       int          // default 20, capped at 200
+	Offset      int          // skip first N
+	Order       string       // "asc" | "desc"; default "asc"
 
 	// Resolution.
 	Res    ResolutionLevel // pointer|abstract|full; default full
@@ -150,6 +152,13 @@ type ResolvedTurn struct {
 
 	// Source is the observer source id (empty for CC sessions).
 	Source string `json:"source,omitempty"`
+
+	// ThreadID / ThreadRole carry the parentUuid-DAG thread this turn belongs
+	// to, as computed by PartitionThreads. Empty when the owning session's
+	// meta has no Threads populated yet (not re-touched since threading
+	// shipped — see SessionMeta.Threads doc comment).
+	ThreadID   string `json:"thread_id,omitempty"`
+	ThreadRole string `json:"thread_role,omitempty"`
 
 	// v0.2 L3 version tags — populated on records indexed with ontology
 	// enforcement enabled. Empty for records indexed before v0.2.
@@ -224,7 +233,7 @@ func parseConversationQueryParams(queryStr string, uq *URIQuery) error {
 
 	// Known params — all processed below (component= and ontology= now active).
 	known := map[string]bool{
-		"q": true, "role": true, "since": true, "until": true,
+		"q": true, "role": true, "thread_role": true, "since": true, "until": true,
 		"limit": true, "offset": true, "order": true,
 		"res": true, "fields": true,
 		"component": true, "ontology": true, // v0.2 activated
@@ -250,6 +259,12 @@ func parseConversationQueryParams(queryStr string, uq *URIQuery) error {
 				return err
 			}
 			uq.Roles = roles
+		case "thread_role":
+			threadRoles, err := parseThreadRoles(v)
+			if err != nil {
+				return err
+			}
+			uq.ThreadRoles = threadRoles
 		case "since":
 			t, err := time.Parse(time.RFC3339, v)
 			if err != nil {
@@ -324,6 +339,26 @@ func parseRoles(v string) ([]Role, error) {
 			out = append(out, Role(p))
 		default:
 			return nil, fmt.Errorf("invalid role %q: must be one of user, assistant, tool, system", p)
+		}
+	}
+	return out, nil
+}
+
+// parseThreadRoles parses a comma-separated thread_role list. Returns an
+// error for any unrecognised value, mirroring parseRoles.
+func parseThreadRoles(v string) ([]ThreadRole, error) {
+	parts := strings.Split(v, ",")
+	out := make([]ThreadRole, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		switch ThreadRole(p) {
+		case ThreadRoleMain, ThreadRoleSubagentSidechain, ThreadRoleUnknownFork:
+			out = append(out, ThreadRole(p))
+		default:
+			return nil, fmt.Errorf("invalid thread_role %q: must be one of main, subagent-sidechain, unknown-fork", p)
 		}
 	}
 	return out, nil
@@ -441,6 +476,17 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 		}
 	}
 
+	// Build thread_role set for fast lookup. Looked up per-turn via the
+	// owning session's Threads (SessionMeta), since Turn only carries the
+	// ThreadID, not the role — see the lookup site below.
+	var threadRoleSet map[ThreadRole]struct{}
+	if len(uq.ThreadRoles) > 0 {
+		threadRoleSet = make(map[ThreadRole]struct{}, len(uq.ThreadRoles))
+		for _, r := range uq.ThreadRoles {
+			threadRoleSet[r] = struct{}{}
+		}
+	}
+
 	// Parse search terms.
 	terms := parseSearchQuery(uq.Query)
 
@@ -493,10 +539,34 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 		}
 		sourcesSeen[src] = struct{}{}
 
+		// Thread role lookup for this session, built once: Turn only carries
+		// ThreadID, so the role comes from the owning SessionMeta.Threads.
+		var threadRoleByID map[string]ThreadRole
+		if len(meta.Threads) > 0 {
+			threadRoleByID = make(map[string]ThreadRole, len(meta.Threads))
+			for _, tm := range meta.Threads {
+				threadRoleByID[tm.ThreadID] = tm.Role
+			}
+		}
+
 		for _, t := range turns {
 			// Role filter.
 			if roleSet != nil {
 				if _, ok := roleSet[t.Role]; !ok {
+					continue
+				}
+			}
+			// thread_role filter. A turn whose session has no Threads
+			// populated yet (not re-touched since threading shipped) has no
+			// resolvable thread role and is excluded when this filter is set
+			// — it cannot be positively matched to any of the requested
+			// roles.
+			if threadRoleSet != nil {
+				role, ok := threadRoleByID[t.ThreadID]
+				if !ok {
+					continue
+				}
+				if _, ok := threadRoleSet[role]; !ok {
 					continue
 				}
 			}
@@ -569,6 +639,15 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 		}
 		if meta, ok := idx.sessions[t.SessionID]; ok {
 			rt.Source = meta.Source
+			if t.ThreadID != "" {
+				rt.ThreadID = t.ThreadID
+				for _, tm := range meta.Threads {
+					if tm.ThreadID == t.ThreadID {
+						rt.ThreadRole = string(tm.Role)
+						break
+					}
+				}
+			}
 		}
 		switch uq.Res {
 		case ResFull:

@@ -1329,6 +1329,12 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	}
 	meta.SourceTailHash = tailHash
 
+	// Partition the assembled turn list into threads (parentUuid DAG
+	// components) as a post-processing step over the in-memory turn list —
+	// does not touch SourceOffset/SourceTailHash/watermark fields. See
+	// threads.go's doc comment for the mechanisms this covers.
+	meta.Threads = PartitionThreads(turns)
+
 	return meta, turns, nil
 }
 

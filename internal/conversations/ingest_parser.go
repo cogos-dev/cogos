@@ -59,6 +59,13 @@ type ingestRecord struct {
 	Text         string          `json:"text"`
 	Identity     string          `json:"identity,omitempty"`
 	Refs         json.RawMessage `json:"refs,omitempty"`
+
+	// Provenance declares how this record's content was obtained when it did
+	// not come from a direct JSONL parse (e.g. "hand-carried",
+	// "log-reconstructed"). Optional; empty means "direct-jsonl" per the
+	// Turn.Provenance convention (types.go). Schema headroom only — no
+	// importer sets this yet (see #557 plan Phase 3).
+	Provenance string `json:"provenance,omitempty"`
 }
 
 // ingestRefs is the optional refs object within an ingest record.
@@ -294,6 +301,7 @@ func (a *ingestAccumulator) ConsumeFile(r io.Reader) error {
 			Component:       componentClass,
 			OntologyVersion: ontRef,
 			MappingVersion:  mappingRef,
+			Provenance:      rec.Provenance,
 		})
 		sess.Meta.TurnCount = len(sess.Turns)
 	}

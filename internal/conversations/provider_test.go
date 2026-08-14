@@ -1363,6 +1363,225 @@ func TestParserSkipsToolResults(t *testing.T) {
 	}
 }
 
+// TestProviderIngest_ThreadPartition indexes a session whose JSONL contains a
+// braided parentUuid DAG: a linear main thread plus a second thread — a
+// subagent-sidechain fresh root (parentUuid:null, isSidechain:true), the
+// verified on-disk mechanism from the #557 plan — and asserts the split is
+// detected, represented in SessionMeta.Threads, and survives the full
+// ApplyPlan → disk (_meta.json) → FetchLive round trip (so a silent field
+// drop in the JSON marshal/unmarshal path would be caught here, not just in
+// the pure PartitionThreads unit tests).
+func TestProviderIngest_ThreadPartition(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const threadSID = "22222222-3333-4444-5555-666666666666"
+
+	lines := []string{
+		makeUserRecord("main-u1", "", threadSID, "main thread question", "2026-06-01T10:00:00Z"),
+		makeAssistantRecord("main-a1", "main-u1", threadSID, "main thread answer", "2026-06-01T10:01:00Z"),
+		makeSidechainUserRecord("sub-u1", "", threadSID, "subagent sidechain turn", "2026-06-01T10:02:00Z"),
+		makeSidechainAssistantRecord("sub-a1", "sub-u1", threadSID, "subagent sidechain reply", "2026-06-01T10:03:00Z"),
+	}
+	writeJSONLFixture(t, srcDir, threadSID, lines)
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if _, err := p.ApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	// Round trip through disk: FetchLive reloads from _meta.json.
+	liveAny2, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive 2: %v", err)
+	}
+	ls, ok := liveAny2.(*liveState)
+	if !ok {
+		t.Fatal("expected *liveState")
+	}
+	entry, ok := ls.Entries[threadSID]
+	if !ok {
+		t.Fatalf("session %s not in live state", threadSID)
+	}
+
+	threads := entry.Meta.Threads
+	if len(threads) != 2 {
+		t.Fatalf("want 2 threads after round trip, got %d: %+v", len(threads), threads)
+	}
+
+	var main, sidechain *ThreadMeta
+	for i := range threads {
+		switch threads[i].Role {
+		case ThreadRoleMain:
+			main = &threads[i]
+		case ThreadRoleSubagentSidechain:
+			sidechain = &threads[i]
+		}
+	}
+	if main == nil {
+		t.Fatalf("no main thread survived the round trip: %+v", threads)
+	}
+	if sidechain == nil {
+		t.Fatalf("no subagent-sidechain thread survived the round trip: %+v", threads)
+	}
+	if main.ThreadID != "main-u1" {
+		t.Errorf("main ThreadID: want main-u1, got %q", main.ThreadID)
+	}
+	if main.MessageCount != 2 {
+		t.Errorf("main MessageCount: want 2, got %d", main.MessageCount)
+	}
+	if sidechain.ThreadID != "sub-u1" {
+		t.Errorf("sidechain ThreadID: want sub-u1, got %q", sidechain.ThreadID)
+	}
+	if sidechain.MessageCount != 2 {
+		t.Errorf("sidechain MessageCount: want 2, got %d", sidechain.MessageCount)
+	}
+
+	// Per-turn ThreadID/IsSidechain must also survive the round trip.
+	idxTurn, ok := p.index.GetTurn(threadSID, 2) // turn_index 2 = sub-u1
+	if !ok {
+		t.Fatalf("GetTurn(threadSID, 2) not found")
+	}
+	if idxTurn.ThreadID != "sub-u1" {
+		t.Errorf("turn 2 ThreadID: want sub-u1, got %q", idxTurn.ThreadID)
+	}
+	if !idxTurn.IsSidechain {
+		t.Error("turn 2 IsSidechain: want true, got false")
+	}
+}
+
+// TestIngestProvenance_HandCarriedRecord exercises the Phase 3 provenance
+// headroom: a normalized-ingest record declaring a non-default provenance
+// (e.g. content recovered by some means other than a direct JSONL parse)
+// carries that value through to the indexed Turn. This is schema headroom
+// only — no importer sets this field yet; the fixture simulates what a
+// future importer's emitted record would look like.
+func TestIngestProvenance_HandCarriedRecord(t *testing.T) {
+	acc := newIngestAccumulator(defaultMaxTurnLen)
+
+	rec := map[string]any{
+		"schema":     "cogos.observatory.conversations/v0.1",
+		"source":     "hand-carried-side-chat",
+		"session_id": "sidechat-001",
+		"role":       "user",
+		"timestamp":  "2026-06-01T10:00:00Z",
+		"text":       "recovered side-chat turn",
+		"provenance": "hand-carried",
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal fixture record: %v", err)
+	}
+	line := append(b, '\n')
+
+	if err := acc.ConsumeFile(strings.NewReader(string(line))); err != nil {
+		t.Fatalf("ConsumeFile: %v", err)
+	}
+
+	sessions := acc.Sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("want 1 session, got %d", len(sessions))
+	}
+	turns := sessions[0].Turns
+	if len(turns) != 1 {
+		t.Fatalf("want 1 turn, got %d", len(turns))
+	}
+	if turns[0].Provenance != "hand-carried" {
+		t.Errorf("Provenance: want %q, got %q", "hand-carried", turns[0].Provenance)
+	}
+
+	// A record with no provenance= field defaults to "" (the "direct-jsonl"
+	// convention — absence means direct parse, not a distinct string value).
+	recDefault := map[string]any{
+		"schema":     "cogos.observatory.conversations/v0.1",
+		"source":     "hand-carried-side-chat",
+		"session_id": "sidechat-002",
+		"role":       "user",
+		"timestamp":  "2026-06-01T10:00:00Z",
+		"text":       "normal ingest turn",
+	}
+	b2, err := json.Marshal(recDefault)
+	if err != nil {
+		t.Fatalf("marshal default fixture record: %v", err)
+	}
+	line2 := append(b2, '\n')
+	if err := acc.ConsumeFile(strings.NewReader(string(line2))); err != nil {
+		t.Fatalf("ConsumeFile 2: %v", err)
+	}
+	sessions2 := acc.Sessions()
+	var defaultTurn *Turn
+	for _, s := range sessions2 {
+		if s.Meta.SessionID == indexKeyForIngest("hand-carried-side-chat", "sidechat-002") {
+			defaultTurn = &s.Turns[0]
+		}
+	}
+	if defaultTurn == nil {
+		t.Fatalf("session sidechat-002 not found")
+	}
+	if defaultTurn.Provenance != "" {
+		t.Errorf("default Provenance: want empty, got %q", defaultTurn.Provenance)
+	}
+}
+
+// makeSidechainUserRecord returns a JSON line representing a user message
+// carrying isSidechain:true — the CC subagent-transcript marker.
+func makeSidechainUserRecord(uuid, parentUUID, sessionID, text, ts string) string {
+	content, _ := json.Marshal([]map[string]string{{"type": "text", "text": text}})
+	msg, _ := json.Marshal(map[string]any{
+		"role":    "user",
+		"content": json.RawMessage(content),
+	})
+	rec := map[string]any{
+		"type":        "user",
+		"uuid":        uuid,
+		"parentUuid":  parentUUID,
+		"sessionId":   sessionID,
+		"timestamp":   ts,
+		"message":     json.RawMessage(msg),
+		"userType":    "external",
+		"entrypoint":  "cli",
+		"isSidechain": true,
+	}
+	b, _ := json.Marshal(rec)
+	return string(b)
+}
+
+// makeSidechainAssistantRecord returns a JSON line representing an assistant
+// message carrying isSidechain:true.
+func makeSidechainAssistantRecord(uuid, parentUUID, sessionID, text, ts string) string {
+	content, _ := json.Marshal([]map[string]string{{"type": "text", "text": text}})
+	msg, _ := json.Marshal(map[string]any{
+		"role":    "assistant",
+		"model":   "claude-sonnet-4-6",
+		"content": json.RawMessage(content),
+	})
+	rec := map[string]any{
+		"type":        "assistant",
+		"uuid":        uuid,
+		"parentUuid":  parentUUID,
+		"sessionId":   sessionID,
+		"timestamp":   ts,
+		"message":     json.RawMessage(msg),
+		"userType":    "external",
+		"entrypoint":  "cli",
+		"isSidechain": true,
+	}
+	b, _ := json.Marshal(rec)
+	return string(b)
+}
+
 // ─── Fixture helpers ─────────────────────────────────────────────────────────
 
 // writeObservatoryConfig writes a minimal .cog/config/observatory.yaml that

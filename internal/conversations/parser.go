@@ -231,13 +231,14 @@ func parseUserRecord(rec *rawRecord, sessionID string, idx int, maxLen int) (Tur
 
 	ts := parseTimestamp(rec.Timestamp)
 	return Turn{
-		UUID:       rec.UUID,
-		SessionID:  sessionID,
-		TurnIndex:  idx,
-		Role:       RoleUser,
-		Timestamp:  ts,
-		Text:       text,
-		ParentUUID: rec.ParentUUID,
+		UUID:        rec.UUID,
+		SessionID:   sessionID,
+		TurnIndex:   idx,
+		Role:        RoleUser,
+		Timestamp:   ts,
+		Text:        text,
+		ParentUUID:  rec.ParentUUID,
+		IsSidechain: rec.IsSidechain,
 	}, true
 }
 
@@ -263,14 +264,15 @@ func parseAssistantRecord(rec *rawRecord, sessionID string, idx int, maxLen int)
 
 	ts := parseTimestamp(rec.Timestamp)
 	return Turn{
-		UUID:       rec.UUID,
-		SessionID:  sessionID,
-		TurnIndex:  idx,
-		Role:       RoleAssistant,
-		Timestamp:  ts,
-		Text:       text,
-		IsToolCall: isToolCall,
-		ParentUUID: rec.ParentUUID,
+		UUID:        rec.UUID,
+		SessionID:   sessionID,
+		TurnIndex:   idx,
+		Role:        RoleAssistant,
+		Timestamp:   ts,
+		Text:        text,
+		IsToolCall:  isToolCall,
+		ParentUUID:  rec.ParentUUID,
+		IsSidechain: rec.IsSidechain,
 	}, true
 }
 

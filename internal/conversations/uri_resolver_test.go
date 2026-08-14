@@ -144,6 +144,57 @@ func TestParseConversationURI_QueryParams(t *testing.T) {
 			errSubstr: "invalid role",
 		},
 		{
+			name: "thread_role single",
+			uri:  "cog:conversations?thread_role=main",
+			check: func(t *testing.T, uq *URIQuery) {
+				if len(uq.ThreadRoles) != 1 || uq.ThreadRoles[0] != ThreadRoleMain {
+					t.Errorf("ThreadRoles: want [main], got %v", uq.ThreadRoles)
+				}
+			},
+		},
+		{
+			name: "thread_role comma-list",
+			uri:  "cog:conversations?thread_role=main,subagent-sidechain",
+			check: func(t *testing.T, uq *URIQuery) {
+				if len(uq.ThreadRoles) != 2 {
+					t.Fatalf("ThreadRoles: want 2 elements, got %v", uq.ThreadRoles)
+				}
+				if uq.ThreadRoles[0] != ThreadRoleMain || uq.ThreadRoles[1] != ThreadRoleSubagentSidechain {
+					t.Errorf("ThreadRoles: want [main subagent-sidechain], got %v", uq.ThreadRoles)
+				}
+			},
+		},
+		{
+			name:      "thread_role invalid",
+			uri:       "cog:conversations?thread_role=side-chat",
+			wantErr:   true,
+			errSubstr: "invalid thread_role",
+		},
+		{
+			name: "thread_role combined with role",
+			uri:  "cog:conversations?role=assistant&thread_role=unknown-fork",
+			check: func(t *testing.T, uq *URIQuery) {
+				if len(uq.Roles) != 1 || uq.Roles[0] != RoleAssistant {
+					t.Errorf("Roles: want [assistant], got %v", uq.Roles)
+				}
+				if len(uq.ThreadRoles) != 1 || uq.ThreadRoles[0] != ThreadRoleUnknownFork {
+					t.Errorf("ThreadRoles: want [unknown-fork], got %v", uq.ThreadRoles)
+				}
+			},
+		},
+		{
+			name: "thread_role combined with component",
+			uri:  "cog:conversations?thread_role=main&component=session.turn",
+			check: func(t *testing.T, uq *URIQuery) {
+				if len(uq.ThreadRoles) != 1 || uq.ThreadRoles[0] != ThreadRoleMain {
+					t.Errorf("ThreadRoles: want [main], got %v", uq.ThreadRoles)
+				}
+				if uq.ComponentClass != "session.turn" {
+					t.Errorf("ComponentClass: want session.turn, got %q", uq.ComponentClass)
+				}
+			},
+		},
+		{
 			name: "since and until",
 			uri:  "cog:conversations?since=2026-06-01T00:00:00Z&until=2026-06-10T00:00:00Z",
 			check: func(t *testing.T, uq *URIQuery) {
@@ -608,6 +659,60 @@ func TestResolveConversationURI_RoleFilter(t *testing.T) {
 	}
 }
 
+// TestResolveConversationURI_ThreadRoleFilter exercises thread_role=
+// filtering against a session whose turns are already partitioned into a
+// main thread and a subagent-sidechain thread (mirrors what
+// PartitionThreads/indexSession would have produced).
+func TestResolveConversationURI_ThreadRoleFilter(t *testing.T) {
+	idx := buildTestIndexWithThreads(t)
+
+	t.Run("thread_role=main", func(t *testing.T) {
+		slice, err := ResolveConversationURI("cog:conversations?thread_role=main", idx)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if slice.Count != 2 {
+			t.Fatalf("want 2 main-thread turns, got %d", slice.Count)
+		}
+		for _, turn := range slice.Turns {
+			if turn.ThreadRole != string(ThreadRoleMain) {
+				t.Errorf("thread_role filter: expected only main, got %q", turn.ThreadRole)
+			}
+		}
+	})
+
+	t.Run("thread_role=subagent-sidechain", func(t *testing.T) {
+		slice, err := ResolveConversationURI("cog:conversations?thread_role=subagent-sidechain", idx)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if slice.Count != 2 {
+			t.Fatalf("want 2 sidechain turns, got %d", slice.Count)
+		}
+		for _, turn := range slice.Turns {
+			if turn.ThreadRole != string(ThreadRoleSubagentSidechain) {
+				t.Errorf("thread_role filter: expected only subagent-sidechain, got %q", turn.ThreadRole)
+			}
+			if turn.ThreadID != "sub-u1" {
+				t.Errorf("thread_role filter: expected ThreadID sub-u1, got %q", turn.ThreadID)
+			}
+		}
+	})
+
+	t.Run("thread_role combined with role", func(t *testing.T) {
+		slice, err := ResolveConversationURI("cog:conversations?thread_role=main&role=assistant", idx)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if slice.Count != 1 {
+			t.Fatalf("want 1 turn (main assistant), got %d", slice.Count)
+		}
+		if slice.Turns[0].Role != string(RoleAssistant) || slice.Turns[0].ThreadRole != string(ThreadRoleMain) {
+			t.Errorf("want main+assistant turn, got role=%q thread_role=%q", slice.Turns[0].Role, slice.Turns[0].ThreadRole)
+		}
+	})
+}
+
 func TestResolveConversationURI_FragmentIDFilter(t *testing.T) {
 	idx := buildTestIndex(t)
 
@@ -723,6 +828,37 @@ func buildTestIndex(t *testing.T) *Index {
 	}
 	idx.sessions["test-session-1"] = meta
 	idx.turns["test-session-1"] = turns
+	return idx
+}
+
+// buildTestIndexWithThreads builds an index with one session whose turns are
+// already partitioned into a main thread (turns 0-1) and a
+// subagent-sidechain thread (turns 2-3), via PartitionThreads — mirroring
+// what indexSession produces.
+func buildTestIndexWithThreads(t *testing.T) *Index {
+	t.Helper()
+	idx := &Index{
+		sessions: make(map[string]SessionMeta),
+		turns:    make(map[string][]Turn),
+	}
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	turns := []Turn{
+		{UUID: "main-u1", SessionID: "threaded-session", TurnIndex: 0, Role: RoleUser, Timestamp: now, Text: "main question"},
+		{UUID: "main-a1", ParentUUID: "main-u1", SessionID: "threaded-session", TurnIndex: 1, Role: RoleAssistant, Timestamp: now.Add(time.Minute), Text: "main answer"},
+		{UUID: "sub-u1", SessionID: "threaded-session", TurnIndex: 2, Role: RoleUser, Timestamp: now.Add(2 * time.Minute), Text: "sidechain turn", IsSidechain: true},
+		{UUID: "sub-a1", ParentUUID: "sub-u1", SessionID: "threaded-session", TurnIndex: 3, Role: RoleAssistant, Timestamp: now.Add(3 * time.Minute), Text: "sidechain reply", IsSidechain: true},
+	}
+	threads := PartitionThreads(turns) // sets turns[i].ThreadID in place
+
+	meta := SessionMeta{
+		SessionID:   "threaded-session",
+		TurnCount:   len(turns),
+		FirstTurnAt: now,
+		LastTurnAt:  now.Add(3 * time.Minute),
+		Threads:     threads,
+	}
+	idx.sessions["threaded-session"] = meta
+	idx.turns["threaded-session"] = turns
 	return idx
 }
 
