@@ -337,7 +337,7 @@ func TestQueuedProviderStreamHoldsSlotUntilChannelClose(t *testing.T) {
 		streamChunks: []string{"a", "b", "c"},
 		streamDelay:  20 * time.Millisecond,
 	}
-	qp := newQueuedProvider(t.Name(), inner, 1)
+	qp := newQueuedProvider(t.Name(), t.Name(), inner, 1)
 	t.Cleanup(resetBackendQueuesForTest)
 
 	ch, err := qp.Stream(context.Background(), &CompletionRequest{})
@@ -388,7 +388,7 @@ func TestQueuedProviderStreamReleasesSlotOnCtxCancelMidGeneration(t *testing.T) 
 		streamChunks: []string{"a", "b", "c", "d", "e"},
 		streamDelay:  50 * time.Millisecond,
 	}
-	qp := newQueuedProvider(t.Name(), inner, 1)
+	qp := newQueuedProvider(t.Name(), t.Name(), inner, 1)
 	t.Cleanup(resetBackendQueuesForTest)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -435,7 +435,7 @@ func TestQueuedProviderForwardsModelListerAndModelContextLister(t *testing.T) {
 			{ID: "model-b", ContextLength: 4096},
 		},
 	}
-	qp := newQueuedProvider(t.Name(), inner, 1)
+	qp := newQueuedProvider(t.Name(), t.Name(), inner, 1)
 	t.Cleanup(resetBackendQueuesForTest)
 
 	var provider Provider = qp
@@ -470,7 +470,7 @@ func TestQueuedProviderForwardsModelListerAndModelContextLister(t *testing.T) {
 func TestQueuedProviderCompleteCancelSafeDelegatesToInnerDirectly(t *testing.T) {
 	t.Parallel()
 	inner := &fakeQueueProvider{name: "fake-cancel-safe"}
-	qp := newQueuedProvider(t.Name(), inner, 1)
+	qp := newQueuedProvider(t.Name(), t.Name(), inner, 1)
 	t.Cleanup(resetBackendQueuesForTest)
 
 	_, err := qp.CompleteCancelSafe(context.Background(), &CompletionRequest{})

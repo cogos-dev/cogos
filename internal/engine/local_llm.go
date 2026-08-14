@@ -134,15 +134,25 @@ func probeOpenAICompatModels(ctx context.Context, baseURL string) ([]string, err
 // providers(.local).yaml — see resolveLocalProviderTimeout.
 const localProviderDefaultTimeoutSec = 300
 
-// agentLocalQueueName is the backendQueues registry key for the
+// agentLocalQueueDisplayName is the queuedProvider DISPLAY name (not the
+// backendQueues registry key — see newQueuedProvider's doc comment) for the
 // buildLocalProvider openai-compat path (autonomic ticks, TriggerAgent, and
 // DispatchToHarness's Path 3 legacy probe). Kept as its own name distinct
 // from any config-declared provider (e.g. "lmstudio-darkstar") because this
-// path has no providers.yaml entry to key off of — it resolves purely from
-// the live probe in detectLocalLLMTarget. See newQueuedProvider's doc
-// comment on why LoadOrStore-based sharing still makes concurrent calls
-// through this path safe against each other.
-const agentLocalQueueName = "agent-local"
+// path has no providers.yaml entry to name itself from — it resolves purely
+// from the live probe in detectLocalLLMTarget.
+//
+// #556 repair (round 2): this used to ALSO be the registry key, which meant
+// this path's queue never shared capacity with makeProvider's
+// "lmstudio-darkstar" or autoDiscoverOpenAICompat's "lmstudio" queues even
+// when all three were fronting the exact same physical LM Studio process at
+// http://localhost:1234 — three independent concurrency-1 queues instead of
+// one, defeating the parallel=1 guarantee. The registry key is now
+// target.BaseURL's normalized endpoint (see buildLocalProvider below), so
+// this display name only affects what shows up as the Name on this
+// queuedProvider's own observation record; the shared *backendQueue itself
+// is keyed and looked up by endpoint like every other local-backend path.
+const agentLocalQueueDisplayName = "agent-local"
 
 func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Provider {
 	if timeoutSec <= 0 {
@@ -174,7 +184,14 @@ func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Pro
 		// default applied in makeProvider.
 		cfg.MaxTokens = openaiCompatDefaultMaxToks
 		inner := NewOpenAICompatProvider("agent-local", cfg)
-		return newQueuedProvider(agentLocalQueueName, inner, 1)
+		// Registry key is the resolved, normalized endpoint (NOT the fixed
+		// "agent-local" display name above) — target.BaseURL already went
+		// through resolveLocalLLMEndpoint in detectLocalLLMTarget, so it is
+		// the same normalized form makeProvider/autoDiscoverOpenAICompat key
+		// their own queues on when they resolve to the same physical
+		// backend. #556 repair (round 2).
+		queueKey := normalizeLocalLLMEndpoint(target.BaseURL)
+		return newQueuedProvider(agentLocalQueueDisplayName, queueKey, inner, 1)
 	}
 }
 

@@ -175,6 +175,43 @@ func (q *backendQueue) release() {
 	q.mu.Unlock()
 }
 
+// setConcurrency reconciles the queue's admitted concurrency to n (clamped
+// to a minimum of 1, mirroring newBackendQueue), for the case where a queue
+// already exists (newQueuedProvider's LoadOrStore load-hit) but the caller's
+// own declared concurrency differs from what the queue currently enforces —
+// e.g. providers.yaml's options.model_state.parallel was edited between
+// dispatches (#556 repair round 2).
+//
+// Narrowing (n < current concurrency) takes effect lazily: callers already
+// holding a slot are not preempted, and no additional slot is granted until
+// inFlight naturally drops back under the new, lower ceiling via a normal
+// release(). Widening (n > current concurrency) takes effect immediately:
+// capacity newly freed by the increase is handed to waiters at the front of
+// the FIFO list right away — the same grant release() performs — rather
+// than leaving them parked until some unrelated future release() call that,
+// if the backend is otherwise idle, might never come.
+func (q *backendQueue) setConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	q.mu.Lock()
+	q.concurrency = n
+	var granted []*queueTicket
+	for q.inFlight < q.concurrency {
+		e := q.waiters.Front()
+		if e == nil {
+			break
+		}
+		q.waiters.Remove(e)
+		q.inFlight++
+		granted = append(granted, e.Value.(*queueTicket))
+	}
+	q.mu.Unlock()
+	for _, t := range granted {
+		close(t.ch)
+	}
+}
+
 // queueCallerSnapshot is one waiter's observable state for GET /v1/queue.
 //
 // Deliberately does NOT include the ticket's caller attribution. GET
@@ -366,32 +403,67 @@ type queuedProvider struct {
 }
 
 // newQueuedProvider wraps inner in a queuedProvider gated by the SHARED
-// *backendQueue registered under name in the process-wide backendQueues
+// *backendQueue registered under queueKey in the process-wide backendQueues
 // registry, so the vitals sampler and GET /v1/queue can find it without
-// Server/Router plumbing.
+// Server/Router plumbing. displayName is the queuedProvider's own identity —
+// used for per-request observation (queueObservation.Backend) and as the
+// queue's initial Snapshot().Name — and is deliberately independent of
+// queueKey; see below for why.
+//
+// queueKey MUST be the backend's normalized physical endpoint
+// (normalizeLocalLLMEndpoint / resolveLocalLLMEndpoint), NOT the provider's
+// config/display name. #556 repair (round 2): round-1 keyed the registry on
+// name, which let the SAME physical LM Studio process end up fronted by up
+// to three independent concurrency-1 queues simultaneously —
+// "agent-local" (buildLocalProvider's fixed literal), "lmstudio-darkstar"
+// (makeProvider from providers.yaml), and "lmstudio" (autoDiscoverOpenAICompat)
+// — because each path names it differently. Keying on the resolved endpoint
+// instead means every path that ends up hitting http://localhost:1234 shares
+// the one queue regardless of what each caller happens to call it, closing
+// the gap where LMS could still receive concurrent generations despite
+// parallel=1 declared on every path individually. The inverse also holds:
+// two genuinely distinct endpoints (e.g. via COGOS_LOCAL_LLM_ENDPOINT
+// pointing somewhere other than :1234) get their own queues instead of
+// collapsing into one over-serialized queue, because a fixed name no longer
+// collapses them.
 //
 // Uses LoadOrStore rather than Store: makeProvider (router.go) is called
 // once per dispatch call, not once per backend, so multiple concurrent
 // callers naming the same backend (e.g. two cog_dispatch_to_harness calls
-// both naming "lmstudio-darkstar") each reach this constructor independently.
-// A plain Store here would let each call clobber the registry with its own
-// brand-new, empty *backendQueue — the losing caller's queue becomes
-// orphaned (still referenced by its queuedProvider, invisible to GET
+// both resolving to the same endpoint) each reach this constructor
+// independently. A plain Store here would let each call clobber the registry
+// with its own brand-new, empty *backendQueue — the losing caller's queue
+// becomes orphaned (still referenced by its queuedProvider, invisible to GET
 // /v1/queue and the vitals gauges) while inFlight/concurrency enforcement
 // silently splits across two separate queue objects instead of being shared,
 // defeating the parallel=1 guarantee #555/#556 exist to provide.
-// LoadOrStore makes registration idempotent per backend name: the first
-// caller to register a given name wins and every subsequent caller
-// (including this one, if it lost the race) reuses that same *backendQueue
-// object, so admission and observability are correctly shared no matter how
-// many Provider instances get built for the same backend.
-func newQueuedProvider(name string, inner Provider, concurrency int) *queuedProvider {
-	q := newBackendQueue(name, concurrency)
-	actual, _ := backendQueues.LoadOrStore(name, q)
+// LoadOrStore makes registration idempotent per endpoint: the first caller
+// to register a given endpoint wins and every subsequent caller (including
+// this one, if it lost the race) reuses that same *backendQueue object, so
+// admission and observability are correctly shared no matter how many
+// Provider instances get built for the same backend.
+//
+// #556 repair (round 2), second regression closed here: a load-hit (this
+// call lost the race and is reusing an existing queue) reconciles the
+// existing queue's concurrency to THIS call's declared value via
+// setConcurrency, rather than silently discarding it. Without this, a
+// backend's declared parallelism froze at whatever the first-ever
+// registration happened to specify — an operator lowering
+// options.model_state.parallel in providers.yaml would have that tightening
+// silently ignored for the life of the process, since
+// local_agent_harness.go's DispatchToHarness path 1 re-reads providers.yaml
+// and calls makeProvider fresh on every dispatch but always hit the
+// load-and-discard branch here.
+func newQueuedProvider(displayName, queueKey string, inner Provider, concurrency int) *queuedProvider {
+	q := newBackendQueue(displayName, concurrency)
+	actual, loaded := backendQueues.LoadOrStore(queueKey, q)
 	if shared, ok := actual.(*backendQueue); ok {
 		q = shared
+		if loaded {
+			q.setConcurrency(concurrency)
+		}
 	}
-	return &queuedProvider{Provider: inner, name: name, queue: q}
+	return &queuedProvider{Provider: inner, name: displayName, queue: q}
 }
 
 // callerAttribution reads RequestMetadata.Attribution off req, falling back

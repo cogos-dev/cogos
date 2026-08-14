@@ -358,6 +358,14 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 			turn.Status = "error"
 			turn.Error = err.Error()
 		}
+		// #556 repair (round 2): matches completeChat's round-1 fix in
+		// serve.go — a request that waited in the FIFO and then failed
+		// upstream must still report the queue headers, otherwise the
+		// caller has no way to see the failure was preceded by queueing.
+		// Must be written before WriteHeader, same as the success path
+		// below. writeQueueHeaders is nil-safe/self-suppressing when
+		// nothing was recorded, so this is a no-op for non-queued providers.
+		writeQueueHeaders(w, queueObservationFromContext(ctx))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{

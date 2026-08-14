@@ -919,7 +919,16 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		if concurrency < 1 {
 			concurrency = 1
 		}
-		return newQueuedProvider(name, inner, concurrency), nil
+		// Registry key is the resolved, normalized endpoint (NOT name) —
+		// the same resolution NewOpenAICompatProvider itself just applied to
+		// pc.Endpoint above — so two differently-NAMED providers.yaml
+		// entries (or this path vs. buildLocalProvider/
+		// autoDiscoverOpenAICompat) that happen to resolve to the same
+		// physical backend share one FIFO queue instead of each getting
+		// their own concurrency-1 queue in front of it. #556 repair
+		// (round 2).
+		queueKey := resolveLocalLLMEndpoint(pc.Endpoint)
+		return newQueuedProvider(name, queueKey, inner, concurrency), nil
 	case "claude-code":
 		if procMgr == nil {
 			procMgr = NewProcessManager(ProcessManagerConfig{})
@@ -1184,7 +1193,10 @@ func autoDiscoverOpenAICompat(router *SimpleRouter, pcfg ProvidersConfig) {
 			// reason as the harness's legacy probe path (local_llm.go's
 			// buildLocalProvider): no config entry exists here to declare
 			// options.model_state.parallel from.
-			router.RegisterProvider(newQueuedProvider(probe.name, p, 1))
+			// Registry key is the normalized endpoint, not probe.name — see
+			// makeProvider's matching comment. #556 repair (round 2).
+			queueKey := normalizeLocalLLMEndpoint(endpoint)
+			router.RegisterProvider(newQueuedProvider(probe.name, queueKey, p, 1))
 			slog.Info("router: auto-discovered", "name", probe.name, "endpoint", endpoint)
 		}
 	}
