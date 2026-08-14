@@ -561,6 +561,114 @@ func TestComputePlanParallelActionReArmsOnConvergence(t *testing.T) {
 	}
 }
 
+// TestComputePlanParallelActionGateSurvivesUnobservedProbe covers the
+// fifth-round reviewer's blocking finding on cogos#555: an unobserved row
+// (Parallel == nil — the `lms ps --json` probe failed, per FetchLive's
+// documented non-fatal-probe-failure behavior) must NOT be read as
+// convergence. Sequence: target=1; observed 4 fires the action; a probe
+// failure on the next cycle (row present, State=="loaded", Parallel==nil)
+// must leave the gate armed; observed 4 again must stay damped, not
+// re-fire — a naive "!parallelMismatch" convergence check would wrongly
+// clear the gate on the unobserved cycle (parallelMismatch(nil, ...) is
+// false) and re-fire here, re-entering the exact thrash this gate exists to
+// close on every failed probe.
+func TestComputePlanParallelActionGateSurvivesUnobservedProbe(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.Parallel = 1
+
+	rowsAtParallel := func(observed int) []lmsModelRow {
+		return []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: ip(observed)}}
+	}
+	rowUnobserved := []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: nil}}
+
+	// Cycle 1: observed 4, want 1 — mismatch, action fires.
+	plan1, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan1.Actions) != 1 || !strings.HasSuffix(plan1.Actions[0].Name, "/parallel") {
+		t.Fatalf("cycle 1: expected one /parallel action, got %#v", plan1.Actions)
+	}
+	if _, err := p.ApplyPlan(context.Background(), plan1); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	// Cycle 2: the probe failed — row present, loaded, but Parallel unobserved
+	// (nil). This must NOT be read as convergence and must NOT clear the gate.
+	plan2, err := p.ComputePlan(&p.target, rowUnobserved, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan2.Actions) != 0 {
+		t.Fatalf("cycle 2: expected an empty plan on an unobserved row, got %#v", plan2.Actions)
+	}
+
+	// Cycle 3: observed 4 again — the SAME value cycle 1 was damped against.
+	// The gate must still be armed: no action.
+	plan3, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan3.Actions) != 0 {
+		t.Fatalf("cycle 3: expected the gate to remain armed across an unobserved probe cycle, got %#v", plan3.Actions)
+	}
+}
+
+// TestComputePlanParallelActionGateSurvivesNotLoadedRow is the SAME-ROOT-CAUSE
+// sibling of TestComputePlanParallelActionGateSurvivesUnobservedProbe: a
+// row with State=="not-loaded" (row present, so the targetRow != nil guard
+// passes, but Parallel is nil and the model isn't actually loaded) must also
+// not be read as convergence. Sequence mirrors the unobserved-probe case.
+func TestComputePlanParallelActionGateSurvivesNotLoadedRow(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.Parallel = 1
+
+	rowsAtParallel := func(observed int) []lmsModelRow {
+		return []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: ip(observed)}}
+	}
+	rowNotLoaded := []lmsModelRow{{ID: "target", State: "not-loaded"}}
+
+	// Cycle 1: observed 4, want 1 — mismatch, action fires.
+	plan1, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan1.Actions) != 1 || !strings.HasSuffix(plan1.Actions[0].Name, "/parallel") {
+		t.Fatalf("cycle 1: expected one /parallel action, got %#v", plan1.Actions)
+	}
+	if _, err := p.ApplyPlan(context.Background(), plan1); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	// Cycle 2: a not-loaded row — e.g. after a manual unload, or a half-failed
+	// actuator invocation. This must NOT be read as convergence and must NOT
+	// clear the gate.
+	plan2, err := p.ComputePlan(&p.target, rowNotLoaded, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawLoad bool
+	for _, a := range plan2.Actions {
+		if strings.HasSuffix(a.Name, "/parallel") {
+			t.Fatalf("cycle 2: expected no /parallel action against a not-loaded row, got %#v", plan2.Actions)
+		}
+		if strings.HasSuffix(a.Name, "/load") {
+			sawLoad = true
+		}
+	}
+	_ = sawLoad // a /load action here is expected and fine; only /parallel is disallowed.
+
+	// Cycle 3: observed 4 again — the SAME value cycle 1 was damped against.
+	// The gate must still be armed: no action.
+	plan3, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan3.Actions) != 0 {
+		t.Fatalf("cycle 3: expected the gate to remain armed across a not-loaded cycle, got %#v", plan3.Actions)
+	}
+}
+
 // TestComputePlanParallelActionWithUnmanagedContext ports the third-round
 // reviewer's TestRR3_E_ParallelActionWithUnmanagedContext scenario (repair
 // item 3): target.ContextLength == 0 (context not being managed) and the

@@ -180,8 +180,13 @@ type LMSModelStateProvider struct {
 	// constructs a fresh LMSModelStateProvider on every BuildRouter call, so
 	// any router rebuild or kernel restart resets the gate to unarmed. Worst
 	// case that costs one extra unload+reload after a rebuild — not a thrash
-	// loop — and the `cogos reconcile` CLI's --dry-run path returns before
-	// ApplyPlan, so a preview can never falsely arm or clear it.
+	// loop. The `cogos reconcile` CLI's --dry-run path can still arm or clear
+	// this gate: recordParallelAction only runs from ApplyPlan (which
+	// --dry-run skips), but clearParallelDampening runs from ComputePlan,
+	// which the CLI's dry-run path does execute. That is safe not because
+	// dry-run is inert here but because the CLI is a separate OS process
+	// with its own LMSModelStateProvider instance — a dry-run preview can
+	// only ever touch its own process-local gate, never the daemon's.
 	lastParallelAttempted bool   // has any "/parallel" action ever been attempted?
 	lastParallelTarget    string // target.Model at the time of that attempt
 	lastParallelObserved  string // parallelStr(targetRow.Parallel) at that time
@@ -494,17 +499,27 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 		return plan, nil
 	}
 
-	// Re-arm the dampening gate on convergence. Once the target row is loaded
-	// at the declared parallelism, any previously-recorded "/parallel" attempt
-	// is stale — the drift it was damping against has resolved. Without this,
-	// a converge-then-re-drift-to-the-SAME-value sequence (e.g. target=1,
-	// observed 4 -> action -> observed 1 (converged) -> observed 4 again, the
-	// LM Studio app default) would find parallelActionDamped still true for
-	// (model, "4") from before convergence and permanently suppress the
-	// action, leaving the reconciler Degraded/OutOfSync with an empty plan
-	// forever. Clearing here means the gate only ever damps a *live*,
-	// unresolved drift, never a resolved one that has recurred.
-	if target.Parallel > 0 && targetRow != nil && !parallelMismatch(targetRow, target.Parallel) {
+	// Re-arm the dampening gate on convergence. Once the target row is
+	// OBSERVED loaded at the declared parallelism, any previously-recorded
+	// "/parallel" attempt is stale — the drift it was damping against has
+	// resolved. Without this, a converge-then-re-drift-to-the-SAME-value
+	// sequence (e.g. target=1, observed 4 -> action -> observed 1
+	// (converged) -> observed 4 again, the LM Studio app default) would find
+	// parallelActionDamped still true for (model, "4") from before
+	// convergence and permanently suppress the action, leaving the
+	// reconciler Degraded/OutOfSync with an empty plan forever. Clearing
+	// here means the gate only ever damps a *live*, unresolved drift, never
+	// a resolved one that has recurred.
+	//
+	// The convergence check requires a genuinely observed match, not merely
+	// the absence of a mismatch: !parallelMismatch is also true when
+	// targetRow.Parallel is nil (unobserved — the `lms ps --json` probe
+	// failed, see FetchLive) or when targetRow.State == "not-loaded". Both
+	// are silence, not convergence, and must not clear the gate — doing so
+	// re-enters the exact thrash this gate exists to close on the very next
+	// probe failure or not-loaded tick.
+	if target.Parallel > 0 && targetRow != nil &&
+		targetRow.State == "loaded" && targetRow.Parallel != nil && *targetRow.Parallel == target.Parallel {
 		p.clearParallelDampening()
 	}
 
