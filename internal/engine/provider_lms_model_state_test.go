@@ -455,6 +455,130 @@ func TestComputePlanParallelUnobservedStaysEmpty(t *testing.T) {
 	}
 }
 
+// TestComputePlanParallelActionDampedAfterApply is the SAFETY test the
+// remediation scope requires (repair item 2, the third-round reviewer's
+// non-convergence risk): once ApplyPlan has run a "/parallel" action against
+// an observed parallel value, ComputePlan must not re-emit that action
+// against the SAME unchanged observed value on the next cycle — otherwise a
+// non-converging reload (LM Studio clamping/ignoring --parallel, or the
+// reload simply not moving the observed number — never independently
+// verified live) would unload+reload the model on every autonomic tick
+// forever. The gate lifts the moment FetchLive reports a DIFFERENT observed
+// value, even if that value is still a mismatch.
+func TestComputePlanParallelActionDampedAfterApply(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.Parallel = 1
+
+	rowsAtParallel := func(observed int) []lmsModelRow {
+		return []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: ip(observed)}}
+	}
+
+	// First cycle: mismatch (observed 4, want 1) — action must fire.
+	plan, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || !strings.HasSuffix(plan.Actions[0].Name, "/parallel") {
+		t.Fatalf("expected one /parallel action on first cycle, got %#v", plan.Actions)
+	}
+
+	// Apply it. The fake actuator never actually changes anything, mirroring
+	// a non-converging reload.
+	if _, err := p.ApplyPlan(context.Background(), plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	// Second cycle: observed value UNCHANGED (still 4) — must be damped.
+	plan2, err := p.ComputePlan(&p.target, rowsAtParallel(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan2.Actions) != 0 {
+		t.Fatalf("expected the /parallel action to be damped on unchanged observed value, got %#v", plan2.Actions)
+	}
+
+	// Third cycle: observed value CHANGED (now 2, still a mismatch) — the
+	// gate lifts and a fresh attempt is allowed.
+	plan3, err := p.ComputePlan(&p.target, rowsAtParallel(2), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan3.Actions) != 1 || !strings.HasSuffix(plan3.Actions[0].Name, "/parallel") {
+		t.Fatalf("expected the gate to lift once the observed value changed, got %#v", plan3.Actions)
+	}
+}
+
+// TestComputePlanParallelActionWithUnmanagedContext ports the third-round
+// reviewer's TestRR3_E_ParallelActionWithUnmanagedContext scenario (repair
+// item 3): target.ContextLength == 0 (context not being managed) and the
+// model is loaded at parallel 4 (want 1) with an observed live context of
+// 262144. The /parallel action's "context_length" detail must carry the
+// OBSERVED live context, not the unset target value — otherwise the reload
+// this action triggers would silently drop the model back to LM Studio's
+// default context.
+func TestComputePlanParallelActionWithUnmanagedContext(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 0) // ContextLength 0 ⇒ unmanaged
+	p.target.Parallel = 1
+	rows := []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: ip(4)}}
+	plan, err := p.ComputePlan(&p.target, rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || !strings.HasSuffix(plan.Actions[0].Name, "/parallel") {
+		t.Fatalf("expected one /parallel action, got %#v", plan.Actions)
+	}
+	if got := plan.Actions[0].Details["context_length"]; got != 262144 {
+		t.Errorf("expected the observed live context (262144) carried into the action when target.ContextLength==0, got %v", got)
+	}
+}
+
+// TestApplyPlanParallelActionWithUnmanagedContext is the end-to-end mirror of
+// TestComputePlanParallelActionWithUnmanagedContext via the local lms CLI
+// fast-path: argv must include --context-length with the observed value
+// rather than omitting it (buildActuatorCmd only adds --context-length when
+// ctxLen > 0, so without the ComputePlan-side fix this would have reloaded
+// at LM Studio's default context).
+func TestApplyPlanParallelActionWithUnmanagedContext(t *testing.T) {
+	p := makeLMSProvider(t, "http://127.0.0.1:1234", "target-model", 0)
+	p.local = true
+	p.target.Parallel = 1
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "lms-calls.log")
+	script := "#!/bin/sh\n" + "echo \"$@\" >> \"" + logPath + "\"\n"
+	lmsPath := filepath.Join(dir, "lms")
+	if err := os.WriteFile(lmsPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake lms CLI: %v", err)
+	}
+	p.lmsCLI = lmsPath
+
+	rows := []lmsModelRow{{ID: "target-model", State: "loaded", LoadedContextLength: ip(262144), Parallel: ip(4)}}
+	plan, err := p.ComputePlan(&p.target, rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 {
+		t.Fatalf("expected one action, got %#v", plan.Actions)
+	}
+	results, err := p.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != reconcile.ApplySucceeded {
+		t.Fatalf("expected one succeeded result, got %#v", results)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("expected the lms CLI fast-path to have been invoked: %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "--context-length 262144") {
+		t.Errorf("expected the observed live context preserved on the reload; argv:\n%s", log)
+	}
+	if !strings.Contains(log, "--parallel 1") {
+		t.Errorf("expected --parallel 1 threaded onto the reload; log:\n%s", log)
+	}
+}
+
 func TestComputePlanJITEvict(t *testing.T) {
 	p := makeLMSProvider(t, "http://x", "target", 262144)
 	p.target.JITEvict = true

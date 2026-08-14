@@ -473,16 +473,29 @@ func checkParallelDrift(ctx context.Context, e modelStateEntry, loadedID string)
 // a prefix match — mirrors the engine copy's mergeParallel exactly, so both
 // provider copies agree on identical live state.
 //
-// `lms ps --json`'s array order is not a matching signal — it reflects
-// whatever order the CLI happens to return rows in, which can and does put a
-// duplicate instance's row (e.g. "target:2", suffixed by LM Studio for a
-// second load of the same base model) ahead of the exact-id row ("target").
-// The old code took the first row satisfying a broad prefix-either-direction
-// predicate, so which of "target" or "target:2" won depended on that
-// incidental ordering rather than on which row is actually correct. Preferring
-// an exact match first fixes the id regardless of array order; the prefix
-// fallback (same "quant suffix / publisher prefix" cases modelIDMatch on the
-// engine side) only runs when no exact match exists.
+// The exact tier is two separate passes, not one OR-combined pass: pass 1
+// scans for id == loadedID, pass 2 scans for id == model, and pass 1 always
+// wins when both are present in the row set. loadedID is the live row's own
+// identifier (resolved from /api/v0/models), so a row that IS the loaded
+// instance must take priority over a same-named sibling row that merely
+// happens to match e.model's declared name. A single OR-combined pass is
+// order-dependent: when loadedID != e.model and some OTHER row's id equals
+// e.model exactly (e.g. two models of one family are loaded and one is
+// literally named the declared target), whichever of the two rows appears
+// first in `lms ps --json`'s array wins — and that array order is not a
+// matching signal, it reflects whatever order the CLI happens to return rows
+// in. Two ordered passes make the winner id-driven instead of order-driven.
+//
+// `lms ps --json`'s array order is likewise not a matching signal for the
+// prefix fallback below — it can and does put a duplicate instance's row
+// (e.g. "target:2", suffixed by LM Studio for a second load of the same base
+// model) ahead of the exact-id row ("target"). The old code took the first
+// row satisfying a broad prefix-either-direction predicate, so which of
+// "target" or "target:2" won depended on that incidental ordering rather
+// than on which row is actually correct. Preferring an exact match first
+// fixes the id regardless of array order; the prefix fallback (same "quant
+// suffix / publisher prefix" cases modelIDMatch on the engine side) only
+// runs when no exact match exists.
 func matchParallelRow(rows []msPsRow, loadedID, model string) *msPsRow {
 	rowID := func(r msPsRow) string {
 		if r.Identifier != "" {
@@ -493,7 +506,13 @@ func matchParallelRow(rows []msPsRow, loadedID, model string) *msPsRow {
 
 	for i := range rows {
 		id := rowID(rows[i])
-		if id != "" && (id == loadedID || id == model) {
+		if id != "" && id == loadedID {
+			return &rows[i]
+		}
+	}
+	for i := range rows {
+		id := rowID(rows[i])
+		if id != "" && id == model {
 			return &rows[i]
 		}
 	}

@@ -59,18 +59,33 @@ note fires when a *local* backend's probe itself fails to observe anything
 (missing/renamed CLI, timeout, no matching `lms ps` row) — an unwatched
 `parallel` dimension must never present as clean coverage either.
 
-`ComputePlan` never emits a dedicated action for a `parallel` mismatch — it is
-alarm-only, not a standalone remediation target. That is narrower than "never
-actuated on any backend," though: the `@lmstudio/sdk` load config used for the
-remote/websocket actuator genuinely has no per-load parallelism knob (§3's
-`lms-actuator` does not accept or forward it), but the **local** `lms load` CLI
-fast-path does — confirmed live via `lms load --help` (`--parallel <count>`).
-Because that same local fast-path is also what executes the `<name>/context`
-action's unload+reload, it now threads the declared `parallel` target into
-every `lms load` it issues, context-triggered reloads included — otherwise a
-context remediation would drop parallelism back to LM Studio's app default and
-manufacture a `parallel` mismatch the reconciler could never clear on its own,
-since `ComputePlan` has no dedicated action for it.
+`ComputePlan` emits a dedicated `<name>/parallel` action for a parallel-only
+mismatch (context otherwise fine) — remediated the same way as `<name>/context`
+(unload+reload; LM Studio has no live resize for either dimension), and
+**local-only**: the `@lmstudio/sdk` load config used for the remote/websocket
+actuator genuinely has no per-load parallelism knob (§3's `lms-actuator` does
+not accept or forward it), but the **local** `lms load` CLI fast-path does —
+confirmed live via `lms load --help` (`--parallel <count>`). On a remote
+backend the dimension remains alarm-only, since `parallelMismatch` can never
+fire there in the first place (`Parallel` is only ever populated by the local
+`lms ps --json` probe). Because the local fast-path is also what executes the
+`<name>/context` action's unload+reload, that action now threads the declared
+`parallel` target into every `lms load` it issues, context-triggered reloads
+included — otherwise a context remediation would drop parallelism back to LM
+Studio's app default and manufacture a fresh `parallel` mismatch behind the
+context fix.
+
+`<name>/parallel` re-emission is dampened: `ComputePlan` will not issue a
+second `<name>/parallel` action for the same target against an *unchanged*
+observed parallel value — it fires once, and only fires again once
+`FetchLive`'s next probe reports a *different* observed value (converged,
+still wrong but freshly so, or moved by other means). This exists because the
+round trip `lms load --parallel N` → `lms ps --json` reporting exactly `N`
+back has not been independently verified against a live LM Studio instance; if
+LM Studio ever clamps or otherwise reports the value differently, an
+un-dampened action would unload and reload the model on every autonomic tick
+forever. Verifying that round trip live is a pre-merge checklist item,
+tracked in the PR, not asserted here.
 
 ## Decision
 

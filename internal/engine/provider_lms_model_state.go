@@ -156,6 +156,24 @@ type LMSModelStateProvider struct {
 	lastProbed time.Time
 	lastErr    error // last FetchLive error (unreachable ⇒ Suspended)
 
+	// --- parallel-action dampening (SAFETY, cogos#555 round 3) ---
+	// Written by recordParallelAction, called from ApplyPlan immediately
+	// before it invokes the actuator for a "/parallel" action — regardless of
+	// whether that invocation later succeeds or fails. Read by
+	// parallelActionDamped, called from ComputePlan before it would otherwise
+	// emit a new "/parallel" action. Together these make the actuator
+	// single-shot per *observed value*: once a "/parallel" action has run for
+	// a target against a given observed parallel, ComputePlan will not emit
+	// another one for that same target until FetchLive reports a DIFFERENT
+	// observed value — whether or not LM Studio actually honored the
+	// requested --parallel exactly. Without this, a non-converging observed
+	// value (LM Studio clamping or rounding the request, or the reload
+	// simply not taking effect) would otherwise unload+reload the model on
+	// every autonomic tick forever. All three fields guarded by mu.
+	lastParallelAttempted bool   // has any "/parallel" action ever been attempted?
+	lastParallelTarget    string // target.Model at the time of that attempt
+	lastParallelObserved  string // parallelStr(targetRow.Parallel) at that time
+
 	// --- reconcile metadata ---
 	workspaceRoot string
 }
@@ -422,12 +440,19 @@ func mergeParallel(rows []lmsModelRow, parallel map[string]int) {
 // ComputePlan diffs the declared target against the live rows and emits
 // Update-typed actions distinguished by a Name suffix:
 //
-//	<name>/load    — target model not loaded
-//	<name>/context — loaded but at the wrong context (unload+reload; no live resize)
-//	<name>/unload  — jit_evict only: a non-target model is loaded and crowds the card
+//	<name>/load     — target model not loaded
+//	<name>/context  — loaded but at the wrong context (unload+reload; no live resize)
+//	<name>/parallel — loaded but at the wrong parallel (unload+reload; local fast-path
+//	                  only — see parallelMismatch); dampened by parallelActionDamped so
+//	                  it fires at most once per observed value (see the provider
+//	                  struct's dampening fields)
+//	<name>/unload   — jit_evict only: a non-target model is loaded and crowds the card
 //
-// An empty plan (Synced) means: the target row exists, state=="loaded", and
-// loaded_context_length matches the target (or no context is being managed).
+// An empty plan (Synced) means: the target row exists, state=="loaded",
+// loaded_context_length matches the target (or no context is being managed),
+// and loaded parallel matches the target (or parallel isn't declared, isn't
+// observable, or a "/parallel" action for the current observed value has
+// already been dampened — see parallelActionDamped).
 func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.State) (*reconcile.Plan, error) {
 	target := p.resolveTarget(config)
 	plan := &reconcile.Plan{ResourceType: lmsModelStateType}
@@ -522,15 +547,42 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 	// autonomic tick (shouldEscalate → escalateDegradedHealth) with nothing
 	// the deterministic self-heal could ever do about it.
 	case target.Parallel > 0 && parallelMismatch(targetRow, target.Parallel):
+		observed := parallelStr(targetRow.Parallel)
+
+		// SAFETY (cogos#555 round 3): don't re-emit the action against an
+		// observed value it has already been tried against. See the
+		// dampening fields' doc comment on the provider struct — this makes
+		// the actuator single-shot per observation regardless of whether the
+		// resulting reload actually moves the observed parallel value (never
+		// independently verified live; see the PR body's pre-merge
+		// checklist). Once FetchLive reports a DIFFERENT observed value —
+		// converged, still wrong but freshly so, or changed by other means —
+		// the gate lifts and a fresh attempt is allowed.
+		if p.parallelActionDamped(target.Model, observed) {
+			break
+		}
+
+		ctxLen := target.ContextLength
+		if ctxLen == 0 && targetRow.LoadedContextLength != nil {
+			// Context is not being managed (target.ContextLength == 0) —
+			// carry the observed live value into the reload instead of
+			// leaving it unset. Without this, ApplyPlan/buildActuatorCmd
+			// omit --context-length whenever ctxLen == 0, so this action's
+			// own unload+reload would silently drop the model back to LM
+			// Studio's default context — the first action in this provider
+			// that reloads a model whose context it isn't managing.
+			ctxLen = *targetRow.LoadedContextLength
+		}
+
 		plan.Actions = append(plan.Actions, reconcile.Action{
 			Action:       reconcile.ActionUpdate,
 			ResourceType: lmsModelStateType,
 			Name:         p.name + "/parallel",
 			Details: map[string]any{
 				"model":           target.Model,
-				"context_length":  target.ContextLength,
+				"context_length":  ctxLen,
 				"parallel":        target.Parallel,
-				"loaded_parallel": parallelStr(targetRow.Parallel),
+				"loaded_parallel": observed,
 				"reason":          "loaded at wrong parallel — LM Studio has no live resize; unload+reload (local fast-path only)",
 			},
 		})
@@ -568,6 +620,15 @@ func (p *LMSModelStateProvider) ApplyPlan(ctx context.Context, plan *reconcile.P
 			// correct context length across the reload (a bare reload with no
 			// context arg would fall back to LM Studio's default config).
 			op, model = "set-context", detailStr(action.Details, "model")
+			// SAFETY (cogos#555 round 3): record the observed value this
+			// action is reacting to BEFORE invoking the actuator, regardless
+			// of the outcome below — see the dampening fields' doc comment.
+			// This makes the actuator single-shot per observed value even
+			// when the invocation fails or when LM Studio doesn't honor
+			// --parallel exactly; a failed apply still gets its own retry
+			// governed by the autonomic ticker's healBackoff, not by
+			// re-emitting this same action every tick.
+			p.recordParallelAction(model, detailStr(action.Details, "loaded_parallel"))
 		case strings.HasSuffix(action.Name, "/unload"):
 			op, model = "unload", detailStr(action.Details, "model")
 		default:
@@ -1002,6 +1063,29 @@ func parallelStr(v *int) string {
 		return "null"
 	}
 	return fmt.Sprintf("%d", *v)
+}
+
+// parallelActionDamped reports whether a "/parallel" action has already been
+// attempted for model against this exact observed parallel value (see
+// recordParallelAction, called from ApplyPlan) and the observed value hasn't
+// changed since. ComputePlan calls this before emitting a new "/parallel"
+// action — see the provider struct's dampening fields for the full rationale.
+func (p *LMSModelStateProvider) parallelActionDamped(model, observed string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.lastParallelAttempted && p.lastParallelTarget == model && p.lastParallelObserved == observed
+}
+
+// recordParallelAction records that a "/parallel" action was attempted for
+// model against observed (the value ComputePlan saw when it emitted the
+// action) so a subsequent ComputePlan call can damp re-emission via
+// parallelActionDamped until FetchLive reports a different observed value.
+func (p *LMSModelStateProvider) recordParallelAction(model, observed string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastParallelAttempted = true
+	p.lastParallelTarget = model
+	p.lastParallelObserved = observed
 }
 
 // parallelGapNote returns an informational suffix for Health() messages

@@ -231,6 +231,47 @@ func TestCheckParallelDrift_PrefixFallbackWhenNoExactMatch(t *testing.T) {
 	}
 }
 
+// TestCheckParallelDrift_ExactTierOrderDependence ports the third-round
+// reviewer's TestRR3_D_ExactTierOrderDependence scenario: e.model="qwen3",
+// loadedID="qwen3-30b" (the prefix-matched loaded row from /api/v0/models —
+// loadedID != e.model), and two exact-id rows are both present in `lms ps`:
+// one named "qwen3" (matches e.model, parallel 8) and one named "qwen3-30b"
+// (matches loadedID, the actually-loaded instance, parallel 1). The single
+// OR-combined pass picked whichever row came first in array order, so the
+// daemon would sometimes report a false mismatch against the sibling's
+// parallel value instead of the live row's own value. loadedID must win
+// regardless of array order, since it identifies the row that IS the loaded
+// instance.
+func TestCheckParallelDrift_ExactTierOrderDependence(t *testing.T) {
+	e := modelStateEntry{name: "b", model: "qwen3", parallel: 1, local: true}
+
+	t.Run("loadedID row first", func(t *testing.T) {
+		lmsCLI := writeFakeLmsPs(t, `[{"identifier":"qwen3-30b","parallel":1},{"identifier":"qwen3","parallel":8}]`, false)
+		e := e
+		e.lmsCLIPath = lmsCLI
+		observed, err := checkParallelDrift(context.Background(), e, "qwen3-30b")
+		if !observed {
+			t.Fatal("expected observed=true")
+		}
+		if err != nil {
+			t.Fatalf("loadedID's own row (parallel 1) must win — got: %v", err)
+		}
+	})
+
+	t.Run("loadedID row last", func(t *testing.T) {
+		lmsCLI := writeFakeLmsPs(t, `[{"identifier":"qwen3","parallel":8},{"identifier":"qwen3-30b","parallel":1}]`, false)
+		e := e
+		e.lmsCLIPath = lmsCLI
+		observed, err := checkParallelDrift(context.Background(), e, "qwen3-30b")
+		if !observed {
+			t.Fatal("expected observed=true")
+		}
+		if err != nil {
+			t.Fatalf("loadedID's own row (parallel 1) must win regardless of array order — got: %v", err)
+		}
+	})
+}
+
 func TestProbeModelStateEntry_ParallelUnsetSkipsProbeEntirely(t *testing.T) {
 	// parallel==0 must skip the check even when local — no CLI invocation needed.
 	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)})
