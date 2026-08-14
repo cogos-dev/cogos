@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,9 +46,12 @@ func TestHandleQueue_EmptyRegistryReturnsEmptyValidSnapshot(t *testing.T) {
 
 // TestHandleQueue_ReportsConcurrencyInFlightAndWaitingCallers exercises the
 // full documented shape: name, concurrency, in_flight, waiting,
-// oldest_wait_ms, and the per-caller list (attribution, position,
-// waiting_ms) — using a real backendQueue registered under a known name so
-// the handler is reading actual registry state, not a stub.
+// oldest_wait_ms, and the per-caller list (position, waiting_ms) — using a
+// real backendQueue registered under a known name so the handler is reading
+// actual registry state, not a stub. Also locks in the security fix (repair
+// round 1, #556): a waiter's attribution (bound-identity subject) must NEVER
+// appear in this response, because GET /v1/queue is grant-exempt like every
+// other GET (isGrantExemptRequest) and therefore reachable with no auth.
 func TestHandleQueue_ReportsConcurrencyInFlightAndWaitingCallers(t *testing.T) {
 	resetBackendQueuesForTest()
 	t.Cleanup(resetBackendQueuesForTest)
@@ -112,11 +116,18 @@ func TestHandleQueue_ReportsConcurrencyInFlightAndWaitingCallers(t *testing.T) {
 	if len(b.Callers) != 1 {
 		t.Fatalf("expected exactly 1 waiting caller, got %d", len(b.Callers))
 	}
-	if b.Callers[0].Attribution != "chazmaniandinkle" {
-		t.Errorf("Callers[0].Attribution = %q, want chazmaniandinkle", b.Callers[0].Attribution)
-	}
 	if b.Callers[0].Position != 1 {
 		t.Errorf("Callers[0].Position = %d, want 1", b.Callers[0].Position)
+	}
+
+	// Security fix verification: the caller was registered with a real,
+	// identifiable attribution ("chazmaniandinkle") but the raw JSON must not
+	// contain it anywhere in the response — GET /v1/queue has no auth gate.
+	if strings.Contains(rec.Body.String(), "chazmaniandinkle") {
+		t.Error("GET /v1/queue response leaked caller attribution; this endpoint is grant-exempt and unauthenticated")
+	}
+	if strings.Contains(rec.Body.String(), "attribution") {
+		t.Error(`GET /v1/queue response contains an "attribution" key; identity must not be exposed on this unauthenticated surface`)
 	}
 }
 

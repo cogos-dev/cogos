@@ -84,9 +84,26 @@ func newBackendQueue(name string, concurrency int) *backendQueue {
 // and waitMs is the time actually spent waiting before being granted.
 //
 // callerID is attribution (RequestMetadata.Attribution, or "anonymous") —
-// recorded on the ticket purely for observability (GET /v1/queue); it plays
-// no role in scheduling, which is strict FIFO regardless of caller identity.
+// recorded on the ticket for potential future internal/gated observability.
+// It plays no role in scheduling, which is strict FIFO regardless of caller
+// identity, and — as of the #556 repair round-1 security fix — it is NOT
+// surfaced on GET /v1/queue, which is unauthenticated (see
+// queueCallerSnapshot's doc comment).
 func (q *backendQueue) Acquire(ctx context.Context, callerID string) (release func(), position int, waitMs int64, err error) {
+	// Fail fast on an already-canceled/expired ctx before ever touching
+	// q.inFlight: without this check, the fast path below grants a slot
+	// unconditionally (it never consults ctx at all), so a caller whose
+	// context is already done — e.g. an HTTP client that disconnected before
+	// dispatch — would still be admitted, still occupy the backend's slot,
+	// and still trigger an upstream generation nobody will read. This is a
+	// best-effort check, not a guarantee against a race immediately after
+	// this point; the ctx.Done() branch in the wait-list path below remains
+	// the authoritative cancellation handling for a caller that goes away
+	// while actually queued.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, 0, 0, ctxErr
+	}
+
 	q.mu.Lock()
 	if q.inFlight < q.concurrency {
 		q.inFlight++
@@ -159,10 +176,18 @@ func (q *backendQueue) release() {
 }
 
 // queueCallerSnapshot is one waiter's observable state for GET /v1/queue.
+//
+// Deliberately does NOT include the ticket's caller attribution. GET
+// /v1/queue is grant-exempt like every other GET request
+// (isGrantExemptRequest, serve_grant_auth.go) — reachable with no auth at
+// all — so exposing each waiter's resolved bound-identity subject here would
+// leak who is currently calling the kernel to anyone who can reach the port.
+// The queue itself still tracks attribution internally (queueTicket.caller)
+// for potential future gated/authenticated views; this snapshot just never
+// surfaces it on the open read surface.
 type queueCallerSnapshot struct {
-	Attribution string `json:"attribution"`
-	Position    int    `json:"position"`
-	WaitingMs   int64  `json:"waiting_ms"`
+	Position  int   `json:"position"`
+	WaitingMs int64 `json:"waiting_ms"`
 }
 
 // queueSnapshot is a point-in-time read of a backendQueue's state.
@@ -202,9 +227,8 @@ func (q *backendQueue) Snapshot() queueSnapshot {
 		}
 		if len(snap.Callers) < maxQueueSnapshotCallers {
 			snap.Callers = append(snap.Callers, queueCallerSnapshot{
-				Attribution: t.caller,
-				Position:    pos,
-				WaitingMs:   waitMs,
+				Position:  pos,
+				WaitingMs: waitMs,
 			})
 		}
 	}
@@ -341,13 +365,32 @@ type queuedProvider struct {
 	queue *backendQueue
 }
 
-// newQueuedProvider wraps inner in a queuedProvider sized to concurrency
-// (clamped to >=1 by newBackendQueue) and registers the backend's queue in
-// the process-wide backendQueues registry under name, so the vitals sampler
-// and GET /v1/queue can find it without Server/Router plumbing.
+// newQueuedProvider wraps inner in a queuedProvider gated by the SHARED
+// *backendQueue registered under name in the process-wide backendQueues
+// registry, so the vitals sampler and GET /v1/queue can find it without
+// Server/Router plumbing.
+//
+// Uses LoadOrStore rather than Store: makeProvider (router.go) is called
+// once per dispatch call, not once per backend, so multiple concurrent
+// callers naming the same backend (e.g. two cog_dispatch_to_harness calls
+// both naming "lmstudio-darkstar") each reach this constructor independently.
+// A plain Store here would let each call clobber the registry with its own
+// brand-new, empty *backendQueue — the losing caller's queue becomes
+// orphaned (still referenced by its queuedProvider, invisible to GET
+// /v1/queue and the vitals gauges) while inFlight/concurrency enforcement
+// silently splits across two separate queue objects instead of being shared,
+// defeating the parallel=1 guarantee #555/#556 exist to provide.
+// LoadOrStore makes registration idempotent per backend name: the first
+// caller to register a given name wins and every subsequent caller
+// (including this one, if it lost the race) reuses that same *backendQueue
+// object, so admission and observability are correctly shared no matter how
+// many Provider instances get built for the same backend.
 func newQueuedProvider(name string, inner Provider, concurrency int) *queuedProvider {
 	q := newBackendQueue(name, concurrency)
-	backendQueues.Store(name, q)
+	actual, _ := backendQueues.LoadOrStore(name, q)
+	if shared, ok := actual.(*backendQueue); ok {
+		q = shared
+	}
 	return &queuedProvider{Provider: inner, name: name, queue: q}
 }
 
@@ -439,12 +482,15 @@ func (p *queuedProvider) CompleteCancelSafe(ctx context.Context, req *Completion
 }
 
 // Stream acquires this backend's queue slot BEFORE calling the inner
-// provider's Stream, and holds it until the inner channel closes or ctx is
-// done — NOT until Stream() returns, which happens immediately while
-// generation continues in a goroutine. A forwarding goroutine relays every
-// chunk from the inner channel to a fresh outer channel (mirrors
-// parseOpenAISSE's goroutine shape in provider_openai.go) and releases the
-// slot exactly once when that relay ends.
+// provider's Stream, and holds it until the inner channel closes — NOT until
+// Stream() returns, which happens immediately while generation continues in
+// a goroutine. A forwarding goroutine relays every chunk from the inner
+// channel to a fresh outer channel (mirrors parseOpenAISSE's goroutine shape
+// in provider_openai.go) and releases the slot once the backend is actually
+// free: either the inner channel closes cleanly, or — if ctx ends first —
+// once a background drain (drainInnerThenRelease below) observes the inner
+// channel close. The slot is deliberately NOT released the instant ctx ends;
+// see drainInnerThenRelease's doc comment for why.
 //
 // Because Acquire blocks synchronously here, Stream itself does not return
 // to the caller until a slot is actually granted — the SAME mechanism that
@@ -454,8 +500,9 @@ func (p *queuedProvider) CompleteCancelSafe(ctx context.Context, req *Completion
 // Acquire's own ctx.Done() branch, so Stream returns ctx.Err() and never
 // touches the inner provider at all. A caller that disconnects AFTER a slot
 // was granted and generation is underway is handled by the forwarding
-// goroutine's own ctx.Done() case below — no new mechanism needed there,
-// since ctx is already threaded end-to-end from the HTTP request.
+// goroutine's own ctx.Done() case below, which stops relaying chunks to the
+// (now-abandoned) caller immediately but does not hand the slot to the next
+// FIFO waiter until the backend itself is confirmed free.
 func (p *queuedProvider) Stream(ctx context.Context, req *CompletionRequest) (<-chan StreamChunk, error) {
 	release, position, waitMs, err := p.queue.Acquire(ctx, callerAttribution(req))
 	if err != nil {
@@ -472,24 +519,52 @@ func (p *queuedProvider) Stream(ctx context.Context, req *CompletionRequest) (<-
 	out := make(chan StreamChunk, 32)
 	go func() {
 		defer close(out)
-		defer release()
 		for {
 			select {
 			case chunk, ok := <-inner:
 				if !ok {
+					// The inner provider's own goroutine is done producing —
+					// the backend is genuinely free now. Release immediately.
+					release()
 					return
 				}
 				select {
 				case out <- chunk:
 				case <-ctx.Done():
+					drainInnerThenRelease(inner, release)
 					return
 				}
 			case <-ctx.Done():
+				drainInnerThenRelease(inner, release)
 				return
 			}
 		}
 	}()
 	return out, nil
+}
+
+// drainInnerThenRelease is the ctx-canceled exit path from queuedProvider's
+// Stream forwarding goroutine above. It must NOT simply call release()
+// immediately: release() frees this backend's queue slot for the next FIFO
+// waiter, and the queue's whole invariant (in_flight never exceeds the
+// backend's declared capacity) is only true if that slot is actually free —
+// i.e. the inner provider (target.Backend's real HTTP call) has actually
+// stopped consuming the backend, not merely that THIS caller stopped
+// listening. A ctx-respecting provider (OpenAICompatProvider) does tear its
+// upstream request down promptly on cancellation, but nothing here can
+// assume every current or future inner Provider implementation does the
+// same — the wrapper's own bookkeeping should not get ahead of reality.
+//
+// So: keep draining (discarding) inner in the background, off the hot
+// forwarding-goroutine path so the disconnecting caller isn't blocked on it,
+// and release only once inner actually closes — the same signal the normal
+// (!ok) exit path above already treats as "the backend is free."
+func drainInnerThenRelease(inner <-chan StreamChunk, release func()) {
+	go func() {
+		defer release()
+		for range inner {
+		}
+	}()
 }
 
 // ListModels forwards to the inner provider when it implements ModelLister.

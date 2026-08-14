@@ -134,6 +134,16 @@ func probeOpenAICompatModels(ctx context.Context, baseURL string) ([]string, err
 // providers(.local).yaml — see resolveLocalProviderTimeout.
 const localProviderDefaultTimeoutSec = 300
 
+// agentLocalQueueName is the backendQueues registry key for the
+// buildLocalProvider openai-compat path (autonomic ticks, TriggerAgent, and
+// DispatchToHarness's Path 3 legacy probe). Kept as its own name distinct
+// from any config-declared provider (e.g. "lmstudio-darkstar") because this
+// path has no providers.yaml entry to key off of — it resolves purely from
+// the live probe in detectLocalLLMTarget. See newQueuedProvider's doc
+// comment on why LoadOrStore-based sharing still makes concurrent calls
+// through this path safe against each other.
+const agentLocalQueueName = "agent-local"
+
 func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Provider {
 	if timeoutSec <= 0 {
 		timeoutSec = localProviderDefaultTimeoutSec
@@ -145,11 +155,26 @@ func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Pro
 	}
 	switch target.Backend {
 	case LocalLLMBackendOllama:
+		// Ollama is not part of #556's "local backend" family (makeProvider
+		// in router.go only queues openai-compat/openai/lmstudio/vllm/
+		// llamacpp) and stays unwrapped here for the same reason.
 		cfg.ContextWindow = 32768
 		return NewOllamaProvider("agent-local", cfg)
 	default:
+		// #556 repair (round 1): this is the ONE remaining openai-compat
+		// construction site that built a raw *OpenAICompatProvider with no
+		// FIFO queue at all — the autonomic ticker (TriggerAgent) and
+		// DispatchToHarness's legacy probe path (Path 3) both call through
+		// here, so without this wrap they ran inference against LMS with
+		// zero queue accounting while HTTP chat waited in the kernel FIFO,
+		// contradicting the queuedProvider doc comment's claim that every
+		// call path gets queued "for free". Concurrency defaults to 1 (no
+		// providers.yaml entry exists on this path to declare
+		// options.model_state.parallel from), matching the #555 backstop
+		// default applied in makeProvider.
 		cfg.MaxTokens = openaiCompatDefaultMaxToks
-		return NewOpenAICompatProvider("agent-local", cfg)
+		inner := NewOpenAICompatProvider("agent-local", cfg)
+		return newQueuedProvider(agentLocalQueueName, inner, 1)
 	}
 }
 

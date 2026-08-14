@@ -21,8 +21,13 @@ type queueSnapshotResponse struct {
 
 // handleQueue serves GET /v1/queue: per-backend concurrency/in-flight/
 // waiting/oldest-wait-ms plus a bounded, best-effort list of waiting callers
-// (attribution, position, waiting_ms) — a live diagnostic read, not a
-// paginated resource. See provider_queue.go's queueSnapshot/Snapshot.
+// (position, waiting_ms) — a live diagnostic read, not a paginated resource.
+// See provider_queue.go's queueSnapshot/Snapshot.
+//
+// Deliberately omits per-caller attribution: this route is grant-exempt like
+// every other GET (isGrantExemptRequest, serve_grant_auth.go), so anything
+// returned here is reachable with no authentication at all. See
+// queueCallerSnapshot's doc comment (provider_queue.go).
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	resp := queueSnapshotResponse{Backends: allBackendQueueSnapshots()}
 	w.Header().Set("Content-Type", "application/json")

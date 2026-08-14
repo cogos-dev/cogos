@@ -30,7 +30,15 @@ func TestHandleChat_QueueHeadersPresentOnIdleQueue(t *testing.T) {
 	t.Cleanup(resetBackendQueuesForTest)
 
 	srv := newTestServer(t)
-	qp := newQueuedProvider("stub", NewStubProvider("stub", "hello world"), 1)
+	// Registry key (newQueuedProvider's first arg) is scoped to this test via
+	// t.Name(), distinct from the routing name ("stub", the inner provider's
+	// Name()): the two are independent per newQueuedProvider's design, and
+	// since #556's repair round-1 fix made the registry properly SHARE one
+	// *backendQueue across every call naming the same key (LoadOrStore,
+	// closing the concurrent-dispatch race), a literal shared key here would
+	// let this test's queue admission bleed into any other t.Parallel() test
+	// that also happened to use "stub" as its registry key.
+	qp := newQueuedProvider(t.Name(), NewStubProvider("stub", "hello world"), 1)
 	router := NewSimpleRouter(RoutingConfig{Default: "stub"})
 	router.RegisterProvider(qp)
 	srv.SetRouter(router)
@@ -62,7 +70,9 @@ func TestHandleChat_QueueHeadersReflectActualWait(t *testing.T) {
 	t.Cleanup(resetBackendQueuesForTest)
 
 	srv := newTestServer(t)
-	qp := newQueuedProvider("stub", NewStubProvider("stub", "hello world"), 1)
+	// See TestHandleChat_QueueHeadersPresentOnIdleQueue's comment on why the
+	// registry key is t.Name() rather than the literal routing name.
+	qp := newQueuedProvider(t.Name(), NewStubProvider("stub", "hello world"), 1)
 	router := NewSimpleRouter(RoutingConfig{Default: "stub"})
 	router.RegisterProvider(qp)
 	srv.SetRouter(router)
@@ -161,7 +171,9 @@ func TestHandleChat_StreamingQueueHeadersSetBeforeFirstByte(t *testing.T) {
 	srv := newTestServer(t)
 	stub := NewStubProvider("stub", "")
 	stub.chunks = []string{"hel", "lo", " world"}
-	qp := newQueuedProvider("stub", stub, 1)
+	// See TestHandleChat_QueueHeadersPresentOnIdleQueue's comment on why the
+	// registry key is t.Name() rather than the literal routing name.
+	qp := newQueuedProvider(t.Name(), stub, 1)
 	router := NewSimpleRouter(RoutingConfig{Default: "stub"})
 	router.RegisterProvider(qp)
 	srv.SetRouter(router)

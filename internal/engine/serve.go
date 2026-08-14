@@ -1505,6 +1505,13 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			turn.Status = "error"
 			turn.Error = err.Error()
 		}
+		// #556 repair (round 1): a request that waited in the FIFO and then
+		// failed upstream must still report the queue headers — otherwise
+		// the caller has no way to see that the failure was preceded by
+		// queueing, which is exactly the attribution the issue asks for.
+		// Must be written before WriteHeader, same as the success path
+		// below.
+		writeQueueHeaders(w, queueObservationFromContext(ctx))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]any{

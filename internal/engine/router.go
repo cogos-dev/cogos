@@ -1174,7 +1174,17 @@ func autoDiscoverOpenAICompat(router *SimpleRouter, pcfg ProvidersConfig) {
 			Timeout:  5,
 		})
 		if p.Available(ctx) {
-			router.RegisterProvider(p)
+			// #556 repair (round 1): auto-discovered backends bypassed
+			// makeProvider entirely (this function registers directly on
+			// router, never through makeProvider's openai-compat case), so
+			// any workspace with no explicit providers.yaml entry for this
+			// endpoint got an unqueued LM Studio backend — invisible to GET
+			// /v1/queue and both vitals gauges, and not subject to the
+			// parallel=1 backstop. Concurrency defaults to 1 for the same
+			// reason as the harness's legacy probe path (local_llm.go's
+			// buildLocalProvider): no config entry exists here to declare
+			// options.model_state.parallel from.
+			router.RegisterProvider(newQueuedProvider(probe.name, p, 1))
 			slog.Info("router: auto-discovered", "name", probe.name, "endpoint", endpoint)
 		}
 	}
