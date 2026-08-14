@@ -1329,22 +1329,20 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	}
 	meta.SourceTailHash = tailHash
 
-	// Bridge each turn's ParentUUID past any run of records ParseSession saw
-	// but that never became a Turn (see bridgeDroppedParents' doc comment),
-	// then partition the assembled turn list into threads (parentUuid DAG
-	// components) as a post-processing step over the in-memory turn list —
-	// does not touch SourceOffset/SourceTailHash/watermark fields. See
-	// threads.go's doc comment for the mechanisms this covers.
-	//
-	// NOTE for whoever merges fix/conversations-provider-watermarks
-	// (indexSessionIncremental, not present on this branch): that path must
-	// also call bridgeDroppedParents + PartitionThreads over its assembled
-	// turn set before returning, or incrementally-indexed sessions will
-	// silently ship with SessionMeta.Threads == nil (see #557 round-2 review
-	// PROCESS finding).
+	// Resolve any compact_boundary whose logicalParentUuid names no uuid
+	// anywhere in the file to the nearest preceding record instead (see
+	// resolveCompactBoundaryFallbacks), then bridge each turn's ParentUUID
+	// past any run of records ParseSession saw but that never became a Turn
+	// (see bridgeDroppedParents' doc comment), then partition the assembled
+	// turn list into threads (parentUuid DAG components) as a
+	// post-processing step over the in-memory turn list — does not touch
+	// SourceOffset/SourceTailHash/watermark fields. See threads.go's doc
+	// comment for the mechanisms this covers.
+	resolveCompactBoundaryFallbacks(meta.rawParents, meta.compactBoundaryFallback)
 	bridged := bridgeDroppedParents(turns, meta.rawParents)
 	meta.Threads = PartitionThreads(turns, bridged)
-	meta.rawParents = nil // parse-time scratch space only; never persisted
+	meta.rawParents = nil              // parse-time scratch space only; never persisted
+	meta.compactBoundaryFallback = nil // parse-time scratch space only; never persisted
 
 	return meta, turns, nil
 }
@@ -1554,6 +1552,23 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 		return meta, combined, false, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
 	}
 	meta.SourceTailHash = newTailHash
+
+	// Recompute Threads over the combined (prefix + tail) turn set — not
+	// just the newly-parsed tail — the same way indexSession does, or an
+	// incrementally-indexed session would silently ship with
+	// SessionMeta.Threads stale (still whatever prevMeta.Threads held) or,
+	// on a session's very first incremental cycle, nil (see #557 round-2
+	// review PROCESS finding, closed by this call). meta.rawParents and
+	// meta.compactBoundaryFallback only cover the tail ParseSession just
+	// read — the prefix's turns were already bridged during whichever prior
+	// cycle produced them, so their ParentUUID fields need no further
+	// rewriting here; bridgeDroppedParents leaves an already-resolved
+	// ParentUUID untouched (see its doc comment).
+	resolveCompactBoundaryFallbacks(meta.rawParents, meta.compactBoundaryFallback)
+	bridged := bridgeDroppedParents(combined, meta.rawParents)
+	meta.Threads = PartitionThreads(combined, bridged)
+	meta.rawParents = nil              // parse-time scratch space only; never persisted
+	meta.compactBoundaryFallback = nil // parse-time scratch space only; never persisted
 
 	return meta, combined, true, nil
 }

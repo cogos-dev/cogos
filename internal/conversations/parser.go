@@ -77,9 +77,19 @@ type rawContentBlock struct {
 	Content  json.RawMessage `json:"content,omitempty"` // tool_result nested
 }
 
-// rawAITitle is the ai-title record type.
+// rawAITitle is the ai-title record type. The field is aiTitle in real
+// Claude Code JSONL (verified against on-disk sessions) — a prior "title"
+// tag here meant Title never populated for any Claude Code session (see
+// #557 round-4 review HIGH finding).
 type rawAITitle struct {
-	Title string `json:"title"`
+	AITitle string `json:"aiTitle"`
+}
+
+// rawCustomTitle is the custom-title record type Claude Code writes when
+// the operator explicitly renames a session (distinct from the
+// auto-generated ai-title). Verified against on-disk sessions.
+type rawCustomTitle struct {
+	CustomTitle string `json:"customTitle"`
 }
 
 // ParseSession streams turns from r, calling callback for each turn and
@@ -135,6 +145,31 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 	// successfully unmarshaled as JSON — see the doc comment above.
 	var lastGoodOffset int64
 
+	// priorTurnCount captures meta.TurnCount as it stood at entry, before
+	// this call's own turns are counted below. For a full parse
+	// (indexSession) meta starts zero-valued, so this is 0. For an
+	// incremental tail parse (indexSessionIncremental), meta is seeded from
+	// prevMeta before ParseSession is called, so this carries the session's
+	// TRUE turn count so far even though this call's own turnIndex starts
+	// at 0 — a compact_boundary at the very start of a resumed tail must
+	// still be treated as mid-file, not head-of-file. See the
+	// compactBoundaryFallback field doc comment in types.go.
+	priorTurnCount := meta.TurnCount
+
+	// lastUUID tracks the uuid of the most recently seen uuid-carrying
+	// record, in file order, so a mid-file compact_boundary can record its
+	// nearest preceding record as a fallback candidate (see
+	// compactBoundaryFallback). Updated once per uuid-carrying record,
+	// after that record's own fallback (if any) is computed, so a boundary
+	// never names itself as its own predecessor.
+	var lastUUID string
+
+	// hasCustomTitle tracks whether an explicit custom-title record has been
+	// seen, regardless of stream order relative to ai-title records: an
+	// operator-chosen title always wins over the auto-generated one. See the
+	// ai-title/custom-title cases below.
+	hasCustomTitle := false
+
 	seenUUIDs := make(map[string]struct{})
 	turnIndex := 0
 	for scanner.Scan() {
@@ -183,9 +218,26 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 				// other dropped record.
 				if rec.Type == "system" && rec.Subtype == "compact_boundary" && rec.LogicalParentUUID != "" {
 					parent = rec.LogicalParentUUID
+
+					// logicalParentUuid can still name a uuid absent from the
+					// whole file (measured on real data — see
+					// resolveCompactBoundaryFallbacks in threads.go). Record
+					// the nearest preceding uuid-carrying record as a
+					// fallback for that case, but only when this boundary is
+					// genuinely mid-file: one seen before any turn has been
+					// parsed is a session resumed into a fresh file, where
+					// the true parent legitimately lives in a different file
+					// this parse never sees, and rooting there is correct.
+					if priorTurnCount+turnIndex > 0 && lastUUID != "" {
+						if meta.compactBoundaryFallback == nil {
+							meta.compactBoundaryFallback = make(map[string]string)
+						}
+						meta.compactBoundaryFallback[rec.UUID] = lastUUID
+					}
 				}
 				meta.rawParents[rec.UUID] = parent
 			}
+			lastUUID = rec.UUID
 		}
 
 		// Populate session-level metadata from whichever record has it.
@@ -195,10 +247,23 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 
 		switch rec.Type {
 		case "ai-title":
-			// Extract the session title from the ai-title record.
-			var t rawAITitle
-			if err := json.Unmarshal(line, &t); err == nil && t.Title != "" {
-				meta.Title = t.Title
+			// Extract the session title from the ai-title record. Never
+			// overrides an explicit custom-title, regardless of which
+			// appeared first in the stream — see hasCustomTitle above.
+			if !hasCustomTitle {
+				var t rawAITitle
+				if err := json.Unmarshal(line, &t); err == nil && t.AITitle != "" {
+					meta.Title = t.AITitle
+				}
+			}
+
+		case "custom-title":
+			// An operator-chosen title always wins over ai-title, whether
+			// this record was seen before or after one.
+			var t rawCustomTitle
+			if err := json.Unmarshal(line, &t); err == nil && t.CustomTitle != "" {
+				meta.Title = t.CustomTitle
+				hasCustomTitle = true
 			}
 
 		case "user":

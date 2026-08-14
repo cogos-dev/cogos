@@ -108,6 +108,45 @@ func bridgeDroppedParents(turns []Turn, rawParents map[string]string) map[string
 	return bridged
 }
 
+// resolveCompactBoundaryFallbacks rewrites rawParents in place for every
+// compact_boundary uuid recorded in compactBoundaryFallback (parser.go)
+// whose logicalParentUuid-derived parent does not resolve to any uuid
+// present in rawParents — i.e. it names a record absent from the whole
+// file, not merely one that never became a Turn. Measured on real data
+// (see #557 round-4 review): 9 of 160 compact_boundary records have this
+// shape, and mid-file it produces a spurious fork indistinguishable, at
+// PartitionThreads' level, from a genuine one.
+//
+// A compaction never starts a new conversation, so an unresolvable
+// logicalParentUuid is treated as a naming error in the record rather than
+// a true root: rawParents[cbUUID] is overwritten with the nearest
+// preceding uuid-carrying record parser.go saw before the boundary's own
+// line — the least-wrong guess available, and exactly the fallback
+// bridgeDroppedParents would need to splice the boundary's children past
+// it like any other dropped record.
+//
+// compactBoundaryFallback only ever contains entries for boundaries seen
+// after at least one turn had already been parsed (see its doc comment in
+// types.go) — a boundary at the true start of a resumed file is correctly
+// left rooted, with no entry here to rewrite it.
+//
+// Call this after ParseSession returns and before bridgeDroppedParents.
+// Mutates rawParents in place; does not touch turns.
+func resolveCompactBoundaryFallbacks(rawParents map[string]string, compactBoundaryFallback map[string]string) {
+	for cbUUID, fallback := range compactBoundaryFallback {
+		parent, ok := rawParents[cbUUID]
+		if !ok || parent == "" {
+			continue // no logicalParentUuid-derived parent was actually recorded
+		}
+		if _, resolves := rawParents[parent]; resolves {
+			continue // names a real record in the file (forward or backward) — leave it
+		}
+		if fallback != "" {
+			rawParents[cbUUID] = fallback
+		}
+	}
+}
+
 // PartitionThreads partitions turns into connected components of the
 // parentUuid DAG, setting Turn.ThreadID on each element of turns IN PLACE
 // (turns is mutated through its backing array — callers must not rely on the

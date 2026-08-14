@@ -218,3 +218,174 @@ func TestListConversations_DefaultLimitCapsUnboundedCall(t *testing.T) {
 		t.Errorf("sessions array length: want %d, got %d", defaultConvListLimit, len(parsed.Sessions))
 	}
 }
+
+// TestListConversations_ByteBudgetCutStaysValidAndHonest is the #557
+// round-4 review HIGH regression fixture for the byte-cut path itself
+// (distinct from the limit cut exercised above): round 4 measured that an
+// explicit limit large enough to exceed maxBytes produced a response whose
+// bytes exceeded the cap, whose JSON did not parse, and whose "count" field
+// overstated how many session objects actually survived the cut — with
+// "truncated" absent entirely, since truncatedByLimit only ever reflected
+// the limit slice, not the byte cut. This fixture uses a small maxBytes and
+// a limit comfortably larger than what fits, and asserts the response is
+// always valid JSON within the budget, with count == len(sessions) == what
+// was actually emitted, and truncated == true.
+func TestListConversations_ByteBudgetCutStaysValidAndHonest(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	const nSessions = 200
+	// A title long enough (45 chars, matching round-4's own measurement)
+	// that only a fraction of nSessions fits under a deliberately small
+	// maxBytes.
+	longTitle := "Investigate the OAuth session refresh contention bug"
+
+	sessions := make(map[string]SessionMeta, nSessions)
+	turns := make(map[string][]Turn, nSessions)
+	for i := 0; i < nSessions; i++ {
+		sid := fmt.Sprintf("%08x-1234-5678-9abc-def012345%03d", i, i)
+		ts := []Turn{{UUID: sid + "-u1", SessionID: sid, TurnIndex: 0, Role: RoleUser, Timestamp: now.Add(time.Duration(i) * time.Second), Text: "hi"}}
+		turns[sid] = ts
+		sessions[sid] = SessionMeta{
+			SessionID:   sid,
+			Title:       longTitle,
+			TurnCount:   i%12 + 1,
+			FirstTurnAt: ts[0].Timestamp,
+			LastTurnAt:  ts[0].Timestamp,
+			IndexedAt:   now,
+			Entrypoint:  "cli",
+			Identity:    "chazmaniandinkle",
+		}
+	}
+
+	idx := &Index{sessions: sessions, turns: turns}
+	p := &Provider{index: idx}
+	const smallMaxBytes = minConvMaxBytes // 4 KiB — forces the byte cut well before Limit is reached
+	handler := makeListConversationsHandler(p, smallMaxBytes)
+
+	result, _, err := handler(context.Background(), nil, listConversationsInput{Limit: nSessions})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("want *mcp.TextContent, got %T", result.Content[0])
+	}
+
+	if len(tc.Text) > smallMaxBytes {
+		t.Fatalf("response text: %d bytes exceeds the %d-byte budget — the byte cut must never let the "+
+			"response exceed maxBytes", len(tc.Text), smallMaxBytes)
+	}
+
+	var parsed struct {
+		Sessions  []map[string]any `json:"sessions"`
+		Count     int              `json:"count"`
+		Total     int              `json:"total"`
+		Truncated bool             `json:"truncated"`
+	}
+	if err := json.Unmarshal([]byte(tc.Text), &parsed); err != nil {
+		t.Fatalf("unmarshal response (must be valid JSON — round 4's own regression was an invalid mid-array "+
+			"cut): %v\nraw: %s", err, tc.Text)
+	}
+
+	if parsed.Total != nSessions {
+		t.Errorf("total: want %d (all matching sessions, uncapped), got %d", nSessions, parsed.Total)
+	}
+	if len(parsed.Sessions) == 0 {
+		t.Fatalf("expected at least some sessions to fit under the budget, got 0")
+	}
+	if len(parsed.Sessions) >= nSessions {
+		t.Fatalf("test setup: expected the byte cut to bite before all %d sessions fit, got %d",
+			nSessions, len(parsed.Sessions))
+	}
+	// The load-bearing assertion: count must equal what actually survived
+	// the cut, not the limit the caller asked for and not the pre-cut
+	// candidate count.
+	if parsed.Count != len(parsed.Sessions) {
+		t.Errorf("count (%d) != actual sessions in response (%d) — count must reflect exactly what was "+
+			"emitted, not an overstated claim", parsed.Count, len(parsed.Sessions))
+	}
+	if !parsed.Truncated {
+		t.Errorf("truncated: want true (the byte cut, not just the limit, dropped sessions), got false")
+	}
+}
+
+// TestGetConversationTurn_IncludesSessionThreadList is the #557 round-4
+// review MEDIUM regression fixture: after cog_list_conversations dropped
+// its per-session threads[] array in favor of a bare thread_count integer,
+// no MCP surface exposed a session's thread list (thread_id, role,
+// message_count) or any thread's message_count at all — the comment
+// claiming cog_get_conversation_turn already covered this was false (it
+// only ever returned the ONE addressed turn's own thread_id/thread_role).
+// This fixture asserts cog_get_conversation_turn's response now carries
+// the addressed session's full "threads" list alongside that per-turn
+// thread_id/thread_role.
+func TestGetConversationTurn_IncludesSessionThreadList(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+
+	turns := []Turn{
+		{UUID: "m-u1", SessionID: "multi-thread-session", TurnIndex: 0, Role: RoleUser, Timestamp: now, Text: "hi"},
+		{UUID: "m-a1", ParentUUID: "m-u1", SessionID: "multi-thread-session", TurnIndex: 1, Role: RoleAssistant, Timestamp: now.Add(time.Minute), Text: "hello"},
+		{UUID: "m-sub-u1", SessionID: "multi-thread-session", TurnIndex: 2, Role: RoleUser, Timestamp: now.Add(2 * time.Minute), Text: "sidechain", IsSidechain: true},
+		{UUID: "m-sub-a1", ParentUUID: "m-sub-u1", SessionID: "multi-thread-session", TurnIndex: 3, Role: RoleAssistant, Timestamp: now.Add(3 * time.Minute), Text: "sidechain reply", IsSidechain: true},
+	}
+	threads := PartitionThreads(turns, nil)
+	if len(threads) != 2 {
+		t.Fatalf("fixture setup: want 2 threads, got %d", len(threads))
+	}
+
+	idx := &Index{
+		sessions: map[string]SessionMeta{
+			"multi-thread-session": {SessionID: "multi-thread-session", TurnCount: len(turns), Threads: threads},
+		},
+		turns: map[string][]Turn{"multi-thread-session": turns},
+	}
+	p := &Provider{index: idx}
+	handler := makeGetConversationTurnHandler(p, defaultConvMaxBytes)
+
+	result, _, err := handler(context.Background(), nil, getConversationTurnInput{SessionID: "multi-thread-session", TurnIndex: 0})
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	tc, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("want *mcp.TextContent, got %T", result.Content[0])
+	}
+
+	var parsed struct {
+		ThreadID   string `json:"thread_id"`
+		ThreadRole string `json:"thread_role"`
+		Threads    []struct {
+			ThreadID     string `json:"thread_id"`
+			Role         string `json:"role"`
+			MessageCount int    `json:"message_count"`
+		} `json:"threads"`
+	}
+	if err := json.Unmarshal([]byte(tc.Text), &parsed); err != nil {
+		t.Fatalf("unmarshal response: %v\nraw: %s", err, tc.Text)
+	}
+
+	if parsed.ThreadID != "m-u1" {
+		t.Errorf("thread_id: want m-u1 (the addressed turn's own thread), got %q", parsed.ThreadID)
+	}
+	if parsed.ThreadRole != string(ThreadRoleMain) {
+		t.Errorf("thread_role: want main, got %q", parsed.ThreadRole)
+	}
+	if len(parsed.Threads) != 2 {
+		t.Fatalf("threads: want 2 entries (the whole session's thread list), got %d: %+v", len(parsed.Threads), parsed.Threads)
+	}
+	byID := map[string]struct {
+		Role  string
+		Count int
+	}{}
+	for _, tm := range parsed.Threads {
+		byID[tm.ThreadID] = struct {
+			Role  string
+			Count int
+		}{tm.Role, tm.MessageCount}
+	}
+	if got, ok := byID["m-u1"]; !ok || got.Role != string(ThreadRoleMain) || got.Count != 2 {
+		t.Errorf("threads[m-u1]: want role=main count=2, got %+v (present=%v)", got, ok)
+	}
+	if got, ok := byID["m-sub-u1"]; !ok || got.Role != string(ThreadRoleSubagentSidechain) || got.Count != 2 {
+		t.Errorf("threads[m-sub-u1]: want role=subagent-sidechain count=2, got %+v (present=%v)", got, ok)
+	}
+}

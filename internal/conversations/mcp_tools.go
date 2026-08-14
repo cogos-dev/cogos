@@ -66,6 +66,9 @@ func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider
 		Name: "cog_get_conversation_turn",
 		Description: "Fetch the full text of one conversation turn by session_id and turn_index. " +
 			"Use after cog_search_conversations to drill into a specific hit. " +
+			"When the turn belongs to a thread, the response also carries the addressed " +
+			"session's full threads list (thread_id, role, message_count per thread) — the " +
+			"per-thread detail cog_list_conversations only summarizes as a thread_count integer. " +
 			"Alternatively, pass uri=cog:conversations/<source>/<session>#id-<uuid> or " +
 			"#turn-N to address a turn via URI (RFC-query-aware-conversation-uris).",
 	}), makeGetConversationTurnHandler(provider, maxBytes))
@@ -79,7 +82,10 @@ func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider
 			"limit says otherwise; response includes total (sessions matching " +
 			"the filter) and truncated (true when total > what was returned), " +
 			"so a capped response is never silent — page with since/until or a " +
-			"larger limit to see the rest.",
+			"larger limit to see the rest. A larger limit can itself hit the " +
+			"response's own byte budget before reaching total; the response is " +
+			"always complete, valid JSON either way, with count reflecting exactly " +
+			"what was returned and truncated set whenever it is less than total.",
 	}), makeListConversationsHandler(provider, maxBytes))
 }
 
@@ -320,6 +326,31 @@ func makeGetConversationTurnHandler(p *Provider, maxBytes int) mcp.ToolHandlerFo
 						break
 					}
 				}
+				// Surface the addressed session's FULL thread list
+				// (thread_id, role, message_count per thread) alongside the
+				// addressed turn's own thread_id/thread_role above — the
+				// only per-session detail cog_list_conversations dropped in
+				// favor of a bare thread_count integer (see
+				// makeListConversationsHandler's ThreadCount doc comment).
+				// Bounded by construction: a single session's own thread
+				// count, not the whole corpus, so it carries none of that
+				// handler's byte-budget risk.
+				if len(meta.Threads) > 0 {
+					type threadOut struct {
+						ThreadID     string `json:"thread_id"`
+						Role         string `json:"role"`
+						MessageCount int    `json:"message_count"`
+					}
+					threads := make([]threadOut, 0, len(meta.Threads))
+					for _, tm := range meta.Threads {
+						threads = append(threads, threadOut{
+							ThreadID:     tm.ThreadID,
+							Role:         string(tm.Role),
+							MessageCount: tm.MessageCount,
+						})
+					}
+					resp["threads"] = threads
+				}
 			}
 		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
@@ -387,17 +418,18 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 			// thread) is unbounded by this handler's own limit — a single
 			// session can carry dozens of threads (see #557 round-3's
 			// compaction-boundary finding) — so it is exactly what pushed a
-			// real 100-session default response over defaultConvMaxBytes
-			// with capConvOutput then cutting mid-array and returning
-			// invalid JSON. An integer count is O(1) per session regardless
-			// of how many threads that session has, so it cannot blow the
-			// budget the way the array did. Callers that need per-thread
-			// detail (thread_id, role, message_count) already have
-			// cog_get_conversation_turn, which surfaces the full Threads
-			// list for one session at a time.
+			// real 100-session default response over defaultConvMaxBytes.
+			// An integer count is O(1) per session regardless of how many
+			// threads that session has, so it cannot blow the budget the
+			// way the array did. Callers that need per-thread detail
+			// (thread_id, role, message_count) have
+			// cog_get_conversation_turn, whose response now carries the
+			// addressed session's full "threads" list alongside the
+			// addressed turn's own thread_id/thread_role — see
+			// makeGetConversationTurnHandler below.
 			ThreadCount int `json:"thread_count,omitempty"`
 		}
-		out := make([]sessionOut, 0, len(metas))
+		candidates := make([]sessionOut, 0, len(metas))
 		for _, m := range metas {
 			so := sessionOut{
 				SessionID:  m.SessionID,
@@ -424,21 +456,61 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 			if !m.IndexedAt.IsZero() {
 				so.IndexedAt = m.IndexedAt.Format(time.RFC3339)
 			}
-			out = append(out, so)
+			candidates = append(candidates, so)
 		}
 
-		resp := map[string]any{
-			"sessions": out,
-			"count":    len(out),
-			"total":    total,
+		buildResp := func(sessions []sessionOut, truncated bool) map[string]any {
+			resp := map[string]any{
+				"sessions": sessions,
+				"count":    len(sessions),
+				"total":    total,
+			}
+			if truncated {
+				resp["truncated"] = true
+			}
+			return resp
 		}
-		if truncatedByLimit {
-			resp["truncated"] = true
+
+		// Assemble against the byte budget: append session objects one at a
+		// time and stop BEFORE the response would exceed maxBytes, instead
+		// of marshaling everything the limit allowed and letting
+		// capConvOutput cut the result mid-array afterward — round-4 review
+		// measured that producing invalid JSON with a "count" overstating
+		// what actually survived the cut. Every trial marshal assumes
+		// truncated:true (the field can only ever ADD bytes), so a response
+		// that ends up needing the field never silently exceeds the budget
+		// it was checked against.
+		var included []sessionOut
+		byteTruncated := false
+		for _, so := range candidates {
+			included = append(included, so)
+			trial, _ := json.MarshalIndent(buildResp(included, true), "", "  ")
+			if len(trial) > maxBytes {
+				included = included[:len(included)-1]
+				byteTruncated = true
+				break
+			}
 		}
-		b, _ := json.MarshalIndent(resp, "", "  ")
-		text := capConvOutput(string(b), maxBytes)
+
+		truncated := truncatedByLimit || byteTruncated
+		resp := buildResp(included, truncated)
+		b, err := json.MarshalIndent(resp, "", "  ")
+		if err != nil || len(b) > maxBytes {
+			// Defensive only: every candidate that made it into `included`
+			// already passed the byte check above, so this fires solely
+			// when even zero sessions plus envelope overhead exceeds
+			// maxBytes (a pathologically small configuration) or json
+			// marshaling itself failed. There is nothing left to cut —
+			// surface an explicit error rather than emit truncated-but-
+			// still-oversized or invalid JSON.
+			return convErrorResult(fmt.Sprintf(
+				"cog_list_conversations: response does not fit within the %d-byte output budget "+
+					"even with 0 sessions (err=%v) — this is a server configuration issue, not a query one",
+				maxBytes, err,
+			)), nil, nil
+		}
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: text}},
+			Content: []mcp.Content{&mcp.TextContent{Text: string(b)}},
 		}, resp, nil
 	}
 }

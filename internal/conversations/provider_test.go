@@ -71,12 +71,28 @@ func makeAssistantRecord(uuid, parentUUID, sessionID, text, ts string) string {
 	return string(b)
 }
 
-// makeAITitleRecord returns a JSON line for an ai-title record.
+// makeAITitleRecord returns a JSON line for an ai-title record. The field is
+// aiTitle — verified against real Claude Code JSONL (see #557 round-4
+// review HIGH finding: a prior "title" tag on the parser side meant this
+// never actually populated SessionMeta.Title for any real session).
 func makeAITitleRecord(sessionID, title string) string {
 	rec := map[string]any{
 		"type":      "ai-title",
 		"sessionId": sessionID,
-		"title":     title,
+		"aiTitle":   title,
+	}
+	b, _ := json.Marshal(rec)
+	return string(b)
+}
+
+// makeCustomTitleRecord returns a JSON line for a custom-title record —
+// written when the operator explicitly renames a session. Verified against
+// real Claude Code JSONL.
+func makeCustomTitleRecord(sessionID, title string) string {
+	rec := map[string]any{
+		"type":        "custom-title",
+		"sessionId":   sessionID,
+		"customTitle": title,
 	}
 	b, _ := json.Marshal(rec)
 	return string(b)
@@ -191,6 +207,64 @@ func TestProviderIngest_SingleSession(t *testing.T) {
 	if !entry.Meta.LastTurnAt.Equal(wantLast) {
 		t.Errorf("LastTurnAt: want %v, got %v", wantLast, entry.Meta.LastTurnAt)
 	}
+}
+
+// TestParseSession_CustomTitleWinsOverAITitle is the #557 round-4 review
+// HIGH regression fixture: an operator-chosen custom-title record must win
+// over the auto-generated ai-title regardless of which appears first in the
+// stream — verified against real Claude Code JSONL, where custom-title
+// consistently precedes ai-title in the file but represents the more
+// deliberate, more recent operator action.
+func TestParseSession_CustomTitleWinsOverAITitle(t *testing.T) {
+	t.Run("custom-title before ai-title", func(t *testing.T) {
+		sid := "title-order-a"
+		lines := []string{
+			makeCustomTitleRecord(sid, "My Custom Name"),
+			makeAITitleRecord(sid, "Auto Generated Name"),
+			makeUserRecord("u1", "", sid, "hello", "2026-06-01T10:00:00Z"),
+		}
+		jsonl := strings.Join(lines, "\n") + "\n"
+		var meta SessionMeta
+		if _, err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool { return true }); err != nil {
+			t.Fatalf("ParseSession: %v", err)
+		}
+		if meta.Title != "My Custom Name" {
+			t.Errorf("Title: want %q, got %q", "My Custom Name", meta.Title)
+		}
+	})
+
+	t.Run("ai-title before custom-title", func(t *testing.T) {
+		sid := "title-order-b"
+		lines := []string{
+			makeAITitleRecord(sid, "Auto Generated Name"),
+			makeCustomTitleRecord(sid, "My Custom Name"),
+			makeUserRecord("u1", "", sid, "hello", "2026-06-01T10:00:00Z"),
+		}
+		jsonl := strings.Join(lines, "\n") + "\n"
+		var meta SessionMeta
+		if _, err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool { return true }); err != nil {
+			t.Fatalf("ParseSession: %v", err)
+		}
+		if meta.Title != "My Custom Name" {
+			t.Errorf("Title: want %q, got %q", "My Custom Name", meta.Title)
+		}
+	})
+
+	t.Run("ai-title only", func(t *testing.T) {
+		sid := "title-order-c"
+		lines := []string{
+			makeAITitleRecord(sid, "Auto Generated Name"),
+			makeUserRecord("u1", "", sid, "hello", "2026-06-01T10:00:00Z"),
+		}
+		jsonl := strings.Join(lines, "\n") + "\n"
+		var meta SessionMeta
+		if _, err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool { return true }); err != nil {
+			t.Fatalf("ParseSession: %v", err)
+		}
+		if meta.Title != "Auto Generated Name" {
+			t.Errorf("Title: want %q, got %q", "Auto Generated Name", meta.Title)
+		}
+	})
 }
 
 // TestProviderIngest_LargeSession verifies that indexing a large synthetic
@@ -1011,6 +1085,118 @@ func TestIndexSessionIncremental_RefreshesSourcePath(t *testing.T) {
 	}
 }
 
+// TestIndexSessionIncremental_ThreadsMatchFullReparse is the #557 round-4
+// review REBASE+INTEGRATION regression fixture: the provider.go NOTE for
+// whoever merged fix/conversations-provider-watermarks required
+// indexSessionIncremental to call bridgeDroppedParents + PartitionThreads
+// over its assembled turn set, or an incrementally-indexed session would
+// silently ship with SessionMeta.Threads stale or nil. The fixture braids a
+// dropped tool_result-only record (ordinary tool-call structure) and a
+// compact_boundary across the incremental watermark, so both the dropped
+// record bridge and the compact_boundary bridge fire on the tail parsed by
+// the incremental cycle, not just the prefix. The result must match a
+// from-byte-0 full re-parse of the same final file: one thread, role=main,
+// covering every turn.
+func TestIndexSessionIncremental_ThreadsMatchFullReparse(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "88888888-9999-aaaa-bbbb-cccccccccccc"
+
+	prefixLines := []string{
+		makeUserRecord("u1", "", sid, "question one", "2026-06-01T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer one", "2026-06-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, prefixLines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (cycle 1): %v", err)
+	}
+	if len(turns1) != 2 {
+		t.Fatalf("expected 2 turns after cycle 1, got %d", len(turns1))
+	}
+
+	// Append a tail that braids both bridging mechanisms across the
+	// watermark: a dropped tool_result-only record, then a compact_boundary
+	// whose logicalParentUuid points back at a1 (in the already-indexed
+	// prefix), then the first post-compaction turn.
+	tailLines := []string{
+		makeToolResultOnlyUserRecord("tr1", "a1", sid, "2026-06-01T10:02:00Z"),
+		makeCompactBoundaryRecord("cb1", "a1", sid, "2026-06-01T10:03:00Z"),
+		makeUserRecord("u2", "cb1", sid, "question two", "2026-06-01T10:04:00Z"),
+		makeAssistantRecord("a2", "u2", sid, "answer two", "2026-06-01T10:05:00Z"),
+	}
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + strings.Join(tailLines, "\n")); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	meta2, turns2, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used")
+	}
+	if len(turns2) != 4 {
+		t.Fatalf("expected 4 turns (u1, a1, u2, a2) after the incremental cycle, got %d", len(turns2))
+	}
+
+	if len(meta2.Threads) != 1 {
+		t.Fatalf("want 1 thread from the incremental cycle (bridging must run over the combined turn set), "+
+			"got %d: %+v", len(meta2.Threads), meta2.Threads)
+	}
+	tm := meta2.Threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main, got %q", tm.Role)
+	}
+	if tm.MessageCount != 4 {
+		t.Errorf("MessageCount: want 4, got %d", tm.MessageCount)
+	}
+	if tm.ThreadID != "u1" {
+		t.Errorf("ThreadID: want u1, got %q", tm.ThreadID)
+	}
+
+	// u2's ParentUUID must have been bridged past the compact_boundary to
+	// a1, exactly as a full re-parse would do.
+	var u2 *Turn
+	for i := range turns2 {
+		if turns2[i].UUID == "u2" {
+			u2 = &turns2[i]
+		}
+	}
+	if u2 == nil {
+		t.Fatalf("u2 not found in incremental turn set")
+	}
+	if u2.ParentUUID != "a1" {
+		t.Errorf("u2 ParentUUID: want a1 (bridged past the compact boundary), got %q", u2.ParentUUID)
+	}
+
+	// Cross-check against a from-byte-0 full re-parse of the same final
+	// file: the incremental path must not diverge from what a full parse
+	// would produce.
+	fullMeta, fullTurns, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (full re-parse): %v", err)
+	}
+	if len(fullTurns) != len(turns2) {
+		t.Fatalf("full re-parse turn count %d != incremental turn count %d", len(fullTurns), len(turns2))
+	}
+	if len(fullMeta.Threads) != len(meta2.Threads) {
+		t.Fatalf("full re-parse thread count %d != incremental thread count %d",
+			len(fullMeta.Threads), len(meta2.Threads))
+	}
+	if fullMeta.Threads[0].ThreadID != meta2.Threads[0].ThreadID ||
+		fullMeta.Threads[0].MessageCount != meta2.Threads[0].MessageCount ||
+		fullMeta.Threads[0].Role != meta2.Threads[0].Role {
+		t.Errorf("incremental Threads %+v != full re-parse Threads %+v", meta2.Threads[0], fullMeta.Threads[0])
+	}
+}
+
 // TestProviderApplyPlan_WatermarkAdvancesAcrossCycles is the end-to-end
 // counterpart to TestIndexSessionIncremental_ReadsOnlyAppendedTail: it drives
 // the same watermark logic through LoadConfig/FetchLive/ComputePlan/ApplyPlan
@@ -1544,7 +1730,7 @@ func TestParseSession_RecordsRawParentsForDroppedRecords(t *testing.T) {
 
 	var meta SessionMeta
 	var turns []Turn
-	if err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool {
+	if _, err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	}); err != nil {
@@ -1737,6 +1923,178 @@ func TestProviderIngest_ThreadPartition_CompactBoundaryNotABranchPoint(t *testin
 	}
 	if u2Turn.ThreadID != "u1" {
 		t.Errorf("u2 ThreadID: want u1 (same thread as the session start), got %q", u2Turn.ThreadID)
+	}
+}
+
+// TestProviderIngest_ThreadPartition_CompactBoundaryAbsentLogicalParentBridgesMidFile
+// is the #557 round-4 review MEDIUM regression fixture: a compact_boundary
+// whose logicalParentUuid names a uuid that appears NOWHERE in the file (not
+// even as a dropped record) — measured on 9 of 160 real compact_boundary
+// records, 3 of which sit mid-file and produce a spurious fork. Unlike
+// TestProviderIngest_ThreadPartition_CompactBoundaryNotABranchPoint (where
+// logicalParentUuid resolves), bridgeDroppedParents' upward walk from the
+// boundary hits a dead end here: rawParents has no entry for the named
+// (ghost) uuid at all. Because the boundary sits after real turns already
+// exist in this file, resolveCompactBoundaryFallbacks must fall back to the
+// nearest preceding uuid-carrying record (a1) instead of leaving the
+// session to fragment. Must still collapse to one thread, role=main,
+// message_count 4, with u2's ParentUUID bridged to a1.
+func TestProviderIngest_ThreadPartition_CompactBoundaryAbsentLogicalParentBridgesMidFile(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const sid = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "question one", "2026-06-01T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer one", "2026-06-01T10:01:00Z"),
+		// Auto-compaction boundary whose logicalParentUuid names a uuid that
+		// never appears anywhere else in this file.
+		makeCompactBoundaryRecord("cb1", "ghost-parent-does-not-exist", sid, "2026-06-01T10:02:00Z"),
+		// First post-compaction turn: its raw JSONL parent is the boundary.
+		makeUserRecord("u2", "cb1", sid, "question two", "2026-06-01T10:03:00Z"),
+		makeAssistantRecord("a2", "u2", sid, "answer two", "2026-06-01T10:04:00Z"),
+	}
+	writeJSONLFixture(t, srcDir, sid, lines)
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if _, err := p.ApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	liveAny2, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive 2: %v", err)
+	}
+	ls, ok := liveAny2.(*liveState)
+	if !ok {
+		t.Fatal("expected *liveState")
+	}
+	entry, ok := ls.Entries[sid]
+	if !ok {
+		t.Fatalf("session %s not in live state", sid)
+	}
+
+	threads := entry.Meta.Threads
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread despite the unresolvable logicalParentUuid, got %d: %+v", len(threads), threads)
+	}
+	tm := threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main, got %q", tm.Role)
+	}
+	if tm.MessageCount != 4 {
+		t.Errorf("MessageCount: want 4 (u1, a1, u2, a2), got %d", tm.MessageCount)
+	}
+	if tm.ThreadID != "u1" {
+		t.Errorf("ThreadID: want u1 (session's true first turn), got %q", tm.ThreadID)
+	}
+
+	u2Turn, ok := p.index.GetTurn(sid, 2) // turn_index 2 = u2
+	if !ok {
+		t.Fatalf("GetTurn(sid, 2) not found")
+	}
+	if u2Turn.ParentUUID != "a1" {
+		t.Errorf("u2 ParentUUID: want a1 (fallback to nearest preceding record), got %q", u2Turn.ParentUUID)
+	}
+	if u2Turn.ThreadID != "u1" {
+		t.Errorf("u2 ThreadID: want u1 (same thread as the session start), got %q", u2Turn.ThreadID)
+	}
+}
+
+// TestProviderIngest_ThreadPartition_CompactBoundaryAbsentLogicalParentAtFileStartStaysRoot
+// is the head-of-file guard for the fix above: a compact_boundary with an
+// unresolvable logicalParentUuid, but seen before any turn has been parsed
+// — the shape of a session resumed into a fresh file, where the true parent
+// legitimately lives in a DIFFERENT file this parse never sees. Measured on
+// real data: 4 of the 9 absent-logicalParentUuid boundaries are exactly
+// this shape, and rooting there is correct. There is no earlier
+// uuid-carrying record to fall back to in this file, so
+// resolveCompactBoundaryFallbacks must leave the boundary — and the turn
+// chained after it — rooted rather than manufacturing a fallback out of
+// nothing.
+func TestProviderIngest_ThreadPartition_CompactBoundaryAbsentLogicalParentAtFileStartStaysRoot(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const sid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
+
+	lines := []string{
+		// The boundary is the very first record in the file — no turn has
+		// been parsed yet — and its logicalParentUuid names a uuid that
+		// lives only in the (unavailable) prior file.
+		makeCompactBoundaryRecord("cb1", "ghost-parent-in-a-different-file", sid, "2026-06-01T10:00:00Z"),
+		makeUserRecord("u1", "cb1", sid, "question one", "2026-06-01T10:01:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer one", "2026-06-01T10:02:00Z"),
+	}
+	writeJSONLFixture(t, srcDir, sid, lines)
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if _, err := p.ApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	liveAny2, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive 2: %v", err)
+	}
+	ls, ok := liveAny2.(*liveState)
+	if !ok {
+		t.Fatal("expected *liveState")
+	}
+	entry, ok := ls.Entries[sid]
+	if !ok {
+		t.Fatalf("session %s not in live state", sid)
+	}
+
+	// u1's raw parent (the boundary) never became a turn and has no
+	// fallback recorded (head-of-file), so u1 must remain an (honest) root
+	// rather than being bridged to something that doesn't exist.
+	threads := entry.Meta.Threads
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread (u1's own), got %d: %+v", len(threads), threads)
+	}
+	tm := threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main, got %q", tm.Role)
+	}
+	if tm.MessageCount != 2 {
+		t.Errorf("MessageCount: want 2 (u1, a1), got %d", tm.MessageCount)
+	}
+	if tm.ThreadID != "u1" {
+		t.Errorf("ThreadID: want u1, got %q", tm.ThreadID)
+	}
+
+	u1Turn, ok := p.index.GetTurn(sid, 0)
+	if !ok {
+		t.Fatalf("GetTurn(sid, 0) not found")
+	}
+	if u1Turn.ParentUUID != "cb1" {
+		t.Errorf("u1 ParentUUID: want cb1 left untouched (no fallback available), got %q", u1Turn.ParentUUID)
 	}
 }
 

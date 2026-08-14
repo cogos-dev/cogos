@@ -141,6 +141,29 @@ type SessionMeta struct {
 	// clears it — it is never persisted (unexported, so encoding/json never
 	// touches it regardless).
 	rawParents map[string]string
+
+	// compactBoundaryFallback is parse-time scratch space: for every
+	// compact_boundary record ParseSession saw AFTER at least one turn had
+	// already been parsed (this call's own turnIndex, or a prior
+	// incremental cycle's TurnCount carried in via meta — see
+	// indexSessionIncremental), the uuid of the nearest preceding
+	// uuid-carrying record it saw before the boundary's own line.
+	//
+	// The boundary's logicalParentUuid remains the primary hypothesis for
+	// its raw parent (see the rawParents override in parser.go); this map
+	// is only consulted by resolveCompactBoundaryFallbacks, as a fallback
+	// for the case measured on real data where logicalParentUuid names no
+	// uuid anywhere in the file — a compaction never starts a new
+	// conversation, so the boundary must bridge to something, and the
+	// nearest preceding record is the least-wrong guess available.
+	//
+	// A compact_boundary seen before any turn has been parsed is
+	// deliberately excluded (never added to this map): that shape is a
+	// session resumed into a fresh file, where the true parent legitimately
+	// lives in a DIFFERENT file this parse never sees, and rooting there is
+	// correct. See resolveCompactBoundaryFallbacks in threads.go. Cleared
+	// after use; never persisted.
+	compactBoundaryFallback map[string]string
 }
 
 // ThreadRole classifies a thread found by PartitionThreads.
