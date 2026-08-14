@@ -33,10 +33,22 @@ can only be **observed** on a local backend. `lms ps --json` (the source for the
 observed value) is a local-only CLI — `lms ps --help` shows no `--host` flag —
 so a remote backend (e.g. Eclipse) can never be checked against a declared
 `parallel` target through this mechanism; `Health()`'s message says so
-explicitly rather than silently reporting full coverage. And unlike
-`context_length`, a `parallel` mismatch is never remediated on any backend:
-`@lmstudio/sdk`'s load config has no per-load parallelism knob, so `ComputePlan`
-never emits an action for it — it is purely an alarm.
+explicitly rather than silently reporting full coverage. Likewise, if the local
+probe itself produces no observation (lms CLI missing/renamed, the probe times
+out or errors, or no `lms ps` row matches the loaded model), `Health()` appends
+the same kind of gap note rather than presenting a dead watch as clean coverage.
+
+`ComputePlan` never emits a dedicated action for a `parallel` mismatch — it is
+purely an alarm, never actuated as its own remediation. That said, the local
+`lms load` CLI fast-path *does* have a `--parallel <count>` flag (confirmed
+live via `lms load --help`), unlike the `@lmstudio/sdk` load config used for
+remote backends, which genuinely has no per-load parallelism knob. To keep the
+reconciler from inducing the exact drift it alarms on, the local fast-path
+threads the declared `parallel` target into every `lms load` it issues —
+including a context-triggered reload (unload+reload; LM Studio has no live
+resize) — so remediating a `context_length` mismatch on a local backend does
+not silently reset parallelism to the app default and manufacture a permanent,
+unclearable `parallel` mismatch behind it.
 
 ## Prerequisites
 

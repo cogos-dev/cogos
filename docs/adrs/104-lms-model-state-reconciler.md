@@ -54,10 +54,23 @@ local/remote asymmetry §3 already documents for the actuator's `lms load` fast
 path. So `parallel` drift is only observable on local backends; on a remote
 backend (e.g. Eclipse) a declared `parallel` target cannot be checked through
 this mechanism at all — the reconciler says so explicitly in its `Health()`
-message rather than silently reporting Healthy on context alone. Like
-`context_length`, `parallel` is **alarm-only, never actuated**: LM Studio's
-`@lmstudio/sdk` load config has no per-load parallelism knob (§3's `lms-actuator`
-does not accept or forward it).
+message rather than silently reporting Healthy on context alone. The same gap
+note fires when a *local* backend's probe itself fails to observe anything
+(missing/renamed CLI, timeout, no matching `lms ps` row) — an unwatched
+`parallel` dimension must never present as clean coverage either.
+
+`ComputePlan` never emits a dedicated action for a `parallel` mismatch — it is
+alarm-only, not a standalone remediation target. That is narrower than "never
+actuated on any backend," though: the `@lmstudio/sdk` load config used for the
+remote/websocket actuator genuinely has no per-load parallelism knob (§3's
+`lms-actuator` does not accept or forward it), but the **local** `lms load` CLI
+fast-path does — confirmed live via `lms load --help` (`--parallel <count>`).
+Because that same local fast-path is also what executes the `<name>/context`
+action's unload+reload, it now threads the declared `parallel` target into
+every `lms load` it issues, context-triggered reloads included — otherwise a
+context remediation would drop parallelism back to LM Studio's app default and
+manufacture a `parallel` mismatch the reconciler could never clear on its own,
+since `ComputePlan` has no dedicated action for it.
 
 ## Decision
 

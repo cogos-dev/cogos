@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -79,7 +80,7 @@ type lmsModelStateConfig struct {
 	Manage        bool   // opt-in switch; false ⇒ Suspended, empty plan
 	Model         string // target model id that should be loaded
 	ContextLength int    // desired loaded_context_length (0 ⇒ don't manage context)
-	Parallel      int    // watched for drift, never actuated (LM Studio SDK load config has no per-load parallelism knob; parallelism is a server/JIT setting). Observed only on local backends via `lms ps --json` — see probeParallelLocal.
+	Parallel      int    // watched for drift on all backends; observed only on local backends via `lms ps --json` (see probeParallelLocal). Never actuated as its own ComputePlan action — but on a local backend it IS threaded into `lms load --parallel` (see buildActuatorCmd) so a context-triggered reload doesn't blow it away; the @lmstudio/sdk load config used for remote backends has no such per-load parallelism knob.
 	KeepWarm      bool   // hint: keep loaded even when idle (advisory metadata)
 	JITEvict      bool   // if true, unload a non-target model that crowds the card
 }
@@ -108,10 +109,16 @@ type lmsModelRow struct {
 // flag — same LM-Link-gated local/remote asymmetry the actuator's fast-path
 // already documents). Confirmed live shape:
 // {"identifier":"ornith-1.0-35b",...,"parallel":1}.
+//
+// Parallel is a pointer for the same reason lmsModelRow.LoadedContextLength is:
+// an older lms CLI (or any future shape change) that omits the `parallel` key
+// must decode to nil (unobserved), never to the Go zero value 0 — a bare int
+// would silently promote "key absent" into "observed 0" and falsely alarm a
+// correctly-loaded backend.
 type lmsPsRow struct {
 	Identifier string `json:"identifier"`
 	ModelKey   string `json:"modelKey"`
-	Parallel   int    `json:"parallel"`
+	Parallel   *int   `json:"parallel"`
 }
 
 // lmsModelsResponse is the /api/v0/models envelope.
@@ -268,7 +275,14 @@ func (p *LMSModelStateProvider) FetchLive(ctx context.Context, _ any) (any, erro
 	// the whole FetchLive or affect Health beyond leaving Parallel nil
 	// (unobserved, not wrong), mirroring how a missing loaded_context_length is
 	// treated as unknown rather than a mismatch.
-	if err == nil && p.local {
+	//
+	// Gated on p.target.Parallel > 0 (mirrors the daemon copy's
+	// `e.parallel > 0 && e.local` gate): without a declared parallel target
+	// there is nothing to compare against, so every local backend — including
+	// the many that have never heard of `parallel:` — would otherwise pay a
+	// ~150-300ms fork/exec of the lms binary on every FetchLive cycle for no
+	// observational benefit.
+	if err == nil && p.local && p.target.Parallel > 0 {
 		if parallel, perr := p.probeParallelLocal(ctx); perr == nil {
 			mergeParallel(rows, parallel)
 		}
@@ -354,20 +368,50 @@ func (p *LMSModelStateProvider) probeParallelLocal(ctx context.Context) (map[str
 		if id == "" {
 			continue
 		}
-		result[id] = r.Parallel
+		if r.Parallel == nil {
+			// `parallel` key omitted (older lms CLI, or a future shape change) —
+			// unobserved, never treated as an observed 0.
+			continue
+		}
+		result[id] = *r.Parallel
 	}
 	return result, nil
 }
 
 // mergeParallel copies observed parallel values from an `lms ps --json` probe
-// into the matching /api/v0/models rows, using the same prefix-either-direction
-// identifier matching as findModelRow (quant suffixes, publisher prefixes).
-// Rows with no match are left with a nil Parallel (unobserved).
+// into the matching /api/v0/models rows. Rows with no match are left with a
+// nil Parallel (unobserved).
+//
+// Matching is deterministic in two ways that matter when the same base model
+// is loaded twice (LM Studio suffixes the second instance, e.g.
+// "ornith-1.0-35b" and "ornith-1.0-35b:2") or when one model id is a prefix
+// of another:
+//  1. An exact identifier match is always preferred over a prefix match.
+//  2. The prefix-either-direction fallback (same rule as findModelRow: quant
+//     suffixes, publisher prefixes) iterates a SORTED slice of keys rather
+//     than ranging the map directly — Go randomizes map iteration order, so
+//     ranging the map would let the attached value change from cycle to
+//     cycle on identical live state, flapping Health between Healthy and
+//     Degraded.
 func mergeParallel(rows []lmsModelRow, parallel map[string]int) {
+	if len(parallel) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(parallel))
+	for id := range parallel {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+
 	for i := range rows {
-		for id, val := range parallel {
+		if val, ok := parallel[rows[i].ID]; ok {
+			v := val
+			rows[i].Parallel = &v
+			continue
+		}
+		for _, id := range keys {
 			if modelIDMatch(rows[i].ID, id) {
-				v := val
+				v := parallel[id]
 				rows[i].Parallel = &v
 				break
 			}
@@ -572,6 +616,19 @@ func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model 
 		if ctxLen > 0 {
 			args = append(args, "--context-length", fmt.Sprintf("%d", ctxLen))
 		}
+		// Thread the declared parallel target on every local load/reload
+		// (confirmed live: `lms load --help` lists `--parallel <count>` on
+		// this CLI — unlike the SDK actuator below, the local fast-path does
+		// have a per-load parallelism knob). Without this, a context-triggered
+		// reload (unload+reload; LM Studio has no live resize) would come back
+		// at the app's default parallelism, manufacturing a parallel mismatch
+		// that this reconciler can never clear on its own — parallel drift is
+		// alarm-only (ComputePlan never emits a dedicated action for it, see
+		// mismatch handling in Health/ComputePlan) — so the self-heal driver
+		// would re-enter on a permanently-Degraded resource with an empty plan.
+		if p.target.Parallel > 0 {
+			args = append(args, "--parallel", fmt.Sprintf("%d", p.target.Parallel))
+		}
 		return exec.CommandContext(ctx, p.lmsCLI, args...), false, nil
 	}
 
@@ -596,11 +653,14 @@ func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model 
 	if ctxLen > 0 {
 		args = append(args, "--context-length", fmt.Sprintf("%d", ctxLen))
 	}
-	// NOTE: `parallel` is intentionally NOT threaded to the actuator. LM Studio's
-	// @lmstudio/sdk load config (v1.5.0) has no per-load parallelism knob —
-	// parallelism is a server/JIT setting, not a load-config field — so passing it
-	// would be a silent no-op. It remains a declared model_state field only for
-	// state reporting (BuildState attributes), not for actuation.
+	// NOTE: `parallel` is intentionally NOT threaded to the SDK actuator here.
+	// LM Studio's @lmstudio/sdk load config (v1.5.0) has no per-load parallelism
+	// knob — parallelism is a server/JIT setting, not a load-config field — so
+	// passing it would be a silent no-op. This is specific to the SDK/websocket
+	// path used for remote backends: the *local* `lms load` CLI fast-path above
+	// does have a `--parallel` flag and threads it. On this (remote) path,
+	// `parallel` remains a declared model_state field only for state reporting
+	// (BuildState attributes) and alarm messages, not for actuation.
 	return exec.CommandContext(ctx, p.nodeBin, args...), true, nil
 }
 
@@ -765,7 +825,7 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 			Operation: reconcile.OperationIdle,
 			Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s, want %d%s",
 				p.name, target.Model, ctxStr(targetRow.LoadedContextLength), target.ContextLength,
-				parallelGapNote(target, p.local)),
+				parallelGapNote(target, p.local, targetRow.Parallel != nil)),
 		}
 	}
 
@@ -787,7 +847,7 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 		Health:    reconcile.HealthHealthy,
 		Operation: reconcile.OperationIdle,
 		Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s%s",
-			p.name, target.Model, ctxStr(targetRow.LoadedContextLength), parallelGapNote(target, p.local)),
+			p.name, target.Model, ctxStr(targetRow.LoadedContextLength), parallelGapNote(target, p.local, targetRow.Parallel != nil)),
 	}
 }
 
@@ -904,14 +964,25 @@ func parallelStr(v *int) string {
 	return fmt.Sprintf("%d", *v)
 }
 
-// parallelGapNote returns an informational suffix for Health() messages when a
-// parallel target is declared but the backend is remote: `lms ps --json` has no
-// --host flag, so remote backends cannot be probed for parallel drift through
-// this mechanism. The gap must stay visible rather than presenting as full
-// coverage when only context is actually being watched.
-func parallelGapNote(target lmsModelStateConfig, local bool) string {
-	if target.Parallel > 0 && !local {
+// parallelGapNote returns an informational suffix for Health() messages
+// whenever a parallel target is declared but is not actually being watched —
+// either because the backend is remote (`lms ps --json` has no --host flag,
+// so remote backends cannot be probed this way) or because the local probe
+// itself produced no observation (lms CLI missing/renamed, probeParallelLocal
+// timed out or errored, or no `lms ps` row matched the loaded model). Without
+// this second case, a local backend whose lms CLI is broken would report a
+// clean Healthy/Synced with zero indication the parallel watch is dead — the
+// exact "invisible drift" failure mode issue #555 exists to prevent, just
+// relocated to the alarm's own dependency instead of the model's context.
+func parallelGapNote(target lmsModelStateConfig, local, observed bool) string {
+	if target.Parallel <= 0 {
+		return ""
+	}
+	if !local {
 		return "; parallel target declared but backend is remote — not observable via lms ps"
+	}
+	if !observed {
+		return "; parallel target declared but not observed — lms ps probe failed, lms CLI missing, or no matching row"
 	}
 	return ""
 }

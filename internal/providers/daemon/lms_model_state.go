@@ -69,13 +69,16 @@ func (p *lmsModelStateProvider) Health() reconcile.ResourceStatus {
 	defer cancel()
 
 	var issues []string
+	var gapNotes []string
 	var anyProgressing bool
 	for _, e := range entries {
-		progressing, err := probeModelStateEntry(ctx, e)
+		progressing, gapNote, err := probeModelStateEntry(ctx, e)
 		if err != nil {
 			issues = append(issues, fmt.Sprintf("%s: %v", e.name, err))
 		} else if progressing {
 			anyProgressing = true
+		} else if gapNote != "" {
+			gapNotes = append(gapNotes, gapNote)
 		}
 	}
 
@@ -107,11 +110,19 @@ func (p *lmsModelStateProvider) Health() reconcile.ResourceStatus {
 	if len(entries) != 1 {
 		noun = "backends"
 	}
+	msg := fmt.Sprintf("%d model_state %s at target", len(entries), noun)
+	if len(gapNotes) > 0 {
+		// Surface the coverage gap even on an otherwise-clean cycle: a declared
+		// parallel target that this daemon cannot actually watch (remote
+		// backend, or a dead/missing local lms CLI) must not present as full
+		// coverage. See probeModelStateEntry's gapNote doc.
+		msg += "; " + strings.Join(gapNotes, "; ")
+	}
 	return reconcile.ResourceStatus{
 		Sync:      reconcile.SyncStatusSynced,
 		Health:    reconcile.HealthHealthy,
 		Operation: reconcile.OperationIdle,
-		Message:   fmt.Sprintf("%d model_state %s at target", len(entries), noun),
+		Message:   msg,
 	}
 }
 
@@ -171,6 +182,12 @@ func loadModelStateEntries(root string) []modelStateEntry {
 // which probeModelStateEntry defaults to localhost). Duplicates the small
 // loopback check in internal/engine/provider_lms_model_state.go's isLocalHost
 // rather than cross-importing engine from daemon.
+//
+// Host is lowercased before comparison so an uppercase scheme/host (e.g.
+// "http://LOCALHOST:1234", which providers.yaml does not forbid) still
+// matches — a case-sensitive miss here would silently disable the parallel
+// watch on an otherwise-local backend with no annotation (the same
+// invisibility class as the gap notes above guard against).
 func isLocalHostEndpoint(endpoint string) bool {
 	host := endpoint
 	if idx := strings.Index(host, "://"); idx >= 0 {
@@ -182,7 +199,7 @@ func isLocalHostEndpoint(endpoint string) bool {
 	if idx := strings.LastIndex(host, ":"); idx >= 0 {
 		host = host[:idx]
 	}
-	switch host {
+	switch strings.ToLower(host) {
 	case "localhost", "127.0.0.1", "::1", "[::1]", "":
 		return true
 	}
@@ -249,13 +266,18 @@ func parseModelStateEntriesFromYAML(data []byte) []modelStateEntry {
 // probeModelStateEntry checks one backend: read /api/v0/models and report whether
 // the declared model is loaded at the declared context. Read-only.
 //
-// Returns (progressing, err). progressing==true means the model is mid-load
-// (state=="loading"), which is Progressing — NOT a health issue: a high-context
-// load can take minutes and must never read as Degraded. A non-nil err is a real
-// problem (unreachable / wrong context / not loaded / absent). Mirrors the engine
-// provider's findModelRow (prefer the state=="loaded" row) and ComputePlan
-// (loading is not drift) so the daemon proprioception matches the engine's Health().
-func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) {
+// Returns (progressing, gapNote, err). progressing==true means the model is
+// mid-load (state=="loading"), which is Progressing — NOT a health issue: a
+// high-context load can take minutes and must never read as Degraded. A
+// non-nil err is a real problem (unreachable / wrong context / not loaded /
+// absent). gapNote is non-empty when a parallel target is declared but this
+// entry could not actually be watched for parallel drift (remote backend, or
+// the local probe produced no observation) — Health() surfaces it even on an
+// otherwise-clean cycle so the watch's coverage never silently degrades to
+// zero while still reporting Healthy. Mirrors the engine provider's
+// findModelRow (prefer the state=="loaded" row) and ComputePlan (loading is
+// not drift) so the daemon proprioception matches the engine's Health().
+func probeModelStateEntry(ctx context.Context, e modelStateEntry) (progressing bool, gapNote string, err error) {
 	base := strings.TrimRight(e.endpoint, "/")
 	if base == "" {
 		base = "http://localhost:1234"
@@ -263,7 +285,7 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) 
 	url := base + "/api/v0/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return false, fmt.Errorf("build request: %w", err)
+		return false, "", fmt.Errorf("build request: %w", err)
 	}
 	if e.apiKeyEnv != "" {
 		if tok := os.Getenv(e.apiKeyEnv); tok != "" {
@@ -273,11 +295,11 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) 
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, fmt.Errorf("unreachable: %v", err)
+		return false, "", fmt.Errorf("unreachable: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("/api/v0/models returned %d", resp.StatusCode)
+		return false, "", fmt.Errorf("/api/v0/models returned %d", resp.StatusCode)
 	}
 
 	var out struct {
@@ -288,7 +310,7 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) 
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return false, fmt.Errorf("decode: %w", err)
+		return false, "", fmt.Errorf("decode: %w", err)
 	}
 
 	// Collect id-matching rows, preferring state=="loaded" so a not-loaded/loading
@@ -323,30 +345,44 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) 
 			if m.LoadedContextLength != nil {
 				got = fmt.Sprintf("%d", *m.LoadedContextLength)
 			}
-			return false, fmt.Errorf("model %q loaded at context %s (want %d)", e.model, got, e.contextLength)
+			return false, "", fmt.Errorf("model %q loaded at context %s (want %d)", e.model, got, e.contextLength)
 		}
-		if e.parallel > 0 && e.local {
-			if err := checkParallelDrift(ctx, e, m.ID); err != nil {
-				return false, err
+		if e.parallel > 0 {
+			if !e.local {
+				gapNote = fmt.Sprintf("%s: parallel target declared but backend is remote — not observable via lms ps", e.name)
+			} else {
+				observed, perr := checkParallelDrift(ctx, e, m.ID)
+				if perr != nil {
+					return false, "", perr
+				}
+				if !observed {
+					gapNote = fmt.Sprintf("%s: parallel target declared but not observed — lms ps probe failed, lms CLI missing, or no matching row", e.name)
+				}
 			}
 		}
-		return false, nil
+		return false, gapNote, nil
 	case loadingIdx != -1:
-		return true, nil // mid-load — Progressing, not an issue
+		return true, "", nil // mid-load — Progressing, not an issue
 	case otherIdx != -1:
-		return false, fmt.Errorf("model %q state=%q (want loaded)", e.model, out.Data[otherIdx].State)
+		return false, "", fmt.Errorf("model %q state=%q (want loaded)", e.model, out.Data[otherIdx].State)
 	default:
-		return false, fmt.Errorf("model %q not present", e.model)
+		return false, "", fmt.Errorf("model %q not present", e.model)
 	}
 }
 
 // msPsRow mirrors `lms ps --json`'s row shape (the local-only lms CLI — no
 // --host flag, so remote backends cannot be probed this way). Confirmed live:
 // {"identifier":"ornith-1.0-35b",...,"parallel":1}.
+//
+// Parallel is a pointer, mirroring lmsPsRow in the engine copy: an older lms
+// CLI (or any future shape change) that omits the `parallel` key must decode
+// to nil (unobserved), never to the Go zero value 0 — a bare int would
+// silently promote "key absent" into "observed 0" and falsely alarm a
+// correctly-loaded backend.
 type msPsRow struct {
 	Identifier string `json:"identifier"`
 	ModelKey   string `json:"modelKey"`
-	Parallel   int    `json:"parallel"`
+	Parallel   *int   `json:"parallel"`
 }
 
 // msParallelProbeTimeout bounds the `lms ps --json` shell-out. Deliberately its
@@ -357,24 +393,31 @@ const msParallelProbeTimeout = 2 * time.Second
 // checkParallelDrift shells `lms ps --json` and compares the observed parallel
 // value for the row matching loadedID (or e.model, prefix-either-direction —
 // mirrors the /api/v0/models matching above) against e.parallel. A probe
-// failure (binary missing, non-zero exit, bad JSON) or no matching row is
-// NON-FATAL — skip the check rather than erroring, the same "unobserved, not
-// wrong" treatment the engine-side provider gives a nil Parallel. Returns a
-// non-nil error ONLY on a genuine observed mismatch, which folds into the
-// existing (progressing, err) issues aggregation in Health().
-func checkParallelDrift(ctx context.Context, e modelStateEntry, loadedID string) error {
+// failure (binary missing, non-zero exit, bad JSON), no matching row, or a
+// matching row whose `parallel` key was omitted is NON-FATAL — skip the check
+// rather than erroring, the same "unobserved, not wrong" treatment the
+// engine-side provider gives a nil Parallel. The err return is non-nil ONLY on
+// a genuine observed mismatch, which folds into the existing (progressing,
+// err) issues aggregation in Health().
+//
+// The observed return distinguishes "checked and matched" from "could not
+// check at all" — probeModelStateEntry uses it to attach a gap note when a
+// parallel target is declared but this probe produced no observation, so a
+// dead/missing lms CLI degrades the watch's coverage visibly instead of
+// silently reporting clean.
+func checkParallelDrift(ctx context.Context, e modelStateEntry, loadedID string) (observed bool, err error) {
 	if e.lmsCLIPath == "" {
-		return nil
+		return false, nil
 	}
 	psCtx, cancel := context.WithTimeout(ctx, msParallelProbeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(psCtx, e.lmsCLIPath, "ps", "--json").Output()
-	if err != nil {
-		return nil // lms CLI unavailable — unobserved, not an issue
+	out, cmdErr := exec.CommandContext(psCtx, e.lmsCLIPath, "ps", "--json").Output()
+	if cmdErr != nil {
+		return false, nil // lms CLI unavailable — unobserved, not an issue
 	}
 	var rows []msPsRow
 	if json.Unmarshal(out, &rows) != nil {
-		return nil // unparseable — unobserved
+		return false, nil // unparseable — unobserved
 	}
 	for _, r := range rows {
 		id := r.Identifier
@@ -388,10 +431,13 @@ func checkParallelDrift(ctx context.Context, e modelStateEntry, loadedID string)
 			id == e.model || strings.HasPrefix(id, e.model) || strings.HasPrefix(e.model, id)) {
 			continue
 		}
-		if r.Parallel != e.parallel {
-			return fmt.Errorf("model %q loaded with parallel %d (want %d)", e.model, r.Parallel, e.parallel)
+		if r.Parallel == nil {
+			return false, nil // `parallel` key omitted — unobserved, not a mismatch
 		}
-		return nil
+		if *r.Parallel != e.parallel {
+			return true, fmt.Errorf("model %q loaded with parallel %d (want %d)", e.model, *r.Parallel, e.parallel)
+		}
+		return true, nil
 	}
-	return nil // no matching row — unobserved
+	return false, nil // no matching row — unobserved
 }

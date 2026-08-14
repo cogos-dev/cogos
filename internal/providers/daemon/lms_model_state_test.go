@@ -46,7 +46,7 @@ func TestProbeModelStateEntry_LoadingIsProgressingNotError(t *testing.T) {
 	// NOT a Degraded-inducing error — a high-context load can take minutes.
 	srv := msModelsServer(t, msRow{ID: "target", State: "loading", Ctx: nil})
 	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
-	progressing, err := probeModelStateEntry(context.Background(), e)
+	progressing, _, err := probeModelStateEntry(context.Background(), e)
 	if err != nil {
 		t.Fatalf("loading must not be an error, got %v", err)
 	}
@@ -62,7 +62,7 @@ func TestProbeModelStateEntry_PrefersLoadedOverDuplicate(t *testing.T) {
 		msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)},
 	)
 	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
-	progressing, err := probeModelStateEntry(context.Background(), e)
+	progressing, _, err := probeModelStateEntry(context.Background(), e)
 	if err != nil {
 		t.Fatalf("loaded duplicate must satisfy the probe, got %v", err)
 	}
@@ -74,7 +74,7 @@ func TestProbeModelStateEntry_PrefersLoadedOverDuplicate(t *testing.T) {
 func TestProbeModelStateEntry_WrongContextIsError(t *testing.T) {
 	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(65536)})
 	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
-	if _, err := probeModelStateEntry(context.Background(), e); err == nil {
+	if _, _, err := probeModelStateEntry(context.Background(), e); err == nil {
 		t.Fatalf("wrong loaded context must be an error")
 	}
 }
@@ -108,7 +108,7 @@ func TestProbeModelStateEntry_ParallelMismatchIsError(t *testing.T) {
 		parallel: 1, local: true,
 		lmsCLIPath: writeFakeLmsPs(t, `[{"identifier":"target","parallel":4}]`, false),
 	}
-	_, err := probeModelStateEntry(context.Background(), e)
+	_, _, err := probeModelStateEntry(context.Background(), e)
 	if err == nil {
 		t.Fatal("expected an error on observed parallel mismatch")
 	}
@@ -126,12 +126,15 @@ func TestProbeModelStateEntry_ParallelSkippedOnRemote(t *testing.T) {
 		parallel: 1, local: false,
 		lmsCLIPath: writeFakeLmsPs(t, `[{"identifier":"target","parallel":99}]`, false),
 	}
-	progressing, err := probeModelStateEntry(context.Background(), e)
+	progressing, gapNote, err := probeModelStateEntry(context.Background(), e)
 	if err != nil {
 		t.Fatalf("remote entry must skip the parallel probe entirely, got error: %v", err)
 	}
 	if progressing {
 		t.Fatal("expected progressing=false for a loaded, non-progressing entry")
+	}
+	if gapNote == "" {
+		t.Error("expected a gap note for a declared parallel target on a remote backend")
 	}
 }
 
@@ -142,12 +145,15 @@ func TestProbeModelStateEntry_ParallelProbeFailureNonFatal(t *testing.T) {
 		parallel: 1, local: true,
 		lmsCLIPath: writeFakeLmsPs(t, "", true), // exits non-zero
 	}
-	progressing, err := probeModelStateEntry(context.Background(), e)
+	progressing, gapNote, err := probeModelStateEntry(context.Background(), e)
 	if err != nil {
 		t.Fatalf("a failed lms CLI probe must be non-fatal (unobserved, not wrong), got: %v", err)
 	}
 	if progressing {
 		t.Fatal("expected progressing=false")
+	}
+	if gapNote == "" {
+		t.Error("expected a gap note when the local parallel probe produces no observation")
 	}
 }
 
@@ -159,9 +165,12 @@ func TestProbeModelStateEntry_ParallelUnsetSkipsProbeEntirely(t *testing.T) {
 		parallel: 0, local: true,
 		lmsCLIPath: writeFakeLmsPs(t, `[{"identifier":"target","parallel":99}]`, false),
 	}
-	_, err := probeModelStateEntry(context.Background(), e)
+	_, gapNote, err := probeModelStateEntry(context.Background(), e)
 	if err != nil {
 		t.Fatalf("parallel==0 must not trigger a mismatch, got: %v", err)
+	}
+	if gapNote != "" {
+		t.Errorf("parallel==0 must not produce a gap note either, got %q", gapNote)
 	}
 }
 
@@ -171,6 +180,7 @@ func TestIsLocalHostEndpoint(t *testing.T) {
 	cases := map[string]bool{
 		"":                           true,
 		"http://localhost:1234":      true,
+		"http://LOCALHOST:1234":      true, // case-insensitive — a config typo must not silently disable the parallel watch
 		"http://127.0.0.1:1234":      true,
 		"http://192.168.10.191:1234": false,
 		"https://eclipse.local:1234": false,

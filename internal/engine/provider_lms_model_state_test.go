@@ -229,6 +229,7 @@ func TestFetchLiveMergesLocalParallel(t *testing.T) {
 
 	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
 	p.local = true
+	p.target.Parallel = 1 // must be declared — FetchLive gates the probe on a declared target
 	p.lmsCLI = writeFakePs(t, `[{"identifier":"ornith-1.0-35b","modelKey":"ornith-1.0-35b","parallel":1}]`, false)
 
 	live, err := p.FetchLive(context.Background(), nil)
@@ -242,6 +243,46 @@ func TestFetchLiveMergesLocalParallel(t *testing.T) {
 	}
 }
 
+func TestFetchLiveSkipsParallelProbeWhenNoTargetDeclared(t *testing.T) {
+	// Without a declared parallel target there is nothing to compare against —
+	// FetchLive must not pay the lms CLI fork/exec cost on every cycle for
+	// local backends that have never heard of `parallel:`. Point lmsCLI at a
+	// script that would fail loudly (a mismatching parallel value) if invoked.
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "ornith-1.0-35b", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+
+	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
+	p.local = true
+	p.target.Parallel = 0 // no target declared
+
+	var invocations int
+	psPath := writeFakePs(t, `[{"identifier":"ornith-1.0-35b","parallel":99}]`, false)
+	// Wrap the fake with a counter so we can assert it was never invoked.
+	countedPath := filepath.Join(t.TempDir(), "lms")
+	script := "#!/bin/sh\necho called >> " + filepath.Join(filepath.Dir(countedPath), "calls.log") + "\nexec " + psPath + " \"$@\"\n"
+	if err := os.WriteFile(countedPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write counting wrapper: %v", err)
+	}
+	p.lmsCLI = countedPath
+
+	live, err := p.FetchLive(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	row := findModelRow(live.([]lmsModelRow), "ornith-1.0-35b")
+	if row == nil || row.Parallel != nil {
+		t.Errorf("expected nil Parallel with no target declared, got %#v", row)
+	}
+	if data, err := os.ReadFile(filepath.Join(filepath.Dir(countedPath), "calls.log")); err == nil {
+		invocations = strings.Count(string(data), "called")
+	}
+	if invocations != 0 {
+		t.Errorf("expected the lms CLI fast-path never invoked with no parallel target declared, got %d invocations", invocations)
+	}
+}
+
 func TestFetchLiveParallelProbeFailureIsNonFatal(t *testing.T) {
 	srv := httptest.NewServer(modelsHandler(
 		modelFixture{id: "ornith-1.0-35b", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
@@ -250,6 +291,7 @@ func TestFetchLiveParallelProbeFailureIsNonFatal(t *testing.T) {
 
 	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
 	p.local = true
+	p.target.Parallel = 1               // must be declared — FetchLive gates the probe on a declared target
 	p.lmsCLI = writeFakePs(t, "", true) // exits non-zero
 
 	live, err := p.FetchLive(context.Background(), nil)
@@ -277,6 +319,7 @@ func TestFetchLiveParallelProbeGarbageJSONIsNonFatal(t *testing.T) {
 
 	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
 	p.local = true
+	p.target.Parallel = 1 // must be declared — FetchLive gates the probe on a declared target
 	p.lmsCLI = writeFakePs(t, "not json", false)
 
 	live, err := p.FetchLive(context.Background(), nil)
@@ -299,7 +342,8 @@ func TestFetchLiveRemoteBackendSkipsParallelProbe(t *testing.T) {
 	defer srv.Close()
 
 	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
-	p.local = false // remote
+	p.local = false       // remote
+	p.target.Parallel = 1 // declared, so this test exercises the local-gate specifically
 	p.lmsCLI = writeFakePs(t, `[{"identifier":"ornith-1.0-35b","parallel":1}]`, false)
 
 	live, err := p.FetchLive(context.Background(), nil)
