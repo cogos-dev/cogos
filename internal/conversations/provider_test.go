@@ -470,6 +470,212 @@ func TestIndexSessionIncremental_FallsBackOnTruncation(t *testing.T) {
 	}
 }
 
+// TestIndexSessionIncremental_FallsBackWhenTurnsProjectionMissing guards
+// against a data-loss regression: prevMeta.TurnCount says N turns are
+// indexed, but the caller-supplied prevTurns is empty (e.g. _meta.json
+// survived while the session's turns projection file was deleted or never
+// loaded — Index.loadTurnsFile returns (nil, nil) for a missing file,
+// unlike a corrupt one). Taking the fast path in this state would merge the
+// newly-appended tail onto an empty prefix and silently discard every
+// already-indexed turn, with no self-healing path (the watermark keeps
+// advancing on subsequent cycles). The fast path must decline so the
+// caller falls back to a full re-parse, which rebuilds the correct history
+// from disk.
+func TestIndexSessionIncremental_FallsBackWhenTurnsProjectionMissing(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "dddddddd-eeee-ffff-0000-111111111111"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "first message", "2026-05-01T10:00:00Z"),
+		makeUserRecord("u2", "u1", sid, "second message", "2026-05-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+	if len(turns1) != 2 || meta1.TurnCount != 2 {
+		t.Fatalf("test setup: expected 2 turns/TurnCount after cycle 1, got turns=%d TurnCount=%d",
+			len(turns1), meta1.TurnCount)
+	}
+
+	// Append a third turn — a legitimate, ordinary growth.
+	thirdLine := makeUserRecord("u3", "u2", sid, "third message", "2026-05-01T10:02:00Z")
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + thirdLine); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	// Simulate the meta-present/turns-file-absent state: prevMeta still
+	// claims TurnCount==2, but prevTurns comes back empty (as
+	// Index.SessionTurns would report for a session whose turns file was
+	// removed while _meta.json survived).
+	var emptyPrevTurns []Turn
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, emptyPrevTurns)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Fatalf("expected the incremental fast path to decline when len(prevTurns) (%d) != prevMeta.TurnCount (%d) — "+
+			"taking it here would silently drop the 2 already-indexed turns and yield only the newly appended tail",
+			len(emptyPrevTurns), meta1.TurnCount)
+	}
+
+	// The self-heal: the caller's fallback to indexSession must recover all
+	// 3 turns from disk.
+	meta2, turns2, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (fallback): %v", err)
+	}
+	if len(turns2) != 3 || meta2.TurnCount != 3 {
+		t.Errorf("expected the full re-parse fallback to recover 3 turns, got turns=%d TurnCount=%d",
+			len(turns2), meta2.TurnCount)
+	}
+}
+
+// TestIndexSessionIncremental_FallsBackOnSameSizeRewrite guards against
+// silent, permanent staleness: a source file rewritten in place at exactly
+// the same byte size (different content, same length) is invisible to the
+// size-only shrink/grow check — fi.Size() still equals the recorded
+// watermark, so a naive "size didn't shrink" test would take the fast path,
+// seek to a watermark whose already-consumed bytes are no longer what was
+// actually parsed, and read zero new bytes forever after (since the
+// watermark never again falls below fi.Size()). The fast path must decline
+// whenever the file is at the watermark size AND its mtime moved, so the
+// caller falls back to a full re-parse that picks up the rewritten content.
+func TestIndexSessionIncremental_FallsBackOnSameSizeRewrite(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "eeeeeeee-ffff-0000-1111-222222222222"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "alpha", "2026-05-01T10:00:00Z"),
+		makeUserRecord("u2", "u1", sid, "bravo", "2026-05-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+	if len(turns1) != 2 {
+		t.Fatalf("test setup: expected 2 turns after cycle 1, got %d", len(turns1))
+	}
+
+	// Rewrite the whole file in place with different records of the exact
+	// same total byte length (same uuid/text lengths as the originals).
+	replacementLines := []string{
+		makeUserRecord("u3", "", sid, "delta", "2026-05-01T11:00:00Z"),
+		makeUserRecord("u4", "u3", sid, "echo!", "2026-05-01T11:01:00Z"),
+	}
+	replacement := strings.Join(replacementLines, "\n") + "\n"
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if len(replacement) != len(original) {
+		t.Fatalf("test setup: replacement length %d != original length %d — fixture must stay same-size",
+			len(replacement), len(original))
+	}
+
+	future := time.Now().Add(10 * time.Second)
+	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
+		t.Fatalf("same-size rewrite: %v", err)
+	}
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Size() != meta1.SourceOffset {
+		t.Fatalf("test setup: rewritten file size %d must equal the watermark %d", fi.Size(), meta1.SourceOffset)
+	}
+
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Fatalf("expected the incremental fast path to decline on a same-size in-place rewrite " +
+			"(size unchanged, mtime moved) — taking it here would parse zero new bytes and leave the " +
+			"index showing the pre-rewrite content forever, with no recovery path")
+	}
+
+	// The self-heal: the caller's fallback to indexSession must pick up the
+	// rewritten content.
+	meta2, turns2, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (fallback): %v", err)
+	}
+	if len(turns2) != 2 {
+		t.Fatalf("expected 2 turns after fallback re-parse, got %d", len(turns2))
+	}
+	if turns2[0].Text != "delta" || turns2[1].Text != "echo!" {
+		t.Errorf("expected the fallback re-parse to reflect the rewritten content, got %q, %q",
+			turns2[0].Text, turns2[1].Text)
+	}
+	if meta2.TurnCount != 2 {
+		t.Errorf("expected TurnCount 2 after fallback, got %d", meta2.TurnCount)
+	}
+}
+
+// TestIndexSessionIncremental_RefreshesSourcePath verifies that a session
+// whose file relocates while keeping its UUID (CC derives its project
+// directory from the cwd slug, so renaming/moving a project dir moves
+// <uuid>.jsonl) does not keep serving the pre-move source_path indefinitely
+// through the incremental fast path — matching indexSession's behavior of
+// always recording the sourcePath it actually parsed.
+func TestIndexSessionIncremental_RefreshesSourcePath(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "ffffffff-0000-1111-2222-333333333333"
+
+	line := makeUserRecord("u1", "", sid, "first message", "2026-05-01T10:00:00Z")
+	path := writeJSONLFixture(t, dir, sid, []string{line})
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+
+	// Simulate a relocated source path (new directory, same UUID filename)
+	// by passing a different sourcePath into the incremental call while
+	// appending a new turn to the original file (indexSessionIncremental
+	// itself reads from the sourcePath argument, so point it at a copy).
+	newDir := filepath.Join(dir, "moved")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	newPath := filepath.Join(newDir, sid+".jsonl")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	secondLine := makeUserRecord("u2", "u1", sid, "second message", "2026-05-01T10:01:00Z")
+	if err := os.WriteFile(newPath, append(original, []byte("\n"+secondLine)...), 0o644); err != nil {
+		t.Fatalf("write moved fixture: %v", err)
+	}
+
+	meta2, _, used, err := indexSessionIncremental(newPath, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used")
+	}
+	if meta2.SourcePath != newPath {
+		t.Errorf("meta.SourcePath = %q, want %q (the relocated path actually parsed, not prevMeta's stale %q)",
+			meta2.SourcePath, newPath, meta1.SourcePath)
+	}
+}
+
 // TestProviderApplyPlan_WatermarkAdvancesAcrossCycles is the end-to-end
 // counterpart to TestIndexSessionIncremental_ReadsOnlyAppendedTail: it drives
 // the same watermark logic through LoadConfig/FetchLive/ComputePlan/ApplyPlan

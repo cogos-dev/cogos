@@ -1089,6 +1089,15 @@ func (idx *Index) turnsLockPath(sessionID string) string {
 // parse error it deletes the session from the in-memory map rather than
 // surfacing a partial result) — a stronger data-loss outcome than #449's
 // "last writer wins on one field".
+//
+// Cost note (issue #558): this always marshals and rewrites the ENTIRE
+// turns list, not just what changed. provider.go's indexSessionIncremental
+// made the parse side of a reconcile cycle O(delta) for an actively-growing
+// session, but every UpsertSessions call still round-trips through here for
+// its full turns slice, so the write side of a cycle with any new turns
+// remains O(session-size) — unaddressed by that change. A large,
+// steadily-growing session can still cost close to its full projection
+// size per cycle on the write path alone.
 func (idx *Index) writeTurnsFileLocked(sessionID string, turns []Turn) error {
 	b, err := json.MarshalIndent(turns, "", "  ")
 	if err != nil {

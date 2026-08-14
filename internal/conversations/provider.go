@@ -1283,24 +1283,39 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 // issue #558 fix: a live, actively-growing session JSONL was being
 // re-parsed in full — O(session-size) — on every reconcile cycle, which is
 // why a 96MB session cost ~77s/cycle against a 500ms budget. Reading only
-// the appended bytes makes steady-state cycle cost O(delta) instead.
+// the appended bytes makes the PARSE step of a steady-state cycle O(delta)
+// instead of O(session-size).
+//
+// NOTE on scope: this only fixes the parse side. Index.UpsertSessions still
+// rewrites the whole per-session turns projection file every cycle
+// (writeTurnsFileLocked in index.go), so the end-to-end apply cost of a
+// cycle that has any new turns remains O(session-size) — a large,
+// steadily-growing session can still straddle CycleBudget even after this
+// change. That write-side cost is a separate, not-yet-addressed piece of
+// work; see index.go's writeTurnsFileLocked doc comment.
 //
 // Returns (meta, turns, usedIncremental, err). usedIncremental is false
-// whenever the fast path isn't safe to take (no established watermark, or
-// the file is smaller than the watermark — a truncation or rewrite, most
-// commonly a CC compaction that replaces the file wholesale) — the caller
-// must fall back to indexSession (a full re-parse) in that case.
+// whenever the fast path isn't safe to take (no established watermark, the
+// file is smaller than the watermark — a truncation or rewrite, most
+// commonly a CC compaction that replaces the file wholesale — the recorded
+// turns don't match the recorded turn count, or the file was rewritten
+// in place at the same size) — the caller must fall back to indexSession (a
+// full re-parse) in that case.
 //
 // This is a size+mtime heuristic, not a content hash: it trusts that bytes
 // already consumed up to prevMeta.SourceOffset are unchanged whenever the
 // file has only grown since. That is the same trust boundary isDrift
 // already relies on for the source-changed decision one level up (mtime +
 // size, no hashing), so it introduces no new class of assumption — it just
-// applies the existing one at finer granularity. It would miss an in-place
-// rewrite that preserves or grows the file size while altering already
-// -consumed bytes; CC session JSONLs are append-only in practice and
-// compaction rewrites are observed as a smaller file (caught below), so
-// this is not expected to occur.
+// applies the existing one at finer granularity. An in-place rewrite that
+// changes already-consumed bytes while leaving the file size unchanged is
+// caught below by comparing mtime against the watermark's recorded mtime
+// (the same signal isDrift uses to decide there's anything to reconcile at
+// all); a rewrite that also changes the size is caught by the shrink check
+// when it shrinks, and otherwise looks like ordinary growth and is not
+// distinguishable from a legitimate append without content hashing — CC
+// session JSONLs are append-only in practice, so that residual case is not
+// expected to occur, but a generic *.jsonl source is not guaranteed to be.
 func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevMeta SessionMeta, prevTurns []Turn) (SessionMeta, []Turn, bool, error) {
 	fi, err := os.Stat(sourcePath)
 	if err != nil {
@@ -1312,6 +1327,36 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 	// full re-parse.
 	if prevMeta.SourceOffset <= 0 || prevMeta.SourceOffset > fi.Size() {
 		return SessionMeta{}, nil, false, nil
+	}
+
+	// prevTurns must actually reflect prevMeta's own bookkeeping. If the
+	// in-memory/on-disk turns projection is short of prevMeta.TurnCount —
+	// e.g. _meta.json survived but the session's turns projection file was
+	// deleted or never loaded (Index.loadTurnsFile returns (nil, nil) for a
+	// missing file, unlike a corrupt one, which Load handles by dropping
+	// the meta entry too) — merging the tail onto prevTurns would silently
+	// discard every already-indexed turn instead of self-healing via a full
+	// re-parse. Decline and let the caller fall back to indexSession.
+	if len(prevTurns) != prevMeta.TurnCount {
+		return SessionMeta{}, nil, false, nil
+	}
+
+	// A same-size in-place rewrite (byte count unchanged, content
+	// different) can't be caught by the shrink check above, since fi.Size()
+	// still equals prevMeta.SourceOffset. Fall back to a full re-parse
+	// whenever the file's mtime moved (beyond the same 2s tolerance isDrift
+	// uses) without the size moving past the watermark — trusting "size
+	// didn't shrink" as sufficient safety would let a same-size rewrite
+	// resume from a watermark whose already-consumed bytes are no longer
+	// what was actually parsed.
+	if fi.Size() == prevMeta.SourceOffset {
+		mtimeDiff := fi.ModTime().Sub(prevMeta.SourceMtime)
+		if mtimeDiff < 0 {
+			mtimeDiff = -mtimeDiff
+		}
+		if mtimeDiff > 2*time.Second {
+			return SessionMeta{}, nil, false, nil
+		}
 	}
 
 	f, err := os.Open(sourcePath)
@@ -1326,8 +1371,12 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 
 	// Seed meta from the previous pass so ParseSession extends (rather than
 	// resets) FirstTurnAt/LastTurnAt/Entrypoint/Title, then overwrite the
-	// per-cycle bookkeeping fields.
+	// per-cycle bookkeeping fields. SourcePath is refreshed from the
+	// sourcePath argument (not left as prevMeta's) so a session whose file
+	// relocates while keeping its UUID doesn't keep serving a stale
+	// source_path indefinitely — matching indexSession's behavior.
 	meta := prevMeta
+	meta.SourcePath = sourcePath
 	meta.IndexedAt = time.Now().UTC()
 	meta.SourceMtime = fi.ModTime()
 	meta.SourceSize = fi.Size()

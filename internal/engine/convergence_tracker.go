@@ -79,6 +79,19 @@ const (
 // withDefaults().
 type ConvergenceConfig struct {
 	// CycleBudget: a cycle slower than this counts as over budget.
+	//
+	// This is a single global value shared by every provider — there is no
+	// per-provider override. That is a known gap for `conversations`: the
+	// #558 fast-path fix makes the parse step of a steady-state cycle
+	// O(delta), but Index.UpsertSessions still rewrites each session's
+	// entire turns projection every cycle (see writeTurnsFileLocked in
+	// internal/conversations/index.go), so a large actively-growing session
+	// can still straddle or exceed this 500ms default on the write side
+	// alone. Raising CycleBudget globally would mask a genuinely slow
+	// provider elsewhere; a correct fix is a per-provider budget (or
+	// finishing the write-side O(delta) work), neither of which this PR
+	// attempts — left as a deliberate, tracked follow-up rather than a
+	// guessed-at config value.
 	CycleBudget time.Duration
 	// OverBudgetCycles: consecutive over-budget ticks before flagging.
 	OverBudgetCycles int
@@ -180,6 +193,18 @@ type provConvState struct {
 	reasonsAtRaise []string
 }
 
+// reasons returns the unqualified anomaly reason strings ("over_budget",
+// "degraded", "quarantined") for the current cycle. These are logged
+// alongside a separate "provider" field (see raise/persist in Observe), so a
+// consumer reading both fields off one log line can attribute a reason to
+// its provider; a consumer that only harvests the "reasons" array (e.g. a
+// cross-provider tally) cannot distinguish `conversations:over_budget` from
+// `some-other-provider:over_budget` without also joining on "provider".
+// Qualifying each reason string with its provider (e.g. "conversations:over_
+// budget") was requested as part of #558 but is not done here — it changes
+// the log schema for every existing consumer of this field, which needs
+// coordination with whoever parses it, not a decision made silently inside
+// a bug-fix change. Left as an explicit, tracked follow-up.
 func (s *provConvState) reasons(cfg ConvergenceConfig) []string {
 	var r []string
 	if s.overBudget >= cfg.OverBudgetCycles {
