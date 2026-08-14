@@ -1823,6 +1823,17 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 			turn.Status = "error"
 			turn.Error = err.Error()
 		}
+		// #556 repair (round 3): a request that Acquire admitted after a
+		// real FIFO wait, whose provider.Stream call then failed on
+		// connect (e.g. LMS returning 4xx/5xx once admitted), used to
+		// return this 500 with no X-Cogos-Queue-* headers — the caller
+		// could not see the failure was preceded by queueing. Matches
+		// completeChat's non-streaming fix (round 2) and must be written
+		// before WriteHeader, same as every other writeQueueHeaders call
+		// site. writeQueueHeaders is nil-safe/self-suppressing when
+		// nothing was recorded (e.g. a cloud provider), so this is a
+		// no-op there.
+		writeQueueHeaders(w, queueObservationFromContext(ctx))
 		// Replace the SSE headers we set above with a JSON error response.
 		// (httptest.ResponseRecorder lets this through; net/http only
 		// honours the first WriteHeader, so a header overwrite here is

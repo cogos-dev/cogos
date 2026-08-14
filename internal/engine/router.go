@@ -908,17 +908,26 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		// FIFO queue (provider_queue.go), sized to the backend's declared
 		// parallelism (options.model_state.parallel — parsed since #555 but
 		// until now purely advisory metadata; this is what makes it
-		// load-bearing for the first time). Unset/zero defaults to 1,
-		// matching the #555 ruling that LMS itself runs parallel=1 as the
-		// enforcement backstop — a kernel-side default of 1 is the safe
-		// assumption absent an explicit declaration. Cloud/remote providers
+		// load-bearing for the first time). Unset/zero (concurrency stays 0
+		// here, deliberately NOT clamped to 1) is passed through to
+		// newQueuedProvider as "unspecified" — matching the #555 ruling
+		// that LMS itself runs parallel=1 as the enforcement backstop, a
+		// kernel-side default of 1 is still the safe assumption absent an
+		// explicit declaration, but newQueuedProvider is the one place that
+		// applies that default (on first creation only), so an unspecified
+		// value from THIS call site can never clobber a concurrency another
+		// call site already declared for the same queueKey. #556 repair
+		// (round 3): this call site is the one PROVIDERS.YAML-DECLARED path
+		// among the three that construct a queued provider for a local
+		// backend (the others — buildLocalProvider, autoDiscoverOpenAICompat
+		// — have no config to declare a value from); pre-clamping here to 1
+		// erased that distinction and let either of the other two, undeclared
+		// paths silently overwrite an operator's declared parallel=4 back
+		// down to 1 on their next load-hit. Cloud/remote providers
 		// (anthropic, claude-oauth, claude-code, codex) are untouched; this
 		// wrap is scoped to the local backend family per the issue's
 		// explicit "local backends" text.
 		concurrency := parseModelStateOptions(pc.Options).Parallel
-		if concurrency < 1 {
-			concurrency = 1
-		}
 		// Registry key is the resolved, normalized endpoint (NOT name) —
 		// the same resolution NewOpenAICompatProvider itself just applied to
 		// pc.Endpoint above — so two differently-NAMED providers.yaml
@@ -1158,12 +1167,18 @@ var openaiCompatWellKnownEndpoints = []openaiCompatProbeEndpoint{
 // servers and registers any that respond. Skips endpoints already configured
 // in providers.yaml to avoid duplicates.
 func autoDiscoverOpenAICompat(router *SimpleRouter, pcfg ProvidersConfig) {
-	// Build a set of already-configured endpoints to avoid duplicates.
+	// Build a set of already-configured endpoints to avoid duplicates. Keyed
+	// on the same canonicalized form normalizeLocalLLMEndpoint produces for
+	// the queue registry (host-canonicalized, not just trailing-slash
+	// trimmed) — #556 repair (round 3): a raw TrimRight comparison let a
+	// providers.yaml entry spelled "http://127.0.0.1:1234" fail to dedup
+	// against this probe's "http://localhost:1234", registering a second,
+	// independent queue for the same physical backend.
 	configuredEndpoints := map[string]bool{}
 	configuredNames := map[string]bool{}
 	for name, pc := range pcfg.Providers {
 		if pc.Endpoint != "" {
-			configuredEndpoints[strings.TrimRight(pc.Endpoint, "/")] = true
+			configuredEndpoints[normalizeLocalLLMEndpoint(pc.Endpoint)] = true
 		}
 		configuredNames[name] = true
 	}
@@ -1173,7 +1188,8 @@ func autoDiscoverOpenAICompat(router *SimpleRouter, pcfg ProvidersConfig) {
 
 	for _, probe := range openaiCompatWellKnownEndpoints {
 		endpoint := strings.TrimRight(probe.endpoint, "/")
-		if configuredEndpoints[endpoint] || configuredNames[probe.name] {
+		queueKey := normalizeLocalLLMEndpoint(endpoint)
+		if configuredEndpoints[queueKey] || configuredNames[probe.name] {
 			continue
 		}
 
@@ -1189,14 +1205,18 @@ func autoDiscoverOpenAICompat(router *SimpleRouter, pcfg ProvidersConfig) {
 			// any workspace with no explicit providers.yaml entry for this
 			// endpoint got an unqueued LM Studio backend — invisible to GET
 			// /v1/queue and both vitals gauges, and not subject to the
-			// parallel=1 backstop. Concurrency defaults to 1 for the same
-			// reason as the harness's legacy probe path (local_llm.go's
-			// buildLocalProvider): no config entry exists here to declare
-			// options.model_state.parallel from.
-			// Registry key is the normalized endpoint, not probe.name — see
-			// makeProvider's matching comment. #556 repair (round 2).
-			queueKey := normalizeLocalLLMEndpoint(endpoint)
-			router.RegisterProvider(newQueuedProvider(probe.name, queueKey, p, 1))
+			// parallel=1 backstop.
+			// Registry key is the normalized (host-canonicalized) endpoint,
+			// not probe.name — see makeProvider's matching comment. #556
+			// repair (round 2), host-canonicalized in round 3.
+			// Concurrency is passed as 0 ("unspecified"), not a hardcoded 1
+			// — #556 repair (round 3): this probe path has no config to
+			// declare a parallelism from, so it must never overwrite an
+			// operator-declared concurrency already registered under this
+			// queueKey by makeProvider. newQueuedProvider treats <1 as
+			// "leave the existing queue's concurrency alone on a load-hit,
+			// default to 1 on first creation." See its doc comment.
+			router.RegisterProvider(newQueuedProvider(probe.name, queueKey, p, 0))
 			slog.Info("router: auto-discovered", "name", probe.name, "endpoint", endpoint)
 		}
 	}

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -35,7 +37,54 @@ func normalizeLocalLLMEndpoint(endpoint string) string {
 	if strings.HasSuffix(endpoint, "/v1") {
 		endpoint = strings.TrimSuffix(endpoint, "/v1")
 	}
-	return strings.TrimRight(endpoint, "/")
+	endpoint = strings.TrimRight(endpoint, "/")
+	return canonicalizeLoopbackHost(endpoint)
+}
+
+// canonicalizeLoopbackHost folds every spelling of "this machine's loopback
+// interface" (127.0.0.1, ::1, [::1], localhost — case-insensitively) down to
+// one canonical host ("localhost") and lowercases the host, so endpoints
+// that are physically the same backend collapse to the same string
+// wherever this function's output is used as a map/registry key — most
+// importantly provider_queue.go's backendQueues registry key and
+// autoDiscoverOpenAICompat's already-configured-endpoint dedup set
+// (router.go).
+//
+// #556 repair (round 3): round 2 keyed the queue registry on
+// normalizeLocalLLMEndpoint's output but that function only trimmed
+// whitespace/trailing-slash/trailing-"/v1" — it did no host canonicalization,
+// so "http://127.0.0.1:1234" and "http://localhost:1234" still produced two
+// different registry keys for the same physical LM Studio process. That
+// reopened, verbatim, the double-queue defect round 2 was written to close:
+// an HTTP chat resolving through one spelling and an autonomic tick through
+// the other could each hold their own queue's only slot, so LMS still saw 2
+// concurrent generations at parallel=1 on both.
+//
+// Default ports (80 for http, 443 for https) are also dropped so
+// "http://localhost:80" and "http://localhost" collapse together. Endpoints
+// that fail to parse as a URL, or have no host component, are returned
+// unchanged — this function only ever tightens a valid endpoint, never
+// invents one.
+func canonicalizeLoopbackHost(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return endpoint
+	}
+	host := strings.ToLower(u.Hostname())
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		host = "localhost"
+	}
+	port := u.Port()
+	if (port == "80" && u.Scheme == "http") || (port == "443" && u.Scheme == "https") {
+		port = ""
+	}
+	if port != "" {
+		u.Host = net.JoinHostPort(host, port)
+	} else {
+		u.Host = host
+	}
+	return u.String()
 }
 
 func resolveLocalLLMEndpoint(cfgEndpoint string) string {
@@ -178,10 +227,7 @@ func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Pro
 		// here, so without this wrap they ran inference against LMS with
 		// zero queue accounting while HTTP chat waited in the kernel FIFO,
 		// contradicting the queuedProvider doc comment's claim that every
-		// call path gets queued "for free". Concurrency defaults to 1 (no
-		// providers.yaml entry exists on this path to declare
-		// options.model_state.parallel from), matching the #555 backstop
-		// default applied in makeProvider.
+		// call path gets queued "for free".
 		cfg.MaxTokens = openaiCompatDefaultMaxToks
 		inner := NewOpenAICompatProvider("agent-local", cfg)
 		// Registry key is the resolved, normalized endpoint (NOT the fixed
@@ -191,7 +237,14 @@ func buildLocalProvider(target LocalLLMTarget, model string, timeoutSec int) Pro
 		// their own queues on when they resolve to the same physical
 		// backend. #556 repair (round 2).
 		queueKey := normalizeLocalLLMEndpoint(target.BaseURL)
-		return newQueuedProvider(agentLocalQueueDisplayName, queueKey, inner, 1)
+		// Concurrency is passed as 0 ("unspecified"), not a hardcoded 1 —
+		// #556 repair (round 3): no providers.yaml entry exists on this path
+		// to declare options.model_state.parallel from, so it must never
+		// overwrite an operator-declared concurrency another call site
+		// (makeProvider) already registered for this queueKey.
+		// newQueuedProvider still applies the #555 backstop default of 1 the
+		// FIRST time this queueKey is registered; see its doc comment.
+		return newQueuedProvider(agentLocalQueueDisplayName, queueKey, inner, 0)
 	}
 }
 

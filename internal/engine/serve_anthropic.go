@@ -423,6 +423,15 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 			turn.Status = "error"
 			turn.Error = err.Error()
 		}
+		// #556 repair (round 3): matches streamChat's round-3 fix in
+		// serve.go and completeAnthropicMessages' round-2 fix above — a
+		// request admitted after a real FIFO wait, whose provider.Stream
+		// call then failed on connect, must still report the queue
+		// headers so the caller can see the failure was preceded by
+		// queueing. Must be written before http.Error's WriteHeader.
+		// writeQueueHeaders is nil-safe/self-suppressing when nothing was
+		// recorded, so this is a no-op for non-queued providers.
+		writeQueueHeaders(w, queueObservationFromContext(ctx))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

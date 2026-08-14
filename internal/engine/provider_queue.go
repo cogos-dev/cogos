@@ -57,6 +57,7 @@ type queueTicket struct {
 type backendQueue struct {
 	mu          sync.Mutex
 	name        string
+	key         string // the canonical backendQueues registry key (queueKey) this queue is stored under — see newQueuedProvider and Snapshot's Endpoint field. Empty for queues constructed directly by tests via newBackendQueue rather than through newQueuedProvider.
 	concurrency int
 	inFlight    int
 	waiters     *list.List // of *queueTicket, oldest at Front
@@ -157,12 +158,32 @@ func (q *backendQueue) makeRelease() func() {
 	}
 }
 
-// release frees one slot: if a waiter is queued, the slot transfers directly
-// to the oldest one (true FIFO — inFlight is unchanged, ownership moves);
-// otherwise inFlight is decremented.
+// release frees one slot: if a waiter is queued AND admitting it would not
+// push inFlight over the current concurrency ceiling, the slot transfers
+// directly to the oldest waiter (true FIFO — inFlight is unchanged,
+// ownership moves from the releasing caller to the waiter); otherwise
+// inFlight is decremented and any waiters stay parked.
+//
+// #556 repair (round 3): this used to transfer to the front waiter
+// UNCONDITIONALLY whenever one was queued, never checking inFlight against
+// concurrency first. setConcurrency's narrowing path (below) only removes
+// capacity lazily — by design, it does not preempt callers already holding
+// a slot — and relies on release() to enforce the new, lower ceiling as
+// those callers finish. Because release() never consulted concurrency, a
+// narrowing (e.g. an operator lowering options.model_state.parallel from 4
+// to 1 while a backlog existed) never actually took effect: each release()
+// kept handing the freed slot straight to the next waiter, holding inFlight
+// at its pre-narrowing level indefinitely. The check here is
+// `q.inFlight <= q.concurrency` (not `<`) evaluated BEFORE any decrement,
+// which is deliberately the same admission test Acquire's fast path uses —
+// it correctly falls through to granting in the steady state (no pending
+// narrowing) where inFlight always equals concurrency when a waiter is
+// present, and correctly withholds admission while inFlight is still above
+// the new ceiling, letting it drain one release() at a time until it is
+// not.
 func (q *backendQueue) release() {
 	q.mu.Lock()
-	if e := q.waiters.Front(); e != nil {
+	if e := q.waiters.Front(); e != nil && q.inFlight <= q.concurrency {
 		q.waiters.Remove(e)
 		t := e.Value.(*queueTicket)
 		q.mu.Unlock()
@@ -183,9 +204,12 @@ func (q *backendQueue) release() {
 // dispatches (#556 repair round 2).
 //
 // Narrowing (n < current concurrency) takes effect lazily: callers already
-// holding a slot are not preempted, and no additional slot is granted until
+// holding a slot are not preempted, and — as of the #556 repair (round 3)
+// fix to release() — no additional slot is granted to a waiter until
 // inFlight naturally drops back under the new, lower ceiling via a normal
-// release(). Widening (n > current concurrency) takes effect immediately:
+// release(); release() now checks inFlight against concurrency before
+// transferring a slot, so this is actually enforced rather than merely
+// documented. Widening (n > current concurrency) takes effect immediately:
 // capacity newly freed by the increase is handed to waiters at the front of
 // the FIFO list right away — the same grant release() performs — rather
 // than leaving them parked until some unrelated future release() call that,
@@ -229,7 +253,19 @@ type queueCallerSnapshot struct {
 
 // queueSnapshot is a point-in-time read of a backendQueue's state.
 type queueSnapshot struct {
-	Name         string                `json:"name"`
+	Name string `json:"name"`
+	// Endpoint is the queue's stable registry identity — the canonical,
+	// host-canonicalized endpoint (backendQueues' map key; see
+	// newQueuedProvider) that this queue is actually shared and looked up
+	// by. #556 repair (round 3): Name is NOT stable — it is whichever
+	// call site's displayName happened to win newQueuedProvider's
+	// LoadOrStore race first (e.g. "agent-local" vs "lmstudio-darkstar"
+	// vs "lmstudio" for the exact same physical backend, depending on
+	// which of buildLocalProvider/makeProvider/autoDiscoverOpenAICompat
+	// ran first), so it is not a reliable identifier for a shared queue.
+	// Endpoint is. Omitted for queues constructed directly by tests via
+	// newBackendQueue (no queueKey to report).
+	Endpoint     string                `json:"endpoint,omitempty"`
 	Concurrency  int                   `json:"concurrency"`
 	InFlight     int                   `json:"in_flight"`
 	Waiting      int                   `json:"waiting"`
@@ -249,6 +285,7 @@ func (q *backendQueue) Snapshot() queueSnapshot {
 
 	snap := queueSnapshot{
 		Name:        q.name,
+		Endpoint:    q.key,
 		Concurrency: q.concurrency,
 		InFlight:    q.inFlight,
 		Waiting:     q.waiters.Len(),
@@ -454,12 +491,31 @@ type queuedProvider struct {
 // local_agent_harness.go's DispatchToHarness path 1 re-reads providers.yaml
 // and calls makeProvider fresh on every dispatch but always hit the
 // load-and-discard branch here.
+// concurrency is 0/negative when the CALLER has no declared value to offer
+// ("unspecified") — buildLocalProvider (local_llm.go) and
+// autoDiscoverOpenAICompat (router.go) both pass 0 for this reason, since
+// neither has a providers.yaml entry to read options.model_state.parallel
+// from. Only makeProvider's providers.yaml-declared path passes a real
+// value (which is itself 0 when the operator never set
+// options.model_state.parallel). newBackendQueue still clamps an
+// unspecified 0 to the #555 backstop default of 1 the FIRST time a given
+// queueKey is registered (a queue that admits nothing is a deadlock), but a
+// load-hit (an existing queue for this queueKey) only reconciles
+// concurrency when THIS call actually declared one (concurrency >= 1) —
+// #556 repair (round 3): unspecified must never win a reconciliation,
+// otherwise whichever of the three call sites happens to run next (all
+// three share the process-wide registry) silently clobbers an
+// operator-declared parallelism back down to the undeclared default,
+// flapping the whole kernel's local queue concurrency between 4 and 1 on
+// every autonomic tick / dispatch. This makes the declared value the
+// only thing that can EVER lower or raise concurrency on a shared queue.
 func newQueuedProvider(displayName, queueKey string, inner Provider, concurrency int) *queuedProvider {
 	q := newBackendQueue(displayName, concurrency)
+	q.key = queueKey
 	actual, loaded := backendQueues.LoadOrStore(queueKey, q)
 	if shared, ok := actual.(*backendQueue); ok {
 		q = shared
-		if loaded {
+		if loaded && concurrency >= 1 {
 			q.setConcurrency(concurrency)
 		}
 	}
