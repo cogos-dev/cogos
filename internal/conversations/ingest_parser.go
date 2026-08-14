@@ -62,9 +62,14 @@ type ingestRecord struct {
 
 	// Provenance declares how this record's content was obtained when it did
 	// not come from a direct JSONL parse (e.g. "hand-carried",
-	// "log-reconstructed"). Optional; empty means "direct-jsonl" per the
-	// Turn.Provenance convention (types.go). Schema headroom only — no
-	// importer sets this yet (see #557 plan Phase 3).
+	// "log-reconstructed"). Optional; empty means only "the observer did not
+	// declare a provenance" — NOT a positive claim of direct-jsonl origin.
+	// An ingest record is by definition not a direct JSONL parse, so it must
+	// never be read as implying "direct-jsonl" the way an empty
+	// Turn.Provenance does on the CC path; see Turn.Provenance's doc comment
+	// (types.go) for the full CC-vs-ingest distinction this field must stay
+	// consistent with. Schema headroom only — no importer sets this yet (see
+	// #557 plan Phase 3).
 	Provenance string `json:"provenance,omitempty"`
 }
 

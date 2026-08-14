@@ -132,17 +132,30 @@ type ResolvedSlice struct {
 	ContentHash string `json:"content_hash,omitempty"`
 
 	// SessionsMissingThreadIndex counts sessions within this query's scope
-	// that have no Threads metadata yet (SessionMeta.Threads is nil —
+	// that have no Threads metadata yet because they are PENDING re-indexing
+	// (SessionMeta.Threads is nil, Source == "" — a Claude Code session
 	// indexed before threading shipped, or not re-touched since; see
-	// SessionMeta.Threads' doc comment on the lazy-migration posture) and
-	// were therefore excluded wholesale from a thread_role= filter rather
-	// than genuinely failing to match it. Zero when thread_role= was not
-	// set, or when every in-scope session already has Threads populated.
-	// Exists so a caller can tell "did not match" apart from "not yet
-	// indexed for threads" instead of reading a masked observable — a
-	// plausible non-empty result set that is silently a subset of the
-	// corpus with no signal that it is.
+	// SessionMeta.Threads' doc comment) and were therefore excluded
+	// wholesale from a thread_role= filter rather than genuinely failing to
+	// match it. This class trends to zero as the corpus is re-touched.
+	// Zero when thread_role= was not set, or when every in-scope CC session
+	// already has Threads populated. Exists so a caller can tell "did not
+	// match" apart from "not yet indexed for threads" instead of reading a
+	// masked observable — a plausible non-empty result set that is silently
+	// a subset of the corpus with no signal that it is.
 	SessionsMissingThreadIndex int `json:"sessions_missing_thread_index,omitempty"`
+
+	// SessionsThreadIndexNotApplicable counts sessions within this query's
+	// scope that have no Threads metadata for a PERMANENT, not pending,
+	// reason: normalized-ingest sessions (SessionMeta.Source != "") carry no
+	// parentUuid in their schema, so PartitionThreads has nothing to
+	// partition and re-indexing will never populate Threads for them. Kept
+	// separate from SessionsMissingThreadIndex so a caller watching that
+	// counter trend to zero can tell "still pending" apart from "will never
+	// resolve" — conflating the two previously meant the pending counter
+	// could never reach zero on a corpus with any ingest sources, with no
+	// way to tell why.
+	SessionsThreadIndexNotApplicable int `json:"sessions_thread_index_not_applicable,omitempty"`
 
 	// Turns carries the resolved content. Shape depends on Res.
 	Turns []ResolvedTurn `json:"turns"`
@@ -538,6 +551,7 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 	var allTurns []Turn
 	sourcesSeen := make(map[string]struct{})
 	sessionsMissingThreadIndex := 0
+	sessionsThreadIndexNotApplicable := 0
 
 	for _, sid := range sids {
 		turns, ok := idx.turns[sid]
@@ -566,8 +580,17 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 			// every one of its turns will be excluded below, not because
 			// none matched, but because none COULD be evaluated. Count it
 			// once per session so the caller can see the difference (see
-			// ResolvedSlice.SessionsMissingThreadIndex).
-			sessionsMissingThreadIndex++
+			// ResolvedSlice.SessionsMissingThreadIndex /
+			// SessionsThreadIndexNotApplicable). meta.Source distinguishes
+			// the two classes: "" is a Claude Code session (pending
+			// re-index), non-empty is a normalized-ingest session (no
+			// parentUuid to partition — permanent, not pending; see
+			// SessionMeta.Threads' doc comment).
+			if meta.Source == "" {
+				sessionsMissingThreadIndex++
+			} else {
+				sessionsThreadIndexNotApplicable++
+			}
 		}
 
 		for _, t := range turns {
@@ -698,13 +721,14 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 	bounded := uq.isBounded()
 
 	slice := &ResolvedSlice{
-		URI:                        rawURI,
-		ResolvedAt:                 time.Now().UTC(),
-		Count:                      len(resolved),
-		Sources:                    sources,
-		Bounded:                    bounded,
-		Turns:                      resolved,
-		SessionsMissingThreadIndex: sessionsMissingThreadIndex,
+		URI:                              rawURI,
+		ResolvedAt:                       time.Now().UTC(),
+		Count:                            len(resolved),
+		Sources:                          sources,
+		Bounded:                          bounded,
+		Turns:                            resolved,
+		SessionsMissingThreadIndex:       sessionsMissingThreadIndex,
+		SessionsThreadIndexNotApplicable: sessionsThreadIndexNotApplicable,
 	}
 
 	// Content hash — only for bounded slices.

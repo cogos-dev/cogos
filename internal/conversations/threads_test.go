@@ -36,7 +36,7 @@ func TestPartitionThreads_SingleLinearRoot(t *testing.T) {
 		mkTurn("u2", "a1", 2, false, now.Add(2*time.Minute)),
 	}
 
-	threads := PartitionThreads(turns)
+	threads := PartitionThreads(turns, nil)
 
 	if len(threads) != 1 {
 		t.Fatalf("want 1 thread, got %d: %+v", len(threads), threads)
@@ -80,7 +80,7 @@ func TestPartitionThreads_SubagentSidechain(t *testing.T) {
 		mkTurn("sub-a1", "sub-u1", 3, true, now.Add(3*time.Minute)),
 	}
 
-	threads := PartitionThreads(turns)
+	threads := PartitionThreads(turns, nil)
 
 	if len(threads) != 2 {
 		t.Fatalf("want 2 threads, got %d: %+v", len(threads), threads)
@@ -143,7 +143,7 @@ func TestPartitionThreads_BranchPoint(t *testing.T) {
 		mkTurn("grandchild-b", "child-b", 3, false, now.Add(3*time.Minute)),
 	}
 
-	threads := PartitionThreads(turns)
+	threads := PartitionThreads(turns, nil)
 
 	if len(threads) != 2 {
 		t.Fatalf("want 2 threads (branch point), got %d: %+v", len(threads), threads)
@@ -203,7 +203,7 @@ func TestPartitionThreads_SidechainRoleDerivesFromRootOnly(t *testing.T) {
 		mkTurn("c", "b", 2, false, now.Add(2*time.Minute)),
 	}
 
-	threads := PartitionThreads(turns)
+	threads := PartitionThreads(turns, nil)
 
 	if len(threads) != 1 {
 		t.Fatalf("want 1 thread, got %d: %+v", len(threads), threads)
@@ -229,7 +229,7 @@ func TestBuildThreadMeta_CycleGetsNonEmptyFirstUUID(t *testing.T) {
 		mkTurn("b", "a", 1, false, now.Add(time.Minute)),
 	}
 
-	threads := PartitionThreads(turns)
+	threads := PartitionThreads(turns, nil)
 
 	if len(threads) != 2 {
 		t.Fatalf("want 2 threads (cycle fallback: each member its own thread), got %d: %+v", len(threads), threads)
@@ -249,7 +249,7 @@ func TestBuildThreadMeta_CycleGetsNonEmptyFirstUUID(t *testing.T) {
 // pointing outside the set, or no UUID at all).
 func TestPartitionThreads_Degenerate(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
-		threads := PartitionThreads(nil)
+		threads := PartitionThreads(nil, nil)
 		if threads != nil {
 			t.Errorf("want nil threads for empty input, got %+v", threads)
 		}
@@ -261,7 +261,7 @@ func TestPartitionThreads_Degenerate(t *testing.T) {
 			mkTurn("o1", "outside-parent-1", 0, false, now),
 			mkTurn("o2", "outside-parent-2", 1, false, now.Add(time.Minute)),
 		}
-		threads := PartitionThreads(turns)
+		threads := PartitionThreads(turns, nil)
 		if len(threads) != 2 {
 			t.Fatalf("want 2 independent threads, got %d: %+v", len(threads), threads)
 		}
@@ -276,7 +276,7 @@ func TestPartitionThreads_Degenerate(t *testing.T) {
 			mkTurn("", "", 0, false, now),
 			mkTurn("", "", 1, false, now.Add(time.Minute)),
 		}
-		threads := PartitionThreads(turns)
+		threads := PartitionThreads(turns, nil)
 		if len(threads) != 2 {
 			t.Fatalf("want 2 synthetic threads for uuid-less turns, got %d: %+v", len(threads), threads)
 		}

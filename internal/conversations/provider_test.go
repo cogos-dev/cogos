@@ -1,15 +1,15 @@
 // provider_test.go — integration tests for the Conversations Observatory provider.
 //
 // Covers:
-//   1. Ingesting a 1-session JSONL fixture; assert turn count, identity, time bounds
-//   2. Streaming a large fixture (512KB equivalent) without OOM
-//   3. Drift detection: session modified after index, re-projection runs
-//   4. MCP tool query path: search for a known string, assert hit
-//   5. Idempotency: re-run ApplyPlan, no double-projection
-//   6. LoadConfig with empty config (default source dirs)
-//   7. FetchLive round-trip (write then read)
-//   8. BuildState structure
-//   9. Health() status transitions
+//  1. Ingesting a 1-session JSONL fixture; assert turn count, identity, time bounds
+//  2. Streaming a large fixture (512KB equivalent) without OOM
+//  3. Drift detection: session modified after index, re-projection runs
+//  4. MCP tool query path: search for a known string, assert hit
+//  5. Idempotency: re-run ApplyPlan, no double-projection
+//  6. LoadConfig with empty config (default source dirs)
+//  7. FetchLive round-trip (write then read)
+//  8. BuildState structure
+//  9. Health() status transitions
 package conversations
 
 import (
@@ -1628,6 +1628,93 @@ func TestProviderIngest_ThreadPartition_BridgesDroppedRecords(t *testing.T) {
 	}
 	if u2Turn.ThreadID != "u1" {
 		t.Errorf("u2 ThreadID: want u1 (same thread as the session start), got %q", u2Turn.ThreadID)
+	}
+}
+
+// TestProviderIngest_ThreadPartition_BridgedSiblingNotABranch is the
+// corpus-measured regression fixture for the round-2 CRITICAL: an assistant
+// turn (a1) with TWO raw children — a2, a direct kept child (ordinary
+// consecutive/parallel tool-call structure), and tr1, a dropped
+// tool_result-only record whose own child (u2) survives and gets bridged
+// straight to a1. Before the fix, bridging spliced u2 onto a1 and the
+// branch-point rule then saw two children of a1 (a2 and the newly-bridged
+// u2) and declared u2 a fresh thread root — fragmenting an entirely linear,
+// single-conversation session into two threads. A bridged child must never
+// count toward branch-point detection, so this must still collapse to
+// exactly one thread, role=main, message_count 4.
+func TestProviderIngest_ThreadPartition_BridgedSiblingNotABranch(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const sid = "44444444-5555-6666-7777-888888888888"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "question one", "2026-06-01T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer one", "2026-06-01T10:01:00Z"),
+		// Direct kept child of a1 (e.g. ordinary parallel tool-call structure).
+		makeAssistantRecord("a2", "a1", sid, "answer one, continued", "2026-06-01T10:01:30Z"),
+		// Dropped: tool_result-only user record, also a direct child of a1.
+		makeToolResultOnlyUserRecord("tr1", "a1", sid, "2026-06-01T10:02:00Z"),
+		// Surviving turn whose JSONL parent (tr1) never became a Turn — must
+		// bridge to a1, and must NOT become a branch root for doing so.
+		makeUserRecord("u2", "tr1", sid, "question two", "2026-06-01T10:03:00Z"),
+	}
+	writeJSONLFixture(t, srcDir, sid, lines)
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if _, err := p.ApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	liveAny2, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive 2: %v", err)
+	}
+	ls, ok := liveAny2.(*liveState)
+	if !ok {
+		t.Fatal("expected *liveState")
+	}
+	entry, ok := ls.Entries[sid]
+	if !ok {
+		t.Fatalf("session %s not in live state", sid)
+	}
+
+	threads := entry.Meta.Threads
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread (bridged sibling is not a branch point), got %d: %+v", len(threads), threads)
+	}
+	tm := threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main, got %q", tm.Role)
+	}
+	if tm.MessageCount != 4 {
+		t.Errorf("MessageCount: want 4 (u1, a1, a2, u2), got %d", tm.MessageCount)
+	}
+	if tm.ThreadID != "u1" {
+		t.Errorf("ThreadID: want u1 (session's true first turn), got %q", tm.ThreadID)
+	}
+
+	u2Turn, ok := p.index.GetTurn(sid, 3) // turn_index 3 = u2 (u1,a1,a2,u2 -> indices 0-3)
+	if !ok {
+		t.Fatalf("GetTurn(sid, 3) not found")
+	}
+	if u2Turn.ParentUUID != "a1" {
+		t.Errorf("u2 ParentUUID: want a1 (bridged past dropped tr1), got %q", u2Turn.ParentUUID)
+	}
+	if u2Turn.ThreadID != "u1" {
+		t.Errorf("u2 ThreadID: want u1 (same thread as the session start, NOT its own fork), got %q", u2Turn.ThreadID)
 	}
 }
 

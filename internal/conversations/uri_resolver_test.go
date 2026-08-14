@@ -387,7 +387,7 @@ func TestParseConversationURI_ReservedParams(t *testing.T) {
 func TestParseConversationURI_UnknownParam(t *testing.T) {
 	tests := []string{
 		"cog:conversations?foo=bar",
-		"cog:conversations?ref=v1",        // ref= is ADR-067 address; not for conversations
+		"cog:conversations?ref=v1", // ref= is ADR-067 address; not for conversations
 		"cog:conversations?format=csv",
 		"cog:conversations?cursor=abc",
 	}
@@ -415,8 +415,8 @@ func TestParseConversationURI_Fragments(t *testing.T) {
 		errSubstr string
 	}{
 		{
-			name: "id anchor",
-			uri:  "cog:conversations/claude-code/sess1#id-abc-123-def",
+			name:     "id anchor",
+			uri:      "cog:conversations/claude-code/sess1#id-abc-123-def",
 			wantFrag: &FragmentSpec{ID: "abc-123-def", TurnM: -1},
 		},
 		{
@@ -425,8 +425,8 @@ func TestParseConversationURI_Fragments(t *testing.T) {
 			wantFrag: &FragmentSpec{TurnN: 5, TurnM: -1},
 		},
 		{
-			name: "turn range",
-			uri:  "cog:conversations#turn-3..10",
+			name:     "turn range",
+			uri:      "cog:conversations#turn-3..10",
 			wantFrag: &FragmentSpec{TurnN: 3, TurnM: 10},
 		},
 		{
@@ -635,6 +635,42 @@ func TestResolveQuery_ThreadRoleFilter_MasksUnindexedSessions(t *testing.T) {
 		}
 		if slice.SessionsMissingThreadIndex != 0 {
 			t.Errorf("SessionsMissingThreadIndex: want 0 when thread_role= not set, got %d", slice.SessionsMissingThreadIndex)
+		}
+	})
+
+	// Round-2 MEDIUM: an ingest-sourced session (Source != "") with no
+	// Threads is a PERMANENT case, not a pending one — applyIngestSource
+	// never calls PartitionThreads because normalized-ingest records carry
+	// no parentUuid. It must count toward SessionsThreadIndexNotApplicable,
+	// not SessionsMissingThreadIndex, so the pending counter is not
+	// permanently non-zero on a corpus with any ingest sources.
+	t.Run("ingest-sourced session with no Threads is not-applicable, not pending", func(t *testing.T) {
+		now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+		idx := &Index{
+			sessions: map[string]SessionMeta{
+				"hermes-cog/ingest-session-1": {
+					SessionID:   "hermes-cog/ingest-session-1",
+					Source:      "hermes-cog",
+					TurnCount:   1,
+					FirstTurnAt: now,
+					LastTurnAt:  now,
+				},
+			},
+			turns: map[string][]Turn{
+				"hermes-cog/ingest-session-1": {
+					{UUID: "i1", SessionID: "hermes-cog/ingest-session-1", TurnIndex: 0, Role: RoleUser, Timestamp: now, Text: "hi"},
+				},
+			},
+		}
+		slice, err := ResolveConversationURI("cog:conversations?thread_role=main", idx)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if slice.SessionsThreadIndexNotApplicable != 1 {
+			t.Errorf("SessionsThreadIndexNotApplicable: want 1, got %d", slice.SessionsThreadIndexNotApplicable)
+		}
+		if slice.SessionsMissingThreadIndex != 0 {
+			t.Errorf("SessionsMissingThreadIndex: want 0 (ingest session is not-applicable, not pending), got %d", slice.SessionsMissingThreadIndex)
 		}
 	})
 }
@@ -850,10 +886,10 @@ func TestCheckURIMixing(t *testing.T) {
 	// Simulate the MCP handler check: if URI is set alongside other filter
 	// params, return an error.
 	tests := []struct {
-		name    string
-		uri     string
+		name           string
+		uri            string
 		hasOtherParams bool
-		wantErr bool
+		wantErr        bool
 	}{
 		{"uri alone", "cog:conversations?q=foo", false, false},
 		{"uri + extra param", "cog:conversations?q=foo", true, true},
@@ -925,7 +961,7 @@ func buildTestIndexWithThreads(t *testing.T) *Index {
 		{UUID: "sub-u1", SessionID: "threaded-session", TurnIndex: 2, Role: RoleUser, Timestamp: now.Add(2 * time.Minute), Text: "sidechain turn", IsSidechain: true},
 		{UUID: "sub-a1", ParentUUID: "sub-u1", SessionID: "threaded-session", TurnIndex: 3, Role: RoleAssistant, Timestamp: now.Add(3 * time.Minute), Text: "sidechain reply", IsSidechain: true},
 	}
-	threads := PartitionThreads(turns) // sets turns[i].ThreadID in place
+	threads := PartitionThreads(turns, nil) // sets turns[i].ThreadID in place
 
 	meta := SessionMeta{
 		SessionID:   "threaded-session",

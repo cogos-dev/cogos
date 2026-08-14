@@ -75,13 +75,30 @@ func RegisterConversationTools(server *mcp.Server, tracker ToolTracker, provider
 		Description: "List indexed conversation sessions with metadata " +
 			"(title, turn count, time bounds, identity, entrypoint). " +
 			"Optional since/until (RFC3339) and identity filters. " +
-			"Returns most-recent sessions first.",
+			"Returns most-recent sessions first, capped at 100 sessions unless " +
+			"limit says otherwise; response includes total (sessions matching " +
+			"the filter) and truncated (true when total > what was returned), " +
+			"so a capped response is never silent — page with since/until or a " +
+			"larger limit to see the rest.",
 	}), makeListConversationsHandler(provider, maxBytes))
 }
 
 const (
 	defaultConvMaxBytes = 32 * 1024 // 32 KiB — mirrors engine.DefaultMaxToolOutputBytes
 	minConvMaxBytes     = 4 * 1024  // 4 KiB floor
+
+	// defaultConvListLimit bounds cog_list_conversations when the caller
+	// passes no limit. Round-2 review measured the unbounded response
+	// (input.Limit applied only when >0, i.e. no limit at all by default)
+	// exceeding defaultConvMaxBytes on a real 196-session corpus once any
+	// multi-thread sessions are present, with capConvOutput then cutting
+	// mid-array on a rune boundary: the truncated text is not even valid
+	// JSON, and sessions past the cut are silently absent with no signal
+	// that anything was dropped. A default limit keeps every response a
+	// complete, valid, bounded document; resp["total"] below still reports
+	// how many sessions matched the filter so a capped response is visibly
+	// partial rather than silently so.
+	defaultConvListLimit = 100
 )
 
 // capConvOutput trims s to at most maxBytes at a UTF-8 boundary and appends
@@ -319,7 +336,10 @@ type listConversationsInput struct {
 	Since    string `json:"since,omitempty"`
 	Until    string `json:"until,omitempty"`
 	Identity string `json:"identity,omitempty"`
-	Limit    int    `json:"limit,omitempty"`
+	// Limit caps the number of sessions returned. 0 (the JSON-omitted
+	// default) means "use defaultConvListLimit", NOT "unbounded" — see
+	// defaultConvListLimit's doc comment.
+	Limit int `json:"limit,omitempty"`
 }
 
 func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[listConversationsInput, map[string]any] {
@@ -341,9 +361,15 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 		}
 
 		metas := idx.ListSessions(since, until, input.Identity)
+		total := len(metas)
 		limit := input.Limit
-		if limit > 0 && len(metas) > limit {
+		if limit <= 0 {
+			limit = defaultConvListLimit
+		}
+		truncatedByLimit := false
+		if len(metas) > limit {
 			metas = metas[:limit]
+			truncatedByLimit = true
 		}
 
 		type threadOut struct {
@@ -406,6 +432,10 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 		resp := map[string]any{
 			"sessions": out,
 			"count":    len(out),
+			"total":    total,
+		}
+		if truncatedByLimit {
+			resp["truncated"] = true
 		}
 		b, _ := json.MarshalIndent(resp, "", "  ")
 		text := capConvOutput(string(b), maxBytes)

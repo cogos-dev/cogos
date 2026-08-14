@@ -11,11 +11,17 @@
 //     only partitions turns already in memory; Phase 2 (a separate PR)
 //     extends source discovery so those turns actually get merged into one
 //     session's turn list before reaching PartitionThreads.
-//  2. A genuine branch point: two turns sharing one parentUuid (e.g. a
-//     resumed/forked continuation). Not verified against real data at plan
-//     time — see the #557 plan's risks section — but handled by the same
-//     algorithm: the first child (by turn order) continues the parent's
-//     thread, every subsequent child starts its own.
+//  2. A genuine branch point: two turns DIRECTLY sharing one parentUuid in
+//     the raw JSONL graph (e.g. a resumed/forked continuation) — not
+//     verified against real data at plan time, see the #557 plan's risks
+//     section — handled by the same algorithm: the first direct child (by
+//     turn order) continues the parent's thread, every subsequent direct
+//     child starts its own. A child reached only via bridgeDroppedParents
+//     splicing across a dropped record (ordinary, including parallel,
+//     tool-call structure routinely produces this) is never a branch point
+//     regardless of how many such bridged children a parent has — see
+//     PartitionThreads' doc comment for the corpus-verified failure this
+//     guards against.
 //
 // PartitionThreads is pure: no I/O, no global state. It operates on an
 // already-fully-assembled, in-order []Turn slice (the caller's responsibility
@@ -54,9 +60,18 @@ import "fmt"
 // A visited-set per turn guards against a cycle in the raw graph (not
 // expected in real Claude Code data, but rawParents is otherwise untrusted
 // input and PartitionThreads' own cycle handling assumes finite walks).
-func bridgeDroppedParents(turns []Turn, rawParents map[string]string) {
+//
+// Returns the set of turn UUIDs whose ParentUUID was actually rewritten
+// (splice performed). PartitionThreads uses this to tell a bridged edge —
+// this turn's true JSONL parent was one or more dropped records, most
+// commonly a tool_result-only user record from ordinary (including
+// parallel) tool-call structure — from a genuine second child recorded
+// directly against the surviving parent. Only the latter is a real branch
+// point; see PartitionThreads' branch-point doc comment.
+func bridgeDroppedParents(turns []Turn, rawParents map[string]string) map[string]bool {
+	bridged := make(map[string]bool)
 	if len(rawParents) == 0 {
-		return
+		return bridged
 	}
 	surviving := make(map[string]bool, len(turns))
 	for _, t := range turns {
@@ -78,6 +93,9 @@ func bridgeDroppedParents(turns []Turn, rawParents map[string]string) {
 			}
 			if surviving[next] {
 				turns[i].ParentUUID = next
+				if turns[i].UUID != "" {
+					bridged[turns[i].UUID] = true
+				}
 				break
 			}
 			if visited[next] {
@@ -87,6 +105,7 @@ func bridgeDroppedParents(turns []Turn, rawParents map[string]string) {
 			cur = next
 		}
 	}
+	return bridged
 }
 
 // PartitionThreads partitions turns into connected components of the
@@ -100,13 +119,29 @@ func bridgeDroppedParents(turns []Turn, rawParents map[string]string) {
 //   - ParentUUID does not match any UUID present in turns (parent outside
 //     this turn set — e.g. this slice is a partial view), or
 //   - ParentUUID matches a turn in this set that already has an earlier
-//     child (a branch point): the first child by turn order continues the
-//     parent's thread, every subsequent child starts its own.
+//     UNBRIDGED child (a genuine branch point): the first such child by
+//     turn order continues the parent's thread, every subsequent one
+//     starts its own.
+//
+// bridged names the turn UUIDs whose ParentUUID was rewritten by
+// bridgeDroppedParents (see its doc comment) — i.e. this turn's real JSONL
+// parent was a dropped record (most commonly a tool_result-only user
+// record), not the surviving parent it now points at directly. A bridged
+// child is never treated as a branch point and never competes with a
+// sibling for "first child" status: ordinary (including parallel) tool-call
+// structure routinely leaves one assistant turn with both a direct
+// surviving child AND a second child reached only by bridging through a
+// dropped tool_result — that is not a conversational fork, and counting the
+// bridged child toward the branch tally fragmented real multi-thousand-turn
+// sessions into a handful-of-messages "main" thread plus large
+// "unknown-fork" threads. Pass nil when the caller performed no bridging
+// (e.g. synthetic test fixtures) — every child is then treated as direct,
+// preserving the original genuine-fork detection.
 //
 // Degenerate input (0 turns, or turns missing a UUID) does not panic: a turn
 // without a UUID becomes the root of a synthetic thread keyed by its index
 // rather than colliding with other UUID-less turns on an empty ThreadID.
-func PartitionThreads(turns []Turn) []ThreadMeta {
+func PartitionThreads(turns []Turn, bridged map[string]bool) []ThreadMeta {
 	n := len(turns)
 	if n == 0 {
 		return nil
@@ -132,14 +167,25 @@ func PartitionThreads(turns []Turn) []ThreadMeta {
 	}
 
 	// Branch points: when a parent uuid is itself present in this turn set
-	// and has more than one child, every child beyond the first (by turns
-	// order) starts its own thread instead of continuing the parent's.
+	// and has more than one UNBRIDGED (direct) child, every such child
+	// beyond the first (by turns order) starts its own thread instead of
+	// continuing the parent's. Bridged children are excluded from this
+	// tally entirely — see the doc comment above — so they never become a
+	// branch root and never bump a direct sibling out of the "first child"
+	// slot.
 	isBranchRoot := make([]bool, n)
 	for parentUUID, kids := range childrenOf {
 		if _, present := uuidToIdx[parentUUID]; !present {
 			continue // parent outside this set — handled by the ParentUUID-absent rule below
 		}
-		for j, kidIdx := range kids {
+		var direct []int
+		for _, kidIdx := range kids {
+			if bridged[turns[kidIdx].UUID] {
+				continue // reached only by splicing across a dropped record — not a fork
+			}
+			direct = append(direct, kidIdx)
+		}
+		for j, kidIdx := range direct {
 			if j > 0 {
 				isBranchRoot[kidIdx] = true
 			}

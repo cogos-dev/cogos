@@ -115,9 +115,21 @@ type SessionMeta struct {
 	Title string `json:"title,omitempty"`
 
 	// Threads is the DAG partition of this session's turns, computed by
-	// PartitionThreads (threads.go). Nil for sessions indexed before this
-	// field existed and not yet re-touched (ActionCreate/ActionUpdate) since —
-	// same lazy-migration posture as SourceOffset/SourceTailHash.
+	// PartitionThreads (threads.go). Nil for two structurally different
+	// reasons, which callers reading SessionsMissingThreadIndex /
+	// SessionsThreadIndexNotApplicable (uri_resolver.go) must be able to
+	// tell apart:
+	//   - PENDING (Source == ""): a Claude Code session indexed via
+	//     indexSession before threading shipped, or not re-touched
+	//     (ActionCreate/ActionUpdate) since — same lazy-migration posture as
+	//     SourceOffset/SourceTailHash. Re-indexing populates it; this class
+	//     trends to zero as the corpus is re-touched.
+	//   - NOT APPLICABLE (Source != ""): a normalized-ingest session
+	//     (applyIngestSource / ingest_parser.go). Ingest records carry no
+	//     parentUuid — the schema has nothing for PartitionThreads to
+	//     partition — so this class is permanent, not pending: no amount of
+	//     re-touching an ingest source will ever populate Threads for it
+	//     under the current schema.
 	Threads []ThreadMeta `json:"threads,omitempty"`
 
 	// rawParents is parse-time scratch space: the uuid -> parentUuid edge for
