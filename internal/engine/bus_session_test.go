@@ -1476,3 +1476,196 @@ func TestReadEventsSince_CacheBoundedByBytesPerBus(t *testing.T) {
 		}
 	}
 }
+
+// sumLiveReadCacheBytes returns the ACTUAL sum of cache.bytes across every
+// live entry in mgr.readCache — the ground truth mgr.readCacheTotalBytes
+// must always equal. Takes readCacheMetaMu itself; callers must not already
+// hold it.
+func sumLiveReadCacheBytes(mgr *BusSessionManager) int64 {
+	mgr.readCacheMetaMu.Lock()
+	defer mgr.readCacheMetaMu.Unlock()
+	var sum int64
+	for _, c := range mgr.readCache {
+		sum += c.bytes
+	}
+	return sum
+}
+
+// TestReadEventsSince_CacheBoundedByTotalBytes verifies the global budget
+// (maxReadCacheTotalBytes) evicts least-recently-used BUSES — via the same
+// evictReadCacheLocked path maxReadCacheBuses uses — once the SUM of
+// retained bytes across every cached bus combined would exceed it, even
+// though no single bus crosses its own per-bus caps. This is the
+// composition-ceiling fix itself: maxReadCacheBuses and
+// maxReadCacheBytesPerBus alone would let every one of these buses' caches
+// coexist (myrgic/cogos#561 follow-up).
+func TestReadEventsSince_CacheBoundedByTotalBytes(t *testing.T) {
+	// Not parallel: mutates package-level bounds.
+	root := t.TempDir()
+	originalTotal := maxReadCacheTotalBytes
+	originalPerBus := maxReadCacheBytesPerBus
+	originalBuses := maxReadCacheBuses
+	maxReadCacheBytesPerBus = 10_000 // high enough that no single bus trips its own cap
+	maxReadCacheBuses = 100          // high enough that the count cap doesn't fire first
+	maxReadCacheTotalBytes = 1500    // small: a handful of ~700-900B buses exceeds this
+	t.Cleanup(func() {
+		maxReadCacheTotalBytes = originalTotal
+		maxReadCacheBytesPerBus = originalPerBus
+		maxReadCacheBuses = originalBuses
+	})
+
+	mgr := NewBusSessionManager(root)
+	bigValue := strings.Repeat("x", 600)
+	busIDs := []string{"tb-a", "tb-b", "tb-c", "tb-d", "tb-e"}
+	for _, id := range busIDs {
+		if _, err := mgr.AppendEvent(id, "m", "tester", map[string]interface{}{"blob": bigValue}); err != nil {
+			t.Fatalf("AppendEvent(%s): %v", id, err)
+		}
+		if _, err := mgr.ReadEventsSince(id, 0); err != nil {
+			t.Fatalf("ReadEventsSince(%s): %v", id, err)
+		}
+	}
+
+	mgr.readCacheMetaMu.Lock()
+	cachedCount := len(mgr.readCache)
+	_, lastStillCached := mgr.readCache[busIDs[len(busIDs)-1]]
+	_, firstStillCached := mgr.readCache[busIDs[0]]
+	mgr.readCacheMetaMu.Unlock()
+
+	if total := mgr.readCacheTotalBytes.Load(); total > maxReadCacheTotalBytes {
+		t.Fatalf("readCacheTotalBytes = %d, want <= %d (maxReadCacheTotalBytes)", total, maxReadCacheTotalBytes)
+	}
+	if cachedCount >= len(busIDs) {
+		t.Fatalf("readCache holds %d of %d written buses, want fewer — no single bus trips maxReadCacheBytesPerBus here, so only the global budget can have evicted anything", cachedCount, len(busIDs))
+	}
+	if !lastStillCached {
+		t.Error("most-recently-read bus was evicted; want LRU eviction to keep the most recent")
+	}
+	if firstStillCached {
+		t.Error("least-recently-read bus is still cached; want it evicted once the global budget was exceeded")
+	}
+
+	// Eviction must never lose data: every bus, including evicted ones,
+	// must still read back correctly (full re-parse from disk).
+	for _, id := range busIDs {
+		events, err := mgr.ReadEventsSince(id, 0)
+		if err != nil {
+			t.Fatalf("ReadEventsSince(%s) after eviction: %v", id, err)
+		}
+		if len(events) != 1 {
+			t.Errorf("bus %s: events = %+v, want exactly one event (global-budget eviction must not lose data)", id, events)
+		}
+	}
+
+	if got, want := mgr.readCacheTotalBytes.Load(), sumLiveReadCacheBytes(mgr); got != want {
+		t.Errorf("readCacheTotalBytes = %d, actual sum over live entries = %d — accounting drift", got, want)
+	}
+}
+
+// TestReadEventsSince_TotalBytesAccountingSurvivesResets exercises every
+// path that removes or resets a busReadCache entry — LRU eviction,
+// rotation detection, the file-not-exist reset, and the per-bus byte-cap
+// trip — repeatedly, across several rounds, and after EVERY single
+// operation asserts mgr.readCacheTotalBytes still equals the actual sum of
+// cache.bytes over live entries.
+//
+// The point: readCacheTotalBytes is maintained incrementally (see its doc
+// comment on BusSessionManager) rather than recomputed by walking the
+// cache — a counter that only increments on growth and never decrements on
+// one of these reset paths is itself an unbounded-growth bug, silently
+// reintroducing the exact class of problem this whole change exists to
+// close. This test is what a dropped decrement site should fail — see the
+// digest for the deliberate-break verification run against this test.
+func TestReadEventsSince_TotalBytesAccountingSurvivesResets(t *testing.T) {
+	// Not parallel: mutates several package-level bounds.
+	root := t.TempDir()
+	originalBuses := maxReadCacheBuses
+	originalBytesPerBus := maxReadCacheBytesPerBus
+	originalEventsPerBus := maxReadCacheEventsPerBus
+	originalTotal := maxReadCacheTotalBytes
+	originalRotate := eventsFileMaxBytes
+	maxReadCacheBuses = 2 // small: forces LRU eviction across distinct buses
+	// Large: isolates the OTHER reset paths under test from the global
+	// budget's own eviction, so each round exercises exactly the path it's
+	// named for.
+	maxReadCacheTotalBytes = 1_000_000
+	t.Cleanup(func() {
+		maxReadCacheBuses = originalBuses
+		maxReadCacheBytesPerBus = originalBytesPerBus
+		maxReadCacheEventsPerBus = originalEventsPerBus
+		maxReadCacheTotalBytes = originalTotal
+		eventsFileMaxBytes = originalRotate
+	})
+
+	mgr := NewBusSessionManager(root)
+
+	assertNoDrift := func(step string) {
+		t.Helper()
+		if got, want := mgr.readCacheTotalBytes.Load(), sumLiveReadCacheBytes(mgr); got != want {
+			t.Fatalf("%s: readCacheTotalBytes = %d, actual sum over live entries = %d — accounting drift", step, got, want)
+		}
+	}
+
+	for round := 0; round < 3; round++ {
+		// --- LRU eviction path: 4 distinct buses through a 2-bus cap, so
+		// every touch past the second evicts the least-recently-used one.
+		lruBusIDs := []string{"acct-lru-a", "acct-lru-b", "acct-lru-c", "acct-lru-d"}
+		for _, id := range lruBusIDs {
+			if _, err := mgr.AppendEvent(id, "m", "tester", map[string]interface{}{"round": round}); err != nil {
+				t.Fatalf("round %d AppendEvent(%s): %v", round, id, err)
+			}
+			if _, err := mgr.ReadEventsSince(id, 0); err != nil {
+				t.Fatalf("round %d ReadEventsSince(%s): %v", round, id, err)
+			}
+			assertNoDrift("round " + strings.Repeat("*", round+1) + " lru:" + id)
+		}
+
+		// --- Rotation-detected reset: a tiny rotation threshold crossed
+		// repeatedly on a dedicated bus.
+		eventsFileMaxBytes = 50
+		rotBus := "acct-rotate"
+		for i := 0; i < 4; i++ {
+			if _, err := mgr.AppendEvent(rotBus, "m", "tester", map[string]interface{}{"i": i}); err != nil {
+				t.Fatalf("round %d AppendEvent(rotate) %d: %v", round, i, err)
+			}
+			if _, err := mgr.ReadEventsSince(rotBus, 0); err != nil {
+				t.Fatalf("round %d ReadEventsSince(rotate) %d: %v", round, i, err)
+			}
+			assertNoDrift("round rotate")
+		}
+		eventsFileMaxBytes = originalRotate
+
+		// --- Per-bus byte-cap trip: dedicated bus, tiny per-bus cap, one
+		// payload guaranteed to cross it (event count stays at 1, so the
+		// count cap can't be what fires — isolates the byte-cap reset).
+		maxReadCacheBytesPerBus = 100
+		maxReadCacheEventsPerBus = 1_000_000
+		capBus := "acct-cap"
+		if _, err := mgr.AppendEvent(capBus, "m", "tester", map[string]interface{}{"blob": strings.Repeat("y", 300)}); err != nil {
+			t.Fatalf("round %d AppendEvent(cap): %v", round, err)
+		}
+		if _, err := mgr.ReadEventsSince(capBus, 0); err != nil {
+			t.Fatalf("round %d ReadEventsSince(cap): %v", round, err)
+		}
+		assertNoDrift("round per-bus cap trip")
+		maxReadCacheBytesPerBus = originalBytesPerBus
+		maxReadCacheEventsPerBus = originalEventsPerBus
+
+		// --- File-not-exist reset: remove events.jsonl out from under a
+		// warm cache entry, then read again.
+		fnBus := "acct-filenotexist"
+		if _, err := mgr.AppendEvent(fnBus, "m", "tester", map[string]interface{}{"round": round}); err != nil {
+			t.Fatalf("round %d AppendEvent(fn): %v", round, err)
+		}
+		if _, err := mgr.ReadEventsSince(fnBus, 0); err != nil {
+			t.Fatalf("round %d ReadEventsSince(fn) warm: %v", round, err)
+		}
+		if err := os.Remove(mgr.EventsPath(fnBus)); err != nil {
+			t.Fatalf("round %d os.Remove: %v", round, err)
+		}
+		if _, err := mgr.ReadEventsSince(fnBus, 0); err != nil {
+			t.Fatalf("round %d ReadEventsSince(fn) after remove: %v", round, err)
+		}
+		assertNoDrift("round file-not-exist")
+	}
+}
