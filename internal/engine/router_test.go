@@ -523,6 +523,10 @@ func TestMakeProviderInfersTypeFromName(t *testing.T) {
 // the OpenAI-compatible provider implementation. vLLM exposes the OpenAI
 // /v1/chat/completions and /v1/models contract; no dedicated provider type
 // is required for the unsupervised case.
+//
+// #556 wraps every local openai-compat-family provider (including vllm) in
+// a queuedProvider at construction time — unwrap one layer to reach the
+// *OpenAICompatProvider this test is actually about.
 func TestMakeProviderVLLM(t *testing.T) {
 	t.Parallel()
 	p, err := makeProvider("vllm-local", ProviderConfig{
@@ -533,8 +537,12 @@ func TestMakeProviderVLLM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("makeProvider(vllm): %v", err)
 	}
-	if _, ok := p.(*OpenAICompatProvider); !ok {
-		t.Errorf("vllm should resolve to *OpenAICompatProvider, got %T", p)
+	qp, ok := p.(*queuedProvider)
+	if !ok {
+		t.Fatalf("vllm should resolve to *queuedProvider (wrapping OpenAICompatProvider per #556), got %T", p)
+	}
+	if _, ok := qp.Provider.(*OpenAICompatProvider); !ok {
+		t.Errorf("vllm's queuedProvider should wrap *OpenAICompatProvider, got %T", qp.Provider)
 	}
 	if p.Name() != "vllm-local" {
 		t.Errorf("Name() = %q; want vllm-local", p.Name())

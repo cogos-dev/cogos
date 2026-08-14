@@ -259,11 +259,20 @@ type RequestMetadata struct {
 	RequiredCapabilities []Capability              `json:"required_capabilities,omitempty"`
 	Source               string                    `json:"source,omitempty"`
 	SalienceSnapshot     *ProviderSalienceSnapshot `json:"salience_snapshot,omitempty"`
-	// Attribution carries the dispatch caller's subject for observability
-	// (RFC-identity-embedding I1/I2). "anonymous" when no DispatchIdentity.Sub
-	// was provided; empty on requests that do not originate from
-	// cog_dispatch_to_harness. Providers must not forward this field to the
-	// upstream model API.
+	// Attribution carries the calling identity's subject for observability
+	// (RFC-identity-embedding I1/I2). Originally dispatch-exclusive
+	// ("anonymous" when no DispatchIdentity.Sub was provided; empty on
+	// requests that do not originate from cog_dispatch_to_harness"). #556
+	// widened population to the external HTTP entry points too (handleChat
+	// in serve.go, handleAnthropicMessages in serve_anthropic.go), which now
+	// set it from the request's resolved bound identity (falling back to
+	// "anonymous") whenever it isn't already set by the dispatch path — so
+	// queuedProvider's backendQueue (provider_queue.go) and GET /v1/queue
+	// always have a caller identity to attach to a waiting ticket regardless
+	// of entry path. Still empty on call sites that go through neither the
+	// dispatch path nor those two HTTP handlers (e.g. the autonomic
+	// consult). Providers must not forward this field to the upstream model
+	// API.
 	Attribution string `json:"attribution,omitempty"`
 }
 

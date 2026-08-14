@@ -30,18 +30,44 @@
 // completions this process is inflight on," not "dispatch-only contention."
 //
 // Honesty about what these gauges measure:
-//   - InferenceQueue is NOT a literal FIFO queue depth — no queue exists on
-//     this path (fan-out is unbounded goroutines, no worker pool or
-//     semaphore). It is the number of non-streaming completions currently
-//     between call and return, which is a real (if partial — see the
-//     streaming exclusion above) contention signal: issue #427 documents
-//     that the local LM Studio provider serializes concurrent inference
-//     server-side, so a nonzero reading here is real queueing pressure on
-//     that single-capacity resource. It is one input the 2026-07-29
-//     scheduling census's manned-valve design (Claim{Resource:
-//     "inference:<node>-lms", Capacity: 1}) and load-balancing v0 name as a
-//     needed gate — not a complete signal on its own, since it misses
-//     streaming traffic on the same resource.
+//
+//   - InferenceQueue is NOT a literal FIFO queue depth — no queue existed on
+//     this path when this file was written (fan-out is unbounded
+//     goroutines, no worker pool or semaphore). It is the number of
+//     non-streaming completions currently between call and return, which is
+//     a real (if partial — see the streaming exclusion above) contention
+//     signal: issue #427 documents that the local LM Studio provider
+//     serializes concurrent inference server-side, so a nonzero reading
+//     here is real queueing pressure on that single-capacity resource. It
+//     is one input the 2026-07-29 scheduling census's manned-valve design
+//     (Claim{Resource: "inference:<node>-lms", Capacity: 1}) and
+//     load-balancing v0 name as a needed gate — not a complete signal on
+//     its own, since it misses streaming traffic on the same resource.
+//
+//     UPDATE (#556): a real FIFO queue now DOES exist — backendQueue in
+//     provider_queue.go, one per local OpenAI-compat backend, gating
+//     Complete/CompleteCancelSafe/Stream via the queuedProvider decorator
+//     wired in router.go's makeProvider. Its depth/wait are the SEPARATE
+//     HostVitals.LocalQueueDepth / LocalQueueWaitP50Ms gauges
+//     (host_vitals.go), not this one. The two overlap in population
+//     (both, in part, observe local-backend contention) but measure
+//     different things and must not be conflated:
+//
+//   - InferenceQueue: non-streaming in-flight COUNT, across ALL
+//     providers (local and cloud) and ALL call sites that route
+//     through CompleteCancelSafeIfSupported (dispatch, tool-loop,
+//     autonomic consult, non-streaming external chat). Streaming is
+//     invisible to it regardless of provider.
+//
+//   - LocalQueueDepth/LocalQueueWaitP50Ms: actual FIFO WAIT-LIST depth
+//     and per-waiter wait time, scoped to the local OpenAI-compat
+//     backend family ONLY (the providers wrapped in queuedProvider),
+//     but covering streaming traffic too — the population this file's
+//     InferenceQueue explicitly excludes.
+//     Read InferenceQueue as it always has been: a partial, non-streaming,
+//     all-providers in-flight count. Read the #556 gauges as the honest
+//     literal-queue answer for the local-backend population specifically.
+//
 //   - InferenceP50Ms is the rolling median of the last dispatchDurationRingCap
 //     completed calls' wall-clock duration, in milliseconds, over the same
 //     non-streaming population described above. A small fixed-capacity ring

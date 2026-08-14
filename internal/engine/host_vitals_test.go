@@ -152,6 +152,103 @@ func TestKernelHealthSnapshot_JSONIncludesHostVitals(t *testing.T) {
 	}
 }
 
+// TestSampleHostVitals_LocalQueueNilWhenNoBackendsRegistered is the #556
+// gauges' soft-degrade contract: with an empty backendQueues registry (no
+// local OpenAI-compat backend configured at all), both LocalQueueDepth and
+// LocalQueueWaitP50Ms must be nil — never a fabricated zero — matching
+// every other gauge in this file's convention.
+func TestSampleHostVitals_LocalQueueNilWhenNoBackendsRegistered(t *testing.T) {
+	resetBackendQueuesForTest()
+	t.Cleanup(resetBackendQueuesForTest)
+
+	hv := sampleHostVitals()
+	if hv.LocalQueueDepth != nil {
+		t.Errorf("expected LocalQueueDepth nil with no registered backend queues, got %v", *hv.LocalQueueDepth)
+	}
+	if hv.LocalQueueWaitP50Ms != nil {
+		t.Errorf("expected LocalQueueWaitP50Ms nil with no registered backend queues, got %v", *hv.LocalQueueWaitP50Ms)
+	}
+}
+
+// TestSampleHostVitals_LocalQueueDepthRealZeroWhenIdle covers the
+// depth-can-be-a-real-zero case: once at least one backend queue is
+// registered, LocalQueueDepth must be populated (a real 0, not omitted) even
+// though nobody is currently waiting — the same "0 is a real reading"
+// convention documented on the field. LocalQueueWaitP50Ms stays nil, since
+// there is no currently-waiting caller to compute a median over.
+func TestSampleHostVitals_LocalQueueDepthRealZeroWhenIdle(t *testing.T) {
+	resetBackendQueuesForTest()
+	t.Cleanup(resetBackendQueuesForTest)
+
+	q := newBackendQueue("idle-backend", 2)
+	backendQueues.Store("idle-backend", q)
+
+	hv := sampleHostVitals()
+	if hv.LocalQueueDepth == nil {
+		t.Fatal("expected LocalQueueDepth to be populated once a backend queue is registered")
+	}
+	if *hv.LocalQueueDepth != 0 {
+		t.Errorf("LocalQueueDepth = %d, want 0 (queue registered but idle)", *hv.LocalQueueDepth)
+	}
+	if hv.LocalQueueWaitP50Ms != nil {
+		t.Errorf("expected LocalQueueWaitP50Ms nil with no currently-waiting caller, got %v", *hv.LocalQueueWaitP50Ms)
+	}
+}
+
+// TestSampleHostVitals_LocalQueueDepthAndWaitPooledAcrossBackends verifies
+// the pooling behavior sampleLocalQueueVitals documents: depth sums Waiting
+// across every registered backend, and the wait-p50 is computed over every
+// currently-waiting caller pooled across backends, not per-backend.
+func TestSampleHostVitals_LocalQueueDepthAndWaitPooledAcrossBackends(t *testing.T) {
+	resetBackendQueuesForTest()
+	t.Cleanup(resetBackendQueuesForTest)
+
+	qa := newBackendQueue("backend-a", 1)
+	qb := newBackendQueue("backend-b", 1)
+	backendQueues.Store("backend-a", qa)
+	backendQueues.Store("backend-b", qb)
+
+	releaseA, _, _, err := qa.Acquire(context.Background(), "seed-a")
+	if err != nil {
+		t.Fatalf("seed-a acquire: %v", err)
+	}
+	t.Cleanup(releaseA)
+	releaseB, _, _, err := qb.Acquire(context.Background(), "seed-b")
+	if err != nil {
+		t.Fatalf("seed-b acquire: %v", err)
+	}
+	t.Cleanup(releaseB)
+
+	// One waiter on each backend so LocalQueueDepth pools to 2.
+	for _, q := range []*backendQueue{qa, qb} {
+		go func(q *backendQueue) {
+			release, _, _, err := q.Acquire(context.Background(), "waiter")
+			if err != nil {
+				return
+			}
+			release()
+		}(q)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for qa.Snapshot().Waiting != 1 || qb.Snapshot().Waiting != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for both backends to have one waiter each")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	hv := sampleHostVitals()
+	if hv.LocalQueueDepth == nil {
+		t.Fatal("expected LocalQueueDepth populated")
+	}
+	if *hv.LocalQueueDepth != 2 {
+		t.Errorf("LocalQueueDepth = %d, want 2 (pooled across both backends)", *hv.LocalQueueDepth)
+	}
+	if hv.LocalQueueWaitP50Ms == nil {
+		t.Fatal("expected LocalQueueWaitP50Ms populated with two waiters currently queued")
+	}
+}
+
 // TestAllGreen_UnaffectedByHostVitals is the N5 normative constraint,
 // tested directly: AllGreen() must be a pure function of Counts/Anomalies,
 // never HostVitals, no matter how extreme the gauge readings are.

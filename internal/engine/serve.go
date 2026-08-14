@@ -217,6 +217,11 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	s.route(mux, "PATCH /v1/settings/context", s.handlePatchContextSettings)
 	s.route(mux, "POST /v1/chat/completions", s.handleChat)
 	s.route(mux, "POST /v1/messages", s.handleAnthropicMessages)
+	// #556: kernel-owned local-backend FIFO queue snapshot. Alongside
+	// chat/messages (not serve_compat.go, the deprecated v2-migration
+	// layer) since this is a first-class observable over the same
+	// completions path.
+	s.route(mux, "GET /v1/queue", s.handleQueue)
 	s.route(mux, "GET /v1/hud/state", s.handleHUDState)
 	s.route(mux, "GET /v1/proprioceptive", s.handleProprioceptive)
 	s.route(mux, "GET /v1/ledger", s.handleLedger)
@@ -988,6 +993,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			ProcessState: "active", // chat requests are always active interactions
 			Priority:     PriorityNormal,
 			Source:       "http",
+			// #556: populate Attribution from the already-resolved bound
+			// identity so queuedProvider always has a caller to attach to a
+			// waiting ticket, regardless of whether this request came in
+			// through cog_dispatch_to_harness. See provider.go's doc
+			// comment on RequestMetadata.Attribution.
+			Attribution: attributionFor(bound),
 		},
 	}
 
@@ -1306,12 +1317,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		BlockID:   block.ID,
 	}
 
+	// #556: carry a queueObservation on the ctx passed to complete/streamChat
+	// so a queuedProvider deep in the Complete/Stream call stack (only ever
+	// handed a context.Context, not a ResponseWriter) can surface this
+	// request's own queue admission stats back out for the
+	// X-Cogos-Queue-Depth / X-Cogos-Queue-Wait-Ms response headers.
+	queueObs := &queueObservation{}
+	inferCtx := withQueueObservation(r.Context(), queueObs)
+
 	inferStart := time.Now()
 	var pt chatPhaseTimings
 	if req.Stream {
-		pt = s.streamChat(w, r.Context(), creq, provider, respID, model, req.StreamOptions, turn)
+		pt = s.streamChat(w, inferCtx, creq, provider, respID, model, req.StreamOptions, turn)
 	} else {
-		pt = s.completeChat(w, r.Context(), creq, provider, respID, model, turn)
+		pt = s.completeChat(w, inferCtx, creq, provider, respID, model, turn)
 	}
 
 	inferMs := float64(time.Since(inferStart).Milliseconds())
@@ -1498,6 +1517,13 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 		})
 		return pt
 	}
+
+	// #556: report THIS request's own queue admission — position/wait
+	// observed at the moment it was dispatched, from the first
+	// (non-tool-loop) Complete call above — before any response body byte
+	// is written. Omitted entirely when no queuedProvider handled this
+	// request (e.g. a cloud provider).
+	writeQueueHeaders(w, queueObservationFromContext(ctx))
 
 	// Server-side execution of MCP-internal tools (cog_*, mod3_*, ...).
 	// When the provider emits a tool_use for a tool the kernel itself owns
@@ -1806,6 +1832,13 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 		})
 		return pt
 	}
+
+	// #556: provider.Stream (queuedProvider.Stream) acquires its queue slot
+	// SYNCHRONOUSLY before returning firstStream above, so this request's
+	// own admission stats are already recorded by the time we get here —
+	// set the headers now, before the first writeSSE call below (headers
+	// can't follow first-byte on a streaming response).
+	writeQueueHeaders(w, queueObservationFromContext(ctx))
 
 	chunks := firstStream
 	isFirstHop := true

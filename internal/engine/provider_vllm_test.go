@@ -100,6 +100,14 @@ func newVLLMTestServer(t *testing.T, modelID string) *httptest.Server {
 // provider type label produces an OpenAICompatProvider — i.e., vLLM
 // reuses the shared dispatch path. This is the load-bearing claim for
 // Phase 0: no new provider implementation is required.
+//
+// #556 wraps every local openai-compat-family provider (including vllm) in
+// a queuedProvider at construction time, so makeProvider's direct return
+// type is now *queuedProvider; unwrap one layer to reach the
+// *OpenAICompatProvider this test is actually about. Name()/Model()/
+// Capabilities() are asserted through the outer queuedProvider, exercising
+// the embedded-interface promotion queuedProvider relies on for everything
+// it doesn't explicitly override.
 func TestVLLMProviderTypeResolvesToOpenAICompat(t *testing.T) {
 	t.Parallel()
 
@@ -112,15 +120,19 @@ func TestVLLMProviderTypeResolvesToOpenAICompat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("makeProvider(vllm): %v", err)
 	}
-	oa, ok := p.(*OpenAICompatProvider)
+	qp, ok := p.(*queuedProvider)
 	if !ok {
-		t.Fatalf("vllm should resolve to *OpenAICompatProvider, got %T", p)
+		t.Fatalf("vllm should resolve to *queuedProvider (wrapping OpenAICompatProvider per #556), got %T", p)
 	}
-	if oa.Name() != "vllm" {
-		t.Errorf("Name() = %q; want vllm", oa.Name())
+	oa, ok := qp.Provider.(*OpenAICompatProvider)
+	if !ok {
+		t.Fatalf("vllm's queuedProvider should wrap *OpenAICompatProvider, got %T", qp.Provider)
 	}
-	if oa.Model() != "gemma4:e4b" {
-		t.Errorf("Model() = %q; want gemma4:e4b", oa.Model())
+	if p.Name() != "vllm" {
+		t.Errorf("Name() = %q; want vllm", p.Name())
+	}
+	if p.Model() != "gemma4:e4b" {
+		t.Errorf("Model() = %q; want gemma4:e4b", p.Model())
 	}
 	caps := oa.Capabilities()
 	if !caps.IsLocal {

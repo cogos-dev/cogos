@@ -171,6 +171,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			ProcessState: "active",
 			Priority:     PriorityNormal,
 			Source:       "http-anthropic",
+			// #556: same rationale as handleChat in serve.go — see
+			// provider.go's doc comment on RequestMetadata.Attribution.
+			Attribution: attributionFor(bound),
 		},
 	}
 
@@ -322,11 +325,17 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		BlockID:   block.ID,
 	}
 
+	// #556: see the matching comment in handleChat (serve.go) — carries this
+	// request's own queue admission stats out of the queuedProvider call
+	// stack for the X-Cogos-Queue-Depth / X-Cogos-Queue-Wait-Ms headers.
+	queueObs := &queueObservation{}
+	inferCtx := withQueueObservation(r.Context(), queueObs)
+
 	turnStart := time.Now()
 	if anthropicReq.Stream {
-		s.streamAnthropicMessages(w, r.Context(), creq, provider, respID, model, turn)
+		s.streamAnthropicMessages(w, inferCtx, creq, provider, respID, model, turn)
 	} else {
-		s.completeAnthropicMessages(w, r.Context(), creq, provider, respID, model, turn)
+		s.completeAnthropicMessages(w, inferCtx, creq, provider, respID, model, turn)
 	}
 
 	turn.DurationMs = time.Since(turnStart).Milliseconds()
@@ -356,6 +365,10 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 		})
 		return
 	}
+
+	// #556: this request's own queue admission stats, observed at the
+	// moment it was dispatched — see the matching comment in completeChat.
+	writeQueueHeaders(w, queueObservationFromContext(ctx))
 
 	if turn != nil {
 		turn.Response = resp.Content
@@ -409,6 +422,11 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+
+	// #556: provider.Stream already acquired its queue slot synchronously
+	// before returning chunks above — set headers now, before any SSE byte
+	// is written. See the matching comment in streamChat.
+	writeQueueHeaders(w, queueObservationFromContext(ctx))
 
 	flusher, canFlush := w.(http.Flusher)
 	bw := bufio.NewWriter(w)

@@ -903,7 +903,23 @@ func makeProvider(name string, pc ProviderConfig, procMgr *ProcessManager) (Prov
 		// model loaded at the declared context. The dispatch provider itself is
 		// unchanged — this is an orthogonal, OFF-BY-DEFAULT concern.
 		maybeRegisterModelStateReconciler(name, pc)
-		return NewOpenAICompatProvider(name, pc), nil
+		inner := NewOpenAICompatProvider(name, pc)
+		// #556: front every local OpenAI-compat backend with a kernel-owned
+		// FIFO queue (provider_queue.go), sized to the backend's declared
+		// parallelism (options.model_state.parallel — parsed since #555 but
+		// until now purely advisory metadata; this is what makes it
+		// load-bearing for the first time). Unset/zero defaults to 1,
+		// matching the #555 ruling that LMS itself runs parallel=1 as the
+		// enforcement backstop — a kernel-side default of 1 is the safe
+		// assumption absent an explicit declaration. Cloud/remote providers
+		// (anthropic, claude-oauth, claude-code, codex) are untouched; this
+		// wrap is scoped to the local backend family per the issue's
+		// explicit "local backends" text.
+		concurrency := parseModelStateOptions(pc.Options).Parallel
+		if concurrency < 1 {
+			concurrency = 1
+		}
+		return newQueuedProvider(name, inner, concurrency), nil
 	case "claude-code":
 		if procMgr == nil {
 			procMgr = NewProcessManager(ProcessManagerConfig{})

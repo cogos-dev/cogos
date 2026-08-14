@@ -18,6 +18,7 @@ package engine
 
 import (
 	"os"
+	"sort"
 	"time"
 )
 
@@ -60,6 +61,28 @@ type HostVitals struct {
 	// why it's still an honest (if partial) proxy for contention on the
 	// single-capacity local inference resource.
 	InferenceQueue *int `json:"inference_queue,omitempty"`
+
+	// LocalQueueDepth is the total number of callers currently WAITING
+	// (not yet granted a slot) across every kernel-owned local-backend
+	// backendQueue (#556, provider_queue.go — registered in backendQueues
+	// as of router construction). Unlike InferenceQueue this IS a literal
+	// FIFO queue depth, and it covers streaming traffic (InferenceQueue
+	// explicitly does not — see dispatch_inference_metrics.go). Nil only
+	// when backendQueues is empty, i.e. no local OpenAI-compat backend is
+	// configured at all; once at least one is, 0 is a real, meaningful
+	// reading (queue idle), never a fabricated placeholder.
+	LocalQueueDepth *int `json:"local_queue_depth,omitempty"`
+
+	// LocalQueueWaitP50Ms is the median WAITING time (milliseconds, as of
+	// this sample) across every caller currently queued on any local
+	// backend's backendQueue, pooled across backends. Nil whenever no
+	// caller is currently waiting anywhere (a genuine "no data" state, same
+	// convention as InferenceP50Ms) — including when backendQueues is
+	// non-empty but every queue is idle. This is a snapshot statistic (how
+	// long has each CURRENTLY waiting caller waited SO FAR), not a
+	// completed-wait history — there is no ring buffer of past waits the
+	// way InferenceP50Ms has one of past completion durations.
+	LocalQueueWaitP50Ms *float64 `json:"local_queue_wait_p50_ms,omitempty"`
 }
 
 // kernelProcessStart is captured at package init and used to compute
@@ -97,5 +120,39 @@ func sampleHostVitals() HostVitals {
 	queue := dispatchQueueDepth()
 	hv.InferenceQueue = &queue
 
+	if depth, waitP50, hasRegistry, hasWaiters := sampleLocalQueueVitals(); hasRegistry {
+		hv.LocalQueueDepth = &depth
+		if hasWaiters {
+			hv.LocalQueueWaitP50Ms = &waitP50
+		}
+	}
+
 	return hv
+}
+
+// sampleLocalQueueVitals pools every registered backend's backendQueue
+// (provider_queue.go) into the two #556 gauges above. hasRegistry reports
+// whether backendQueues has at least one entry at all (distinct from
+// hasWaiters, which reports whether any caller is currently queued anywhere
+// — depth can be a real 0 while hasWaiters is false).
+func sampleLocalQueueVitals() (depth int, waitP50Ms float64, hasRegistry, hasWaiters bool) {
+	var waits []int64
+	backendQueues.Range(func(_, v any) bool {
+		q, ok := v.(*backendQueue)
+		if !ok {
+			return true
+		}
+		hasRegistry = true
+		snap := q.Snapshot()
+		depth += snap.Waiting
+		for _, c := range snap.Callers {
+			waits = append(waits, c.WaitingMs)
+		}
+		return true
+	})
+	if len(waits) == 0 {
+		return depth, 0, hasRegistry, false
+	}
+	sort.Slice(waits, func(i, j int) bool { return waits[i] < waits[j] })
+	return depth, float64(waits[len(waits)/2]), hasRegistry, true
 }
