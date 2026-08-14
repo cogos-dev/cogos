@@ -245,16 +245,46 @@ func PartitionThreads(turns []Turn, bridged map[string]bool) []ThreadMeta {
 			}
 		}
 	}
-	// Defensive fallback: any turn left unassigned (should not happen given
-	// every non-root has a present, in-set parent) becomes its own thread
-	// root rather than silently carrying an empty ThreadID.
+	// Defensive fallback: a cycle in the (post-bridge) parentUuid graph —
+	// e.g. two turns each bridged to the other as parent, which a real
+	// compact_boundary logicalParentUuid can produce when the "preserved
+	// segment" it names was replayed AFTER the boundary in the raw file
+	// rather than sitting before it — leaves every member of that cycle
+	// with isRoot false (its parent is present and unbridged-single-child,
+	// so none of the three isRoot rules ever fire) and unreachable from any
+	// other root, so the main BFS above never visits it. Minting one
+	// synthetic thread PER leftover turn here (the original, simpler form
+	// of this fallback) turns that single stranded component into as many
+	// threads as it has members — measured on a real corpus session: 2241
+	// turns, one continuous conversation, exploded into 2241 one-turn
+	// threads. Instead, sweep each remaining connected component with its
+	// own BFS (seeded from its first-by-turns-order member, so turn_index 0
+	// — if it's the stranded one — still anchors role=main via
+	// buildThreadMeta's mainThreadID lookup) so the whole component
+	// collapses into a single thread instead.
 	for i := range turns {
-		if threadID[i] == "" {
-			id := turns[i].UUID
-			if id == "" {
-				id = fmt.Sprintf("no-uuid-%d", i)
+		if threadID[i] != "" {
+			continue
+		}
+		id := turns[i].UUID
+		if id == "" {
+			id = fmt.Sprintf("no-uuid-%d", i)
+		}
+		threadID[i] = id
+		queue := []int{i}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			curUUID := turns[cur].UUID
+			if curUUID == "" {
+				continue
 			}
-			threadID[i] = id
+			for _, childIdx := range childrenOf[curUUID] {
+				if threadID[childIdx] == "" {
+					threadID[childIdx] = id
+					queue = append(queue, childIdx)
+				}
+			}
 		}
 	}
 

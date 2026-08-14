@@ -1506,6 +1506,27 @@ func makeSystemRecord(uuid, parentUUID, sessionID, ts string) string {
 	return string(b)
 }
 
+// makeCompactBoundaryRecord returns a JSON line for a type:"system",
+// subtype:"compact_boundary" record — the marker Claude Code writes at every
+// auto-compaction. It always carries parentUuid:null (a fresh DAG root by
+// that field alone) but names the true continuation point — the last turn
+// preserved across the compaction — in logicalParentUuid.
+func makeCompactBoundaryRecord(uuid, logicalParentUUID, sessionID, ts string) string {
+	rec := map[string]any{
+		"type":              "system",
+		"subtype":           "compact_boundary",
+		"uuid":              uuid,
+		"parentUuid":        nil,
+		"logicalParentUuid": logicalParentUUID,
+		"sessionId":         sessionID,
+		"timestamp":         ts,
+		"content":           "Conversation compacted",
+		"level":             "info",
+	}
+	b, _ := json.Marshal(rec)
+	return string(b)
+}
+
 // TestParseSession_RecordsRawParentsForDroppedRecords verifies that
 // ParseSession populates meta.rawParents for every record with a uuid, kept
 // or dropped alike — the raw graph bridgeDroppedParents needs to splice a
@@ -1625,6 +1646,94 @@ func TestProviderIngest_ThreadPartition_BridgesDroppedRecords(t *testing.T) {
 	}
 	if u2Turn.ParentUUID != "a1" {
 		t.Errorf("u2 ParentUUID: want a1 (bridged past dropped tr1/sys1), got %q", u2Turn.ParentUUID)
+	}
+	if u2Turn.ThreadID != "u1" {
+		t.Errorf("u2 ThreadID: want u1 (same thread as the session start), got %q", u2Turn.ThreadID)
+	}
+}
+
+// TestProviderIngest_ThreadPartition_CompactBoundaryNotABranchPoint is the
+// round-3 regression fixture: an auto-compaction boundary record
+// (type:"system", subtype:"compact_boundary", parentUuid:null) sits between
+// two turns of one continuous conversation. Without special handling, its
+// null parentUuid terminates bridgeDroppedParents' upward walk right there,
+// so the first post-compaction turn (u2) looks like a fresh DAG root and the
+// session spuriously fragments — even though logicalParentUuid names exactly
+// where the conversation continues from (a1). This must still collapse to
+// one thread, role=main, message_count 4, with u2's ParentUUID bridged past
+// the boundary to a1.
+func TestProviderIngest_ThreadPartition_CompactBoundaryNotABranchPoint(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const sid = "55555555-6666-7777-8888-999999999999"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "question one", "2026-06-01T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer one", "2026-06-01T10:01:00Z"),
+		// Auto-compaction boundary: parentUuid:null, but logicalParentUuid
+		// names a1 as the true continuation point.
+		makeCompactBoundaryRecord("cb1", "a1", sid, "2026-06-01T10:02:00Z"),
+		// First post-compaction turn: its raw JSONL parent is the boundary.
+		makeUserRecord("u2", "cb1", sid, "question two", "2026-06-01T10:03:00Z"),
+		makeAssistantRecord("a2", "u2", sid, "answer two", "2026-06-01T10:04:00Z"),
+	}
+	writeJSONLFixture(t, srcDir, sid, lines)
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if _, err := p.ApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	liveAny2, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive 2: %v", err)
+	}
+	ls, ok := liveAny2.(*liveState)
+	if !ok {
+		t.Fatal("expected *liveState")
+	}
+	entry, ok := ls.Entries[sid]
+	if !ok {
+		t.Fatalf("session %s not in live state", sid)
+	}
+
+	// The compact_boundary record must not have fragmented this into 2 threads.
+	threads := entry.Meta.Threads
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread across the compaction boundary, got %d: %+v", len(threads), threads)
+	}
+	tm := threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main, got %q", tm.Role)
+	}
+	if tm.MessageCount != 4 {
+		t.Errorf("MessageCount: want 4 (u1, a1, u2, a2), got %d", tm.MessageCount)
+	}
+	if tm.ThreadID != "u1" {
+		t.Errorf("ThreadID: want u1 (session's true first turn), got %q", tm.ThreadID)
+	}
+
+	// u2's ParentUUID should have been bridged past the compact_boundary
+	// record straight to a1.
+	u2Turn, ok := p.index.GetTurn(sid, 2) // turn_index 2 = u2
+	if !ok {
+		t.Fatalf("GetTurn(sid, 2) not found")
+	}
+	if u2Turn.ParentUUID != "a1" {
+		t.Errorf("u2 ParentUUID: want a1 (bridged past the compact boundary), got %q", u2Turn.ParentUUID)
 	}
 	if u2Turn.ThreadID != "u1" {
 		t.Errorf("u2 ThreadID: want u1 (same thread as the session start), got %q", u2Turn.ThreadID)

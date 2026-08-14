@@ -372,22 +372,30 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 			truncatedByLimit = true
 		}
 
-		type threadOut struct {
-			ThreadID     string `json:"thread_id"`
-			Role         string `json:"role"`
-			MessageCount int    `json:"message_count"`
-		}
 		type sessionOut struct {
-			SessionID   string      `json:"session_id"`
-			Source      string      `json:"source,omitempty"`
-			Title       string      `json:"title,omitempty"`
-			TurnCount   int         `json:"turn_count"`
-			FirstTurnAt string      `json:"first_turn_at,omitempty"`
-			LastTurnAt  string      `json:"last_turn_at,omitempty"`
-			IndexedAt   string      `json:"indexed_at,omitempty"`
-			Identity    string      `json:"identity,omitempty"`
-			Entrypoint  string      `json:"entrypoint,omitempty"`
-			Threads     []threadOut `json:"threads,omitempty"`
+			SessionID   string `json:"session_id"`
+			Source      string `json:"source,omitempty"`
+			Title       string `json:"title,omitempty"`
+			TurnCount   int    `json:"turn_count"`
+			FirstTurnAt string `json:"first_turn_at,omitempty"`
+			LastTurnAt  string `json:"last_turn_at,omitempty"`
+			IndexedAt   string `json:"indexed_at,omitempty"`
+			Identity    string `json:"identity,omitempty"`
+			Entrypoint  string `json:"entrypoint,omitempty"`
+			// ThreadCount is a plain integer, not a per-thread array. A
+			// per-session threads[] array (thread_id/role/message_count per
+			// thread) is unbounded by this handler's own limit — a single
+			// session can carry dozens of threads (see #557 round-3's
+			// compaction-boundary finding) — so it is exactly what pushed a
+			// real 100-session default response over defaultConvMaxBytes
+			// with capConvOutput then cutting mid-array and returning
+			// invalid JSON. An integer count is O(1) per session regardless
+			// of how many threads that session has, so it cannot blow the
+			// budget the way the array did. Callers that need per-thread
+			// detail (thread_id, role, message_count) already have
+			// cog_get_conversation_turn, which surfaces the full Threads
+			// list for one session at a time.
+			ThreadCount int `json:"thread_count,omitempty"`
 		}
 		out := make([]sessionOut, 0, len(metas))
 		for _, m := range metas {
@@ -399,23 +407,13 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 				Identity:   m.Identity,
 				Entrypoint: m.Entrypoint,
 			}
-			// Only surface threads[] for genuinely multi-thread sessions
-			// (N>1 roots, per #557 §2's own definition). The overwhelming
-			// majority of sessions have exactly one thread — emitting a
-			// one-entry array there is pure duplication of turn_count/
-			// message_count and, multiplied across every session in the
-			// default (unbounded) response, was blowing the per-call byte
-			// budget on session #1 alone before session #2 was ever
-			// reached. A single-thread session's shape is already fully
-			// described by the top-level counts.
+			// Only surface thread_count for genuinely multi-thread sessions
+			// (N>1 roots, per #557 §2's own definition) — omitempty then
+			// leaves it off entirely for the overwhelming majority of
+			// sessions, which have exactly one thread already fully
+			// described by turn_count.
 			if len(m.Threads) > 1 {
-				for _, tm := range m.Threads {
-					so.Threads = append(so.Threads, threadOut{
-						ThreadID:     tm.ThreadID,
-						Role:         string(tm.Role),
-						MessageCount: tm.MessageCount,
-					})
-				}
+				so.ThreadCount = len(m.Threads)
 			}
 			if !m.FirstTurnAt.IsZero() {
 				so.FirstTurnAt = m.FirstTurnAt.Format(time.RFC3339)

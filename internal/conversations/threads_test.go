@@ -222,6 +222,15 @@ func TestPartitionThreads_SidechainRoleDerivesFromRootOnly(t *testing.T) {
 // isRoot, so the normal FirstUUID assignment never fires. FirstUUID must
 // still come back non-empty (falling back to ThreadID) rather than shipping
 // an empty string that looks like a computed-but-blank value.
+//
+// The two cycle members collapse into ONE thread, not two — round-3's
+// TestPartitionThreads_MutualParentCycleCollapsesToOneThread is the fuller
+// regression for why: PartitionThreads' fallback used to mint a separate
+// synthetic thread per unassigned turn, which is exactly what exploded a
+// real 2241-turn session (one continuous conversation, stranded by a cycle
+// with no external root) into 2241 one-turn threads. This test only checks
+// the FirstUUID-non-empty invariant on whatever the fallback produces; it
+// no longer asserts the thread COUNT the old fallback happened to produce.
 func TestBuildThreadMeta_CycleGetsNonEmptyFirstUUID(t *testing.T) {
 	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	turns := []Turn{
@@ -231,8 +240,8 @@ func TestBuildThreadMeta_CycleGetsNonEmptyFirstUUID(t *testing.T) {
 
 	threads := PartitionThreads(turns, nil)
 
-	if len(threads) != 2 {
-		t.Fatalf("want 2 threads (cycle fallback: each member its own thread), got %d: %+v", len(threads), threads)
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread (cycle members collapse together), got %d: %+v", len(threads), threads)
 	}
 	for _, tm := range threads {
 		if tm.FirstUUID == "" {
@@ -287,4 +296,54 @@ func TestPartitionThreads_Degenerate(t *testing.T) {
 			t.Errorf("synthetic ThreadID must not be empty: %q, %q", turns[0].ThreadID, turns[1].ThreadID)
 		}
 	})
+}
+
+// TestPartitionThreads_MutualParentCycleCollapsesToOneThread is the round-3
+// regression for a genuine mutual-parent cycle found on a real corpus
+// session: two turns each bridged to name the other as parent (a1's parent
+// is a2, a2's parent is a1 — the compact_boundary fix can produce exactly
+// this when a compaction's logicalParentUuid names a turn that is itself
+// downstream, in the raw file, of the boundary's own first child, closing a
+// back-edge). Neither cycle member satisfies any of the three isRoot rules
+// (parent present, unbridged, and no branch-point — each has exactly one
+// direct child), so the main root-seeded BFS never visits the cycle or
+// anything hanging off it. Before this fix, PartitionThreads' fallback
+// minted one synthetic thread PER unassigned turn — on the real session
+// this fired on, 2241 turns of one continuous conversation became 2241
+// one-turn threads. The whole stranded component — the cycle plus whatever
+// hangs off it — must collapse into exactly one thread instead, with
+// role=main when the cycle contains turn_index 0.
+func TestPartitionThreads_MutualParentCycleCollapsesToOneThread(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	turns := []Turn{
+		// a1 and a2 mutually name each other as parent — a genuine cycle,
+		// not a chain either could ever root from. a1's edge to a2 is
+		// BRIDGED (mirroring the real shape: a1's true raw parent was a
+		// dropped compact_boundary record, spliced by bridgeDroppedParents
+		// to name a2 directly) — without marking it bridged here, a2 would
+		// see two "direct" children (a1 and a3 below) and the PRE-EXISTING
+		// branch-point rule would wrongly split a3 into its own thread,
+		// which is not what this test is targeting.
+		mkTurn("a1", "a2", 0, false, now),
+		mkTurn("a2", "a1", 1, false, now.Add(time.Minute)),
+		// a3 hangs normally off the cycle (a2's real second-in-time child,
+		// same shape as ordinary continued conversation after the
+		// replayed/preserved segment) via a direct, unbridged edge.
+		mkTurn("a3", "a2", 2, false, now.Add(2*time.Minute)),
+	}
+	bridged := map[string]bool{"a1": true}
+	threads := PartitionThreads(turns, bridged)
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread (cycle + its descendant collapsed together), got %d: %+v", len(threads), threads)
+	}
+	tm := threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main (cycle contains turn_index 0), got %q", tm.Role)
+	}
+	if tm.MessageCount != 3 {
+		t.Errorf("MessageCount: want 3 (a1, a2, a3), got %d", tm.MessageCount)
+	}
+	if turns[0].ThreadID != turns[1].ThreadID || turns[1].ThreadID != turns[2].ThreadID {
+		t.Errorf("all three turns must share one ThreadID, got %q, %q, %q", turns[0].ThreadID, turns[1].ThreadID, turns[2].ThreadID)
+	}
 }

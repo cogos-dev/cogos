@@ -40,17 +40,25 @@ var systemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*?</system-remi
 // rawRecord is the outermost envelope of every JSONL line.
 // We decode into this first and then dispatch on Type.
 type rawRecord struct {
-	Type        string          `json:"type"`
-	UUID        string          `json:"uuid"`
-	ParentUUID  string          `json:"parentUuid"`
-	SessionID   string          `json:"sessionId"`
-	Timestamp   string          `json:"timestamp"`
-	Message     json.RawMessage `json:"message"`
-	Content     string          `json:"content"` // system records use content string
-	UserType    string          `json:"userType"`
-	Entrypoint  string          `json:"entrypoint"`
-	IsSidechain bool            `json:"isSidechain"`
-	Level       string          `json:"level"`
+	Type       string          `json:"type"`
+	UUID       string          `json:"uuid"`
+	ParentUUID string          `json:"parentUuid"`
+	SessionID  string          `json:"sessionId"`
+	Timestamp  string          `json:"timestamp"`
+	Message    json.RawMessage `json:"message"`
+	Content    string          `json:"content"` // system records use content string
+	UserType   string          `json:"userType"`
+	Entrypoint string          `json:"entrypoint"`
+	// Subtype and LogicalParentUUID are only populated on type:"system"
+	// records. A "compact_boundary" subtype record marks an auto-compaction
+	// point: Claude Code writes it with parentUuid:null (a fresh DAG root by
+	// the raw parentUuid field alone) but names the true continuation point
+	// — the last turn preserved across the compaction — in
+	// logicalParentUuid. See the rawParents override below.
+	Subtype           string `json:"subtype"`
+	LogicalParentUUID string `json:"logicalParentUuid"`
+	IsSidechain       bool   `json:"isSidechain"`
+	Level             string `json:"level"`
 }
 
 // rawMessage is message.* within a user or assistant record.
@@ -163,7 +171,20 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 				meta.rawParents = make(map[string]string)
 			}
 			if _, seen := meta.rawParents[rec.UUID]; !seen {
-				meta.rawParents[rec.UUID] = rec.ParentUUID
+				parent := rec.ParentUUID
+				// Auto-compaction boundaries carry parentUuid:null, which
+				// would otherwise terminate bridgeDroppedParents' upward
+				// walk right here and strand the first post-compaction turn
+				// as a fresh (spurious) thread root — even though the
+				// conversation is continuous. Use the record's own
+				// logicalParentUuid instead: it names the last turn Claude
+				// Code preserved across the compaction, so the walk
+				// continues past the boundary exactly like it does for any
+				// other dropped record.
+				if rec.Type == "system" && rec.Subtype == "compact_boundary" && rec.LogicalParentUUID != "" {
+					parent = rec.LogicalParentUUID
+				}
+				meta.rawParents[rec.UUID] = parent
 			}
 		}
 
