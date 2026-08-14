@@ -18,13 +18,25 @@ adds a second concern on top: model/context state. See
 
 | Method | What it does |
 |--------|--------------|
-| `FetchLive` | read-only `GET {endpoint}/api/v0/models` (LM Studio's native REST surface — exposes per-model `state` + `loaded_context_length`) |
-| `ComputePlan` | diffs declared target vs live → `load` / `context` (unload+reload; LM Studio has no live resize) / `unload` (jit_evict) actions |
+| `FetchLive` | read-only `GET {endpoint}/api/v0/models` (LM Studio's native REST surface — exposes per-model `state` + `loaded_context_length`); on a **local** backend also shells `lms ps --json` and merges its `parallel` field — `/api/v0/models` does not expose `parallel` at all |
+| `ComputePlan` | diffs declared target vs live → `load` / `context` (unload+reload; LM Studio has no live resize) / `unload` (jit_evict) actions. `parallel` never appears here — it is alarm-only (see `Health`), never actuated |
 | `ApplyPlan` | shells the Node `@lmstudio/sdk` actuator (`scripts/lms-actuator/`) over `ws://`; token via `LMS_ACTUATOR_TOKEN` env, never argv |
-| `Health` | O(1) from cached rows: Synced/Healthy when loaded at target; Degraded on wrong context; Missing when absent; Progressing while loading; **Suspended** when unmanaged, unreachable, or the actuator is not installed |
+| `Health` | O(1) from cached rows: Synced/Healthy when loaded at target; Degraded on wrong context **or** wrong `parallel` (local only); Missing when absent; Progressing while loading; **Suspended** when unmanaged, unreachable, or the actuator is not installed |
 
 An **unreachable** backend reports **Suspended, not Degraded** — the autonomic
 ticker does not try to self-heal a box that is simply off or off-LAN.
+
+### `parallel` drift — local-only, alarm-only
+
+`parallel` is watched the same way `context_length` is, with one asymmetry: it
+can only be **observed** on a local backend. `lms ps --json` (the source for the
+observed value) is a local-only CLI — `lms ps --help` shows no `--host` flag —
+so a remote backend (e.g. Eclipse) can never be checked against a declared
+`parallel` target through this mechanism; `Health()`'s message says so
+explicitly rather than silently reporting full coverage. And unlike
+`context_length`, a `parallel` mismatch is never remediated on any backend:
+`@lmstudio/sdk`'s load config has no per-load parallelism knob, so `ComputePlan`
+never emits an action for it — it is purely an alarm.
 
 ## Prerequisites
 
@@ -99,3 +111,13 @@ Do not enable both with divergent targets.
    `ApplyPlan` mutates, and only via the external actuator.
 2. Opt-in, off by default. No `model_state` block ⇒ Suspended, empty plan,
    nothing registered.
+
+## Out of scope: remote-backend `parallel` observability
+
+Extending `parallel` drift detection to remote backends (Eclipse) would require
+the Node SDK actuator's `list` verb (`client.llm.listLoaded()`) to expose a
+parallel-equivalent field over the websocket bridge. That is unverified — the
+SDK is not installed in a bare checkout (`scripts/lms-actuator/node_modules` is
+absent until `npm install` is run), so `listLoaded()`'s returned shape could not
+be inspected to confirm it. Deferred; `scripts/lms-actuator/lms-actuator.mjs` is
+untouched by this change.

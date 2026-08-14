@@ -43,6 +43,22 @@ value. The decoder uses a `*int` pointer so a missing field never shadows a real
 one, and row-matching prefers a `state=="loaded"` row over a not-loaded
 duplicate of the same id.
 
+### `parallel` drift is watched too, but observed differently (issue #555)
+
+`GET /api/v0/models` does **not** expose `parallel` — confirmed live against
+Darkstar's `:1234` instance, it is simply absent from the response. The value
+*is* exposed by the local `lms` CLI's `lms ps --json` (confirmed live:
+`{"identifier":"ornith-1.0-35b",...,"parallel":1}`), which is a **local-only**
+command — `lms ps --help` shows no `--host` flag, the same LM-Link-gated
+local/remote asymmetry §3 already documents for the actuator's `lms load` fast
+path. So `parallel` drift is only observable on local backends; on a remote
+backend (e.g. Eclipse) a declared `parallel` target cannot be checked through
+this mechanism at all — the reconciler says so explicitly in its `Health()`
+message rather than silently reporting Healthy on context alone. Like
+`context_length`, `parallel` is **alarm-only, never actuated**: LM Studio's
+`@lmstudio/sdk` load config has no per-load parallelism knob (§3's `lms-actuator`
+does not accept or forward it).
+
 ## Decision
 
 Introduce a new reconcile type, `lms-model-state`, that manages the
@@ -88,7 +104,16 @@ backend.
 | target `state=="loading"` | Unknown | Progressing | Waiting |
 | target absent / not-loaded | OutOfSync | Missing | Idle |
 | loaded at wrong context | OutOfSync | Degraded | Idle |
+| loaded, `parallel≠target` (local only) | OutOfSync | Degraded | Idle |
 | loaded at target context | Synced | Healthy | Idle |
+
+Context is checked before `parallel`, so if both are simultaneously wrong only
+the context mismatch is reported that cycle — a known, accepted simplification
+(see issue #555), not a full multi-dimensional drift report. A `parallel`
+target declared against a **remote** backend never triggers the Degraded row
+above (it cannot be observed there); instead the Healthy/Degraded message gets
+an appended note that the parallel target isn't observable via `lms ps`, so the
+gap stays visible instead of presenting as full coverage.
 
 The deliberate call: an **unreachable** backend maps to **Suspended, not
 Degraded**. A box that is simply off or off-LAN is not something the self-heal

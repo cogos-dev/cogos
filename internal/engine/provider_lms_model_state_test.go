@@ -201,6 +201,117 @@ func TestFetchLiveNullDoesNotShadowLoaded(t *testing.T) {
 	}
 }
 
+// ── FetchLive: local parallel probe merge ────────────────────────────────────
+
+// writeFakePs writes a shell script standing in for `lms ps --json`. body is the
+// raw JSON it prints on stdout; if exitNonZero is true it exits 1 instead.
+func writeFakePs(t *testing.T, body string, exitNonZero bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n"
+	if exitNonZero {
+		script += "echo 'boom' >&2\nexit 1\n"
+	} else {
+		script += "cat <<'EOF'\n" + body + "\nEOF\n"
+	}
+	path := filepath.Join(dir, "lms")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake lms CLI: %v", err)
+	}
+	return path
+}
+
+func TestFetchLiveMergesLocalParallel(t *testing.T) {
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "ornith-1.0-35b", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+
+	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
+	p.local = true
+	p.lmsCLI = writeFakePs(t, `[{"identifier":"ornith-1.0-35b","modelKey":"ornith-1.0-35b","parallel":1}]`, false)
+
+	live, err := p.FetchLive(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	rows := live.([]lmsModelRow)
+	row := findModelRow(rows, "ornith-1.0-35b")
+	if row == nil || row.Parallel == nil || *row.Parallel != 1 {
+		t.Fatalf("expected merged Parallel=1, got %#v", row)
+	}
+}
+
+func TestFetchLiveParallelProbeFailureIsNonFatal(t *testing.T) {
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "ornith-1.0-35b", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+
+	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
+	p.local = true
+	p.lmsCLI = writeFakePs(t, "", true) // exits non-zero
+
+	live, err := p.FetchLive(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("FetchLive must succeed despite parallel-probe failure: %v", err)
+	}
+	rows := live.([]lmsModelRow)
+	row := findModelRow(rows, "ornith-1.0-35b")
+	if row == nil {
+		t.Fatal("expected the /api/v0/models row to still be present")
+	}
+	if row.Parallel != nil {
+		t.Errorf("expected nil (unobserved) Parallel on probe failure, got %v", *row.Parallel)
+	}
+	if row.LoadedContextLength == nil || *row.LoadedContextLength != 262144 {
+		t.Errorf("context data must remain intact despite parallel-probe failure, got %v", row.LoadedContextLength)
+	}
+}
+
+func TestFetchLiveParallelProbeGarbageJSONIsNonFatal(t *testing.T) {
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "ornith-1.0-35b", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+
+	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
+	p.local = true
+	p.lmsCLI = writeFakePs(t, "not json", false)
+
+	live, err := p.FetchLive(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("FetchLive must succeed despite garbage parallel-probe output: %v", err)
+	}
+	row := findModelRow(live.([]lmsModelRow), "ornith-1.0-35b")
+	if row == nil || row.Parallel != nil {
+		t.Errorf("expected nil Parallel on unparseable lms ps output, got %#v", row)
+	}
+}
+
+func TestFetchLiveRemoteBackendSkipsParallelProbe(t *testing.T) {
+	// A remote backend must never attempt the lms CLI fast-path (no --host flag
+	// makes it meaningless there). Point lmsCLI at a script that would fail loudly
+	// if invoked, and assert the row's Parallel stays nil without erroring.
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "ornith-1.0-35b", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+
+	p := makeLMSProvider(t, srv.URL, "ornith-1.0-35b", 262144)
+	p.local = false // remote
+	p.lmsCLI = writeFakePs(t, `[{"identifier":"ornith-1.0-35b","parallel":1}]`, false)
+
+	live, err := p.FetchLive(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	row := findModelRow(live.([]lmsModelRow), "ornith-1.0-35b")
+	if row == nil || row.Parallel != nil {
+		t.Errorf("remote backend must not merge a parallel probe, got %#v", row)
+	}
+}
+
 // ── ComputePlan: drift states ──────────────────────────────────────────────────
 
 func TestComputePlanLoadWhenAbsent(t *testing.T) {
@@ -401,6 +512,92 @@ func TestHealthSuspendedWhenActuatorMissing(t *testing.T) {
 	h := p.Health()
 	if h.Health != reconcile.HealthSuspended {
 		t.Fatalf("missing actuator ⇒ Suspended; got %s (%s)", h.Health, h.Message)
+	}
+}
+
+// ── Health: parallel drift (local-only, alarm-only) ───────────────────────────
+
+func TestHealthDegradedOnParallelMismatch(t *testing.T) {
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "target", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+	p := makeLMSProvider(t, srv.URL, "target", 262144)
+	p.target.Parallel = 1
+	p.local = true
+	p.lmsCLI = writeFakePs(t, `[{"identifier":"target","parallel":4}]`, false)
+	mustFetch(t, p)
+	h := p.Health()
+	assertHealth(t, h, reconcile.SyncStatusOutOfSync, reconcile.HealthDegraded)
+	if !strings.Contains(h.Message, "parallel") {
+		t.Errorf("expected parallel mismatch in message, got %q", h.Message)
+	}
+}
+
+func TestHealthHealthyWhenParallelUnset(t *testing.T) {
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "target", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+	p := makeLMSProvider(t, srv.URL, "target", 262144)
+	p.target.Parallel = 0 // unset — no parallel check even though observed differs
+	p.local = true
+	p.lmsCLI = writeFakePs(t, `[{"identifier":"target","parallel":4}]`, false)
+	mustFetch(t, p)
+	h := p.Health()
+	assertHealth(t, h, reconcile.SyncStatusSynced, reconcile.HealthHealthy)
+}
+
+func TestHealthRemoteBackendDoesNotFalseAlarmOnParallel(t *testing.T) {
+	// A remote backend cannot be probed for parallel (no --host flag on lms CLI).
+	// A declared parallel target must not cause a false Degraded, but the gap
+	// must be visible in the message rather than silently presenting as full
+	// coverage.
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "target", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+	p := makeLMSProvider(t, srv.URL, "target", 262144)
+	p.target.Parallel = 1
+	p.local = false
+	mustFetch(t, p)
+	h := p.Health()
+	assertHealth(t, h, reconcile.SyncStatusSynced, reconcile.HealthHealthy)
+	if !strings.Contains(h.Message, "not observable via lms ps") {
+		t.Errorf("expected remote-gap annotation in message, got %q", h.Message)
+	}
+}
+
+// ── BuildState: observed_parallel attribute ────────────────────────────────────
+
+func TestBuildStateReportsObservedParallel(t *testing.T) {
+	srv := httptest.NewServer(modelsHandler(
+		modelFixture{id: "target", state: "loaded", loadedCtx: 262144, maxCtx: 262144},
+	))
+	defer srv.Close()
+	p := makeLMSProvider(t, srv.URL, "target", 262144)
+	p.target.Parallel = 1
+	p.local = true
+	p.lmsCLI = writeFakePs(t, `[{"identifier":"target","parallel":1}]`, false)
+	mustFetch(t, p)
+
+	live, err := p.FetchLive(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	state, err := p.BuildState(nil, live, nil)
+	if err != nil {
+		t.Fatalf("BuildState: %v", err)
+	}
+	if len(state.Resources) != 1 {
+		t.Fatalf("expected one resource, got %d", len(state.Resources))
+	}
+	attrs := state.Resources[0].Attributes
+	if got := attrs["observed_parallel"]; got != "1" {
+		t.Errorf("observed_parallel: got %v, want \"1\"", got)
+	}
+	if got := attrs["parallel"]; got != 1 {
+		t.Errorf("declared parallel attribute must be unchanged, got %v", got)
 	}
 }
 

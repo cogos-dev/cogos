@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -121,6 +122,15 @@ type modelStateEntry struct {
 	apiKeyEnv     string
 	model         string
 	contextLength int
+	parallel      int // 0 ⇒ don't watch parallel
+
+	// local and lmsCLIPath gate the parallel probe (see checkParallelDrift):
+	// `lms ps --json` is a local-only CLI (no --host flag), so parallel drift is
+	// only observable on a localhost endpoint. Computed in loadModelStateEntries
+	// from the endpoint host; test-constructed modelStateEntry{} literals may set
+	// these directly for injection (no test-only global needed).
+	local      bool
+	lmsCLIPath string
 }
 
 // loadModelStateEntries reads providers(.local).yaml and returns entries whose
@@ -148,7 +158,46 @@ func loadModelStateEntries(root string) []modelStateEntry {
 			}
 		}
 	}
+
+	lmsCLI := resolveLmsCLIPath()
+	for i := range result {
+		result[i].local = isLocalHostEndpoint(result[i].endpoint)
+		result[i].lmsCLIPath = lmsCLI
+	}
 	return result
+}
+
+// isLocalHostEndpoint reports whether endpoint's host is loopback (or empty,
+// which probeModelStateEntry defaults to localhost). Duplicates the small
+// loopback check in internal/engine/provider_lms_model_state.go's isLocalHost
+// rather than cross-importing engine from daemon.
+func isLocalHostEndpoint(endpoint string) bool {
+	host := endpoint
+	if idx := strings.Index(host, "://"); idx >= 0 {
+		host = host[idx+3:]
+	}
+	if idx := strings.Index(host, "/"); idx >= 0 {
+		host = host[:idx]
+	}
+	if idx := strings.LastIndex(host, ":"); idx >= 0 {
+		host = host[:idx]
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "::1", "[::1]", "":
+		return true
+	}
+	return false
+}
+
+// resolveLmsCLIPath returns the local lms CLI fast-path binary path,
+// best-effort. An empty result disables the parallel probe (checkParallelDrift
+// treats it as unavailable — not fatal).
+func resolveLmsCLIPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".lmstudio", "bin", "lms")
 }
 
 // msProviderFileCfg is the top-level shape used for the daemon-side model_state
@@ -171,6 +220,7 @@ type msModelStateCfg struct {
 	Manage        bool   `yaml:"manage"`
 	Model         string `yaml:"model"`
 	ContextLength int    `yaml:"context_length"`
+	Parallel      int    `yaml:"parallel"`
 }
 
 // parseModelStateEntriesFromYAML returns entries with model_state.manage:true.
@@ -190,6 +240,7 @@ func parseModelStateEntriesFromYAML(data []byte) []modelStateEntry {
 			apiKeyEnv:     p.APIKeyEnv,
 			model:         p.Options.ModelState.Model,
 			contextLength: p.Options.ModelState.ContextLength,
+			parallel:      p.Options.ModelState.Parallel,
 		})
 	}
 	return entries
@@ -274,6 +325,11 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) 
 			}
 			return false, fmt.Errorf("model %q loaded at context %s (want %d)", e.model, got, e.contextLength)
 		}
+		if e.parallel > 0 && e.local {
+			if err := checkParallelDrift(ctx, e, m.ID); err != nil {
+				return false, err
+			}
+		}
 		return false, nil
 	case loadingIdx != -1:
 		return true, nil // mid-load — Progressing, not an issue
@@ -282,4 +338,60 @@ func probeModelStateEntry(ctx context.Context, e modelStateEntry) (bool, error) 
 	default:
 		return false, fmt.Errorf("model %q not present", e.model)
 	}
+}
+
+// msPsRow mirrors `lms ps --json`'s row shape (the local-only lms CLI — no
+// --host flag, so remote backends cannot be probed this way). Confirmed live:
+// {"identifier":"ornith-1.0-35b",...,"parallel":1}.
+type msPsRow struct {
+	Identifier string `json:"identifier"`
+	ModelKey   string `json:"modelKey"`
+	Parallel   int    `json:"parallel"`
+}
+
+// msParallelProbeTimeout bounds the `lms ps --json` shell-out. Deliberately its
+// own short budget rather than sharing the outer 4s Health() timeout across all
+// entries — a hung lms CLI must not block the whole proprioception cycle.
+const msParallelProbeTimeout = 2 * time.Second
+
+// checkParallelDrift shells `lms ps --json` and compares the observed parallel
+// value for the row matching loadedID (or e.model, prefix-either-direction —
+// mirrors the /api/v0/models matching above) against e.parallel. A probe
+// failure (binary missing, non-zero exit, bad JSON) or no matching row is
+// NON-FATAL — skip the check rather than erroring, the same "unobserved, not
+// wrong" treatment the engine-side provider gives a nil Parallel. Returns a
+// non-nil error ONLY on a genuine observed mismatch, which folds into the
+// existing (progressing, err) issues aggregation in Health().
+func checkParallelDrift(ctx context.Context, e modelStateEntry, loadedID string) error {
+	if e.lmsCLIPath == "" {
+		return nil
+	}
+	psCtx, cancel := context.WithTimeout(ctx, msParallelProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(psCtx, e.lmsCLIPath, "ps", "--json").Output()
+	if err != nil {
+		return nil // lms CLI unavailable — unobserved, not an issue
+	}
+	var rows []msPsRow
+	if json.Unmarshal(out, &rows) != nil {
+		return nil // unparseable — unobserved
+	}
+	for _, r := range rows {
+		id := r.Identifier
+		if id == "" {
+			id = r.ModelKey
+		}
+		if id == "" {
+			continue
+		}
+		if !(id == loadedID || strings.HasPrefix(id, loadedID) || strings.HasPrefix(loadedID, id) ||
+			id == e.model || strings.HasPrefix(id, e.model) || strings.HasPrefix(e.model, id)) {
+			continue
+		}
+		if r.Parallel != e.parallel {
+			return fmt.Errorf("model %q loaded with parallel %d (want %d)", e.model, r.Parallel, e.parallel)
+		}
+		return nil
+	}
+	return nil // no matching row — unobserved
 }

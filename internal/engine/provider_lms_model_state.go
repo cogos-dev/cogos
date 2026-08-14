@@ -62,6 +62,11 @@ const lmsFetchTimeout = 4 * time.Second
 // lmsApplyTimeout bounds a single actuator invocation in ApplyPlan.
 const lmsApplyTimeout = 180 * time.Second
 
+// lmsPsProbeTimeout bounds the `lms ps --json` parallel probe in FetchLive.
+// This is deliberately its own (short) budget rather than sharing lmsFetchTimeout
+// — a hung lms CLI must not eat the whole /api/v0/models probe window.
+const lmsPsProbeTimeout = 3 * time.Second
+
 // lmsActuatorTokenEnv is the environment variable the Node actuator reads for
 // its Bearer token. ApplyPlan sets it from the provider's cached token; it is
 // never passed on argv.
@@ -74,7 +79,7 @@ type lmsModelStateConfig struct {
 	Manage        bool   // opt-in switch; false ⇒ Suspended, empty plan
 	Model         string // target model id that should be loaded
 	ContextLength int    // desired loaded_context_length (0 ⇒ don't manage context)
-	Parallel      int    // advisory metadata only, reported in BuildState — NOT actuated (LM Studio SDK load config has no per-load parallelism knob; parallelism is a server/JIT setting)
+	Parallel      int    // watched for drift, never actuated (LM Studio SDK load config has no per-load parallelism knob; parallelism is a server/JIT setting). Observed only on local backends via `lms ps --json` — see probeParallelLocal.
 	KeepWarm      bool   // hint: keep loaded even when idle (advisory metadata)
 	JITEvict      bool   // if true, unload a non-target model that crowds the card
 }
@@ -90,6 +95,23 @@ type lmsModelRow struct {
 	LoadedContextLength *int   `json:"loaded_context_length,omitempty"`
 	MaxContextLength    int    `json:"max_context_length,omitempty"`
 	Type                string `json:"type,omitempty"`
+
+	// Parallel is NOT part of the /api/v0/models response — LM Studio does not
+	// expose it there (confirmed live against Darkstar's :1234). It is merged in
+	// after the fact, on local backends only, from `lms ps --json` (see
+	// probeParallelLocal). nil ⇒ unobserved (remote backend, or the CLI probe
+	// failed) — never treated as a mismatch; distinct from an observed 0.
+	Parallel *int `json:"-"`
+}
+
+// lmsPsRow is one entry from `lms ps --json` (the local-only lms CLI, no --host
+// flag — same LM-Link-gated local/remote asymmetry the actuator's fast-path
+// already documents). Confirmed live shape:
+// {"identifier":"ornith-1.0-35b",...,"parallel":1}.
+type lmsPsRow struct {
+	Identifier string `json:"identifier"`
+	ModelKey   string `json:"modelKey"`
+	Parallel   int    `json:"parallel"`
 }
 
 // lmsModelsResponse is the /api/v0/models envelope.
@@ -241,6 +263,17 @@ func (p *LMSModelStateProvider) LoadConfig(root string) (any, error) {
 func (p *LMSModelStateProvider) FetchLive(ctx context.Context, _ any) (any, error) {
 	rows, err := p.probeModels(ctx)
 
+	// Merge the local-only `lms ps --json` parallel probe. A probe failure here
+	// (binary missing, non-zero exit, bad JSON) is NON-FATAL — it must not fail
+	// the whole FetchLive or affect Health beyond leaving Parallel nil
+	// (unobserved, not wrong), mirroring how a missing loaded_context_length is
+	// treated as unknown rather than a mismatch.
+	if err == nil && p.local {
+		if parallel, perr := p.probeParallelLocal(ctx); perr == nil {
+			mergeParallel(rows, parallel)
+		}
+	}
+
 	p.mu.Lock()
 	p.lastProbed = time.Now()
 	p.lastErr = err
@@ -287,6 +320,59 @@ func (p *LMSModelStateProvider) probeModels(ctx context.Context) ([]lmsModelRow,
 		return nil, fmt.Errorf("lms-model-state %q: decode /api/v0/models: %w", p.name, err)
 	}
 	return out.Data, nil
+}
+
+// probeParallelLocal shells out to `lms ps --json` (the local-only lms CLI —
+// confirmed no --host flag, so it cannot reach a remote instance; the same
+// LM-Link-gated asymmetry the actuator's fast-path already documents) and
+// returns a map of model identifier -> observed parallel value. Callers must
+// gate this behind p.local; it is only meaningful against the local instance.
+func (p *LMSModelStateProvider) probeParallelLocal(ctx context.Context) (map[string]int, error) {
+	if !p.local || p.lmsCLI == "" || !statOK(p.lmsCLI) {
+		return nil, fmt.Errorf("lms-model-state %q: lms CLI fast-path unavailable for parallel probe", p.name)
+	}
+
+	psCtx, cancel := context.WithTimeout(ctx, lmsPsProbeTimeout)
+	defer cancel()
+
+	out, err := exec.CommandContext(psCtx, p.lmsCLI, "ps", "--json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("lms-model-state %q: lms ps --json: %w", p.name, err)
+	}
+
+	var rows []lmsPsRow
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil, fmt.Errorf("lms-model-state %q: decode lms ps --json: %w", p.name, err)
+	}
+
+	result := make(map[string]int, len(rows))
+	for _, r := range rows {
+		id := r.Identifier
+		if id == "" {
+			id = r.ModelKey
+		}
+		if id == "" {
+			continue
+		}
+		result[id] = r.Parallel
+	}
+	return result, nil
+}
+
+// mergeParallel copies observed parallel values from an `lms ps --json` probe
+// into the matching /api/v0/models rows, using the same prefix-either-direction
+// identifier matching as findModelRow (quant suffixes, publisher prefixes).
+// Rows with no match are left with a nil Parallel (unobserved).
+func mergeParallel(rows []lmsModelRow, parallel map[string]int) {
+	for i := range rows {
+		for id, val := range parallel {
+			if modelIDMatch(rows[i].ID, id) {
+				v := val
+				rows[i].Parallel = &v
+				break
+			}
+		}
+	}
 }
 
 // ComputePlan diffs the declared target against the live rows and emits
@@ -573,6 +659,7 @@ func (p *LMSModelStateProvider) BuildState(_ any, live any, existing *reconcile.
 		attrs["loaded_model"] = loaded.ID
 		attrs["loaded_context_length"] = ctxStr(loaded.LoadedContextLength)
 		attrs["max_context_length"] = loaded.MaxContextLength
+		attrs["observed_parallel"] = parallelStr(loaded.Parallel)
 	}
 
 	state.Resources = []reconcile.Resource{{
@@ -676,8 +763,21 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 			Sync:      reconcile.SyncStatusOutOfSync,
 			Health:    reconcile.HealthDegraded,
 			Operation: reconcile.OperationIdle,
-			Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s, want %d",
-				p.name, target.Model, ctxStr(targetRow.LoadedContextLength), target.ContextLength),
+			Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s, want %d%s",
+				p.name, target.Model, ctxStr(targetRow.LoadedContextLength), target.ContextLength,
+				parallelGapNote(target, p.local)),
+		}
+	}
+
+	// Wrong parallel (local only — alarm-only, never actuated: LM Studio's load
+	// config has no per-load parallelism knob) ⇒ Degraded/OutOfSync.
+	if target.Parallel > 0 && p.local && parallelMismatch(targetRow, target.Parallel) {
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusOutOfSync,
+			Health:    reconcile.HealthDegraded,
+			Operation: reconcile.OperationIdle,
+			Message: fmt.Sprintf("lms-model-state %q: %s loaded with parallel %s, want %d",
+				p.name, target.Model, parallelStr(targetRow.Parallel), target.Parallel),
 		}
 	}
 
@@ -686,8 +786,8 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 		Sync:      reconcile.SyncStatusSynced,
 		Health:    reconcile.HealthHealthy,
 		Operation: reconcile.OperationIdle,
-		Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s",
-			p.name, target.Model, ctxStr(targetRow.LoadedContextLength)),
+		Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s%s",
+			p.name, target.Model, ctxStr(targetRow.LoadedContextLength), parallelGapNote(target, p.local)),
 	}
 }
 
@@ -783,6 +883,37 @@ func ctxStr(v *int) string {
 		return "null"
 	}
 	return fmt.Sprintf("%d", *v)
+}
+
+// parallelMismatch reports whether a loaded row's observed parallel value
+// differs from target. A nil Parallel (unobserved — remote backend, or the
+// `lms ps --json` probe failed/found no match) is NOT a mismatch: we cannot
+// compare, and this dimension is alarm-only anyway (never actuated).
+func parallelMismatch(r *lmsModelRow, target int) bool {
+	if r == nil || r.Parallel == nil {
+		return false
+	}
+	return *r.Parallel != target
+}
+
+// parallelStr renders a *int observed-parallel value ("null" when nil).
+func parallelStr(v *int) string {
+	if v == nil {
+		return "null"
+	}
+	return fmt.Sprintf("%d", *v)
+}
+
+// parallelGapNote returns an informational suffix for Health() messages when a
+// parallel target is declared but the backend is remote: `lms ps --json` has no
+// --host flag, so remote backends cannot be probed for parallel drift through
+// this mechanism. The gap must stay visible rather than presenting as full
+// coverage when only context is actually being watched.
+func parallelGapNote(target lmsModelStateConfig, local bool) string {
+	if target.Parallel > 0 && !local {
+		return "; parallel target declared but backend is remote — not observable via lms ps"
+	}
+	return ""
 }
 
 // ── option / detail helpers ────────────────────────────────────────────────────
