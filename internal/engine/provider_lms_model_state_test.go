@@ -1219,6 +1219,12 @@ func TestHostPortBracketedIPv6(t *testing.T) {
 		{"http://[::1]", "[::1]", 9999, true},
 		{"http://[::1]/v1", "[::1]", 9999, true},
 		{"http://[::1]:1234", "[::1]", 1234, true},
+		// Case-insensitivity: the engine gate must agree with the daemon's
+		// isLocalHostEndpoint (which lowercases) on the same backend — the
+		// engine copy is the one that actually probes and remediates.
+		{"http://LocalHost:1234", "LocalHost", 1234, true},
+		{"http://LOCALHOST", "LOCALHOST", 9999, true},
+		{"HTTP://LocalHost:1234/v1", "LocalHost", 1234, true},
 	}
 	for _, tc := range cases {
 		host, port := hostPort(tc.endpoint, 9999)

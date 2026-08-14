@@ -1274,9 +1274,13 @@ func hostPort(endpoint string, defaultPort int) (string, int) {
 	return host, port
 }
 
-// isLocalHost reports whether host is a loopback name/address.
+// isLocalHost reports whether host is a loopback name/address. Hostname
+// comparison is case-insensitive (DNS names are; an endpoint spelled
+// http://LocalHost:1234 must gate identically to http://localhost:1234 —
+// the daemon's isLocalHostEndpoint already lowercases, and the two copies
+// must agree on the same backend).
 func isLocalHost(host string) bool {
-	switch host {
+	switch strings.ToLower(host) {
 	case "localhost", "127.0.0.1", "::1", "[::1]":
 		return true
 	}
