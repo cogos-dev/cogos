@@ -311,6 +311,817 @@ func TestProviderDriftDetection(t *testing.T) {
 	}
 }
 
+// TestIndexSessionIncremental_ReadsOnlyAppendedTail proves the issue #558
+// fix: given a watermark from a prior full parse, a second parse pass reads
+// only the bytes appended since — it never re-derives the already-indexed
+// prefix from disk.
+//
+// The proof: after the first full parse, the on-disk prefix (the bytes
+// already consumed, [0, SourceOffset)) is overwritten in place with a
+// same-length record carrying a DIFFERENT uuid and different text before
+// the tail is appended. The merged result always starts with the
+// caller-supplied prevTurns (so turns2[0] alone can't prove anything — a
+// buggy from-byte-0 re-read would still be prefixed with prevTurns by the
+// merge step), so the real tell is length and position 1: a from-byte-0 re-
+// read would encounter the corrupted record under its new uuid — distinct
+// from anything in prevTurns' dedup set — and append it as a 3rd, bogus
+// turn ahead of the genuinely-new tail turn. A correct tail-only read never
+// sees those corrupted bytes at all: exactly 2 turns come back, and the one
+// tail turn is the genuinely appended one.
+func TestIndexSessionIncremental_ReadsOnlyAppendedTail(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	// The corrupted-sentinel technique below only proves "the parse seeks
+	// to the watermark instead of re-scanning from byte 0" if the corrupted
+	// bytes sit OUTSIDE tailFingerprintWindow — otherwise the
+	// SourceTailHash check (added to close the rewrite-then-grow gap, see
+	// TestIndexSessionIncremental_FallsBackOnRewriteThenGrow) would
+	// correctly decline the fast path before the seek is ever reached, and
+	// this test would stop exercising the seek-offset regression it's named
+	// for. A filler turn larger than the fingerprint window pushes the
+	// sentinel line's bytes below (watermark - tailFingerprintWindow), so
+	// it falls outside the fingerprinted tail while the bytes the
+	// fingerprint actually covers (the filler line's own tail) stay
+	// untouched and matching.
+	firstText := "first message"
+	firstLine := makeUserRecord("u1", "", sid, firstText, "2026-05-01T10:00:00Z")
+	fillerText := strings.Repeat("F", tailFingerprintWindow+1000)
+	fillerLine := makeUserRecord("u2", "u1", sid, fillerText, "2026-05-01T10:00:30Z")
+	path := writeJSONLFixture(t, dir, sid, []string{firstLine, fillerLine})
+
+	// Cycle 1: full parse establishes the watermark (and its tail fingerprint).
+	meta1, turns1, err := indexSession(path, sid, 2*tailFingerprintWindow+4096)
+	if err != nil {
+		t.Fatalf("indexSession (cycle 1): %v", err)
+	}
+	if len(turns1) != 2 {
+		t.Fatalf("expected 2 turns after cycle 1, got %d", len(turns1))
+	}
+	if meta1.SourceOffset != meta1.SourceSize {
+		t.Fatalf("expected SourceOffset == SourceSize after a full parse, got offset=%d size=%d",
+			meta1.SourceOffset, meta1.SourceSize)
+	}
+	if meta1.SourceOffset <= int64(len(firstLine))+int64(tailFingerprintWindow) {
+		t.Fatalf("test setup: watermark (%d) must exceed len(firstLine)+tailFingerprintWindow (%d) so the "+
+			"sentinel line lands outside the fingerprinted tail", meta1.SourceOffset,
+			int64(len(firstLine))+int64(tailFingerprintWindow))
+	}
+
+	// Corrupt the already-consumed sentinel line in place — same byte length
+	// (so the watermark byte offset still lands exactly on the line
+	// boundary), different uuid AND different text. Different uuid matters:
+	// it is what keeps this corrupted record out of the dedup-by-uuid set
+	// seeded from prevTurns, so a wrongly-reread copy of it cannot be
+	// silently absorbed as a harmless "duplicate" — it would show up as a
+	// distinct extra turn.
+	corruptedText := strings.Repeat("Z", len(firstText))
+	corruptedLine := strings.Replace(firstLine, `"`+firstText+`"`, `"`+corruptedText+`"`, 1)
+	corruptedLine = strings.Replace(corruptedLine, `"u1"`, `"z1"`, 1)
+	if len(corruptedLine) != len(firstLine) {
+		t.Fatalf("test setup: corrupted line length %d != original %d", len(corruptedLine), len(firstLine))
+	}
+	wf, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for prefix overwrite: %v", err)
+	}
+	if _, err := wf.WriteAt([]byte(corruptedLine), 0); err != nil {
+		wf.Close()
+		t.Fatalf("overwrite prefix: %v", err)
+	}
+	wf.Close()
+
+	// Append a genuinely new turn after the watermark.
+	secondText := "second message"
+	secondLine := makeUserRecord("u3", "u2", sid, secondText, "2026-05-01T10:01:00Z")
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + secondLine); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	// Cycle 2: incremental parse from the watermark, seeded with cycle 1's
+	// in-memory turns (as ApplyPlan would supply via idx.SessionTurns).
+	meta2, turns2, used, err := indexSessionIncremental(path, sid, 2*tailFingerprintWindow+4096, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used (the sentinel corruption sits below " +
+			"the fingerprinted tail, so SourceTailHash still matches)")
+	}
+	// The length check is the load-bearing proof: a from-byte-0 re-read
+	// would pick up the corrupted sentinel record (different uuid, so not
+	// deduped) as a spurious extra turn. Exactly 3 back means the corrupted
+	// prefix bytes were never read.
+	if len(turns2) != 3 {
+		t.Fatalf("expected exactly 3 turns after cycle 2 (got %d) — a from-byte-0 re-read would have "+
+			"picked up the corrupted sentinel record (text %q) as a spurious extra turn, meaning the "+
+			"parse read past the watermark into already-indexed, now-corrupted bytes instead of "+
+			"resuming the tail from it", len(turns2), corruptedText)
+	}
+	if turns2[0].Text != firstText {
+		t.Errorf("turns2[0].Text = %q, want %q (the caller-supplied prevTurns prefix)", turns2[0].Text, firstText)
+	}
+	if turns2[1].Text != fillerText {
+		t.Errorf("turns2[1].Text mismatch on the filler turn (want the unmodified prevTurns prefix)")
+	}
+	if turns2[2].Text != secondText {
+		t.Errorf("turns2[2].Text = %q, want %q — the sole new tail turn should be the genuinely "+
+			"appended record, not the corrupted sentinel record", turns2[2].Text, secondText)
+	}
+	if turns2[0].TurnIndex != 0 || turns2[1].TurnIndex != 1 || turns2[2].TurnIndex != 2 {
+		t.Errorf("expected contiguous turn indices 0,1,2; got %d,%d,%d",
+			turns2[0].TurnIndex, turns2[1].TurnIndex, turns2[2].TurnIndex)
+	}
+	if meta2.TurnCount != 3 {
+		t.Errorf("expected TurnCount 3, got %d", meta2.TurnCount)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if meta2.SourceOffset != fi.Size() {
+		t.Errorf("expected watermark to advance to the new EOF (%d), got %d", fi.Size(), meta2.SourceOffset)
+	}
+}
+
+// TestIndexSessionIncremental_FallsBackOnRewriteThenGrow guards against the
+// residual left by the same-size rewrite check alone: a source file
+// rewritten in place with different records that ALSO change the file's
+// total size is invisible to both the shrink check (the file didn't shrink)
+// and the same-size mtime check (the size did move, so that branch never
+// runs) — a size-only/mtime-only heuristic sees this as ordinary append-only
+// growth and would resume from the watermark, merging the stale prevTurns
+// prefix onto a tail parsed from content that no longer follows it,
+// producing a permanently and silently wrong index with no self-heal path
+// (the watermark advances to the new EOF on the very cycle that corrupts
+// it). SourceTailHash closes this: the bytes below the watermark no longer
+// match what was fingerprinted at the last parse, so the fast path must
+// decline regardless of which direction the size moved.
+func TestIndexSessionIncremental_FallsBackOnRewriteThenGrow(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "cccccccc-dddd-eeee-ffff-000000000000"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "alpha", "2026-05-01T10:00:00Z"),
+		makeUserRecord("u2", "u1", sid, "bravo", "2026-05-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+	if len(turns1) != 2 {
+		t.Fatalf("test setup: expected 2 turns after cycle 1, got %d", len(turns1))
+	}
+	if meta1.SourceTailHash == "" {
+		t.Fatalf("test setup: expected indexSession to populate SourceTailHash")
+	}
+
+	// Rewrite the whole file in place with 3 different records, strictly
+	// larger than the original — the reviewer's exact rewrite-then-grow
+	// scenario. Ground truth is whatever a full re-parse of this content
+	// produces: [delta, echo, foxtrot], not a merge of the stale
+	// [alpha, bravo] prefix with any part of the new content.
+	replacementLines := []string{
+		makeUserRecord("u3", "", sid, "delta-rewritten", "2026-05-01T11:00:00Z"),
+		makeUserRecord("u4", "u3", sid, "echo-rewritten", "2026-05-01T11:01:00Z"),
+		makeUserRecord("u5", "u4", sid, "foxtrot-rewritten", "2026-05-01T11:02:00Z"),
+	}
+	replacement := strings.Join(replacementLines, "\n") + "\n"
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if len(replacement) <= len(original) {
+		t.Fatalf("test setup: replacement (%d bytes) must be strictly larger than the original (%d bytes)",
+			len(replacement), len(original))
+	}
+
+	future := time.Now().Add(10 * time.Second)
+	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
+		t.Fatalf("rewrite-then-grow: %v", err)
+	}
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Size() <= meta1.SourceOffset {
+		t.Fatalf("test setup: rewritten file size %d must exceed the watermark %d (grown, not shrunk)",
+			fi.Size(), meta1.SourceOffset)
+	}
+
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Fatalf("expected the incremental fast path to decline on a rewrite-then-grow (content below the " +
+			"watermark no longer matches SourceTailHash, even though the file grew) — taking it here " +
+			"would silently merge the stale [alpha, bravo] prefix onto a tail read from unrelated " +
+			"content, corrupting the index with no recovery path")
+	}
+
+	// The self-heal: the caller's fallback to indexSession must match a
+	// from-scratch full re-parse of the rewritten content exactly — the
+	// ground truth this scenario is checked against.
+	meta3, turns3, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (fallback): %v", err)
+	}
+	if len(turns3) != 3 {
+		t.Fatalf("expected 3 turns after fallback re-parse, got %d", len(turns3))
+	}
+	wantTexts := []string{"delta-rewritten", "echo-rewritten", "foxtrot-rewritten"}
+	for i, want := range wantTexts {
+		if turns3[i].Text != want {
+			t.Errorf("turns3[%d].Text = %q, want %q", i, turns3[i].Text, want)
+		}
+	}
+	if meta3.TurnCount != 3 {
+		t.Errorf("expected TurnCount 3 after fallback, got %d", meta3.TurnCount)
+	}
+}
+
+// TestIndexSessionIncremental_FallsBackOnTruncation verifies that when the
+// source file is smaller than the recorded watermark (a compaction rewrite,
+// or any other truncation), the incremental path declines (usedIncremental
+// == false) rather than seeking past EOF or trusting stale offsets, leaving
+// the caller to fall back to a full re-parse.
+func TestIndexSessionIncremental_FallsBackOnTruncation(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "first message", "2026-05-01T10:00:00Z"),
+		makeUserRecord("u2", "u1", sid, "second message", "2026-05-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+	if meta1.SourceOffset == 0 {
+		t.Fatalf("expected a non-zero watermark")
+	}
+
+	// Replace with a smaller file (e.g. a compaction rewrite).
+	replacement := makeUserRecord("u3", "", sid, "replaced", "2026-05-01T10:02:00Z") + "\n"
+	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
+		t.Fatalf("truncate/replace: %v", err)
+	}
+	if fi, _ := os.Stat(path); fi.Size() >= meta1.SourceOffset {
+		t.Fatalf("test setup: replacement (%d bytes) must be smaller than the watermark (%d bytes)",
+			fi.Size(), meta1.SourceOffset)
+	}
+
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Errorf("expected the incremental path to decline when the file shrank below the watermark")
+	}
+}
+
+// TestIndexSessionIncremental_FallsBackWhenTurnsProjectionMissing guards
+// against a data-loss regression: prevMeta.TurnCount says N turns are
+// indexed, but the caller-supplied prevTurns is empty (e.g. _meta.json
+// survived while the session's turns projection file was deleted or never
+// loaded — Index.loadTurnsFile returns (nil, nil) for a missing file,
+// unlike a corrupt one). Taking the fast path in this state would merge the
+// newly-appended tail onto an empty prefix and silently discard every
+// already-indexed turn, with no self-healing path (the watermark keeps
+// advancing on subsequent cycles). The fast path must decline so the
+// caller falls back to a full re-parse, which rebuilds the correct history
+// from disk.
+func TestIndexSessionIncremental_FallsBackWhenTurnsProjectionMissing(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "dddddddd-eeee-ffff-0000-111111111111"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "first message", "2026-05-01T10:00:00Z"),
+		makeUserRecord("u2", "u1", sid, "second message", "2026-05-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+	if len(turns1) != 2 || meta1.TurnCount != 2 {
+		t.Fatalf("test setup: expected 2 turns/TurnCount after cycle 1, got turns=%d TurnCount=%d",
+			len(turns1), meta1.TurnCount)
+	}
+
+	// Append a third turn — a legitimate, ordinary growth.
+	thirdLine := makeUserRecord("u3", "u2", sid, "third message", "2026-05-01T10:02:00Z")
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + thirdLine); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	// Simulate the meta-present/turns-file-absent state: prevMeta still
+	// claims TurnCount==2, but prevTurns comes back empty (as
+	// Index.SessionTurns would report for a session whose turns file was
+	// removed while _meta.json survived).
+	var emptyPrevTurns []Turn
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, emptyPrevTurns)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Fatalf("expected the incremental fast path to decline when len(prevTurns) (%d) != prevMeta.TurnCount (%d) — "+
+			"taking it here would silently drop the 2 already-indexed turns and yield only the newly appended tail",
+			len(emptyPrevTurns), meta1.TurnCount)
+	}
+
+	// The self-heal: the caller's fallback to indexSession must recover all
+	// 3 turns from disk.
+	meta2, turns2, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (fallback): %v", err)
+	}
+	if len(turns2) != 3 || meta2.TurnCount != 3 {
+		t.Errorf("expected the full re-parse fallback to recover 3 turns, got turns=%d TurnCount=%d",
+			len(turns2), meta2.TurnCount)
+	}
+}
+
+// TestIndexSessionIncremental_FallsBackOnSameSizeRewrite guards against
+// silent, permanent staleness: a source file rewritten in place at exactly
+// the same byte size (different content, same length) is invisible to the
+// size-only shrink/grow check — fi.Size() still equals the recorded
+// watermark, so a naive "size didn't shrink" test would take the fast path,
+// seek to a watermark whose already-consumed bytes are no longer what was
+// actually parsed, and read zero new bytes forever after (since the
+// watermark never again falls below fi.Size()). The fast path must decline
+// whenever the file is at the watermark size AND its mtime moved, so the
+// caller falls back to a full re-parse that picks up the rewritten content.
+func TestIndexSessionIncremental_FallsBackOnSameSizeRewrite(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "eeeeeeee-ffff-0000-1111-222222222222"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "alpha", "2026-05-01T10:00:00Z"),
+		makeUserRecord("u2", "u1", sid, "bravo", "2026-05-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+	if len(turns1) != 2 {
+		t.Fatalf("test setup: expected 2 turns after cycle 1, got %d", len(turns1))
+	}
+
+	// Rewrite the whole file in place with different records of the exact
+	// same total byte length (same uuid/text lengths as the originals).
+	replacementLines := []string{
+		makeUserRecord("u3", "", sid, "delta", "2026-05-01T11:00:00Z"),
+		makeUserRecord("u4", "u3", sid, "echo!", "2026-05-01T11:01:00Z"),
+	}
+	replacement := strings.Join(replacementLines, "\n") + "\n"
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	if len(replacement) != len(original) {
+		t.Fatalf("test setup: replacement length %d != original length %d — fixture must stay same-size",
+			len(replacement), len(original))
+	}
+
+	future := time.Now().Add(10 * time.Second)
+	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
+		t.Fatalf("same-size rewrite: %v", err)
+	}
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if fi.Size() != meta1.SourceOffset {
+		t.Fatalf("test setup: rewritten file size %d must equal the watermark %d", fi.Size(), meta1.SourceOffset)
+	}
+
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Fatalf("expected the incremental fast path to decline on a same-size in-place rewrite " +
+			"(size unchanged, mtime moved) — taking it here would parse zero new bytes and leave the " +
+			"index showing the pre-rewrite content forever, with no recovery path")
+	}
+
+	// The self-heal: the caller's fallback to indexSession must pick up the
+	// rewritten content.
+	meta2, turns2, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (fallback): %v", err)
+	}
+	if len(turns2) != 2 {
+		t.Fatalf("expected 2 turns after fallback re-parse, got %d", len(turns2))
+	}
+	if turns2[0].Text != "delta" || turns2[1].Text != "echo!" {
+		t.Errorf("expected the fallback re-parse to reflect the rewritten content, got %q, %q",
+			turns2[0].Text, turns2[1].Text)
+	}
+	if meta2.TurnCount != 2 {
+		t.Errorf("expected TurnCount 2 after fallback, got %d", meta2.TurnCount)
+	}
+}
+
+// TestIndexSessionIncremental_TornLastLineNotLostOnCompletion guards against
+// issue #558 part 1's torn-last-line finding: a session JSONL can have a
+// partially-written last line whenever a cycle reads it mid-append (CC
+// flushes a record's bytes incrementally, not atomically). parser.go already
+// skips such a line as unparseable — but indexSession/indexSessionIncremental
+// used to record the watermark as fi.Size() regardless, advancing it PAST
+// those unparsed bytes. Once the writer finished the line, the bytes below
+// the (wrongly advanced) watermark were unchanged, so SourceTailHash still
+// matched, the incremental fast path was taken, and the now-complete record
+// — sitting entirely below the watermark — was never read: a permanent,
+// silent turn loss with no self-heal.
+//
+// Reproduction: 2 complete records, then a 3rd record torn mid-JSON with no
+// trailing newline (the writer stopped mid-append). Cycle 1 must record the
+// watermark at the end of the 2nd record, strictly before the torn bytes —
+// proving indexSession no longer uses fi.Size(). The writer then completes
+// the 3rd record by appending the rest of its JSON plus a trailing newline.
+// Cycle 2 must pick up the completed 3rd record via the incremental path,
+// yielding turns identical to a full re-parse ground truth.
+func TestIndexSessionIncremental_TornLastLineNotLostOnCompletion(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "ffffffff-0000-1111-2222-333333333333"
+
+	alphaLine := makeUserRecord("u1", "", sid, "alpha", "2026-05-01T10:00:00Z")
+	bravoLine := makeUserRecord("u2", "u1", sid, "bravo", "2026-05-01T10:01:00Z")
+	charlieLine := makeUserRecord("u3", "u2", sid, "charlie-the-torn-record", "2026-05-01T10:02:00Z")
+
+	// Cut charlieLine partway through — mid-JSON, no trailing newline — to
+	// simulate the writer having flushed only a prefix of the record so far.
+	cut := len(charlieLine) * 3 / 5
+	tornPrefix := charlieLine[:cut]
+	completionSuffix := charlieLine[cut:]
+	if err := json.Unmarshal([]byte(tornPrefix), &map[string]any{}); err == nil {
+		t.Fatalf("test setup: tornPrefix must NOT be valid JSON on its own (got a clean parse)")
+	}
+
+	path := filepath.Join(dir, sid+".jsonl")
+	initial := alphaLine + "\n" + bravoLine + "\n" + tornPrefix // no trailing newline: torn
+	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
+		t.Fatalf("write initial fixture: %v", err)
+	}
+
+	// Cycle 1: full parse. Only the 2 complete records are readable; the
+	// torn 3rd line is skipped like any other unparseable line.
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (cycle 1): %v", err)
+	}
+	if len(turns1) != 2 {
+		t.Fatalf("expected 2 turns after cycle 1 (torn 3rd line must be skipped), got %d", len(turns1))
+	}
+	if turns1[0].Text != "alpha" || turns1[1].Text != "bravo" {
+		t.Fatalf("unexpected cycle 1 turn texts: %q, %q", turns1[0].Text, turns1[1].Text)
+	}
+
+	wantWatermark := int64(len(alphaLine) + 1 + len(bravoLine) + 1)
+	// THE LOAD-BEARING ASSERTION: the watermark must land exactly at the end
+	// of the 2nd (complete) line, strictly before the torn bytes — never at
+	// fi.Size(), which would include them.
+	if meta1.SourceOffset != wantWatermark {
+		t.Fatalf("meta1.SourceOffset = %d, want %d (end of the 2nd complete line) — a watermark of %d "+
+			"(fi.Size()) would advance past the %d torn bytes and permanently lose the record once "+
+			"completed", meta1.SourceOffset, wantWatermark, meta1.SourceSize, len(tornPrefix))
+	}
+	if meta1.SourceOffset >= meta1.SourceSize {
+		t.Fatalf("test setup: watermark (%d) must be strictly less than the file size (%d) for this "+
+			"reproduction to exercise anything", meta1.SourceOffset, meta1.SourceSize)
+	}
+
+	// The writer completes the 3rd record: appends the rest of its JSON plus
+	// a trailing newline. The bytes below cycle 1's watermark are untouched.
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString(completionSuffix + "\n"); err != nil {
+		af.Close()
+		t.Fatalf("append completion: %v", err)
+	}
+	af.Close()
+
+	// Cycle 2: incremental parse from cycle 1's watermark, seeded with cycle
+	// 1's in-memory turns.
+	meta2, turns2, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental (cycle 2): %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used (bytes below the watermark are unchanged)")
+	}
+	if len(turns2) != 3 {
+		t.Fatalf("expected 3 turns after cycle 2 (got %d) — the completed 3rd record must be re-read from "+
+			"below the (correctly unadvanced) watermark, not lost", len(turns2))
+	}
+	wantTexts := []string{"alpha", "bravo", "charlie-the-torn-record"}
+	for i, want := range wantTexts {
+		if turns2[i].Text != want {
+			t.Errorf("turns2[%d].Text = %q, want %q", i, turns2[i].Text, want)
+		}
+	}
+	if meta2.TurnCount != 3 {
+		t.Errorf("expected TurnCount 3, got %d", meta2.TurnCount)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if meta2.SourceOffset != fi.Size() {
+		t.Errorf("expected watermark to advance to the new EOF (%d) now that the 3rd line is complete, got %d",
+			fi.Size(), meta2.SourceOffset)
+	}
+
+	// Ground truth: a full re-parse of the final file content must match
+	// cycle 2's incremental result exactly.
+	meta3, turns3, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (ground truth): %v", err)
+	}
+	if len(turns3) != len(turns2) {
+		t.Fatalf("ground truth full re-parse yielded %d turns, incremental cycle 2 yielded %d", len(turns3), len(turns2))
+	}
+	for i := range turns3 {
+		if turns3[i].Text != turns2[i].Text || turns3[i].UUID != turns2[i].UUID {
+			t.Errorf("turn %d mismatch vs ground truth: incremental={%q,%q} full-reparse={%q,%q}",
+				i, turns2[i].UUID, turns2[i].Text, turns3[i].UUID, turns3[i].Text)
+		}
+	}
+	if meta3.TurnCount != meta2.TurnCount {
+		t.Errorf("ground truth TurnCount %d != incremental TurnCount %d", meta3.TurnCount, meta2.TurnCount)
+	}
+
+	// Cycle 3: repeat the torn-line scenario, but this time appended AFTER
+	// an already-established incremental watermark, to exercise
+	// indexSessionIncremental's own offset bookkeeping (not indexSession's) —
+	// the two are separate call sites of ParseSession and each sets
+	// meta.SourceOffset independently.
+	deltaLine := makeUserRecord("u4", "u3", sid, "delta-the-second-torn-record", "2026-05-01T10:03:00Z")
+	deltaCut := len(deltaLine) * 2 / 5
+	deltaTornPrefix := deltaLine[:deltaCut]
+	deltaCompletionSuffix := deltaLine[deltaCut:]
+	if err := json.Unmarshal([]byte(deltaTornPrefix), &map[string]any{}); err == nil {
+		t.Fatalf("test setup: deltaTornPrefix must NOT be valid JSON on its own (got a clean parse)")
+	}
+
+	af2, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for delta append: %v", err)
+	}
+	if _, err := af2.WriteString(deltaTornPrefix); err != nil { // no trailing newline: torn again
+		af2.Close()
+		t.Fatalf("append torn delta: %v", err)
+	}
+	af2.Close()
+
+	meta4, turns4, used, err := indexSessionIncremental(path, sid, 8192, meta2, turns2)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental (cycle 3, torn delta): %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used for cycle 3")
+	}
+	if len(turns4) != 3 {
+		t.Fatalf("expected 3 turns after cycle 3 (torn 4th line must be skipped), got %d", len(turns4))
+	}
+	// THE LOAD-BEARING ASSERTION for indexSessionIncremental specifically:
+	// the watermark must stay exactly where cycle 2 left it — never advance
+	// into the torn delta bytes just because fi.Size() grew.
+	if meta4.SourceOffset != meta2.SourceOffset {
+		t.Fatalf("meta4.SourceOffset = %d, want %d (unchanged from cycle 2) — advancing past the torn "+
+			"delta bytes here would permanently lose that record once completed, via "+
+			"indexSessionIncremental's own offset computation rather than indexSession's",
+			meta4.SourceOffset, meta2.SourceOffset)
+	}
+
+	// The writer completes the 4th record.
+	af3, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for delta completion: %v", err)
+	}
+	if _, err := af3.WriteString(deltaCompletionSuffix + "\n"); err != nil {
+		af3.Close()
+		t.Fatalf("append delta completion: %v", err)
+	}
+	af3.Close()
+
+	meta5, turns5, used, err := indexSessionIncremental(path, sid, 8192, meta4, turns4)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental (cycle 4): %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used for cycle 4")
+	}
+	if len(turns5) != 4 {
+		t.Fatalf("expected 4 turns after cycle 4 (got %d) — the completed 4th record must be re-read", len(turns5))
+	}
+	if turns5[3].Text != "delta-the-second-torn-record" {
+		t.Errorf("turns5[3].Text = %q, want %q", turns5[3].Text, "delta-the-second-torn-record")
+	}
+	fi5, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if meta5.SourceOffset != fi5.Size() {
+		t.Errorf("expected watermark to advance to the new EOF (%d), got %d", fi5.Size(), meta5.SourceOffset)
+	}
+	if meta5.TurnCount != 4 {
+		t.Errorf("expected TurnCount 4, got %d", meta5.TurnCount)
+	}
+}
+
+// TestIndexSessionIncremental_RefreshesSourcePath verifies that a session
+// whose file relocates while keeping its UUID (CC derives its project
+// directory from the cwd slug, so renaming/moving a project dir moves
+// <uuid>.jsonl) does not keep serving the pre-move source_path indefinitely
+// through the incremental fast path — matching indexSession's behavior of
+// always recording the sourcePath it actually parsed.
+func TestIndexSessionIncremental_RefreshesSourcePath(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "ffffffff-0000-1111-2222-333333333333"
+
+	line := makeUserRecord("u1", "", sid, "first message", "2026-05-01T10:00:00Z")
+	path := writeJSONLFixture(t, dir, sid, []string{line})
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+
+	// Simulate a relocated source path (new directory, same UUID filename)
+	// by passing a different sourcePath into the incremental call while
+	// appending a new turn to the original file (indexSessionIncremental
+	// itself reads from the sourcePath argument, so point it at a copy).
+	newDir := filepath.Join(dir, "moved")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	newPath := filepath.Join(newDir, sid+".jsonl")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+	secondLine := makeUserRecord("u2", "u1", sid, "second message", "2026-05-01T10:01:00Z")
+	if err := os.WriteFile(newPath, append(original, []byte("\n"+secondLine)...), 0o644); err != nil {
+		t.Fatalf("write moved fixture: %v", err)
+	}
+
+	meta2, _, used, err := indexSessionIncremental(newPath, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used")
+	}
+	if meta2.SourcePath != newPath {
+		t.Errorf("meta.SourcePath = %q, want %q (the relocated path actually parsed, not prevMeta's stale %q)",
+			meta2.SourcePath, newPath, meta1.SourcePath)
+	}
+}
+
+// TestProviderApplyPlan_WatermarkAdvancesAcrossCycles is the end-to-end
+// counterpart to TestIndexSessionIncremental_ReadsOnlyAppendedTail: it drives
+// the same watermark logic through LoadConfig/FetchLive/ComputePlan/ApplyPlan
+// across three append cycles on a live-growing session, and asserts that
+// each cycle's applied SourceOffset lands exactly on the file's new EOF and
+// turn counts accumulate correctly — i.e. the provider, not just the parsing
+// helper in isolation, drives a second cycle off the appended tail.
+func TestProviderApplyPlan_WatermarkAdvancesAcrossCycles(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const sid = "cccccccc-dddd-eeee-ffff-000000000000"
+
+	fixturePath := writeJSONLFixture(t, srcDir, sid, []string{
+		makeUserRecord("u1", "", sid, "turn one", "2026-05-01T10:00:00Z"),
+	})
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	apply := func() {
+		cfgAny, err := p.LoadConfig(root)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		liveAny, err := p.FetchLive(ctx, cfgAny)
+		if err != nil {
+			t.Fatalf("FetchLive: %v", err)
+		}
+		plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+		if err != nil {
+			t.Fatalf("ComputePlan: %v", err)
+		}
+		if _, err := p.ApplyPlan(ctx, plan); err != nil {
+			t.Fatalf("ApplyPlan: %v", err)
+		}
+	}
+	appendLine := func(line string) {
+		f, err := os.OpenFile(fixturePath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatalf("open for append: %v", err)
+		}
+		if _, err := f.WriteString("\n" + line); err != nil {
+			f.Close()
+			t.Fatalf("append: %v", err)
+		}
+		f.Close()
+		future := time.Now().Add(2 * time.Second)
+		if err := os.Chtimes(fixturePath, future, future); err != nil {
+			t.Logf("chtimes: %v (non-fatal)", err)
+		}
+	}
+
+	// Cycle 1: initial create.
+	apply()
+	meta, ok := p.index.GetMeta(sid)
+	if !ok {
+		t.Fatalf("session not indexed after cycle 1")
+	}
+	if meta.TurnCount != 1 {
+		t.Fatalf("expected 1 turn after cycle 1, got %d", meta.TurnCount)
+	}
+	fi, _ := os.Stat(fixturePath)
+	if meta.SourceOffset != fi.Size() {
+		t.Fatalf("expected watermark == EOF (%d) after cycle 1, got %d", fi.Size(), meta.SourceOffset)
+	}
+
+	// Cycle 2: append and re-apply.
+	appendLine(makeUserRecord("u2", "u1", sid, "turn two", "2026-05-01T10:01:00Z"))
+	apply()
+	meta, ok = p.index.GetMeta(sid)
+	if !ok {
+		t.Fatalf("session missing after cycle 2")
+	}
+	if meta.TurnCount != 2 {
+		t.Fatalf("expected 2 turns after cycle 2, got %d", meta.TurnCount)
+	}
+	fi, _ = os.Stat(fixturePath)
+	if meta.SourceOffset != fi.Size() {
+		t.Fatalf("expected watermark to advance to EOF (%d) after cycle 2, got %d", fi.Size(), meta.SourceOffset)
+	}
+
+	// Cycle 3: append again and re-apply — the watermark from cycle 2 must
+	// keep advancing, not reset.
+	appendLine(makeUserRecord("u3", "u2", sid, "turn three", "2026-05-01T10:02:00Z"))
+	apply()
+	meta, ok = p.index.GetMeta(sid)
+	if !ok {
+		t.Fatalf("session missing after cycle 3")
+	}
+	if meta.TurnCount != 3 {
+		t.Fatalf("expected 3 turns after cycle 3, got %d", meta.TurnCount)
+	}
+	fi, _ = os.Stat(fixturePath)
+	if meta.SourceOffset != fi.Size() {
+		t.Fatalf("expected watermark to advance to EOF (%d) after cycle 3, got %d", fi.Size(), meta.SourceOffset)
+	}
+
+	turns := p.index.SessionTurns(sid)
+	if len(turns) != 3 {
+		t.Fatalf("expected 3 turns in the index, got %d", len(turns))
+	}
+	wantTexts := []string{"turn one", "turn two", "turn three"}
+	for i, want := range wantTexts {
+		if turns[i].Text != want {
+			t.Errorf("turn[%d].Text = %q, want %q", i, turns[i].Text, want)
+		}
+		if turns[i].TurnIndex != i {
+			t.Errorf("turn[%d].TurnIndex = %d, want %d", i, turns[i].TurnIndex, i)
+		}
+	}
+}
+
 // TestProviderIdempotency verifies that running ApplyPlan twice on the same
 // session produces a skip on the second pass (no double-indexing).
 func TestProviderIdempotency(t *testing.T) {
@@ -493,7 +1304,7 @@ func TestParserSystemReminderStripped(t *testing.T) {
 
 	var meta SessionMeta
 	var turns []Turn
-	err := ParseSession(strings.NewReader(jsonl), "test-session", 8192, &meta, func(t Turn) bool {
+	_, err := ParseSession(strings.NewReader(jsonl), "test-session", 8192, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	})
@@ -537,7 +1348,7 @@ func TestParserSkipsToolResults(t *testing.T) {
 
 	var meta SessionMeta
 	var turns []Turn
-	_ = ParseSession(strings.NewReader(jsonl), "test-session-2", 8192, &meta, func(t Turn) bool {
+	_, _ = ParseSession(strings.NewReader(jsonl), "test-session-2", 8192, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	})

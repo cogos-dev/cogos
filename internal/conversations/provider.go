@@ -15,8 +15,11 @@ package conversations
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -649,7 +652,36 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				continue
 			}
 
-			meta, turns, err := indexSession(sourcePath, action.Name, defaultMaxTurnLen)
+			// For an update (as opposed to a brand-new session), try to
+			// resume from the last recorded watermark instead of re-parsing
+			// the whole file — issue #558. Only attempted when a prior
+			// index entry + turns are actually available; falls through to
+			// the full indexSession parse whenever the fast path declines
+			// (usedIncremental == false) or errors.
+			var meta SessionMeta
+			var turns []Turn
+			var err error
+			usedIncremental := false
+			if action.Action == reconcile.ActionUpdate {
+				if prevMeta, ok := idx.GetMeta(action.Name); ok {
+					prevTurns := idx.SessionTurns(action.Name)
+					meta, turns, usedIncremental, err = indexSessionIncremental(sourcePath, action.Name, defaultMaxTurnLen, prevMeta, prevTurns)
+					if err != nil {
+						res.Status = reconcile.ApplyFailed
+						res.Error = fmt.Sprintf("index session %s (incremental): %v", action.Name, err)
+						results = append(results, res)
+						if isLockBackpressure(err) {
+							backpressure++
+						} else {
+							errs = append(errs, res.Error)
+						}
+						continue
+					}
+				}
+			}
+			if !usedIncremental {
+				meta, turns, err = indexSession(sourcePath, action.Name, defaultMaxTurnLen)
+			}
 			if err != nil {
 				res.Status = reconcile.ApplyFailed
 				res.Error = fmt.Sprintf("index session %s: %v", action.Name, err)
@@ -1204,8 +1236,50 @@ func isDrift(meta SessionMeta, f sourceFileInfo) bool {
 	return diff > 2*time.Second
 }
 
-// indexSession opens sourcePath, streams turns, and returns the resulting
-// SessionMeta and Turn slice. Does not hold the file open after return.
+// tailFingerprintWindow is the number of bytes, immediately below a
+// watermark offset, that get hashed into SessionMeta.SourceTailHash. Kept
+// small and fixed so verifying it is O(tailFingerprintWindow) — a cheap,
+// constant-cost check — never O(session-size). 4096 bytes is comfortably
+// larger than a single CC JSONL record in the common case, so an in-place
+// rewrite of the record(s) nearest the watermark is caught even when the
+// rewrite also changes the file's total size.
+const tailFingerprintWindow = 4096
+
+// tailFingerprint hashes the up-to-tailFingerprintWindow bytes immediately
+// preceding offset in f, returning a hex-encoded sha256 digest. offset <= 0
+// (nothing below the watermark to fingerprint) returns the empty string.
+// Files shorter than the window are handled by clamping the start of the
+// read to byte 0, hashing whatever is actually there.
+//
+// This is deliberately a bounded-window check, not a whole-file hash: it
+// catches a rewrite that touches the bytes nearest the watermark (the
+// common case for an in-place rewrite, truncate+replace, or restore that
+// replaces a session file wholesale) at O(window) cost, not a rewrite
+// confined entirely to bytes further back in a large file than the window
+// reaches. That residual is the same class of trade CC session JSONLs
+// already accept elsewhere (see indexSessionIncremental's doc comment) in
+// exchange for keeping the per-cycle cost independent of session size.
+func tailFingerprint(f *os.File, offset int64) (string, error) {
+	if offset <= 0 {
+		return "", nil
+	}
+	start := offset - tailFingerprintWindow
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, offset-start)
+	if _, err := f.ReadAt(buf, start); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// indexSession opens sourcePath, streams turns from byte 0, and returns the
+// resulting SessionMeta and Turn slice. Does not hold the file open after
+// return. This is the full re-parse path: used for brand-new sessions
+// (ActionCreate) and as the fallback whenever an incremental resume isn't
+// possible (see indexSessionIncremental).
 func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []Turn, error) {
 	fi, err := os.Stat(sourcePath)
 	if err != nil {
@@ -1227,7 +1301,7 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	}
 
 	var turns []Turn
-	err = ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
+	parsedOffset, err := ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
 		turns = append(turns, t)
 		return true
 	})
@@ -1235,7 +1309,236 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 		return meta, turns, fmt.Errorf("parse %s: %w", sourcePath, err)
 	}
 
+	// Record the byte offset of the last COMPLETE, successfully-parsed line
+	// as the watermark — NOT fi.Size(). A session file can have a
+	// partially-written last line (the writer is still mid-append); using
+	// fi.Size() would advance the watermark past those unparsed bytes, and
+	// once the writer finishes the line the tail fingerprint below the
+	// watermark would still match, so the incremental fast path would take
+	// over and that completed line would never be (re-)read — a permanent,
+	// silent turn loss with no self-heal (issue #558 part 1). See
+	// ParseSession's doc comment.
+	meta.SourceOffset = parsedOffset
+
+	// Fingerprint the bytes below the new watermark so the next incremental
+	// cycle can verify they're unchanged before trusting the watermark. See
+	// SessionMeta.SourceTailHash.
+	tailHash, err := tailFingerprint(f, meta.SourceOffset)
+	if err != nil {
+		return meta, turns, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
+	}
+	meta.SourceTailHash = tailHash
+
 	return meta, turns, nil
+}
+
+// indexSessionIncremental resumes parsing sourcePath from prevMeta's
+// recorded watermark (SourceOffset) instead of byte 0, appending only the
+// newly written tail to prevTurns (the already-indexed prefix). This is the
+// issue #558 fix: a live, actively-growing session JSONL was being
+// re-parsed in full — O(session-size) — on every reconcile cycle, which is
+// why a 96MB session cost ~77s/cycle against a 500ms budget. Reading only
+// the appended bytes makes the PARSE step of a steady-state cycle O(delta)
+// instead of O(session-size).
+//
+// NOTE on scope: this only fixes the parse side, and only the parse side.
+// Index.UpsertSessions still rewrites the whole per-session turns
+// projection file every cycle (writeTurnsFileLocked in index.go), so the
+// end-to-end apply cost of a cycle that has any new turns remains
+// O(session-size) — a large, steadily-growing session can still straddle
+// CycleBudget even after this change. That write-side cost, along with
+// issue #558's other two items (a CycleBudget breach that only logs, with
+// no per-provider override or actuator; a provider-qualified anomaly tag
+// for the "over_budget" reason), is deliberately not addressed here — it is
+// severed into a follow-up so this change stays reviewable as one concern
+// (the parse-side data-loss and staleness gaps). #558 should stay open
+// until that follow-up lands.
+//
+// Returns (meta, turns, usedIncremental, err). usedIncremental is false
+// whenever the fast path isn't safe to take: no established watermark; the
+// file is smaller than the watermark (a truncation or rewrite, most
+// commonly a CC compaction that replaces the file wholesale); the recorded
+// turns don't match the recorded turn count; no SourceTailHash was
+// recorded to verify against (prevMeta indexed before that field existed);
+// the bytes below the watermark no longer match SourceTailHash (an
+// in-place rewrite, whether or not it also changed the file's size — see
+// tailFingerprint); or the file was rewritten in place at the same size
+// with its mtime moved. The caller must fall back to indexSession (a full
+// re-parse) in that case.
+//
+// This is a size+mtime heuristic AND a bounded content fingerprint: it
+// trusts that bytes already consumed up to prevMeta.SourceOffset are
+// unchanged whenever the file has only grown since, but verifies that trust
+// against SourceTailHash (a hash of the tailFingerprintWindow bytes
+// immediately below the watermark, recorded at the last parse) rather than
+// taking it on faith. A same-size in-place rewrite is additionally caught
+// by comparing mtime against the watermark's recorded mtime (the same
+// signal isDrift uses to decide there's anything to reconcile at all); a
+// rewrite that shrinks the file is caught by the shrink check; a rewrite
+// that changes bytes within the fingerprint window — including one that
+// also grows the file, which looks like ordinary append-only growth to a
+// pure size/mtime check — is caught by the SourceTailHash mismatch below.
+// The one residual this still cannot see is a rewrite confined entirely to
+// bytes below the fingerprint window in a file larger than that window
+// (see tailFingerprint's doc comment): CC session JSONLs are append-only in
+// practice, so that narrower case is not expected to occur, but a generic
+// *.jsonl source is not guaranteed to be. A partially-written last line (the
+// writer still mid-append when a cycle reads the file) is NOT a residual of
+// this mechanism: ParseSession only ever reports the offset of the last
+// COMPLETE, successfully-parsed line as the new watermark, so a torn line
+// is re-read — once the writer finishes it — on every subsequent cycle
+// until it parses, rather than being silently skipped forever. See
+// ParseSession's doc comment in parser.go.
+func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevMeta SessionMeta, prevTurns []Turn) (SessionMeta, []Turn, bool, error) {
+	fi, err := os.Stat(sourcePath)
+	if err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("stat %s: %w", sourcePath, err)
+	}
+
+	// No usable watermark, or the file shrank relative to it (truncation /
+	// rewrite) — the tail-only fast path is unsafe. Caller falls back to a
+	// full re-parse.
+	if prevMeta.SourceOffset <= 0 || prevMeta.SourceOffset > fi.Size() {
+		return SessionMeta{}, nil, false, nil
+	}
+
+	// prevTurns must actually reflect prevMeta's own bookkeeping. If the
+	// in-memory/on-disk turns projection is short of prevMeta.TurnCount —
+	// e.g. _meta.json survived but the session's turns projection file was
+	// deleted or never loaded (Index.loadTurnsFile returns (nil, nil) for a
+	// missing file, unlike a corrupt one, which Load handles by dropping
+	// the meta entry too) — merging the tail onto prevTurns would silently
+	// discard every already-indexed turn instead of self-healing via a full
+	// re-parse. Decline and let the caller fall back to indexSession.
+	if len(prevTurns) != prevMeta.TurnCount {
+		return SessionMeta{}, nil, false, nil
+	}
+
+	f, err := os.Open(sourcePath)
+	if err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("open %s: %w", sourcePath, err)
+	}
+	defer f.Close()
+
+	// Verify the bytes below the watermark are still what they were at the
+	// last parse before trusting the watermark as a resume point. No
+	// recorded fingerprint (prevMeta indexed before SourceTailHash existed)
+	// can't be verified — decline so the caller falls back to a full
+	// re-parse, which also backfills the hash for subsequent cycles.
+	if prevMeta.SourceTailHash == "" {
+		return SessionMeta{}, nil, false, nil
+	}
+	tailHash, err := tailFingerprint(f, prevMeta.SourceOffset)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			// TOCTOU: the file was truncated or replaced between the
+			// os.Stat above and this ReadAt (e.g. a concurrent compaction).
+			// Decline the fast path rather than surfacing a hard error —
+			// the caller's full re-parse fallback self-heals, and the next
+			// cycle re-observes the file in whatever state it settles into.
+			return SessionMeta{}, nil, false, nil
+		}
+		return SessionMeta{}, nil, false, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
+	}
+	if tailHash != prevMeta.SourceTailHash {
+		// The bytes below the watermark no longer match what was
+		// fingerprinted at the last parse — an in-place rewrite, whether
+		// or not it also changed the file's size (a rewrite-then-grow is
+		// invisible to the size/mtime checks alone). Decline; the caller's
+		// full re-parse fallback self-heals.
+		return SessionMeta{}, nil, false, nil
+	}
+
+	// A same-size in-place rewrite that happens to leave the fingerprint
+	// window's bytes unchanged (e.g. the rewrite lands entirely below the
+	// window in a file larger than tailFingerprintWindow) can't be caught
+	// by the fingerprint or the shrink check above, since fi.Size() still
+	// equals prevMeta.SourceOffset. Fall back to a full re-parse whenever
+	// the file's mtime moved (beyond the same 2s tolerance isDrift uses)
+	// without the size moving past the watermark — trusting "size didn't
+	// shrink and the fingerprint matched" as sufficient safety would let
+	// such a rewrite resume from a watermark whose already-consumed bytes
+	// are no longer what was actually parsed.
+	if fi.Size() == prevMeta.SourceOffset {
+		mtimeDiff := fi.ModTime().Sub(prevMeta.SourceMtime)
+		if mtimeDiff < 0 {
+			mtimeDiff = -mtimeDiff
+		}
+		if mtimeDiff > 2*time.Second {
+			return SessionMeta{}, nil, false, nil
+		}
+	}
+
+	if _, err := f.Seek(prevMeta.SourceOffset, io.SeekStart); err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("seek %s to %d: %w", sourcePath, prevMeta.SourceOffset, err)
+	}
+
+	// Seed meta from the previous pass so ParseSession extends (rather than
+	// resets) FirstTurnAt/LastTurnAt/Entrypoint/Title, then overwrite the
+	// per-cycle bookkeeping fields. SourcePath is refreshed from the
+	// sourcePath argument (not left as prevMeta's) so a session whose file
+	// relocates while keeping its UUID doesn't keep serving a stale
+	// source_path indefinitely — matching indexSession's behavior.
+	meta := prevMeta
+	meta.SourcePath = sourcePath
+	meta.IndexedAt = time.Now().UTC()
+	meta.SourceMtime = fi.ModTime()
+	meta.SourceSize = fi.Size()
+
+	// Dedup against the already-indexed prefix too — ParseSession's own
+	// dedup only sees uuids within the bytes it scans (the tail here), and
+	// a resumed/compacted JSONL can legitimately re-append a turn whose uuid
+	// already appears in prevTurns.
+	seen := make(map[string]struct{}, len(prevTurns))
+	for _, t := range prevTurns {
+		if t.UUID != "" {
+			seen[t.UUID] = struct{}{}
+		}
+	}
+
+	var newTurns []Turn
+	parsedTailOffset, err := ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
+		if t.UUID != "" {
+			if _, dup := seen[t.UUID]; dup {
+				return true
+			}
+			seen[t.UUID] = struct{}{}
+		}
+		newTurns = append(newTurns, t)
+		return true
+	})
+	if err != nil {
+		return meta, nil, false, fmt.Errorf("parse %s (tail from offset %d): %w", sourcePath, prevMeta.SourceOffset, err)
+	}
+
+	combined := make([]Turn, 0, len(prevTurns)+len(newTurns))
+	combined = append(combined, prevTurns...)
+	combined = append(combined, newTurns...)
+	// TurnIndex must be a contiguous 0-based sequence over the WHOLE
+	// session, not just the tail just parsed — renumber the merged slice.
+	for i := range combined {
+		combined[i].TurnIndex = i
+	}
+
+	meta.TurnCount = len(combined)
+	// parsedTailOffset is relative to the seek point (prevMeta.SourceOffset),
+	// not absolute — add it back. Like indexSession, this is the offset of
+	// the last COMPLETE, successfully-parsed line in the tail, never
+	// fi.Size(): a torn last line here must not advance the watermark past
+	// it, or the next cycle's tail fingerprint would match once the writer
+	// completes it and the completed line would never be read. See
+	// ParseSession's doc comment.
+	meta.SourceOffset = prevMeta.SourceOffset + parsedTailOffset
+
+	// Re-fingerprint the (now larger) window below the new watermark so the
+	// next cycle can verify it. See SessionMeta.SourceTailHash.
+	newTailHash, err := tailFingerprint(f, meta.SourceOffset)
+	if err != nil {
+		return meta, combined, false, fmt.Errorf("fingerprint %s tail: %w", sourcePath, err)
+	}
+	meta.SourceTailHash = newTailHash
+
+	return meta, combined, true, nil
 }
 
 // isIngestDrift returns true when the indexed sessions of a source are stale

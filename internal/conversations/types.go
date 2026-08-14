@@ -71,6 +71,39 @@ type SessionMeta struct {
 	// SourceSize records the source file size at index time (drift detection).
 	SourceSize int64 `json:"source_size"`
 
+	// SourceOffset records the byte offset in the source file up to which
+	// turns have been parsed and merged into this session's index. Equal to
+	// SourceSize after a normal indexing pass (the whole file, start to
+	// current EOF, has been consumed). Used as the resume point for the next
+	// incremental parse: when a subsequent cycle's file size has grown and
+	// SourceOffset still points at a prefix of the new file, only the bytes
+	// from SourceOffset onward need to be read and parsed (see
+	// indexSessionIncremental in provider.go), instead of re-parsing the
+	// whole file from byte 0 every reconcile cycle (issue #558).
+	//
+	// Zero (the default for entries indexed before this field existed, or
+	// for sessions that have never completed a full parse) means "unknown
+	// watermark" and forces a full re-parse on the next update.
+	SourceOffset int64 `json:"source_offset,omitempty"`
+
+	// SourceTailHash is a hex-encoded sha256 digest of the up-to-
+	// tailFingerprintWindow bytes immediately preceding SourceOffset, as of
+	// the last parse (full or incremental). indexSessionIncremental
+	// re-reads that same window on its next cycle and compares digests
+	// before trusting SourceOffset as a resume point: a mismatch means the
+	// bytes below the watermark were rewritten (in place, or as part of a
+	// rewrite that also grew the file — the case a size-only shrink/growth
+	// check cannot see) and the fast path must decline in favor of a full
+	// re-parse. See indexSessionIncremental and tailFingerprint in
+	// provider.go.
+	//
+	// Empty (the default for entries indexed before this field existed)
+	// means "no fingerprint to verify against" and, like a zero
+	// SourceOffset, forces a full re-parse on the next update — a one-time
+	// migration cost per session that also backfills the hash for
+	// subsequent cycles.
+	SourceTailHash string `json:"source_tail_hash,omitempty"`
+
 	// Identity is the operator identity extracted from the JSONL (e.g. "example-user").
 	// Populated from userType/sessionId/cwd fields present in the records.
 	Identity string `json:"identity,omitempty"`

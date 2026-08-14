@@ -664,6 +664,29 @@ func (idx *Index) GetTurn(sessionID string, turnIndex int) (Turn, bool) {
 	return turns[turnIndex], true
 }
 
+// SessionTurns returns a copy of the full, in-order turns slice currently
+// indexed for sessionID, or nil if the session is not indexed. Used by
+// ApplyPlan's incremental-parse path (issue #558) to seed the
+// already-indexed prefix of a session before appending newly parsed tail
+// turns, without re-reading the turns projection file from disk (idx.turns
+// is this process's live in-memory copy, kept in sync with disk by
+// Load/UpsertSession(s)).
+//
+// Returns a copy so callers can freely append to it without racing a
+// concurrent Load/UpsertSession mutation of the index's own slice.
+func (idx *Index) SessionTurns(sessionID string) []Turn {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	turns, ok := idx.turns[sessionID]
+	if !ok {
+		return nil
+	}
+	out := make([]Turn, len(turns))
+	copy(out, turns)
+	return out
+}
+
 // Search performs a case-insensitive multi-term search over all indexed turns.
 //
 // Query parsing rules:
@@ -1066,6 +1089,15 @@ func (idx *Index) turnsLockPath(sessionID string) string {
 // parse error it deletes the session from the in-memory map rather than
 // surfacing a partial result) — a stronger data-loss outcome than #449's
 // "last writer wins on one field".
+//
+// Cost note (issue #558): this always marshals and rewrites the ENTIRE
+// turns list, not just what changed. provider.go's indexSessionIncremental
+// made the parse side of a reconcile cycle O(delta) for an actively-growing
+// session, but every UpsertSessions call still round-trips through here for
+// its full turns slice, so the write side of a cycle with any new turns
+// remains O(session-size) — unaddressed by that change. A large,
+// steadily-growing session can still cost close to its full projection
+// size per cycle on the write path alone.
 func (idx *Index) writeTurnsFileLocked(sessionID string, turns []Turn) error {
 	b, err := json.MarshalIndent(turns, "", "  ")
 	if err != nil {
