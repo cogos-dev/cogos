@@ -10,6 +10,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/myrgic/cogos/pkg/substrate/reconcile"
@@ -43,7 +46,7 @@ func TestProbeModelStateEntry_LoadingIsProgressingNotError(t *testing.T) {
 	// NOT a Degraded-inducing error — a high-context load can take minutes.
 	srv := msModelsServer(t, msRow{ID: "target", State: "loading", Ctx: nil})
 	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
-	progressing, err := probeModelStateEntry(context.Background(), e)
+	progressing, _, err := probeModelStateEntry(context.Background(), e)
 	if err != nil {
 		t.Fatalf("loading must not be an error, got %v", err)
 	}
@@ -59,7 +62,7 @@ func TestProbeModelStateEntry_PrefersLoadedOverDuplicate(t *testing.T) {
 		msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)},
 	)
 	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
-	progressing, err := probeModelStateEntry(context.Background(), e)
+	progressing, _, err := probeModelStateEntry(context.Background(), e)
 	if err != nil {
 		t.Fatalf("loaded duplicate must satisfy the probe, got %v", err)
 	}
@@ -71,8 +74,293 @@ func TestProbeModelStateEntry_PrefersLoadedOverDuplicate(t *testing.T) {
 func TestProbeModelStateEntry_WrongContextIsError(t *testing.T) {
 	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(65536)})
 	e := modelStateEntry{name: "b", endpoint: srv.URL, model: "target", contextLength: 262144}
-	if _, err := probeModelStateEntry(context.Background(), e); err == nil {
+	if _, _, err := probeModelStateEntry(context.Background(), e); err == nil {
 		t.Fatalf("wrong loaded context must be an error")
+	}
+}
+
+// ── probeModelStateEntry: parallel drift (local-only, checkParallelDrift) ───────
+
+// writeFakeLmsPs writes a shell script standing in for `lms ps --json`.
+func writeFakeLmsPs(t *testing.T, body string, exitNonZero bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n"
+	if exitNonZero {
+		script += "echo boom >&2\nexit 1\n"
+	} else {
+		script += "cat <<'EOF'\n" + body + "\nEOF\n"
+	}
+	path := filepath.Join(dir, "lms")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake lms CLI: %v", err)
+	}
+	return path
+}
+
+func TestProbeModelStateEntry_ParallelMismatchIsError(t *testing.T) {
+	// The error return here folds into Health()'s existing (progressing, err)
+	// issues aggregation exactly like the context-length check above — no
+	// separate aggregation path was added, so this covers that contract.
+	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)})
+	e := modelStateEntry{
+		name: "b", endpoint: srv.URL, model: "target", contextLength: 262144,
+		parallel: 1, local: true,
+		lmsCLIPath: writeFakeLmsPs(t, `[{"identifier":"target","parallel":4}]`, false),
+	}
+	_, _, err := probeModelStateEntry(context.Background(), e)
+	if err == nil {
+		t.Fatal("expected an error on observed parallel mismatch")
+	}
+	if !strings.Contains(err.Error(), "parallel") {
+		t.Errorf("expected 'parallel' in the error message, got %q", err.Error())
+	}
+}
+
+func TestProbeModelStateEntry_ParallelSkippedOnRemote(t *testing.T) {
+	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)})
+	// Point lmsCLIPath at a script that would fail loudly (non-empty stdout
+	// asserting a mismatch) if ever invoked — local:false must never shell out.
+	e := modelStateEntry{
+		name: "b", endpoint: srv.URL, model: "target", contextLength: 262144,
+		parallel: 1, local: false,
+		lmsCLIPath: writeFakeLmsPs(t, `[{"identifier":"target","parallel":99}]`, false),
+	}
+	progressing, gapNote, err := probeModelStateEntry(context.Background(), e)
+	if err != nil {
+		t.Fatalf("remote entry must skip the parallel probe entirely, got error: %v", err)
+	}
+	if progressing {
+		t.Fatal("expected progressing=false for a loaded, non-progressing entry")
+	}
+	if gapNote == "" {
+		t.Error("expected a gap note for a declared parallel target on a remote backend")
+	}
+}
+
+func TestProbeModelStateEntry_ParallelProbeFailureNonFatal(t *testing.T) {
+	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)})
+	e := modelStateEntry{
+		name: "b", endpoint: srv.URL, model: "target", contextLength: 262144,
+		parallel: 1, local: true,
+		lmsCLIPath: writeFakeLmsPs(t, "", true), // exits non-zero
+	}
+	progressing, gapNote, err := probeModelStateEntry(context.Background(), e)
+	if err != nil {
+		t.Fatalf("a failed lms CLI probe must be non-fatal (unobserved, not wrong), got: %v", err)
+	}
+	if progressing {
+		t.Fatal("expected progressing=false")
+	}
+	if gapNote == "" {
+		t.Error("expected a gap note when the local parallel probe produces no observation")
+	}
+}
+
+// TestCheckParallelDrift_DuplicateInstanceMatching reproduces the reviewer's
+// scenario A: `lms ps` lists a duplicate instance's row ("target:2", loaded at
+// parallel 4) BEFORE the exact-id row ("target", loaded at parallel 1) in its
+// own array order. The declared target is parallel 1 against loadedID
+// "target". The old first-satisfying-row-in-array-order matching picked
+// "target:2" (a prefix match) purely because of array position, reporting a
+// false mismatch (parallel 4, want 1) against live state that is actually
+// correct. Exact-id-match-first must find "target" regardless of array order.
+func TestCheckParallelDrift_DuplicateInstanceMatching(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"target:2","parallel":4},{"identifier":"target","parallel":1}]`, false)
+	e := modelStateEntry{name: "b", model: "target", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "target")
+	if !observed {
+		t.Fatal("expected observed=true — an exact-id row is present")
+	}
+	if err != nil {
+		t.Fatalf("exact-id match must resolve to the correct row (parallel 1, matches target) and report Healthy, got: %v", err)
+	}
+}
+
+// TestCheckParallelDrift_DuplicateInstanceMatching_RealMismatch is the mirror
+// case: the exact-id row genuinely IS at the wrong parallel, with a
+// non-matching duplicate ordered first. The fix must not swallow a real
+// mismatch just because it now prefers exact matches.
+func TestCheckParallelDrift_DuplicateInstanceMatching_RealMismatch(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"target:2","parallel":1},{"identifier":"target","parallel":4}]`, false)
+	e := modelStateEntry{name: "b", model: "target", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "target")
+	if !observed {
+		t.Fatal("expected observed=true")
+	}
+	if err == nil {
+		t.Fatal("expected a mismatch error — the exact-id row is genuinely at parallel 4, want 1")
+	}
+	if !strings.Contains(err.Error(), "parallel 4") {
+		t.Errorf("expected the error to cite the exact-id row's parallel (4), got %q", err.Error())
+	}
+}
+
+// TestCheckParallelDrift_PrefixSiblingModel reproduces the reviewer's scenario
+// B: a prefix-sibling model ("qwen3-coder-30b", parallel 8) is loaded and
+// listed BEFORE the declared model's own row ("qwen3", parallel 1) in `lms ps`
+// array order. The old broad prefix-either-direction predicate matched the
+// sibling first purely by array position; exact-match-first must resolve to
+// "qwen3" itself since an exact match exists.
+func TestCheckParallelDrift_PrefixSiblingModel(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"qwen3-coder-30b","parallel":8},{"identifier":"qwen3","parallel":1}]`, false)
+	e := modelStateEntry{name: "b", model: "qwen3", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "qwen3")
+	if !observed {
+		t.Fatal("expected observed=true — an exact-id row is present")
+	}
+	if err != nil {
+		t.Fatalf("exact-id match must resolve to \"qwen3\" (parallel 1) and report Healthy, not the sibling \"qwen3-coder-30b\", got: %v", err)
+	}
+}
+
+// TestCheckParallelDrift_PrefixFallbackWhenNoExactMatch covers the case the
+// prefix fallback still needs to handle: no row has the exact declared id
+// (e.g. the loaded row's id itself carries a quant-suffix difference from the
+// declared model — "target-q4" vs "target"), so the fallback must still find
+// it rather than reporting unobserved.
+func TestCheckParallelDrift_PrefixFallbackWhenNoExactMatch(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"target-q4","parallel":1}]`, false)
+	e := modelStateEntry{name: "b", model: "target", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "target")
+	if !observed {
+		t.Fatal("expected observed=true via the prefix fallback")
+	}
+	if err != nil {
+		t.Fatalf("expected the prefix-matched row to report Healthy, got: %v", err)
+	}
+}
+
+// TestCheckParallelDrift_ExactTierOrderDependence ports the third-round
+// reviewer's TestRR3_D_ExactTierOrderDependence scenario: e.model="qwen3",
+// loadedID="qwen3-30b" (the prefix-matched loaded row from /api/v0/models —
+// loadedID != e.model), and two exact-id rows are both present in `lms ps`:
+// one named "qwen3" (matches e.model, parallel 8) and one named "qwen3-30b"
+// (matches loadedID, the actually-loaded instance, parallel 1). The single
+// OR-combined pass picked whichever row came first in array order, so the
+// daemon would sometimes report a false mismatch against the sibling's
+// parallel value instead of the live row's own value. loadedID must win
+// regardless of array order, since it identifies the row that IS the loaded
+// instance.
+func TestCheckParallelDrift_ExactTierOrderDependence(t *testing.T) {
+	e := modelStateEntry{name: "b", model: "qwen3", parallel: 1, local: true}
+
+	t.Run("loadedID row first", func(t *testing.T) {
+		lmsCLI := writeFakeLmsPs(t, `[{"identifier":"qwen3-30b","parallel":1},{"identifier":"qwen3","parallel":8}]`, false)
+		e := e
+		e.lmsCLIPath = lmsCLI
+		observed, err := checkParallelDrift(context.Background(), e, "qwen3-30b")
+		if !observed {
+			t.Fatal("expected observed=true")
+		}
+		if err != nil {
+			t.Fatalf("loadedID's own row (parallel 1) must win — got: %v", err)
+		}
+	})
+
+	t.Run("loadedID row last", func(t *testing.T) {
+		lmsCLI := writeFakeLmsPs(t, `[{"identifier":"qwen3","parallel":8},{"identifier":"qwen3-30b","parallel":1}]`, false)
+		e := e
+		e.lmsCLIPath = lmsCLI
+		observed, err := checkParallelDrift(context.Background(), e, "qwen3-30b")
+		if !observed {
+			t.Fatal("expected observed=true")
+		}
+		if err != nil {
+			t.Fatalf("loadedID's own row (parallel 1) must win regardless of array order — got: %v", err)
+		}
+	})
+}
+
+func TestProbeModelStateEntry_ParallelUnsetSkipsProbeEntirely(t *testing.T) {
+	// parallel==0 must skip the check even when local — no CLI invocation needed.
+	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)})
+	e := modelStateEntry{
+		name: "b", endpoint: srv.URL, model: "target", contextLength: 262144,
+		parallel: 0, local: true,
+		lmsCLIPath: writeFakeLmsPs(t, `[{"identifier":"target","parallel":99}]`, false),
+	}
+	_, gapNote, err := probeModelStateEntry(context.Background(), e)
+	if err != nil {
+		t.Fatalf("parallel==0 must not trigger a mismatch, got: %v", err)
+	}
+	if gapNote != "" {
+		t.Errorf("parallel==0 must not produce a gap note either, got %q", gapNote)
+	}
+}
+
+// ── healthIssuesMessage: gapNotes must not be discarded on the issues path ──────
+
+func TestHealthIssuesMessage_GapNotesSurviveAlongsideIssues(t *testing.T) {
+	// Two managed backends in one Health() cycle: A is unreachable (an issue),
+	// B's parallel watch is dead (a gap note, no issue of its own). The old
+	// code returned early on len(issues)>0 and discarded gapNotes entirely, so
+	// B's coverage gap was invisible for exactly as long as A was also loud.
+	got := healthIssuesMessage(
+		[]string{"backend-a: unreachable: dial tcp: connection refused"},
+		[]string{"backend-b: parallel target declared but not observed — lms ps probe failed, lms CLI missing, or no matching row"},
+	)
+	if !strings.Contains(got, "backend-a") {
+		t.Errorf("expected the issue to survive, got %q", got)
+	}
+	if !strings.Contains(got, "backend-b") {
+		t.Errorf("expected the gap note to survive alongside the issue, got %q", got)
+	}
+}
+
+func TestHealthIssuesMessage_NoGapNotes(t *testing.T) {
+	got := healthIssuesMessage([]string{"backend-a: unreachable"}, nil)
+	if got != "backend-a: unreachable" {
+		t.Errorf("got %q; want no trailing separator when there are no gap notes", got)
+	}
+}
+
+// ── isLocalHostEndpoint ──────────────────────────────────────────────────────────
+
+func TestIsLocalHostEndpoint(t *testing.T) {
+	cases := map[string]bool{
+		"":                           true,
+		"http://localhost:1234":      true,
+		"http://LOCALHOST:1234":      true, // case-insensitive — a config typo must not silently disable the parallel watch
+		"http://127.0.0.1:1234":      true,
+		"http://192.168.10.191:1234": false,
+		"https://eclipse.local:1234": false,
+		// Bracketed IPv6 literals: the naive strings.LastIndex(host, ":") port
+		// strip cuts INSIDE the brackets on a literal with no port suffix
+		// ("[::1]" → "[:", a miss), and only works on "[::1]:1234" by
+		// accident (LastIndex happens to land on the port-separator colon).
+		"http://[::1]":      true,
+		"http://[::1]/v1":   true,
+		"http://[::1]:1234": true,
+	}
+	for endpoint, want := range cases {
+		if got := isLocalHostEndpoint(endpoint); got != want {
+			t.Errorf("isLocalHostEndpoint(%q) = %v, want %v", endpoint, got, want)
+		}
+	}
+}
+
+// ── parseModelStateEntriesFromYAML: parallel field ──────────────────────────────
+
+func TestParseModelStateEntries_ParallelField(t *testing.T) {
+	t.Parallel()
+	yaml := `providers:
+  local:
+    type: lmstudio
+    endpoint: http://localhost:1234
+    options:
+      model_state:
+        manage: true
+        model: ornith-1.0-35b
+        context_length: 262144
+        parallel: 1
+`
+	got := parseModelStateEntriesFromYAML([]byte(yaml))
+	if len(got) != 1 {
+		t.Fatalf("got %d; want 1", len(got))
+	}
+	if got[0].parallel != 1 {
+		t.Errorf("parallel: got %d; want 1", got[0].parallel)
 	}
 }
 

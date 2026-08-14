@@ -43,6 +43,64 @@ value. The decoder uses a `*int` pointer so a missing field never shadows a real
 one, and row-matching prefers a `state=="loaded"` row over a not-loaded
 duplicate of the same id.
 
+### `parallel` drift is watched too, but observed differently (issue #555)
+
+`GET /api/v0/models` does **not** expose `parallel` — confirmed live against
+Darkstar's `:1234` instance, it is simply absent from the response. The value
+*is* exposed by the local `lms` CLI's `lms ps --json` (confirmed live:
+`{"identifier":"ornith-1.0-35b",...,"parallel":1}`), which is a **local-only**
+command — `lms ps --help` shows no `--host` flag, the same LM-Link-gated
+local/remote asymmetry §3 already documents for the actuator's `lms load` fast
+path. So `parallel` drift is only observable on local backends; on a remote
+backend (e.g. Eclipse) a declared `parallel` target cannot be checked through
+this mechanism at all — the reconciler says so explicitly in its `Health()`
+message rather than silently reporting Healthy on context alone. The same gap
+note fires when a *local* backend's probe itself fails to observe anything
+(missing/renamed CLI, timeout, no matching `lms ps` row) — an unwatched
+`parallel` dimension must never present as clean coverage either.
+
+`ComputePlan` emits a dedicated `<name>/parallel` action for a parallel-only
+mismatch (context otherwise fine) — remediated the same way as `<name>/context`
+(unload+reload; LM Studio has no live resize for either dimension), and
+**local-only**: the `@lmstudio/sdk` load config used for the remote/websocket
+actuator genuinely has no per-load parallelism knob (§3's `lms-actuator` does
+not accept or forward it), but the **local** `lms load` CLI fast-path does —
+confirmed live via `lms load --help` (`--parallel <count>`). On a remote
+backend the dimension remains alarm-only, since `parallelMismatch` can never
+fire there in the first place (`Parallel` is only ever populated by the local
+`lms ps --json` probe). Because the local fast-path is also what executes the
+`<name>/context` action's unload+reload, that action now threads the declared
+`parallel` target into every `lms load` it issues, context-triggered reloads
+included — otherwise a context remediation would drop parallelism back to LM
+Studio's app default and manufacture a fresh `parallel` mismatch behind the
+context fix.
+
+`<name>/parallel` re-emission is dampened: `ComputePlan` will not issue a
+second `<name>/parallel` action for the same target against an *unchanged*
+observed parallel value — it fires once, and only fires again once
+`FetchLive`'s next probe reports a *different* observed value (converged,
+still wrong but freshly so, or moved by other means), or once the target row
+converges (loaded at the declared parallelism), at which point `ComputePlan`
+clears the record outright so a later re-drift to the same observed value
+fires a fresh action rather than being shadowed by the pre-convergence
+record. This exists because a non-converging observed value (LM Studio
+clamping or rounding the request, or the reload simply not taking effect)
+would otherwise unload and reload the model on every autonomic tick forever.
+
+The round trip `lms load --parallel N` → `lms ps --json` reporting exactly
+`N` back was verified live on Darkstar 2026-08-14 against `ornith-1.0-35b`:
+`--parallel 2` landed as `"parallel": 2`, restoring `--parallel 1` landed as
+`"parallel": 1`, context length held at 262144 across both reloads, and warm
+reloads took roughly 12s. The dampening gate is kept regardless, as
+defense-in-depth for other backends and LM Studio versions where the round
+trip may not hold.
+
+The dampening state is process-local and non-persistent — it lives on the
+provider instance, not in `reconcile.State`, and a fresh provider is
+constructed on every router rebuild (including a kernel restart), so the gate
+resets to unarmed. Worst case that costs one extra unload+reload after a
+rebuild, not a thrash loop.
+
 ## Decision
 
 Introduce a new reconcile type, `lms-model-state`, that manages the
@@ -88,7 +146,16 @@ backend.
 | target `state=="loading"` | Unknown | Progressing | Waiting |
 | target absent / not-loaded | OutOfSync | Missing | Idle |
 | loaded at wrong context | OutOfSync | Degraded | Idle |
+| loaded, `parallel≠target` (local only) | OutOfSync | Degraded | Idle |
 | loaded at target context | Synced | Healthy | Idle |
+
+Context is checked before `parallel`, so if both are simultaneously wrong only
+the context mismatch is reported that cycle — a known, accepted simplification
+(see issue #555), not a full multi-dimensional drift report. A `parallel`
+target declared against a **remote** backend never triggers the Degraded row
+above (it cannot be observed there); instead the Healthy/Degraded message gets
+an appended note that the parallel target isn't observable via `lms ps`, so the
+gap stays visible instead of presenting as full coverage.
 
 The deliberate call: an **unreachable** backend maps to **Suspended, not
 Degraded**. A box that is simply off or off-LAN is not something the self-heal

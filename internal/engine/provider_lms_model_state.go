@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +63,11 @@ const lmsFetchTimeout = 4 * time.Second
 // lmsApplyTimeout bounds a single actuator invocation in ApplyPlan.
 const lmsApplyTimeout = 180 * time.Second
 
+// lmsPsProbeTimeout bounds the `lms ps --json` parallel probe in FetchLive.
+// This is deliberately its own (short) budget rather than sharing lmsFetchTimeout
+// — a hung lms CLI must not eat the whole /api/v0/models probe window.
+const lmsPsProbeTimeout = 3 * time.Second
+
 // lmsActuatorTokenEnv is the environment variable the Node actuator reads for
 // its Bearer token. ApplyPlan sets it from the provider's cached token; it is
 // never passed on argv.
@@ -74,7 +80,7 @@ type lmsModelStateConfig struct {
 	Manage        bool   // opt-in switch; false ⇒ Suspended, empty plan
 	Model         string // target model id that should be loaded
 	ContextLength int    // desired loaded_context_length (0 ⇒ don't manage context)
-	Parallel      int    // advisory metadata only, reported in BuildState — NOT actuated (LM Studio SDK load config has no per-load parallelism knob; parallelism is a server/JIT setting)
+	Parallel      int    // watched for drift on all backends; observed only on local backends via `lms ps --json` (see probeParallelLocal). On a local backend, parallel-only drift IS remediated by ComputePlan's own "/parallel" action (unload+reload via the "set-context" verb, threading `lms load --parallel` — see buildActuatorCmd); on a remote backend it remains alarm-only, since the @lmstudio/sdk load config has no per-load parallelism knob.
 	KeepWarm      bool   // hint: keep loaded even when idle (advisory metadata)
 	JITEvict      bool   // if true, unload a non-target model that crowds the card
 }
@@ -90,6 +96,29 @@ type lmsModelRow struct {
 	LoadedContextLength *int   `json:"loaded_context_length,omitempty"`
 	MaxContextLength    int    `json:"max_context_length,omitempty"`
 	Type                string `json:"type,omitempty"`
+
+	// Parallel is NOT part of the /api/v0/models response — LM Studio does not
+	// expose it there (confirmed live against Darkstar's :1234). It is merged in
+	// after the fact, on local backends only, from `lms ps --json` (see
+	// probeParallelLocal). nil ⇒ unobserved (remote backend, or the CLI probe
+	// failed) — never treated as a mismatch; distinct from an observed 0.
+	Parallel *int `json:"-"`
+}
+
+// lmsPsRow is one entry from `lms ps --json` (the local-only lms CLI, no --host
+// flag — same LM-Link-gated local/remote asymmetry the actuator's fast-path
+// already documents). Confirmed live shape:
+// {"identifier":"ornith-1.0-35b",...,"parallel":1}.
+//
+// Parallel is a pointer for the same reason lmsModelRow.LoadedContextLength is:
+// an older lms CLI (or any future shape change) that omits the `parallel` key
+// must decode to nil (unobserved), never to the Go zero value 0 — a bare int
+// would silently promote "key absent" into "observed 0" and falsely alarm a
+// correctly-loaded backend.
+type lmsPsRow struct {
+	Identifier string `json:"identifier"`
+	ModelKey   string `json:"modelKey"`
+	Parallel   *int   `json:"parallel"`
 }
 
 // lmsModelsResponse is the /api/v0/models envelope.
@@ -126,6 +155,41 @@ type LMSModelStateProvider struct {
 	lastLive   []lmsModelRow
 	lastProbed time.Time
 	lastErr    error // last FetchLive error (unreachable ⇒ Suspended)
+
+	// --- parallel-action dampening (SAFETY, cogos#555 round 3) ---
+	// Written by recordParallelAction, called from ApplyPlan immediately
+	// before it invokes the actuator for a "/parallel" action — regardless of
+	// whether that invocation later succeeds or fails. Read by
+	// parallelActionDamped, called from ComputePlan before it would otherwise
+	// emit a new "/parallel" action. Together these make the actuator
+	// single-shot per *observed value*: once a "/parallel" action has run for
+	// a target against a given observed parallel, ComputePlan will not emit
+	// another one for that same target until FetchLive reports a DIFFERENT
+	// observed value — whether or not LM Studio actually honored the
+	// requested --parallel exactly. Without this, a non-converging observed
+	// value (LM Studio clamping or rounding the request, or the reload
+	// simply not taking effect) would otherwise unload+reload the model on
+	// every autonomic tick forever. ComputePlan also clears this record
+	// outright once the target row converges (loaded at the declared
+	// parallelism), so a later re-drift to the SAME observed value is not
+	// shadowed by a stale record from before convergence — see
+	// clearParallelDampening. All three fields guarded by mu.
+	//
+	// This state is process-local and non-persistent: it is not written into
+	// reconcile.State via BuildState, and maybeRegisterModelStateReconciler
+	// constructs a fresh LMSModelStateProvider on every BuildRouter call, so
+	// any router rebuild or kernel restart resets the gate to unarmed. Worst
+	// case that costs one extra unload+reload after a rebuild — not a thrash
+	// loop. The `cogos reconcile` CLI's --dry-run path can still arm or clear
+	// this gate: recordParallelAction only runs from ApplyPlan (which
+	// --dry-run skips), but clearParallelDampening runs from ComputePlan,
+	// which the CLI's dry-run path does execute. That is safe not because
+	// dry-run is inert here but because the CLI is a separate OS process
+	// with its own LMSModelStateProvider instance — a dry-run preview can
+	// only ever touch its own process-local gate, never the daemon's.
+	lastParallelAttempted bool   // has any "/parallel" action ever been attempted?
+	lastParallelTarget    string // target.Model at the time of that attempt
+	lastParallelObserved  string // parallelStr(targetRow.Parallel) at that time
 
 	// --- reconcile metadata ---
 	workspaceRoot string
@@ -241,6 +305,24 @@ func (p *LMSModelStateProvider) LoadConfig(root string) (any, error) {
 func (p *LMSModelStateProvider) FetchLive(ctx context.Context, _ any) (any, error) {
 	rows, err := p.probeModels(ctx)
 
+	// Merge the local-only `lms ps --json` parallel probe. A probe failure here
+	// (binary missing, non-zero exit, bad JSON) is NON-FATAL — it must not fail
+	// the whole FetchLive or affect Health beyond leaving Parallel nil
+	// (unobserved, not wrong), mirroring how a missing loaded_context_length is
+	// treated as unknown rather than a mismatch.
+	//
+	// Gated on p.target.Parallel > 0 (mirrors the daemon copy's
+	// `e.parallel > 0 && e.local` gate): without a declared parallel target
+	// there is nothing to compare against, so every local backend — including
+	// the many that have never heard of `parallel:` — would otherwise pay a
+	// ~150-300ms fork/exec of the lms binary on every FetchLive cycle for no
+	// observational benefit.
+	if err == nil && p.local && p.target.Parallel > 0 {
+		if parallel, perr := p.probeParallelLocal(ctx); perr == nil {
+			mergeParallel(rows, parallel)
+		}
+	}
+
 	p.mu.Lock()
 	p.lastProbed = time.Now()
 	p.lastErr = err
@@ -289,15 +371,105 @@ func (p *LMSModelStateProvider) probeModels(ctx context.Context) ([]lmsModelRow,
 	return out.Data, nil
 }
 
+// probeParallelLocal shells out to `lms ps --json` (the local-only lms CLI —
+// confirmed no --host flag, so it cannot reach a remote instance; the same
+// LM-Link-gated asymmetry the actuator's fast-path already documents) and
+// returns a map of model identifier -> observed parallel value. Callers must
+// gate this behind p.local; it is only meaningful against the local instance.
+func (p *LMSModelStateProvider) probeParallelLocal(ctx context.Context) (map[string]int, error) {
+	if !p.local || p.lmsCLI == "" || !statOK(p.lmsCLI) {
+		return nil, fmt.Errorf("lms-model-state %q: lms CLI fast-path unavailable for parallel probe", p.name)
+	}
+
+	psCtx, cancel := context.WithTimeout(ctx, lmsPsProbeTimeout)
+	defer cancel()
+
+	out, err := exec.CommandContext(psCtx, p.lmsCLI, "ps", "--json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("lms-model-state %q: lms ps --json: %w", p.name, err)
+	}
+
+	var rows []lmsPsRow
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil, fmt.Errorf("lms-model-state %q: decode lms ps --json: %w", p.name, err)
+	}
+
+	result := make(map[string]int, len(rows))
+	for _, r := range rows {
+		id := r.Identifier
+		if id == "" {
+			id = r.ModelKey
+		}
+		if id == "" {
+			continue
+		}
+		if r.Parallel == nil {
+			// `parallel` key omitted (older lms CLI, or a future shape change) —
+			// unobserved, never treated as an observed 0.
+			continue
+		}
+		result[id] = *r.Parallel
+	}
+	return result, nil
+}
+
+// mergeParallel copies observed parallel values from an `lms ps --json` probe
+// into the matching /api/v0/models rows. Rows with no match are left with a
+// nil Parallel (unobserved).
+//
+// Matching is deterministic in two ways that matter when the same base model
+// is loaded twice (LM Studio suffixes the second instance, e.g.
+// "ornith-1.0-35b" and "ornith-1.0-35b:2") or when one model id is a prefix
+// of another:
+//  1. An exact identifier match is always preferred over a prefix match.
+//  2. The prefix-either-direction fallback (same rule as findModelRow: quant
+//     suffixes, publisher prefixes) iterates a SORTED slice of keys rather
+//     than ranging the map directly — Go randomizes map iteration order, so
+//     ranging the map would let the attached value change from cycle to
+//     cycle on identical live state, flapping Health between Healthy and
+//     Degraded.
+func mergeParallel(rows []lmsModelRow, parallel map[string]int) {
+	if len(parallel) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(parallel))
+	for id := range parallel {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+
+	for i := range rows {
+		if val, ok := parallel[rows[i].ID]; ok {
+			v := val
+			rows[i].Parallel = &v
+			continue
+		}
+		for _, id := range keys {
+			if modelIDMatch(rows[i].ID, id) {
+				v := parallel[id]
+				rows[i].Parallel = &v
+				break
+			}
+		}
+	}
+}
+
 // ComputePlan diffs the declared target against the live rows and emits
 // Update-typed actions distinguished by a Name suffix:
 //
-//	<name>/load    — target model not loaded
-//	<name>/context — loaded but at the wrong context (unload+reload; no live resize)
-//	<name>/unload  — jit_evict only: a non-target model is loaded and crowds the card
+//	<name>/load     — target model not loaded
+//	<name>/context  — loaded but at the wrong context (unload+reload; no live resize)
+//	<name>/parallel — loaded but at the wrong parallel (unload+reload; local fast-path
+//	                  only — see parallelMismatch); dampened by parallelActionDamped so
+//	                  it fires at most once per observed value (see the provider
+//	                  struct's dampening fields)
+//	<name>/unload   — jit_evict only: a non-target model is loaded and crowds the card
 //
-// An empty plan (Synced) means: the target row exists, state=="loaded", and
-// loaded_context_length matches the target (or no context is being managed).
+// An empty plan (Synced) means: the target row exists, state=="loaded",
+// loaded_context_length matches the target (or no context is being managed),
+// and loaded parallel matches the target (or parallel isn't declared, isn't
+// observable, or a "/parallel" action for the current observed value has
+// already been dampened — see parallelActionDamped).
 func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.State) (*reconcile.Plan, error) {
 	target := p.resolveTarget(config)
 	plan := &reconcile.Plan{ResourceType: lmsModelStateType}
@@ -325,6 +497,30 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 	// from ever finishing loading.
 	if targetRow != nil && targetRow.State == "loading" {
 		return plan, nil
+	}
+
+	// Re-arm the dampening gate on convergence. Once the target row is
+	// OBSERVED loaded at the declared parallelism, any previously-recorded
+	// "/parallel" attempt is stale — the drift it was damping against has
+	// resolved. Without this, a converge-then-re-drift-to-the-SAME-value
+	// sequence (e.g. target=1, observed 4 -> action -> observed 1
+	// (converged) -> observed 4 again, the LM Studio app default) would find
+	// parallelActionDamped still true for (model, "4") from before
+	// convergence and permanently suppress the action, leaving the
+	// reconciler Degraded/OutOfSync with an empty plan forever. Clearing
+	// here means the gate only ever damps a *live*, unresolved drift, never
+	// a resolved one that has recurred.
+	//
+	// The convergence check requires a genuinely observed match, not merely
+	// the absence of a mismatch: !parallelMismatch is also true when
+	// targetRow.Parallel is nil (unobserved — the `lms ps --json` probe
+	// failed, see FetchLive) or when targetRow.State == "not-loaded". Both
+	// are silence, not convergence, and must not clear the gate — doing so
+	// re-enters the exact thrash this gate exists to close on the very next
+	// probe failure or not-loaded tick.
+	if target.Parallel > 0 && targetRow != nil &&
+		targetRow.State == "loaded" && targetRow.Parallel != nil && *targetRow.Parallel == target.Parallel {
+		p.clearParallelDampening()
 	}
 
 	// jit_evict FIRST: any eviction must precede the load so VRAM is actually
@@ -376,6 +572,78 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 			},
 		})
 		plan.Summary.Updates++
+
+	// Wrong parallel, context otherwise fine ⇒ unload+reload at the declared
+	// parallelism. Local-only: parallelMismatch is defined to never fire when
+	// targetRow.Parallel is nil, and Parallel is only ever populated by the
+	// local `lms ps --json` probe (see FetchLive's p.local gate) — so this
+	// case is naturally a no-op on a remote backend, matching the SDK
+	// actuator's inability to set parallelism (see buildActuatorCmd's remote
+	// branch). If context is ALSO mismatched, the case above already fires
+	// first and its reload carries the correct parallel value too (see
+	// buildActuatorCmd's unconditional --parallel on every local reload) —
+	// this case only needs to handle parallel-only drift. Without this,
+	// parallel drift pinned the resource permanently Degraded/OutOfSync with
+	// an empty plan, which re-triggered the LLM escalation path on every
+	// autonomic tick (shouldEscalate → escalateDegradedHealth) with nothing
+	// the deterministic self-heal could ever do about it.
+	//
+	// NOTE on the dampened terminal state: once parallelActionDamped suppresses
+	// re-emission for a non-converging observed value, this case is back to an
+	// empty plan while Health() (independent of the gate) still reports
+	// Degraded/OutOfSync — the exact state this comment says the action exists
+	// to avoid. That's accepted as a bounded, intentional trade: escalation is
+	// throttled to roughly once per idle-recheckin window by the
+	// stable-degradation fingerprint dedupe in local_agent_harness.go, not
+	// re-fired every tick, and the gate re-arms on convergence (see the
+	// clearParallelDampening call above the jit_evict section) so the terminal
+	// state only persists while the drift is genuinely unresolved.
+	case target.Parallel > 0 && parallelMismatch(targetRow, target.Parallel):
+		observed := parallelStr(targetRow.Parallel)
+
+		// SAFETY (cogos#555 round 3): don't re-emit the action against an
+		// observed value it has already been tried against. See the
+		// dampening fields' doc comment on the provider struct — this makes
+		// the actuator single-shot per observation regardless of whether the
+		// resulting reload actually moves the observed parallel value. The
+		// live round trip (`lms load --parallel N` -> `lms ps --json`
+		// reporting N) was verified on Darkstar 2026-08-14: parallel 2 and
+		// parallel 1 both landed exactly as requested, context preserved,
+		// warm reloads ~12s. Once FetchLive reports a DIFFERENT observed
+		// value — converged, still wrong but freshly so, or changed by other
+		// means — the gate lifts and a fresh attempt is allowed; and once the
+		// target row converges, ComputePlan clears the gate outright (see the
+		// re-arm block above the jit_evict section) so a later re-drift to
+		// the same value isn't shadowed by a stale record.
+		if p.parallelActionDamped(target.Model, observed) {
+			break
+		}
+
+		ctxLen := target.ContextLength
+		if ctxLen == 0 && targetRow.LoadedContextLength != nil {
+			// Context is not being managed (target.ContextLength == 0) —
+			// carry the observed live value into the reload instead of
+			// leaving it unset. Without this, ApplyPlan/buildActuatorCmd
+			// omit --context-length whenever ctxLen == 0, so this action's
+			// own unload+reload would silently drop the model back to LM
+			// Studio's default context — the first action in this provider
+			// that reloads a model whose context it isn't managing.
+			ctxLen = *targetRow.LoadedContextLength
+		}
+
+		plan.Actions = append(plan.Actions, reconcile.Action{
+			Action:       reconcile.ActionUpdate,
+			ResourceType: lmsModelStateType,
+			Name:         p.name + "/parallel",
+			Details: map[string]any{
+				"model":           target.Model,
+				"context_length":  ctxLen,
+				"parallel":        target.Parallel,
+				"loaded_parallel": observed,
+				"reason":          "loaded at wrong parallel — LM Studio has no live resize; unload+reload (local fast-path only)",
+			},
+		})
+		plan.Summary.Updates++
 	}
 
 	return plan, nil
@@ -401,6 +669,23 @@ func (p *LMSModelStateProvider) ApplyPlan(ctx context.Context, plan *reconcile.P
 			// No live resize: a context change is an unload+reload. The actuator
 			// performs both under the "set-context" verb.
 			op, model = "set-context", detailStr(action.Details, "model")
+		case strings.HasSuffix(action.Name, "/parallel"):
+			// No live resize for parallelism either: reuse "set-context" (unload
+			// then reload). buildActuatorCmd's local fast-path unconditionally
+			// threads --parallel from p.target.Parallel on every load/set-context,
+			// and this action's context_length detail preserves the previously
+			// correct context length across the reload (a bare reload with no
+			// context arg would fall back to LM Studio's default config).
+			op, model = "set-context", detailStr(action.Details, "model")
+			// SAFETY (cogos#555 round 3): record the observed value this
+			// action is reacting to BEFORE invoking the actuator, regardless
+			// of the outcome below — see the dampening fields' doc comment.
+			// This makes the actuator single-shot per observed value even
+			// when the invocation fails or when LM Studio doesn't honor
+			// --parallel exactly; a failed apply still gets its own retry
+			// governed by the autonomic ticker's healBackoff, not by
+			// re-emitting this same action every tick.
+			p.recordParallelAction(model, detailStr(action.Details, "loaded_parallel"))
 		case strings.HasSuffix(action.Name, "/unload"):
 			op, model = "unload", detailStr(action.Details, "model")
 		default:
@@ -486,6 +771,18 @@ func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model 
 		if ctxLen > 0 {
 			args = append(args, "--context-length", fmt.Sprintf("%d", ctxLen))
 		}
+		// Thread the declared parallel target on every local load/reload
+		// (confirmed live: `lms load --help` lists `--parallel <count>` on
+		// this CLI — unlike the SDK actuator below, the local fast-path does
+		// have a per-load parallelism knob). Without this, a context-triggered
+		// reload (unload+reload; LM Studio has no live resize) would come back
+		// at the app's default parallelism, manufacturing a fresh parallel
+		// mismatch behind the context fix. ComputePlan's "/parallel" action
+		// (see its doc comment) would clear that mismatch on a later tick, but
+		// only after an extra unload+reload cycle this line avoids entirely.
+		if p.target.Parallel > 0 {
+			args = append(args, "--parallel", fmt.Sprintf("%d", p.target.Parallel))
+		}
 		return exec.CommandContext(ctx, p.lmsCLI, args...), false, nil
 	}
 
@@ -510,11 +807,14 @@ func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model 
 	if ctxLen > 0 {
 		args = append(args, "--context-length", fmt.Sprintf("%d", ctxLen))
 	}
-	// NOTE: `parallel` is intentionally NOT threaded to the actuator. LM Studio's
-	// @lmstudio/sdk load config (v1.5.0) has no per-load parallelism knob —
-	// parallelism is a server/JIT setting, not a load-config field — so passing it
-	// would be a silent no-op. It remains a declared model_state field only for
-	// state reporting (BuildState attributes), not for actuation.
+	// NOTE: `parallel` is intentionally NOT threaded to the SDK actuator here.
+	// LM Studio's @lmstudio/sdk load config (v1.5.0) has no per-load parallelism
+	// knob — parallelism is a server/JIT setting, not a load-config field — so
+	// passing it would be a silent no-op. This is specific to the SDK/websocket
+	// path used for remote backends: the *local* `lms load` CLI fast-path above
+	// does have a `--parallel` flag and threads it. On this (remote) path,
+	// `parallel` remains a declared model_state field only for state reporting
+	// (BuildState attributes) and alarm messages, not for actuation.
 	return exec.CommandContext(ctx, p.nodeBin, args...), true, nil
 }
 
@@ -573,6 +873,7 @@ func (p *LMSModelStateProvider) BuildState(_ any, live any, existing *reconcile.
 		attrs["loaded_model"] = loaded.ID
 		attrs["loaded_context_length"] = ctxStr(loaded.LoadedContextLength)
 		attrs["max_context_length"] = loaded.MaxContextLength
+		attrs["observed_parallel"] = parallelStr(loaded.Parallel)
 	}
 
 	state.Resources = []reconcile.Resource{{
@@ -676,8 +977,22 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 			Sync:      reconcile.SyncStatusOutOfSync,
 			Health:    reconcile.HealthDegraded,
 			Operation: reconcile.OperationIdle,
-			Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s, want %d",
-				p.name, target.Model, ctxStr(targetRow.LoadedContextLength), target.ContextLength),
+			Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s, want %d%s",
+				p.name, target.Model, ctxStr(targetRow.LoadedContextLength), target.ContextLength,
+				parallelGapNote(target, p.local, targetRow.Parallel != nil)),
+		}
+	}
+
+	// Wrong parallel (local only — remediated by ComputePlan's "/parallel"
+	// action; see its doc comment) ⇒ Degraded/OutOfSync until the next
+	// self-heal cycle applies the reload.
+	if target.Parallel > 0 && p.local && parallelMismatch(targetRow, target.Parallel) {
+		return reconcile.ResourceStatus{
+			Sync:      reconcile.SyncStatusOutOfSync,
+			Health:    reconcile.HealthDegraded,
+			Operation: reconcile.OperationIdle,
+			Message: fmt.Sprintf("lms-model-state %q: %s loaded with parallel %s, want %d",
+				p.name, target.Model, parallelStr(targetRow.Parallel), target.Parallel),
 		}
 	}
 
@@ -686,8 +1001,8 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 		Sync:      reconcile.SyncStatusSynced,
 		Health:    reconcile.HealthHealthy,
 		Operation: reconcile.OperationIdle,
-		Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s",
-			p.name, target.Model, ctxStr(targetRow.LoadedContextLength)),
+		Message: fmt.Sprintf("lms-model-state %q: %s loaded at context %s%s",
+			p.name, target.Model, ctxStr(targetRow.LoadedContextLength), parallelGapNote(target, p.local, targetRow.Parallel != nil)),
 	}
 }
 
@@ -785,6 +1100,87 @@ func ctxStr(v *int) string {
 	return fmt.Sprintf("%d", *v)
 }
 
+// parallelMismatch reports whether a loaded row's observed parallel value
+// differs from target. A nil Parallel (unobserved — remote backend, or the
+// `lms ps --json` probe failed/found no match) is NOT a mismatch: we cannot
+// compare. Since Parallel is only ever populated on a local backend (see
+// probeParallelLocal's p.local gate), this also means the dimension is
+// alarm-only-and-never-actuated on remote backends specifically, while
+// ComputePlan's "/parallel" action remediates it on local ones.
+func parallelMismatch(r *lmsModelRow, target int) bool {
+	if r == nil || r.Parallel == nil {
+		return false
+	}
+	return *r.Parallel != target
+}
+
+// parallelStr renders a *int observed-parallel value ("null" when nil).
+func parallelStr(v *int) string {
+	if v == nil {
+		return "null"
+	}
+	return fmt.Sprintf("%d", *v)
+}
+
+// parallelActionDamped reports whether a "/parallel" action has already been
+// attempted for model against this exact observed parallel value (see
+// recordParallelAction, called from ApplyPlan) and the observed value hasn't
+// changed since. ComputePlan calls this before emitting a new "/parallel"
+// action — see the provider struct's dampening fields for the full rationale.
+func (p *LMSModelStateProvider) parallelActionDamped(model, observed string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.lastParallelAttempted && p.lastParallelTarget == model && p.lastParallelObserved == observed
+}
+
+// recordParallelAction records that a "/parallel" action was attempted for
+// model against observed (the value ComputePlan saw when it emitted the
+// action) so a subsequent ComputePlan call can damp re-emission via
+// parallelActionDamped until FetchLive reports a different observed value.
+func (p *LMSModelStateProvider) recordParallelAction(model, observed string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastParallelAttempted = true
+	p.lastParallelTarget = model
+	p.lastParallelObserved = observed
+}
+
+// clearParallelDampening resets the "/parallel" dampening record so a future
+// drift to any observed value — including one identical to a prior, already-
+// resolved drift — is free to fire a fresh action. Called from ComputePlan
+// once the target row converges (loaded at the declared parallelism); see
+// the call site for the re-arm rationale.
+func (p *LMSModelStateProvider) clearParallelDampening() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastParallelAttempted = false
+	p.lastParallelTarget = ""
+	p.lastParallelObserved = ""
+}
+
+// parallelGapNote returns an informational suffix for Health() messages
+// whenever a parallel target is declared but is not actually being watched —
+// either because the backend is remote (`lms ps --json` has no --host flag,
+// so remote backends cannot be probed this way) or because the local probe
+// itself produced no observation (lms CLI missing/renamed, probeParallelLocal
+// timed out or errored, or no `lms ps` row matched the loaded model). Without
+// this second case, a local backend whose lms CLI is broken would report a
+// clean Healthy/Synced with zero indication the parallel watch is dead — the
+// exact "invisible drift" failure mode issue #555 exists to prevent, just
+// relocated to the alarm's own dependency instead of the model's context.
+func parallelGapNote(target lmsModelStateConfig, local, observed bool) string {
+	if target.Parallel <= 0 {
+		return ""
+	}
+	if !local {
+		return "; parallel target declared but backend is remote — not observable via lms ps"
+	}
+	if !observed {
+		return "; parallel target declared but not observed — lms ps probe failed, lms CLI missing, or no matching row"
+	}
+	return ""
+}
+
 // ── option / detail helpers ────────────────────────────────────────────────────
 
 func optBool(m map[string]interface{}, key string) bool {
@@ -841,6 +1237,15 @@ func detailInt(d map[string]any, key string) int {
 // ── url / host helpers ─────────────────────────────────────────────────────────
 
 // hostPort splits "http://host:port" into (host, port), defaulting the port.
+//
+// Bracket-aware for an IPv6 literal: a bracketed host with no port suffix
+// (e.g. "[::1]") must not have its LAST colon — which sits INSIDE the
+// brackets — mistaken for a port separator. A naive strings.LastIndex(s, ":")
+// split turns "[::1]" into host="[:" (silently failing isLocalHost's loopback
+// match) and only produces the right host by accident when a port happens to
+// follow the brackets, because LastIndex then lands on that outer colon
+// instead. Locate the closing ']' first and treat everything after it as the
+// optional ":<port>" suffix.
 func hostPort(endpoint string, defaultPort int) (string, int) {
 	s := endpoint
 	if idx := strings.Index(s, "://"); idx >= 0 {
@@ -849,9 +1254,17 @@ func hostPort(endpoint string, defaultPort int) (string, int) {
 	if idx := strings.Index(s, "/"); idx >= 0 {
 		s = s[:idx]
 	}
+
 	host := s
 	port := defaultPort
-	if idx := strings.LastIndex(s, ":"); idx >= 0 {
+	if strings.HasPrefix(s, "[") {
+		if end := strings.Index(s, "]"); end >= 0 {
+			host = s[:end+1]
+			if end+1 < len(s) && s[end+1] == ':' {
+				port = extractPort(endpoint, defaultPort)
+			}
+		}
+	} else if idx := strings.LastIndex(s, ":"); idx >= 0 {
 		host = s[:idx]
 		port = extractPort(endpoint, defaultPort)
 	}
@@ -861,9 +1274,13 @@ func hostPort(endpoint string, defaultPort int) (string, int) {
 	return host, port
 }
 
-// isLocalHost reports whether host is a loopback name/address.
+// isLocalHost reports whether host is a loopback name/address. Hostname
+// comparison is case-insensitive (DNS names are; an endpoint spelled
+// http://LocalHost:1234 must gate identically to http://localhost:1234 —
+// the daemon's isLocalHostEndpoint already lowercases, and the two copies
+// must agree on the same backend).
 func isLocalHost(host string) bool {
-	switch host {
+	switch strings.ToLower(host) {
 	case "localhost", "127.0.0.1", "::1", "[::1]":
 		return true
 	}
