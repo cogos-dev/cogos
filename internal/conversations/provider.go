@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -649,7 +650,36 @@ func (p *Provider) ApplyPlan(ctx context.Context, plan *reconcile.Plan) ([]recon
 				continue
 			}
 
-			meta, turns, err := indexSession(sourcePath, action.Name, defaultMaxTurnLen)
+			// For an update (as opposed to a brand-new session), try to
+			// resume from the last recorded watermark instead of re-parsing
+			// the whole file — issue #558. Only attempted when a prior
+			// index entry + turns are actually available; falls through to
+			// the full indexSession parse whenever the fast path declines
+			// (usedIncremental == false) or errors.
+			var meta SessionMeta
+			var turns []Turn
+			var err error
+			usedIncremental := false
+			if action.Action == reconcile.ActionUpdate {
+				if prevMeta, ok := idx.GetMeta(action.Name); ok {
+					prevTurns := idx.SessionTurns(action.Name)
+					meta, turns, usedIncremental, err = indexSessionIncremental(sourcePath, action.Name, defaultMaxTurnLen, prevMeta, prevTurns)
+					if err != nil {
+						res.Status = reconcile.ApplyFailed
+						res.Error = fmt.Sprintf("index session %s (incremental): %v", action.Name, err)
+						results = append(results, res)
+						if isLockBackpressure(err) {
+							backpressure++
+						} else {
+							errs = append(errs, res.Error)
+						}
+						continue
+					}
+				}
+			}
+			if !usedIncremental {
+				meta, turns, err = indexSession(sourcePath, action.Name, defaultMaxTurnLen)
+			}
 			if err != nil {
 				res.Status = reconcile.ApplyFailed
 				res.Error = fmt.Sprintf("index session %s: %v", action.Name, err)
@@ -1204,8 +1234,11 @@ func isDrift(meta SessionMeta, f sourceFileInfo) bool {
 	return diff > 2*time.Second
 }
 
-// indexSession opens sourcePath, streams turns, and returns the resulting
-// SessionMeta and Turn slice. Does not hold the file open after return.
+// indexSession opens sourcePath, streams turns from byte 0, and returns the
+// resulting SessionMeta and Turn slice. Does not hold the file open after
+// return. This is the full re-parse path: used for brand-new sessions
+// (ActionCreate) and as the fallback whenever an incremental resume isn't
+// possible (see indexSessionIncremental).
 func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []Turn, error) {
 	fi, err := os.Stat(sourcePath)
 	if err != nil {
@@ -1235,7 +1268,109 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 		return meta, turns, fmt.Errorf("parse %s: %w", sourcePath, err)
 	}
 
+	// The whole file, start to current EOF, was just consumed — record that
+	// as the watermark so the next update cycle (if the file has only grown)
+	// can resume from here instead of re-parsing from byte 0. See
+	// SessionMeta.SourceOffset and indexSessionIncremental.
+	meta.SourceOffset = fi.Size()
+
 	return meta, turns, nil
+}
+
+// indexSessionIncremental resumes parsing sourcePath from prevMeta's
+// recorded watermark (SourceOffset) instead of byte 0, appending only the
+// newly written tail to prevTurns (the already-indexed prefix). This is the
+// issue #558 fix: a live, actively-growing session JSONL was being
+// re-parsed in full — O(session-size) — on every reconcile cycle, which is
+// why a 96MB session cost ~77s/cycle against a 500ms budget. Reading only
+// the appended bytes makes steady-state cycle cost O(delta) instead.
+//
+// Returns (meta, turns, usedIncremental, err). usedIncremental is false
+// whenever the fast path isn't safe to take (no established watermark, or
+// the file is smaller than the watermark — a truncation or rewrite, most
+// commonly a CC compaction that replaces the file wholesale) — the caller
+// must fall back to indexSession (a full re-parse) in that case.
+//
+// This is a size+mtime heuristic, not a content hash: it trusts that bytes
+// already consumed up to prevMeta.SourceOffset are unchanged whenever the
+// file has only grown since. That is the same trust boundary isDrift
+// already relies on for the source-changed decision one level up (mtime +
+// size, no hashing), so it introduces no new class of assumption — it just
+// applies the existing one at finer granularity. It would miss an in-place
+// rewrite that preserves or grows the file size while altering already
+// -consumed bytes; CC session JSONLs are append-only in practice and
+// compaction rewrites are observed as a smaller file (caught below), so
+// this is not expected to occur.
+func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevMeta SessionMeta, prevTurns []Turn) (SessionMeta, []Turn, bool, error) {
+	fi, err := os.Stat(sourcePath)
+	if err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("stat %s: %w", sourcePath, err)
+	}
+
+	// No usable watermark, or the file shrank relative to it (truncation /
+	// rewrite) — the tail-only fast path is unsafe. Caller falls back to a
+	// full re-parse.
+	if prevMeta.SourceOffset <= 0 || prevMeta.SourceOffset > fi.Size() {
+		return SessionMeta{}, nil, false, nil
+	}
+
+	f, err := os.Open(sourcePath)
+	if err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("open %s: %w", sourcePath, err)
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(prevMeta.SourceOffset, io.SeekStart); err != nil {
+		return SessionMeta{}, nil, false, fmt.Errorf("seek %s to %d: %w", sourcePath, prevMeta.SourceOffset, err)
+	}
+
+	// Seed meta from the previous pass so ParseSession extends (rather than
+	// resets) FirstTurnAt/LastTurnAt/Entrypoint/Title, then overwrite the
+	// per-cycle bookkeeping fields.
+	meta := prevMeta
+	meta.IndexedAt = time.Now().UTC()
+	meta.SourceMtime = fi.ModTime()
+	meta.SourceSize = fi.Size()
+
+	// Dedup against the already-indexed prefix too — ParseSession's own
+	// dedup only sees uuids within the bytes it scans (the tail here), and
+	// a resumed/compacted JSONL can legitimately re-append a turn whose uuid
+	// already appears in prevTurns.
+	seen := make(map[string]struct{}, len(prevTurns))
+	for _, t := range prevTurns {
+		if t.UUID != "" {
+			seen[t.UUID] = struct{}{}
+		}
+	}
+
+	var newTurns []Turn
+	err = ParseSession(f, sessionID, maxTurnLen, &meta, func(t Turn) bool {
+		if t.UUID != "" {
+			if _, dup := seen[t.UUID]; dup {
+				return true
+			}
+			seen[t.UUID] = struct{}{}
+		}
+		newTurns = append(newTurns, t)
+		return true
+	})
+	if err != nil {
+		return meta, nil, false, fmt.Errorf("parse %s (tail from offset %d): %w", sourcePath, prevMeta.SourceOffset, err)
+	}
+
+	combined := make([]Turn, 0, len(prevTurns)+len(newTurns))
+	combined = append(combined, prevTurns...)
+	combined = append(combined, newTurns...)
+	// TurnIndex must be a contiguous 0-based sequence over the WHOLE
+	// session, not just the tail just parsed — renumber the merged slice.
+	for i := range combined {
+		combined[i].TurnIndex = i
+	}
+
+	meta.TurnCount = len(combined)
+	meta.SourceOffset = fi.Size()
+
+	return meta, combined, true, nil
 }
 
 // isIngestDrift returns true when the indexed sessions of a source are stale

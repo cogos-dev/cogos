@@ -311,6 +311,276 @@ func TestProviderDriftDetection(t *testing.T) {
 	}
 }
 
+// TestIndexSessionIncremental_ReadsOnlyAppendedTail proves the issue #558
+// fix: given a watermark from a prior full parse, a second parse pass reads
+// only the bytes appended since — it never re-derives the already-indexed
+// prefix from disk.
+//
+// The proof: after the first full parse, the on-disk prefix (the bytes
+// already consumed, [0, SourceOffset)) is overwritten in place with a
+// same-length record carrying a DIFFERENT uuid and different text before
+// the tail is appended. The merged result always starts with the
+// caller-supplied prevTurns (so turns2[0] alone can't prove anything — a
+// buggy from-byte-0 re-read would still be prefixed with prevTurns by the
+// merge step), so the real tell is length and position 1: a from-byte-0 re-
+// read would encounter the corrupted record under its new uuid — distinct
+// from anything in prevTurns' dedup set — and append it as a 3rd, bogus
+// turn ahead of the genuinely-new tail turn. A correct tail-only read never
+// sees those corrupted bytes at all: exactly 2 turns come back, and the one
+// tail turn is the genuinely appended one.
+func TestIndexSessionIncremental_ReadsOnlyAppendedTail(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	firstText := "first message"
+	firstLine := makeUserRecord("u1", "", sid, firstText, "2026-05-01T10:00:00Z")
+	path := writeJSONLFixture(t, dir, sid, []string{firstLine})
+
+	// Cycle 1: full parse establishes the watermark.
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (cycle 1): %v", err)
+	}
+	if len(turns1) != 1 {
+		t.Fatalf("expected 1 turn after cycle 1, got %d", len(turns1))
+	}
+	if meta1.SourceOffset != meta1.SourceSize {
+		t.Fatalf("expected SourceOffset == SourceSize after a full parse, got offset=%d size=%d",
+			meta1.SourceOffset, meta1.SourceSize)
+	}
+	if meta1.SourceOffset == 0 {
+		t.Fatalf("expected a non-zero watermark after cycle 1")
+	}
+
+	// Corrupt the already-consumed prefix in place — same byte length (so
+	// the watermark byte offset still lands exactly on the line boundary),
+	// different uuid AND different text. Different uuid matters: it is what
+	// keeps this corrupted record out of the dedup-by-uuid set seeded from
+	// prevTurns, so a wrongly-reread copy of it cannot be silently absorbed
+	// as a harmless "duplicate" — it would show up as a distinct 3rd turn.
+	corruptedText := strings.Repeat("Z", len(firstText))
+	corruptedLine := strings.Replace(firstLine, `"`+firstText+`"`, `"`+corruptedText+`"`, 1)
+	corruptedLine = strings.Replace(corruptedLine, `"u1"`, `"z1"`, 1)
+	if len(corruptedLine) != len(firstLine) {
+		t.Fatalf("test setup: corrupted line length %d != original %d", len(corruptedLine), len(firstLine))
+	}
+	wf, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for prefix overwrite: %v", err)
+	}
+	if _, err := wf.WriteAt([]byte(corruptedLine), 0); err != nil {
+		wf.Close()
+		t.Fatalf("overwrite prefix: %v", err)
+	}
+	wf.Close()
+
+	// Append a genuinely new turn after the watermark.
+	secondText := "second message"
+	secondLine := makeUserRecord("u2", "u1", sid, secondText, "2026-05-01T10:01:00Z")
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + secondLine); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	// Cycle 2: incremental parse from the watermark, seeded with cycle 1's
+	// in-memory turns (as ApplyPlan would supply via idx.SessionTurns).
+	meta2, turns2, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used")
+	}
+	// The length check is the load-bearing proof: a from-byte-0 re-read
+	// would pick up the corrupted record (different uuid, so not deduped)
+	// as a spurious 3rd turn. Exactly 2 back means the corrupted prefix
+	// bytes were never read.
+	if len(turns2) != 2 {
+		t.Fatalf("expected exactly 2 turns after cycle 2 (got %d) — a from-byte-0 re-read would have "+
+			"picked up the corrupted prefix record (text %q) as a spurious extra turn, meaning the "+
+			"parse read past the watermark into already-indexed, now-corrupted bytes instead of "+
+			"resuming the tail from it", len(turns2), corruptedText)
+	}
+	if turns2[0].Text != firstText {
+		t.Errorf("turns2[0].Text = %q, want %q (the caller-supplied prevTurns prefix)", turns2[0].Text, firstText)
+	}
+	if turns2[1].Text != secondText {
+		t.Errorf("turns2[1].Text = %q, want %q — the sole new tail turn should be the genuinely "+
+			"appended record, not the corrupted prefix record", turns2[1].Text, secondText)
+	}
+	if turns2[0].TurnIndex != 0 || turns2[1].TurnIndex != 1 {
+		t.Errorf("expected contiguous turn indices 0,1; got %d,%d", turns2[0].TurnIndex, turns2[1].TurnIndex)
+	}
+	if meta2.TurnCount != 2 {
+		t.Errorf("expected TurnCount 2, got %d", meta2.TurnCount)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if meta2.SourceOffset != fi.Size() {
+		t.Errorf("expected watermark to advance to the new EOF (%d), got %d", fi.Size(), meta2.SourceOffset)
+	}
+}
+
+// TestIndexSessionIncremental_FallsBackOnTruncation verifies that when the
+// source file is smaller than the recorded watermark (a compaction rewrite,
+// or any other truncation), the incremental path declines (usedIncremental
+// == false) rather than seeking past EOF or trusting stale offsets, leaving
+// the caller to fall back to a full re-parse.
+func TestIndexSessionIncremental_FallsBackOnTruncation(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "first message", "2026-05-01T10:00:00Z"),
+		makeUserRecord("u2", "u1", sid, "second message", "2026-05-01T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession: %v", err)
+	}
+	if meta1.SourceOffset == 0 {
+		t.Fatalf("expected a non-zero watermark")
+	}
+
+	// Replace with a smaller file (e.g. a compaction rewrite).
+	replacement := makeUserRecord("u3", "", sid, "replaced", "2026-05-01T10:02:00Z") + "\n"
+	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
+		t.Fatalf("truncate/replace: %v", err)
+	}
+	if fi, _ := os.Stat(path); fi.Size() >= meta1.SourceOffset {
+		t.Fatalf("test setup: replacement (%d bytes) must be smaller than the watermark (%d bytes)",
+			fi.Size(), meta1.SourceOffset)
+	}
+
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Errorf("expected the incremental path to decline when the file shrank below the watermark")
+	}
+}
+
+// TestProviderApplyPlan_WatermarkAdvancesAcrossCycles is the end-to-end
+// counterpart to TestIndexSessionIncremental_ReadsOnlyAppendedTail: it drives
+// the same watermark logic through LoadConfig/FetchLive/ComputePlan/ApplyPlan
+// across three append cycles on a live-growing session, and asserts that
+// each cycle's applied SourceOffset lands exactly on the file's new EOF and
+// turn counts accumulate correctly — i.e. the provider, not just the parsing
+// helper in isolation, drives a second cycle off the appended tail.
+func TestProviderApplyPlan_WatermarkAdvancesAcrossCycles(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const sid = "cccccccc-dddd-eeee-ffff-000000000000"
+
+	fixturePath := writeJSONLFixture(t, srcDir, sid, []string{
+		makeUserRecord("u1", "", sid, "turn one", "2026-05-01T10:00:00Z"),
+	})
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	apply := func() {
+		cfgAny, err := p.LoadConfig(root)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		liveAny, err := p.FetchLive(ctx, cfgAny)
+		if err != nil {
+			t.Fatalf("FetchLive: %v", err)
+		}
+		plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+		if err != nil {
+			t.Fatalf("ComputePlan: %v", err)
+		}
+		if _, err := p.ApplyPlan(ctx, plan); err != nil {
+			t.Fatalf("ApplyPlan: %v", err)
+		}
+	}
+	appendLine := func(line string) {
+		f, err := os.OpenFile(fixturePath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatalf("open for append: %v", err)
+		}
+		if _, err := f.WriteString("\n" + line); err != nil {
+			f.Close()
+			t.Fatalf("append: %v", err)
+		}
+		f.Close()
+		future := time.Now().Add(2 * time.Second)
+		if err := os.Chtimes(fixturePath, future, future); err != nil {
+			t.Logf("chtimes: %v (non-fatal)", err)
+		}
+	}
+
+	// Cycle 1: initial create.
+	apply()
+	meta, ok := p.index.GetMeta(sid)
+	if !ok {
+		t.Fatalf("session not indexed after cycle 1")
+	}
+	if meta.TurnCount != 1 {
+		t.Fatalf("expected 1 turn after cycle 1, got %d", meta.TurnCount)
+	}
+	fi, _ := os.Stat(fixturePath)
+	if meta.SourceOffset != fi.Size() {
+		t.Fatalf("expected watermark == EOF (%d) after cycle 1, got %d", fi.Size(), meta.SourceOffset)
+	}
+
+	// Cycle 2: append and re-apply.
+	appendLine(makeUserRecord("u2", "u1", sid, "turn two", "2026-05-01T10:01:00Z"))
+	apply()
+	meta, ok = p.index.GetMeta(sid)
+	if !ok {
+		t.Fatalf("session missing after cycle 2")
+	}
+	if meta.TurnCount != 2 {
+		t.Fatalf("expected 2 turns after cycle 2, got %d", meta.TurnCount)
+	}
+	fi, _ = os.Stat(fixturePath)
+	if meta.SourceOffset != fi.Size() {
+		t.Fatalf("expected watermark to advance to EOF (%d) after cycle 2, got %d", fi.Size(), meta.SourceOffset)
+	}
+
+	// Cycle 3: append again and re-apply — the watermark from cycle 2 must
+	// keep advancing, not reset.
+	appendLine(makeUserRecord("u3", "u2", sid, "turn three", "2026-05-01T10:02:00Z"))
+	apply()
+	meta, ok = p.index.GetMeta(sid)
+	if !ok {
+		t.Fatalf("session missing after cycle 3")
+	}
+	if meta.TurnCount != 3 {
+		t.Fatalf("expected 3 turns after cycle 3, got %d", meta.TurnCount)
+	}
+	fi, _ = os.Stat(fixturePath)
+	if meta.SourceOffset != fi.Size() {
+		t.Fatalf("expected watermark to advance to EOF (%d) after cycle 3, got %d", fi.Size(), meta.SourceOffset)
+	}
+
+	turns := p.index.SessionTurns(sid)
+	if len(turns) != 3 {
+		t.Fatalf("expected 3 turns in the index, got %d", len(turns))
+	}
+	wantTexts := []string{"turn one", "turn two", "turn three"}
+	for i, want := range wantTexts {
+		if turns[i].Text != want {
+			t.Errorf("turn[%d].Text = %q, want %q", i, turns[i].Text, want)
+		}
+		if turns[i].TurnIndex != i {
+			t.Errorf("turn[%d].TurnIndex = %d, want %d", i, turns[i].TurnIndex, i)
+		}
+	}
+}
+
 // TestProviderIdempotency verifies that running ApplyPlan twice on the same
 // session produces a skip on the second pass (no double-indexing).
 func TestProviderIdempotency(t *testing.T) {

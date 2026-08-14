@@ -664,6 +664,29 @@ func (idx *Index) GetTurn(sessionID string, turnIndex int) (Turn, bool) {
 	return turns[turnIndex], true
 }
 
+// SessionTurns returns a copy of the full, in-order turns slice currently
+// indexed for sessionID, or nil if the session is not indexed. Used by
+// ApplyPlan's incremental-parse path (issue #558) to seed the
+// already-indexed prefix of a session before appending newly parsed tail
+// turns, without re-reading the turns projection file from disk (idx.turns
+// is this process's live in-memory copy, kept in sync with disk by
+// Load/UpsertSession(s)).
+//
+// Returns a copy so callers can freely append to it without racing a
+// concurrent Load/UpsertSession mutation of the index's own slice.
+func (idx *Index) SessionTurns(sessionID string) []Turn {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	turns, ok := idx.turns[sessionID]
+	if !ok {
+		return nil
+	}
+	out := make([]Turn, len(turns))
+	copy(out, turns)
+	return out
+}
+
 // Search performs a case-insensitive multi-term search over all indexed turns.
 //
 // Query parsing rules:
