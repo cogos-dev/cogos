@@ -394,6 +394,67 @@ func TestComputePlanSyncedEmptyPlan(t *testing.T) {
 	}
 }
 
+// TestComputePlanParallelOnlyDriftEmitsAction is the plan-emission test the
+// remediation scope requires: parallel-only drift (context is fine, parallel
+// is not) must produce a NON-EMPTY plan that actuates a reload at the
+// declared parallel — mirroring how context_length drift is remediated.
+// Before this fix, ComputePlan emitted nothing for a parallel mismatch,
+// pinning the resource permanently Degraded and re-triggering the autonomic
+// ticker's LLM escalation path on every tick with nothing the deterministic
+// self-heal could do about it.
+func TestComputePlanParallelOnlyDriftEmitsAction(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.Parallel = 1
+	rows := []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: ip(4)}}
+	plan, err := p.ComputePlan(&p.target, rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || !strings.HasSuffix(plan.Actions[0].Name, "/parallel") {
+		t.Fatalf("expected one /parallel action, got %#v", plan.Actions)
+	}
+	// context_length must be carried in the action's Details so ApplyPlan's
+	// reload doesn't silently fall back to LM Studio's default context.
+	if got := plan.Actions[0].Details["context_length"]; got != 262144 {
+		t.Errorf("expected context_length=262144 preserved in the /parallel action, got %v", got)
+	}
+}
+
+// TestComputePlanContextMismatchTakesPriorityOverParallel: when BOTH context
+// and parallel are wrong, only the /context action fires — its reload already
+// carries the declared parallel via buildActuatorCmd's unconditional
+// --parallel on every local reload, so a second /parallel action in the same
+// plan would be redundant.
+func TestComputePlanContextMismatchTakesPriorityOverParallel(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.Parallel = 1
+	rows := []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(65536), Parallel: ip(4)}}
+	plan, err := p.ComputePlan(&p.target, rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || !strings.HasSuffix(plan.Actions[0].Name, "/context") {
+		t.Fatalf("expected exactly one /context action (parallel folded in), got %#v", plan.Actions)
+	}
+}
+
+// TestComputePlanParallelUnobservedStaysEmpty: a nil observed Parallel (remote
+// backend, or the local probe found no observation) must never be treated as
+// a mismatch — ComputePlan must not manufacture an action from "we don't
+// know".
+func TestComputePlanParallelUnobservedStaysEmpty(t *testing.T) {
+	p := makeLMSProvider(t, "http://x", "target", 262144)
+	p.target.Parallel = 1
+	rows := []lmsModelRow{{ID: "target", State: "loaded", LoadedContextLength: ip(262144), Parallel: nil}}
+	plan, err := p.ComputePlan(&p.target, rows, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 0 {
+		t.Fatalf("expected empty plan on unobserved parallel, got %#v", plan.Actions)
+	}
+}
+
 func TestComputePlanJITEvict(t *testing.T) {
 	p := makeLMSProvider(t, "http://x", "target", 262144)
 	p.target.JITEvict = true
@@ -749,6 +810,95 @@ func TestApplyPlanContextActionUsesSetContext(t *testing.T) {
 	}
 }
 
+// TestApplyPlanParallelActionUsesSetContext mirrors
+// TestApplyPlanContextActionUsesSetContext: a "/parallel" action must reuse
+// the same unload+reload "set-context" verb — LM Studio has no live
+// parallelism resize either, and buildActuatorCmd's local fast-path threads
+// --parallel unconditionally on that verb regardless of which drift triggered
+// it.
+func TestApplyPlanParallelActionUsesSetContext(t *testing.T) {
+	p := makeLMSProvider(t, "http://192.168.10.191:1234", "target-model", 262144)
+	plan := &reconcile.Plan{
+		ResourceType: lmsModelStateType,
+		Actions: []reconcile.Action{{
+			Action: reconcile.ActionUpdate,
+			Name:   p.name + "/parallel",
+			Details: map[string]any{
+				"model":          "target-model",
+				"context_length": 262144,
+				"parallel":       1,
+			},
+		}},
+	}
+	results, err := p.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != reconcile.ApplySucceeded {
+		t.Fatalf("expected one succeeded result, got %#v", results)
+	}
+	log := readActuatorLog(t, p.actuatorScript)
+	if !strings.Contains(log, "set-context") {
+		t.Errorf("parallel action should invoke set-context; log:\n%s", log)
+	}
+	// context_length must survive into the actuator call too — otherwise the
+	// reload this action triggers would silently drop back to LM Studio's
+	// default context length instead of preserving the previously-correct one.
+	if !strings.Contains(log, "--context-length 262144") {
+		t.Errorf("parallel action's reload must preserve context_length; log:\n%s", log)
+	}
+}
+
+// TestApplyPlanParallelActionThreadsParallelOnLocalFastPath exercises the
+// local `lms load` fast-path end to end for a "/parallel" action: the
+// declared p.target.Parallel must be threaded onto the reload the action
+// triggers (buildActuatorCmd's local branch appends --parallel unconditionally
+// on every load/set-context, see its doc comment).
+func TestApplyPlanParallelActionThreadsParallelOnLocalFastPath(t *testing.T) {
+	p := makeLMSProvider(t, "http://127.0.0.1:1234", "target-model", 262144)
+	p.local = true
+	p.target.Parallel = 1
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "lms-calls.log")
+	script := "#!/bin/sh\n" + "echo \"$@\" >> \"" + logPath + "\"\n"
+	lmsPath := filepath.Join(dir, "lms")
+	if err := os.WriteFile(lmsPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake lms CLI: %v", err)
+	}
+	p.lmsCLI = lmsPath
+
+	plan := &reconcile.Plan{
+		ResourceType: lmsModelStateType,
+		Actions: []reconcile.Action{{
+			Action: reconcile.ActionUpdate,
+			Name:   p.name + "/parallel",
+			Details: map[string]any{
+				"model":          "target-model",
+				"context_length": 262144,
+				"parallel":       1,
+			},
+		}},
+	}
+	results, err := p.ApplyPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != reconcile.ApplySucceeded {
+		t.Fatalf("expected one succeeded result, got %#v", results)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("expected the lms CLI fast-path to have been invoked: %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "--parallel 1") {
+		t.Errorf("expected --parallel 1 threaded onto the local reload; log:\n%s", log)
+	}
+	if !strings.Contains(log, "--context-length 262144") {
+		t.Errorf("expected --context-length 262144 preserved on the local reload; log:\n%s", log)
+	}
+}
+
 // ── construction / parsing ─────────────────────────────────────────────────────
 
 func TestParseModelStateOptions(t *testing.T) {
@@ -765,6 +915,34 @@ func TestParseModelStateOptions(t *testing.T) {
 	c := parseModelStateOptions(opts)
 	if !c.Manage || c.Model != "m" || c.ContextLength != 262144 || c.Parallel != 4 || !c.KeepWarm || c.JITEvict {
 		t.Fatalf("parse mismatch: %#v", c)
+	}
+}
+
+// TestHostPortBracketedIPv6 covers hostPort's bracket-aware port strip: a
+// naive strings.LastIndex(s, ":") split cuts INSIDE the brackets on a
+// bracketed IPv6 literal with no port suffix ("[::1]" → "[:", silently
+// failing isLocalHost's loopback match), and only produced the right host on
+// "[::1]:1234" by accident (LastIndex happened to land on the port-separator
+// colon rather than an internal IPv6 colon).
+func TestHostPortBracketedIPv6(t *testing.T) {
+	cases := []struct {
+		endpoint  string
+		wantHost  string
+		wantPort  int
+		wantLocal bool
+	}{
+		{"http://[::1]", "[::1]", 9999, true},
+		{"http://[::1]/v1", "[::1]", 9999, true},
+		{"http://[::1]:1234", "[::1]", 1234, true},
+	}
+	for _, tc := range cases {
+		host, port := hostPort(tc.endpoint, 9999)
+		if host != tc.wantHost || port != tc.wantPort {
+			t.Errorf("hostPort(%q) = (%q, %d); want (%q, %d)", tc.endpoint, host, port, tc.wantHost, tc.wantPort)
+		}
+		if got := isLocalHost(host); got != tc.wantLocal {
+			t.Errorf("isLocalHost(hostPort(%q)) = %v; want %v", tc.endpoint, got, tc.wantLocal)
+		}
 	}
 }
 

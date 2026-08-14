@@ -157,6 +157,80 @@ func TestProbeModelStateEntry_ParallelProbeFailureNonFatal(t *testing.T) {
 	}
 }
 
+// TestCheckParallelDrift_DuplicateInstanceMatching reproduces the reviewer's
+// scenario A: `lms ps` lists a duplicate instance's row ("target:2", loaded at
+// parallel 4) BEFORE the exact-id row ("target", loaded at parallel 1) in its
+// own array order. The declared target is parallel 1 against loadedID
+// "target". The old first-satisfying-row-in-array-order matching picked
+// "target:2" (a prefix match) purely because of array position, reporting a
+// false mismatch (parallel 4, want 1) against live state that is actually
+// correct. Exact-id-match-first must find "target" regardless of array order.
+func TestCheckParallelDrift_DuplicateInstanceMatching(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"target:2","parallel":4},{"identifier":"target","parallel":1}]`, false)
+	e := modelStateEntry{name: "b", model: "target", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "target")
+	if !observed {
+		t.Fatal("expected observed=true — an exact-id row is present")
+	}
+	if err != nil {
+		t.Fatalf("exact-id match must resolve to the correct row (parallel 1, matches target) and report Healthy, got: %v", err)
+	}
+}
+
+// TestCheckParallelDrift_DuplicateInstanceMatching_RealMismatch is the mirror
+// case: the exact-id row genuinely IS at the wrong parallel, with a
+// non-matching duplicate ordered first. The fix must not swallow a real
+// mismatch just because it now prefers exact matches.
+func TestCheckParallelDrift_DuplicateInstanceMatching_RealMismatch(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"target:2","parallel":1},{"identifier":"target","parallel":4}]`, false)
+	e := modelStateEntry{name: "b", model: "target", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "target")
+	if !observed {
+		t.Fatal("expected observed=true")
+	}
+	if err == nil {
+		t.Fatal("expected a mismatch error — the exact-id row is genuinely at parallel 4, want 1")
+	}
+	if !strings.Contains(err.Error(), "parallel 4") {
+		t.Errorf("expected the error to cite the exact-id row's parallel (4), got %q", err.Error())
+	}
+}
+
+// TestCheckParallelDrift_PrefixSiblingModel reproduces the reviewer's scenario
+// B: a prefix-sibling model ("qwen3-coder-30b", parallel 8) is loaded and
+// listed BEFORE the declared model's own row ("qwen3", parallel 1) in `lms ps`
+// array order. The old broad prefix-either-direction predicate matched the
+// sibling first purely by array position; exact-match-first must resolve to
+// "qwen3" itself since an exact match exists.
+func TestCheckParallelDrift_PrefixSiblingModel(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"qwen3-coder-30b","parallel":8},{"identifier":"qwen3","parallel":1}]`, false)
+	e := modelStateEntry{name: "b", model: "qwen3", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "qwen3")
+	if !observed {
+		t.Fatal("expected observed=true — an exact-id row is present")
+	}
+	if err != nil {
+		t.Fatalf("exact-id match must resolve to \"qwen3\" (parallel 1) and report Healthy, not the sibling \"qwen3-coder-30b\", got: %v", err)
+	}
+}
+
+// TestCheckParallelDrift_PrefixFallbackWhenNoExactMatch covers the case the
+// prefix fallback still needs to handle: no row has the exact declared id
+// (e.g. the loaded row's id itself carries a quant-suffix difference from the
+// declared model — "target-q4" vs "target"), so the fallback must still find
+// it rather than reporting unobserved.
+func TestCheckParallelDrift_PrefixFallbackWhenNoExactMatch(t *testing.T) {
+	lmsCLI := writeFakeLmsPs(t, `[{"identifier":"target-q4","parallel":1}]`, false)
+	e := modelStateEntry{name: "b", model: "target", parallel: 1, local: true, lmsCLIPath: lmsCLI}
+	observed, err := checkParallelDrift(context.Background(), e, "target")
+	if !observed {
+		t.Fatal("expected observed=true via the prefix fallback")
+	}
+	if err != nil {
+		t.Fatalf("expected the prefix-matched row to report Healthy, got: %v", err)
+	}
+}
+
 func TestProbeModelStateEntry_ParallelUnsetSkipsProbeEntirely(t *testing.T) {
 	// parallel==0 must skip the check even when local — no CLI invocation needed.
 	srv := msModelsServer(t, msRow{ID: "target", State: "loaded", Ctx: msIntp(262144)})
@@ -174,6 +248,32 @@ func TestProbeModelStateEntry_ParallelUnsetSkipsProbeEntirely(t *testing.T) {
 	}
 }
 
+// ── healthIssuesMessage: gapNotes must not be discarded on the issues path ──────
+
+func TestHealthIssuesMessage_GapNotesSurviveAlongsideIssues(t *testing.T) {
+	// Two managed backends in one Health() cycle: A is unreachable (an issue),
+	// B's parallel watch is dead (a gap note, no issue of its own). The old
+	// code returned early on len(issues)>0 and discarded gapNotes entirely, so
+	// B's coverage gap was invisible for exactly as long as A was also loud.
+	got := healthIssuesMessage(
+		[]string{"backend-a: unreachable: dial tcp: connection refused"},
+		[]string{"backend-b: parallel target declared but not observed — lms ps probe failed, lms CLI missing, or no matching row"},
+	)
+	if !strings.Contains(got, "backend-a") {
+		t.Errorf("expected the issue to survive, got %q", got)
+	}
+	if !strings.Contains(got, "backend-b") {
+		t.Errorf("expected the gap note to survive alongside the issue, got %q", got)
+	}
+}
+
+func TestHealthIssuesMessage_NoGapNotes(t *testing.T) {
+	got := healthIssuesMessage([]string{"backend-a: unreachable"}, nil)
+	if got != "backend-a: unreachable" {
+		t.Errorf("got %q; want no trailing separator when there are no gap notes", got)
+	}
+}
+
 // ── isLocalHostEndpoint ──────────────────────────────────────────────────────────
 
 func TestIsLocalHostEndpoint(t *testing.T) {
@@ -184,6 +284,13 @@ func TestIsLocalHostEndpoint(t *testing.T) {
 		"http://127.0.0.1:1234":      true,
 		"http://192.168.10.191:1234": false,
 		"https://eclipse.local:1234": false,
+		// Bracketed IPv6 literals: the naive strings.LastIndex(host, ":") port
+		// strip cuts INSIDE the brackets on a literal with no port suffix
+		// ("[::1]" → "[:", a miss), and only works on "[::1]:1234" by
+		// accident (LastIndex happens to land on the port-separator colon).
+		"http://[::1]":      true,
+		"http://[::1]/v1":   true,
+		"http://[::1]:1234": true,
 	}
 	for endpoint, want := range cases {
 		if got := isLocalHostEndpoint(endpoint); got != want {

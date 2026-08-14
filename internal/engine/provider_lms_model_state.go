@@ -80,7 +80,7 @@ type lmsModelStateConfig struct {
 	Manage        bool   // opt-in switch; false ⇒ Suspended, empty plan
 	Model         string // target model id that should be loaded
 	ContextLength int    // desired loaded_context_length (0 ⇒ don't manage context)
-	Parallel      int    // watched for drift on all backends; observed only on local backends via `lms ps --json` (see probeParallelLocal). Never actuated as its own ComputePlan action — but on a local backend it IS threaded into `lms load --parallel` (see buildActuatorCmd) so a context-triggered reload doesn't blow it away; the @lmstudio/sdk load config used for remote backends has no such per-load parallelism knob.
+	Parallel      int    // watched for drift on all backends; observed only on local backends via `lms ps --json` (see probeParallelLocal). On a local backend, parallel-only drift IS remediated by ComputePlan's own "/parallel" action (unload+reload via the "set-context" verb, threading `lms load --parallel` — see buildActuatorCmd); on a remote backend it remains alarm-only, since the @lmstudio/sdk load config has no per-load parallelism knob.
 	KeepWarm      bool   // hint: keep loaded even when idle (advisory metadata)
 	JITEvict      bool   // if true, unload a non-target model that crowds the card
 }
@@ -506,6 +506,35 @@ func (p *LMSModelStateProvider) ComputePlan(config any, live any, _ *reconcile.S
 			},
 		})
 		plan.Summary.Updates++
+
+	// Wrong parallel, context otherwise fine ⇒ unload+reload at the declared
+	// parallelism. Local-only: parallelMismatch is defined to never fire when
+	// targetRow.Parallel is nil, and Parallel is only ever populated by the
+	// local `lms ps --json` probe (see FetchLive's p.local gate) — so this
+	// case is naturally a no-op on a remote backend, matching the SDK
+	// actuator's inability to set parallelism (see buildActuatorCmd's remote
+	// branch). If context is ALSO mismatched, the case above already fires
+	// first and its reload carries the correct parallel value too (see
+	// buildActuatorCmd's unconditional --parallel on every local reload) —
+	// this case only needs to handle parallel-only drift. Without this,
+	// parallel drift pinned the resource permanently Degraded/OutOfSync with
+	// an empty plan, which re-triggered the LLM escalation path on every
+	// autonomic tick (shouldEscalate → escalateDegradedHealth) with nothing
+	// the deterministic self-heal could ever do about it.
+	case target.Parallel > 0 && parallelMismatch(targetRow, target.Parallel):
+		plan.Actions = append(plan.Actions, reconcile.Action{
+			Action:       reconcile.ActionUpdate,
+			ResourceType: lmsModelStateType,
+			Name:         p.name + "/parallel",
+			Details: map[string]any{
+				"model":           target.Model,
+				"context_length":  target.ContextLength,
+				"parallel":        target.Parallel,
+				"loaded_parallel": parallelStr(targetRow.Parallel),
+				"reason":          "loaded at wrong parallel — LM Studio has no live resize; unload+reload (local fast-path only)",
+			},
+		})
+		plan.Summary.Updates++
 	}
 
 	return plan, nil
@@ -530,6 +559,14 @@ func (p *LMSModelStateProvider) ApplyPlan(ctx context.Context, plan *reconcile.P
 		case strings.HasSuffix(action.Name, "/context"):
 			// No live resize: a context change is an unload+reload. The actuator
 			// performs both under the "set-context" verb.
+			op, model = "set-context", detailStr(action.Details, "model")
+		case strings.HasSuffix(action.Name, "/parallel"):
+			// No live resize for parallelism either: reuse "set-context" (unload
+			// then reload). buildActuatorCmd's local fast-path unconditionally
+			// threads --parallel from p.target.Parallel on every load/set-context,
+			// and this action's context_length detail preserves the previously
+			// correct context length across the reload (a bare reload with no
+			// context arg would fall back to LM Studio's default config).
 			op, model = "set-context", detailStr(action.Details, "model")
 		case strings.HasSuffix(action.Name, "/unload"):
 			op, model = "unload", detailStr(action.Details, "model")
@@ -621,11 +658,10 @@ func (p *LMSModelStateProvider) buildActuatorCmd(ctx context.Context, op, model 
 		// this CLI — unlike the SDK actuator below, the local fast-path does
 		// have a per-load parallelism knob). Without this, a context-triggered
 		// reload (unload+reload; LM Studio has no live resize) would come back
-		// at the app's default parallelism, manufacturing a parallel mismatch
-		// that this reconciler can never clear on its own — parallel drift is
-		// alarm-only (ComputePlan never emits a dedicated action for it, see
-		// mismatch handling in Health/ComputePlan) — so the self-heal driver
-		// would re-enter on a permanently-Degraded resource with an empty plan.
+		// at the app's default parallelism, manufacturing a fresh parallel
+		// mismatch behind the context fix. ComputePlan's "/parallel" action
+		// (see its doc comment) would clear that mismatch on a later tick, but
+		// only after an extra unload+reload cycle this line avoids entirely.
 		if p.target.Parallel > 0 {
 			args = append(args, "--parallel", fmt.Sprintf("%d", p.target.Parallel))
 		}
@@ -829,8 +865,9 @@ func (p *LMSModelStateProvider) Health() reconcile.ResourceStatus {
 		}
 	}
 
-	// Wrong parallel (local only — alarm-only, never actuated: LM Studio's load
-	// config has no per-load parallelism knob) ⇒ Degraded/OutOfSync.
+	// Wrong parallel (local only — remediated by ComputePlan's "/parallel"
+	// action; see its doc comment) ⇒ Degraded/OutOfSync until the next
+	// self-heal cycle applies the reload.
 	if target.Parallel > 0 && p.local && parallelMismatch(targetRow, target.Parallel) {
 		return reconcile.ResourceStatus{
 			Sync:      reconcile.SyncStatusOutOfSync,
@@ -948,7 +985,10 @@ func ctxStr(v *int) string {
 // parallelMismatch reports whether a loaded row's observed parallel value
 // differs from target. A nil Parallel (unobserved — remote backend, or the
 // `lms ps --json` probe failed/found no match) is NOT a mismatch: we cannot
-// compare, and this dimension is alarm-only anyway (never actuated).
+// compare. Since Parallel is only ever populated on a local backend (see
+// probeParallelLocal's p.local gate), this also means the dimension is
+// alarm-only-and-never-actuated on remote backends specifically, while
+// ComputePlan's "/parallel" action remediates it on local ones.
 func parallelMismatch(r *lmsModelRow, target int) bool {
 	if r == nil || r.Parallel == nil {
 		return false
@@ -1043,6 +1083,15 @@ func detailInt(d map[string]any, key string) int {
 // ── url / host helpers ─────────────────────────────────────────────────────────
 
 // hostPort splits "http://host:port" into (host, port), defaulting the port.
+//
+// Bracket-aware for an IPv6 literal: a bracketed host with no port suffix
+// (e.g. "[::1]") must not have its LAST colon — which sits INSIDE the
+// brackets — mistaken for a port separator. A naive strings.LastIndex(s, ":")
+// split turns "[::1]" into host="[:" (silently failing isLocalHost's loopback
+// match) and only produces the right host by accident when a port happens to
+// follow the brackets, because LastIndex then lands on that outer colon
+// instead. Locate the closing ']' first and treat everything after it as the
+// optional ":<port>" suffix.
 func hostPort(endpoint string, defaultPort int) (string, int) {
 	s := endpoint
 	if idx := strings.Index(s, "://"); idx >= 0 {
@@ -1051,9 +1100,17 @@ func hostPort(endpoint string, defaultPort int) (string, int) {
 	if idx := strings.Index(s, "/"); idx >= 0 {
 		s = s[:idx]
 	}
+
 	host := s
 	port := defaultPort
-	if idx := strings.LastIndex(s, ":"); idx >= 0 {
+	if strings.HasPrefix(s, "[") {
+		if end := strings.Index(s, "]"); end >= 0 {
+			host = s[:end+1]
+			if end+1 < len(s) && s[end+1] == ':' {
+				port = extractPort(endpoint, defaultPort)
+			}
+		}
+	} else if idx := strings.LastIndex(s, ":"); idx >= 0 {
 		host = s[:idx]
 		port = extractPort(endpoint, defaultPort)
 	}

@@ -19,17 +19,18 @@ adds a second concern on top: model/context state. See
 | Method | What it does |
 |--------|--------------|
 | `FetchLive` | read-only `GET {endpoint}/api/v0/models` (LM Studio's native REST surface — exposes per-model `state` + `loaded_context_length`); on a **local** backend also shells `lms ps --json` and merges its `parallel` field — `/api/v0/models` does not expose `parallel` at all |
-| `ComputePlan` | diffs declared target vs live → `load` / `context` (unload+reload; LM Studio has no live resize) / `unload` (jit_evict) actions. `parallel` never appears here — it is alarm-only (see `Health`), never actuated |
+| `ComputePlan` | diffs declared target vs live → `load` / `context` (unload+reload; LM Studio has no live resize) / `parallel` (unload+reload at the declared parallelism; **local only** — a nil observed `Parallel` on a remote backend means this case never fires there) / `unload` (jit_evict) actions |
 | `ApplyPlan` | shells the Node `@lmstudio/sdk` actuator (`scripts/lms-actuator/`) over `ws://`; token via `LMS_ACTUATOR_TOKEN` env, never argv |
-| `Health` | O(1) from cached rows: Synced/Healthy when loaded at target; Degraded on wrong context **or** wrong `parallel` (local only); Missing when absent; Progressing while loading; **Suspended** when unmanaged, unreachable, or the actuator is not installed |
+| `Health` | O(1) from cached rows: Synced/Healthy when loaded at target; Degraded on wrong context **or** wrong `parallel` (local only, until the next self-heal cycle applies the `parallel` action); Missing when absent; Progressing while loading; **Suspended** when unmanaged, unreachable, or the actuator is not installed |
 
 An **unreachable** backend reports **Suspended, not Degraded** — the autonomic
 ticker does not try to self-heal a box that is simply off or off-LAN.
 
-### `parallel` drift — local-only, alarm-only
+### `parallel` drift — local-only observability, local-only remediation
 
 `parallel` is watched the same way `context_length` is, with one asymmetry: it
-can only be **observed** on a local backend. `lms ps --json` (the source for the
+can only be **observed** (and, as of this reconciler's local fast-path, only
+**remediated**) on a local backend. `lms ps --json` (the source for the
 observed value) is a local-only CLI — `lms ps --help` shows no `--host` flag —
 so a remote backend (e.g. Eclipse) can never be checked against a declared
 `parallel` target through this mechanism; `Health()`'s message says so
@@ -38,17 +39,20 @@ probe itself produces no observation (lms CLI missing/renamed, the probe times
 out or errors, or no `lms ps` row matches the loaded model), `Health()` appends
 the same kind of gap note rather than presenting a dead watch as clean coverage.
 
-`ComputePlan` never emits a dedicated action for a `parallel` mismatch — it is
-purely an alarm, never actuated as its own remediation. That said, the local
-`lms load` CLI fast-path *does* have a `--parallel <count>` flag (confirmed
-live via `lms load --help`), unlike the `@lmstudio/sdk` load config used for
-remote backends, which genuinely has no per-load parallelism knob. To keep the
-reconciler from inducing the exact drift it alarms on, the local fast-path
-threads the declared `parallel` target into every `lms load` it issues —
-including a context-triggered reload (unload+reload; LM Studio has no live
-resize) — so remediating a `context_length` mismatch on a local backend does
-not silently reset parallelism to the app default and manufacture a permanent,
-unclearable `parallel` mismatch behind it.
+On a local backend, `ComputePlan` emits a dedicated `parallel` action
+(unload+reload via the same "set-context" actuator verb `context` uses,
+carrying forward the previously-correct `context_length` so the reload does
+not fall back to LM Studio's default context) whenever the target is loaded at
+the wrong parallelism and context is otherwise fine — mirroring how `context`
+drift is remediated. This is possible because the local `lms load` CLI
+fast-path *does* have a `--parallel <count>` flag (confirmed live via
+`lms load --help`), unlike the `@lmstudio/sdk` load config used for remote
+backends, which genuinely has no per-load parallelism knob — so on a remote
+backend `parallel` remains alarm-only, never actuated. The local fast-path also
+threads the declared `parallel` target into *every* `lms load` it issues,
+including a context-triggered reload, so remediating a `context_length`
+mismatch on a local backend never silently resets parallelism to the app
+default and manufactures a fresh `parallel` mismatch behind it.
 
 ## Prerequisites
 

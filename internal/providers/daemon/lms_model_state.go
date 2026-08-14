@@ -90,7 +90,7 @@ func (p *lmsModelStateProvider) Health() reconcile.ResourceStatus {
 			Sync:      reconcile.SyncStatusOutOfSync,
 			Health:    reconcile.HealthDegraded,
 			Operation: reconcile.OperationIdle,
-			Message:   strings.Join(issues, "; "),
+			Message:   healthIssuesMessage(issues, gapNotes),
 		}
 	}
 
@@ -124,6 +124,21 @@ func (p *lmsModelStateProvider) Health() reconcile.ResourceStatus {
 		Operation: reconcile.OperationIdle,
 		Message:   msg,
 	}
+}
+
+// healthIssuesMessage joins the Degraded-path issues and gapNotes into a
+// single message. gapNotes from OTHER entries must not be dropped just
+// because some entry in the same cycle reported a louder issue — otherwise a
+// coverage gap on backend B (e.g. its lms CLI is missing, so its parallel
+// watch is dead) goes invisible for exactly as long as backend A is also
+// loudly unreachable, defeating the reason gap notes exist: never present a
+// dead watch as clean/silent coverage. See probeModelStateEntry's gapNote doc.
+func healthIssuesMessage(issues, gapNotes []string) string {
+	msg := strings.Join(issues, "; ")
+	if len(gapNotes) > 0 {
+		msg += "; " + strings.Join(gapNotes, "; ")
+	}
+	return msg
 }
 
 // modelStateEntry is the minimal config needed for a daemon-side health probe.
@@ -196,14 +211,34 @@ func isLocalHostEndpoint(endpoint string) bool {
 	if idx := strings.Index(host, "/"); idx >= 0 {
 		host = host[:idx]
 	}
-	if idx := strings.LastIndex(host, ":"); idx >= 0 {
-		host = host[:idx]
-	}
+	host = stripHostPort(host)
 	switch strings.ToLower(host) {
 	case "localhost", "127.0.0.1", "::1", "[::1]", "":
 		return true
 	}
 	return false
+}
+
+// stripHostPort removes a trailing ":<port>" from host, bracket-aware for an
+// IPv6 literal. A naive strings.LastIndex(host, ":") cuts inside the brackets
+// on a bracketed literal with no port suffix — "[::1]" has its LAST colon at
+// index 2, so a bare LastIndex split yields "[:" (not "[::1]"), silently
+// failing the loopback match ("http://[::1]" and "http://[::1]/v1" would both
+// report false). With a port present the naive split works only by accident,
+// because the LastIndex happens to land on the port-separator colon rather
+// than an internal IPv6 colon. Handling the bracketed case explicitly (locate
+// the closing ']', keep everything through it) fixes both.
+func stripHostPort(host string) string {
+	if strings.HasPrefix(host, "[") {
+		if end := strings.Index(host, "]"); end >= 0 {
+			return host[:end+1]
+		}
+		return host // malformed literal — no closing bracket; leave as-is
+	}
+	if idx := strings.LastIndex(host, ":"); idx >= 0 {
+		return host[:idx]
+	}
+	return host
 }
 
 // resolveLmsCLIPath returns the local lms CLI fast-path binary path,
@@ -419,25 +454,58 @@ func checkParallelDrift(ctx context.Context, e modelStateEntry, loadedID string)
 	if json.Unmarshal(out, &rows) != nil {
 		return false, nil // unparseable — unobserved
 	}
-	for _, r := range rows {
-		id := r.Identifier
-		if id == "" {
-			id = r.ModelKey
-		}
-		if id == "" {
-			continue
-		}
-		if !(id == loadedID || strings.HasPrefix(id, loadedID) || strings.HasPrefix(loadedID, id) ||
-			id == e.model || strings.HasPrefix(id, e.model) || strings.HasPrefix(e.model, id)) {
-			continue
-		}
-		if r.Parallel == nil {
-			return false, nil // `parallel` key omitted — unobserved, not a mismatch
-		}
-		if *r.Parallel != e.parallel {
-			return true, fmt.Errorf("model %q loaded with parallel %d (want %d)", e.model, *r.Parallel, e.parallel)
-		}
-		return true, nil
+
+	row := matchParallelRow(rows, loadedID, e.model)
+	if row == nil {
+		return false, nil // no matching row — unobserved
 	}
-	return false, nil // no matching row — unobserved
+	if row.Parallel == nil {
+		return false, nil // `parallel` key omitted — unobserved, not a mismatch
+	}
+	if *row.Parallel != e.parallel {
+		return true, fmt.Errorf("model %q loaded with parallel %d (want %d)", e.model, *row.Parallel, e.parallel)
+	}
+	return true, nil
+}
+
+// matchParallelRow selects the `lms ps --json` row to compare against,
+// preferring an exact identifier match (against loadedID, then e.model) over
+// a prefix match — mirrors the engine copy's mergeParallel exactly, so both
+// provider copies agree on identical live state.
+//
+// `lms ps --json`'s array order is not a matching signal — it reflects
+// whatever order the CLI happens to return rows in, which can and does put a
+// duplicate instance's row (e.g. "target:2", suffixed by LM Studio for a
+// second load of the same base model) ahead of the exact-id row ("target").
+// The old code took the first row satisfying a broad prefix-either-direction
+// predicate, so which of "target" or "target:2" won depended on that
+// incidental ordering rather than on which row is actually correct. Preferring
+// an exact match first fixes the id regardless of array order; the prefix
+// fallback (same "quant suffix / publisher prefix" cases modelIDMatch on the
+// engine side) only runs when no exact match exists.
+func matchParallelRow(rows []msPsRow, loadedID, model string) *msPsRow {
+	rowID := func(r msPsRow) string {
+		if r.Identifier != "" {
+			return r.Identifier
+		}
+		return r.ModelKey
+	}
+
+	for i := range rows {
+		id := rowID(rows[i])
+		if id != "" && (id == loadedID || id == model) {
+			return &rows[i]
+		}
+	}
+	for i := range rows {
+		id := rowID(rows[i])
+		if id == "" {
+			continue
+		}
+		if strings.HasPrefix(id, loadedID) || strings.HasPrefix(loadedID, id) ||
+			strings.HasPrefix(id, model) || strings.HasPrefix(model, id) {
+			return &rows[i]
+		}
+	}
+	return nil
 }
