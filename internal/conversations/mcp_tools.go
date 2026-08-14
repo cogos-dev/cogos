@@ -373,12 +373,23 @@ func makeListConversationsHandler(p *Provider, maxBytes int) mcp.ToolHandlerFor[
 				Identity:   m.Identity,
 				Entrypoint: m.Entrypoint,
 			}
-			for _, tm := range m.Threads {
-				so.Threads = append(so.Threads, threadOut{
-					ThreadID:     tm.ThreadID,
-					Role:         string(tm.Role),
-					MessageCount: tm.MessageCount,
-				})
+			// Only surface threads[] for genuinely multi-thread sessions
+			// (N>1 roots, per #557 §2's own definition). The overwhelming
+			// majority of sessions have exactly one thread — emitting a
+			// one-entry array there is pure duplication of turn_count/
+			// message_count and, multiplied across every session in the
+			// default (unbounded) response, was blowing the per-call byte
+			// budget on session #1 alone before session #2 was ever
+			// reached. A single-thread session's shape is already fully
+			// described by the top-level counts.
+			if len(m.Threads) > 1 {
+				for _, tm := range m.Threads {
+					so.Threads = append(so.Threads, threadOut{
+						ThreadID:     tm.ThreadID,
+						Role:         string(tm.Role),
+						MessageCount: tm.MessageCount,
+					})
+				}
 			}
 			if !m.FirstTurnAt.IsZero() {
 				so.FirstTurnAt = m.FirstTurnAt.Format(time.RFC3339)
@@ -448,6 +459,9 @@ func sliceToMap(slice *ResolvedSlice) map[string]any {
 	}
 	if slice.ContentHash != "" {
 		m["content_hash"] = slice.ContentHash
+	}
+	if slice.SessionsMissingThreadIndex > 0 {
+		m["sessions_missing_thread_index"] = slice.SessionsMissingThreadIndex
 	}
 	return m
 }

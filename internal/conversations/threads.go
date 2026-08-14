@@ -21,9 +21,73 @@
 // already-fully-assembled, in-order []Turn slice (the caller's responsibility
 // — see indexSession in provider.go, which calls this once on the final
 // turn slice before returning).
+//
+// Before calling PartitionThreads, indexSession first calls
+// bridgeDroppedParents (this file) to rewrite each turn's ParentUUID past
+// any chain of records ParseSession saw but never turned into a Turn
+// (tool_result-only user records, type:"system" records, hook outputs,
+// text-less assistant records, duplicate uuids). Without that step, a
+// surviving turn whose immediate JSONL parent was one of those dropped
+// records looks like a fresh DAG root here — which fragments every
+// tool-using session (i.e. nearly all of them) into hundreds of spurious
+// one- or two-message threads. PartitionThreads itself stays pure and
+// unaware of the raw JSONL; the bridging happens one layer up, over the raw
+// uuid graph parser.go now records alongside the turn set.
 package conversations
 
 import "fmt"
+
+// bridgeDroppedParents rewrites turns[i].ParentUUID, in place, to splice
+// across any run of records that ParseSession saw but that never became a
+// Turn. rawParents is the full uuid -> parentUuid graph parser.go records
+// for every line with a uuid, kept or dropped alike.
+//
+// For each turn whose direct ParentUUID does not name a turn present in the
+// given slice, this walks rawParents upward — parent, grandparent, and so
+// on — until it finds a uuid that DOES survive in turns, and rewrites
+// ParentUUID to that ancestor. If the chain terminates (empty parentUuid, a
+// link absent from rawParents, or a cycle) before reaching a surviving
+// ancestor, ParentUUID is left untouched: it already fails to match any
+// surviving uuid, so PartitionThreads's existing "parent outside this set"
+// root rule already treats it correctly.
+//
+// A visited-set per turn guards against a cycle in the raw graph (not
+// expected in real Claude Code data, but rawParents is otherwise untrusted
+// input and PartitionThreads' own cycle handling assumes finite walks).
+func bridgeDroppedParents(turns []Turn, rawParents map[string]string) {
+	if len(rawParents) == 0 {
+		return
+	}
+	surviving := make(map[string]bool, len(turns))
+	for _, t := range turns {
+		if t.UUID != "" {
+			surviving[t.UUID] = true
+		}
+	}
+	for i := range turns {
+		p := turns[i].ParentUUID
+		if p == "" || surviving[p] {
+			continue // true root, or parent already present — nothing to bridge
+		}
+		visited := map[string]bool{p: true}
+		cur := p
+		for {
+			next, ok := rawParents[cur]
+			if !ok || next == "" {
+				break // chain leaves the raw graph or reaches a true root
+			}
+			if surviving[next] {
+				turns[i].ParentUUID = next
+				break
+			}
+			if visited[next] {
+				break // cycle in the raw graph — give up, leave ParentUUID as-is
+			}
+			visited[next] = true
+			cur = next
+		}
+	}
+}
 
 // PartitionThreads partitions turns into connected components of the
 // parentUuid DAG, setting Turn.ThreadID on each element of turns IN PLACE
@@ -188,7 +252,16 @@ func buildThreadMeta(turns []Turn, isRoot []bool) []ThreadMeta {
 		}
 		tm.MessageCount++
 		tm.LastUUID = t.UUID
-		if t.IsSidechain {
+		// Role derives from the thread's ROOT turn's IsSidechain, not from
+		// any member: a thread is a subagent-sidechain thread because it
+		// forked from one (parentUuid:null, isSidechain:true), not because
+		// some later member happens to carry the flag. Checking every member
+		// meant one isSidechain turn anywhere downstream of a plain root
+		// (e.g. once Phase 2 merges subagent turns into a session ahead of
+		// PartitionThreads) reclassified the WHOLE thread — including the
+		// session's actual main thread — leaving no thread with role=main at
+		// all.
+		if isRoot[i] && t.IsSidechain {
 			tm.Role = ThreadRoleSubagentSidechain
 		}
 		if !t.Timestamp.IsZero() {
@@ -217,6 +290,18 @@ func buildThreadMeta(turns []Turn, isRoot []bool) []ThreadMeta {
 			tm.Role = ThreadRoleMain
 		} else if tm.Role == "" {
 			tm.Role = ThreadRoleUnknownFork
+		}
+		// A cycle in the parentUuid graph (e.g. a(parent=b), b(parent=a))
+		// means no member of the thread is ever marked isRoot, so neither
+		// FirstUUID assignment above fires and it would otherwise ship as
+		// the empty string — a positive false claim (FirstUUID has no
+		// omitempty), not just a missing value. ThreadID is guaranteed
+		// non-empty here (PartitionThreads' own fallback sets it to the
+		// member's own uuid, or a synthetic id, before this ever runs), so
+		// it is the honest fallback: "this thread's identity, root
+		// unresolved" rather than a lie that FirstUUID was computed.
+		if tm.FirstUUID == "" {
+			tm.FirstUUID = tm.ThreadID
 		}
 		out = append(out, *tm)
 	}

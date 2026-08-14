@@ -16,7 +16,7 @@
 //   - index.go         — in-memory full-text index backed by flat projection files
 //   - provider.go      — Reconcilable implementation
 //   - mcp_tools.go     — cog_search_conversations, cog_get_conversation_turn,
-//                        cog_list_conversations tool registrations
+//     cog_list_conversations tool registrations
 package conversations
 
 import "time"
@@ -119,6 +119,16 @@ type SessionMeta struct {
 	// field existed and not yet re-touched (ActionCreate/ActionUpdate) since —
 	// same lazy-migration posture as SourceOffset/SourceTailHash.
 	Threads []ThreadMeta `json:"threads,omitempty"`
+
+	// rawParents is parse-time scratch space: the uuid -> parentUuid edge for
+	// EVERY record ParseSession saw, including records that never became a
+	// Turn (tool_result-only user records, type:"system" records, hook
+	// outputs, text-less assistant records, duplicate uuids). indexSession
+	// uses it to bridge Turn.ParentUUID across those gaps (see
+	// bridgeDroppedParents in threads.go) before PartitionThreads runs, then
+	// clears it — it is never persisted (unexported, so encoding/json never
+	// touches it regardless).
+	rawParents map[string]string
 }
 
 // ThreadRole classifies a thread found by PartitionThreads.
@@ -207,13 +217,24 @@ type Turn struct {
 	ThreadID string `json:"thread_id,omitempty"`
 
 	// Provenance declares how this turn's content was obtained, for records
-	// that did not come from a direct JSONL parse. Empty (the default) means
-	// "direct-jsonl" — parsed straight from a CC session or subagent
-	// transcript file. A future importer that recovers content by some other
-	// means (e.g. hand-carried from a side-chat panel export, or
+	// that did not come from a direct JSONL parse. Empty is the default for
+	// any record whose source did not set this field explicitly — on the CC
+	// path that means "direct-jsonl" (parsed straight from a CC session or
+	// subagent transcript file), but on the normalized-ingest path (see
+	// ingest_parser.go) empty means only "the observer did not declare a
+	// provenance", not a positive claim of direct-jsonl origin: an ingest
+	// record is by definition not a direct JSONL parse, and this field
+	// currently carries no source/carrier/capture-time distinctions (unlike
+	// QuarantineProvenance or cogblock.BlockProvenance) to say more than
+	// that. A future importer that recovers content by some other means
+	// (e.g. hand-carried from a side-chat panel export, or
 	// log-reconstructed) should set an explicit value here rather than
-	// impersonating a directly-parsed record. This is schema headroom only —
-	// no importer exists yet (see #557 plan Phase 3).
+	// leaving it empty. This is schema headroom only — no importer exists
+	// yet, and the richer shape (source/carrier/capture-time, a schema
+	// version bump) is deliberately deferred: #557's own follow-up comments
+	// establish that side-chat capture needs a materially different,
+	// capture-at-emit-time design, not a sweep-side parser field (see
+	// #557 plan Phase 3).
 	Provenance string `json:"provenance,omitempty"`
 
 	// Component is the L1 component class for this record (e.g. "session.turn").
@@ -236,8 +257,8 @@ type SearchHit struct {
 	UUID         string    `json:"uuid"`
 	Timestamp    time.Time `json:"timestamp"`
 	Role         Role      `json:"role"`
-	Excerpt      string    `json:"excerpt"`              // ~300-char snippet containing the match
-	Context      string    `json:"context,omitempty"`   // preceding/following text
+	Excerpt      string    `json:"excerpt"`           // ~300-char snippet containing the match
+	Context      string    `json:"context,omitempty"` // preceding/following text
 	SessionTitle string    `json:"session_title,omitempty"`
 	Identity     string    `json:"identity,omitempty"`
 	Source       string    `json:"source,omitempty"` // observer source id, empty for CC sessions
@@ -247,9 +268,9 @@ type SearchHit struct {
 type IndexDepth string
 
 const (
-	DepthFull          IndexDepth = "full"           // all turns parsed and indexed
-	DepthMetaOnly      IndexDepth = "meta_only"      // meta parsed, turns not
-	DepthNotProjected  IndexDepth = "not_projected"  // file seen, not yet indexed
+	DepthFull         IndexDepth = "full"          // all turns parsed and indexed
+	DepthMetaOnly     IndexDepth = "meta_only"     // meta parsed, turns not
+	DepthNotProjected IndexDepth = "not_projected" // file seen, not yet indexed
 )
 
 // IndexEntry describes one session's projection status.

@@ -40,33 +40,33 @@ var systemReminderRE = regexp.MustCompile(`(?s)<system-reminder>.*?</system-remi
 // rawRecord is the outermost envelope of every JSONL line.
 // We decode into this first and then dispatch on Type.
 type rawRecord struct {
-	Type       string          `json:"type"`
-	UUID       string          `json:"uuid"`
-	ParentUUID string          `json:"parentUuid"`
-	SessionID  string          `json:"sessionId"`
-	Timestamp  string          `json:"timestamp"`
-	Message    json.RawMessage `json:"message"`
-	Content    string          `json:"content"` // system records use content string
-	UserType   string          `json:"userType"`
-	Entrypoint string          `json:"entrypoint"`
-	IsSidechain bool           `json:"isSidechain"`
-	Level      string          `json:"level"`
+	Type        string          `json:"type"`
+	UUID        string          `json:"uuid"`
+	ParentUUID  string          `json:"parentUuid"`
+	SessionID   string          `json:"sessionId"`
+	Timestamp   string          `json:"timestamp"`
+	Message     json.RawMessage `json:"message"`
+	Content     string          `json:"content"` // system records use content string
+	UserType    string          `json:"userType"`
+	Entrypoint  string          `json:"entrypoint"`
+	IsSidechain bool            `json:"isSidechain"`
+	Level       string          `json:"level"`
 }
 
 // rawMessage is message.* within a user or assistant record.
 type rawMessage struct {
-	Role    string             `json:"role"`
-	Model   string             `json:"model"`
-	Content json.RawMessage    `json:"content"`
+	Role    string          `json:"role"`
+	Model   string          `json:"model"`
+	Content json.RawMessage `json:"content"`
 }
 
 // rawContentBlock is one element of message.content when it is an array.
 type rawContentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text"`
-	Thinking  string          `json:"thinking"`
-	Input     json.RawMessage `json:"input,omitempty"`    // tool_use
-	Content   json.RawMessage `json:"content,omitempty"`  // tool_result nested
+	Type     string          `json:"type"`
+	Text     string          `json:"text"`
+	Thinking string          `json:"thinking"`
+	Input    json.RawMessage `json:"input,omitempty"`   // tool_use
+	Content  json.RawMessage `json:"content,omitempty"` // tool_result nested
 }
 
 // rawAITitle is the ai-title record type.
@@ -147,6 +147,25 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 			continue
 		}
 		lastGoodOffset = consumedOffset
+
+		// Record this record's uuid -> parentUuid edge, regardless of
+		// whether it goes on to become a Turn. This is the raw DAG that
+		// bridgeDroppedParents (threads.go) walks to splice a surviving
+		// turn's ParentUUID past tool_result-only user records, type:"system"
+		// records, hook outputs, text-less assistant records, and
+		// duplicate-uuid records — all of which are otherwise invisible to
+		// PartitionThreads and would misclassify their surviving children as
+		// fresh thread roots. First-seen wins per uuid, mirroring the
+		// uuid-dedup rule below (the turn set anchors on the first
+		// occurrence of any uuid).
+		if rec.UUID != "" {
+			if meta.rawParents == nil {
+				meta.rawParents = make(map[string]string)
+			}
+			if _, seen := meta.rawParents[rec.UUID]; !seen {
+				meta.rawParents[rec.UUID] = rec.ParentUUID
+			}
+		}
 
 		// Populate session-level metadata from whichever record has it.
 		if rec.Entrypoint != "" && meta.Entrypoint == "" {

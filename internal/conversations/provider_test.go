@@ -1462,6 +1462,175 @@ func TestProviderIngest_ThreadPartition(t *testing.T) {
 	}
 }
 
+// makeToolResultOnlyUserRecord returns a JSON line for a user record whose
+// only content block is a tool_result — parseUserRecord (parser.go) drops
+// this (extractContentText returns "" since tool_result blocks are skipped),
+// so it never becomes a Turn. Real CC sessions are full of these: every tool
+// invocation's result comes back as exactly this shape.
+func makeToolResultOnlyUserRecord(uuid, parentUUID, sessionID, ts string) string {
+	content, _ := json.Marshal([]map[string]any{
+		{"type": "tool_result", "tool_use_id": "toolu_x", "content": "tool output"},
+	})
+	msg, _ := json.Marshal(map[string]any{
+		"role":    "user",
+		"content": json.RawMessage(content),
+	})
+	rec := map[string]any{
+		"type":       "user",
+		"uuid":       uuid,
+		"parentUuid": parentUUID,
+		"sessionId":  sessionID,
+		"timestamp":  ts,
+		"message":    json.RawMessage(msg),
+		"userType":   "external",
+		"entrypoint": "cli",
+	}
+	b, _ := json.Marshal(rec)
+	return string(b)
+}
+
+// makeSystemRecord returns a JSON line for a type:"system" record — not in
+// ParseSession's type switch at all, so it never becomes a Turn regardless
+// of content.
+func makeSystemRecord(uuid, parentUUID, sessionID, ts string) string {
+	rec := map[string]any{
+		"type":       "system",
+		"uuid":       uuid,
+		"parentUuid": parentUUID,
+		"sessionId":  sessionID,
+		"timestamp":  ts,
+		"content":    "some system-level note",
+		"level":      "info",
+	}
+	b, _ := json.Marshal(rec)
+	return string(b)
+}
+
+// TestParseSession_RecordsRawParentsForDroppedRecords verifies that
+// ParseSession populates meta.rawParents for every record with a uuid, kept
+// or dropped alike — the raw graph bridgeDroppedParents needs to splice a
+// surviving turn's ParentUUID past the records the turn set itself never
+// sees.
+func TestParseSession_RecordsRawParentsForDroppedRecords(t *testing.T) {
+	sid := "raw-parents-session"
+	lines := []string{
+		makeUserRecord("u1", "", sid, "question", "2026-06-01T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer", "2026-06-01T10:01:00Z"),
+		makeToolResultOnlyUserRecord("dropped-tr", "a1", sid, "2026-06-01T10:02:00Z"),
+		makeAssistantRecord("a2", "dropped-tr", sid, "follow-up", "2026-06-01T10:03:00Z"),
+	}
+	jsonl := strings.Join(lines, "\n") + "\n"
+
+	var meta SessionMeta
+	var turns []Turn
+	if err := ParseSession(strings.NewReader(jsonl), sid, 8192, &meta, func(t Turn) bool {
+		turns = append(turns, t)
+		return true
+	}); err != nil {
+		t.Fatalf("ParseSession: %v", err)
+	}
+
+	// The dropped tool_result-only record never became a Turn...
+	if len(turns) != 3 {
+		t.Fatalf("want 3 surviving turns (u1, a1, a2), got %d: %+v", len(turns), turns)
+	}
+	// ...but its uuid -> parentUuid edge is still in rawParents.
+	if got, want := meta.rawParents["dropped-tr"], "a1"; got != want {
+		t.Errorf("rawParents[dropped-tr]: want %q, got %q", want, got)
+	}
+	if got, want := meta.rawParents["a2"], "dropped-tr"; got != want {
+		t.Errorf("rawParents[a2]: want %q, got %q", want, got)
+	}
+}
+
+// TestProviderIngest_ThreadPartition_BridgesDroppedRecords is the real-shaped
+// regression fixture the #557 review's over-fragmentation finding asked for:
+// a session where every surviving turn's immediate JSONL parent is a record
+// type ParseSession drops (a tool_result-only user record, then a
+// type:"system" record, chained back to back). Without bridging, each
+// surviving turn downstream of a dropped record looks like a fresh DAG root
+// and the session fragments into spurious singleton threads; the actual
+// on-disk shape (a single linear conversation) must still collapse to
+// exactly one thread, role=main, message_count 4.
+func TestProviderIngest_ThreadPartition_BridgesDroppedRecords(t *testing.T) {
+	p, root := newTestProvider(t)
+	srcDir := t.TempDir()
+	const sid = "33333333-4444-5555-6666-777777777777"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "question one", "2026-06-01T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer one", "2026-06-01T10:01:00Z"),
+		// Dropped: tool_result-only user record (a1's child in the raw file).
+		makeToolResultOnlyUserRecord("tr1", "a1", sid, "2026-06-01T10:02:00Z"),
+		// Dropped: type:"system" record (tr1's child in the raw file).
+		makeSystemRecord("sys1", "tr1", sid, "2026-06-01T10:02:30Z"),
+		// Surviving turn whose JSONL parent (sys1) never became a Turn.
+		makeUserRecord("u2", "sys1", sid, "question two", "2026-06-01T10:03:00Z"),
+		makeAssistantRecord("a2", "u2", sid, "answer two", "2026-06-01T10:04:00Z"),
+	}
+	writeJSONLFixture(t, srcDir, sid, lines)
+	writeObservatoryConfig(t, root, []string{srcDir})
+
+	ctx := context.Background()
+	cfgAny, err := p.LoadConfig(root)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	liveAny, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive: %v", err)
+	}
+	plan, err := p.ComputePlan(cfgAny, liveAny, nil)
+	if err != nil {
+		t.Fatalf("ComputePlan: %v", err)
+	}
+	if _, err := p.ApplyPlan(ctx, plan); err != nil {
+		t.Fatalf("ApplyPlan: %v", err)
+	}
+
+	liveAny2, err := p.FetchLive(ctx, cfgAny)
+	if err != nil {
+		t.Fatalf("FetchLive 2: %v", err)
+	}
+	ls, ok := liveAny2.(*liveState)
+	if !ok {
+		t.Fatal("expected *liveState")
+	}
+	entry, ok := ls.Entries[sid]
+	if !ok {
+		t.Fatalf("session %s not in live state", sid)
+	}
+
+	// The 2 dropped records must not have fragmented this into 3 threads.
+	threads := entry.Meta.Threads
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread after bridging dropped records, got %d: %+v", len(threads), threads)
+	}
+	tm := threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main, got %q", tm.Role)
+	}
+	if tm.MessageCount != 4 {
+		t.Errorf("MessageCount: want 4 (u1, a1, u2, a2), got %d", tm.MessageCount)
+	}
+	if tm.ThreadID != "u1" {
+		t.Errorf("ThreadID: want u1 (session's true first turn), got %q", tm.ThreadID)
+	}
+
+	// u2's ParentUUID should have been bridged to a1 (the nearest surviving
+	// ancestor), not left pointing at the dropped sys1.
+	u2Turn, ok := p.index.GetTurn(sid, 2) // turn_index 2 = u2
+	if !ok {
+		t.Fatalf("GetTurn(sid, 2) not found")
+	}
+	if u2Turn.ParentUUID != "a1" {
+		t.Errorf("u2 ParentUUID: want a1 (bridged past dropped tr1/sys1), got %q", u2Turn.ParentUUID)
+	}
+	if u2Turn.ThreadID != "u1" {
+		t.Errorf("u2 ThreadID: want u1 (same thread as the session start), got %q", u2Turn.ThreadID)
+	}
+}
+
 // TestIngestProvenance_HandCarriedRecord exercises the Phase 3 provenance
 // headroom: a normalized-ingest record declaring a non-default provenance
 // (e.g. content recovered by some means other than a direct JSONL parse)

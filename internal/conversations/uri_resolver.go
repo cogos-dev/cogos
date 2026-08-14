@@ -131,6 +131,19 @@ type ResolvedSlice struct {
 	// ContentHash is non-empty only when Bounded=true.
 	ContentHash string `json:"content_hash,omitempty"`
 
+	// SessionsMissingThreadIndex counts sessions within this query's scope
+	// that have no Threads metadata yet (SessionMeta.Threads is nil —
+	// indexed before threading shipped, or not re-touched since; see
+	// SessionMeta.Threads' doc comment on the lazy-migration posture) and
+	// were therefore excluded wholesale from a thread_role= filter rather
+	// than genuinely failing to match it. Zero when thread_role= was not
+	// set, or when every in-scope session already has Threads populated.
+	// Exists so a caller can tell "did not match" apart from "not yet
+	// indexed for threads" instead of reading a masked observable — a
+	// plausible non-empty result set that is silently a subset of the
+	// corpus with no signal that it is.
+	SessionsMissingThreadIndex int `json:"sessions_missing_thread_index,omitempty"`
+
 	// Turns carries the resolved content. Shape depends on Res.
 	Turns []ResolvedTurn `json:"turns"`
 }
@@ -524,6 +537,7 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 	// Collect matching turns.
 	var allTurns []Turn
 	sourcesSeen := make(map[string]struct{})
+	sessionsMissingThreadIndex := 0
 
 	for _, sid := range sids {
 		turns, ok := idx.turns[sid]
@@ -547,6 +561,13 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 			for _, tm := range meta.Threads {
 				threadRoleByID[tm.ThreadID] = tm.Role
 			}
+		} else if threadRoleSet != nil {
+			// thread_role= is set but this session has no Threads yet —
+			// every one of its turns will be excluded below, not because
+			// none matched, but because none COULD be evaluated. Count it
+			// once per session so the caller can see the difference (see
+			// ResolvedSlice.SessionsMissingThreadIndex).
+			sessionsMissingThreadIndex++
 		}
 
 		for _, t := range turns {
@@ -560,7 +581,8 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 			// populated yet (not re-touched since threading shipped) has no
 			// resolvable thread role and is excluded when this filter is set
 			// — it cannot be positively matched to any of the requested
-			// roles.
+			// roles. See sessionsMissingThreadIndex above for the honest
+			// count of how many in-scope sessions this affected.
 			if threadRoleSet != nil {
 				role, ok := threadRoleByID[t.ThreadID]
 				if !ok {
@@ -676,12 +698,13 @@ func resolveQuery(rawURI string, uq *URIQuery, idx *Index) (*ResolvedSlice, erro
 	bounded := uq.isBounded()
 
 	slice := &ResolvedSlice{
-		URI:        rawURI,
-		ResolvedAt: time.Now().UTC(),
-		Count:      len(resolved),
-		Sources:    sources,
-		Bounded:    bounded,
-		Turns:      resolved,
+		URI:                        rawURI,
+		ResolvedAt:                 time.Now().UTC(),
+		Count:                      len(resolved),
+		Sources:                    sources,
+		Bounded:                    bounded,
+		Turns:                      resolved,
+		SessionsMissingThreadIndex: sessionsMissingThreadIndex,
 	}
 
 	// Content hash — only for bounded slices.
@@ -717,10 +740,51 @@ func abstractText(text string) string {
 	return text[:abstractMaxLen] + "…"
 }
 
+// hashableTurn is the field subset computeSliceHash hashes — deliberately
+// NOT the full ResolvedTurn. content_hash is a stability contract (§5: the
+// citable artifact for a bounded slice); ResolvedTurn gets new fields as the
+// schema grows (ThreadID/ThreadRole were added by #557), and hashing the
+// struct directly means the hash of IDENTICAL conversation content silently
+// changes the moment a new omitempty field starts being populated — breaking
+// verification of any already-issued citation with no migration marker.
+// Add a field here only when it should be part of what content_hash attests
+// to; new schema headroom (ThreadID/ThreadRole today, and anything future)
+// stays out until a deliberate, versioned decision says otherwise.
+type hashableTurn struct {
+	SessionID string `json:"session_id"`
+	TurnIndex int    `json:"turn_index"`
+	UUID      string `json:"uuid"`
+	Role      string `json:"role"`
+	Timestamp string `json:"timestamp,omitempty"`
+	IDAnchor  string `json:"id_anchor"`
+	Text      string `json:"text,omitempty"`
+	Source    string `json:"source,omitempty"`
+
+	Component       string `json:"component,omitempty"`
+	OntologyVersion string `json:"ontology_version,omitempty"`
+	MappingVersion  string `json:"mapping_version,omitempty"`
+}
+
 // computeSliceHash returns a hex-encoded SHA-256 of the JSON serialisation of
-// the resolved turns. Used only for bounded slices.
+// the resolved turns' hashableTurn projection. Used only for bounded slices.
 func computeSliceHash(turns []ResolvedTurn) (string, error) {
-	b, err := json.Marshal(turns)
+	hashable := make([]hashableTurn, len(turns))
+	for i, t := range turns {
+		hashable[i] = hashableTurn{
+			SessionID:       t.SessionID,
+			TurnIndex:       t.TurnIndex,
+			UUID:            t.UUID,
+			Role:            t.Role,
+			Timestamp:       t.Timestamp,
+			IDAnchor:        t.IDAnchor,
+			Text:            t.Text,
+			Source:          t.Source,
+			Component:       t.Component,
+			OntologyVersion: t.OntologyVersion,
+			MappingVersion:  t.MappingVersion,
+		}
+	}
+	b, err := json.Marshal(hashable)
 	if err != nil {
 		return "", err
 	}

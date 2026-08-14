@@ -189,6 +189,61 @@ func TestPartitionThreads_BranchPoint(t *testing.T) {
 	}
 }
 
+// TestPartitionThreads_SidechainRoleDerivesFromRootOnly: a and c are plain
+// (non-sidechain) turns continuing the same DAG chain through b, which is a
+// non-root member carrying IsSidechain:true. Role must come from the
+// thread's ROOT (a), not from any member (b) — otherwise a single
+// isSidechain turn anywhere downstream reclassifies the whole thread,
+// including turn_index 0, leaving no thread with role=main at all.
+func TestPartitionThreads_SidechainRoleDerivesFromRootOnly(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	turns := []Turn{
+		mkTurn("a", "", 0, false, now),
+		mkTurn("b", "a", 1, true, now.Add(time.Minute)), // non-root, IsSidechain
+		mkTurn("c", "b", 2, false, now.Add(2*time.Minute)),
+	}
+
+	threads := PartitionThreads(turns)
+
+	if len(threads) != 1 {
+		t.Fatalf("want 1 thread, got %d: %+v", len(threads), threads)
+	}
+	tm := threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main (root a is not IsSidechain), got %q", tm.Role)
+	}
+	if tm.MessageCount != 3 {
+		t.Errorf("MessageCount: want 3, got %d", tm.MessageCount)
+	}
+}
+
+// TestBuildThreadMeta_CycleGetsNonEmptyFirstUUID: a cycle in the parentUuid
+// graph (a's parent is b, b's parent is a) means no member is ever marked
+// isRoot, so the normal FirstUUID assignment never fires. FirstUUID must
+// still come back non-empty (falling back to ThreadID) rather than shipping
+// an empty string that looks like a computed-but-blank value.
+func TestBuildThreadMeta_CycleGetsNonEmptyFirstUUID(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	turns := []Turn{
+		mkTurn("a", "b", 0, false, now),
+		mkTurn("b", "a", 1, false, now.Add(time.Minute)),
+	}
+
+	threads := PartitionThreads(turns)
+
+	if len(threads) != 2 {
+		t.Fatalf("want 2 threads (cycle fallback: each member its own thread), got %d: %+v", len(threads), threads)
+	}
+	for _, tm := range threads {
+		if tm.FirstUUID == "" {
+			t.Errorf("thread %q: FirstUUID must not be empty, even for a cycle", tm.ThreadID)
+		}
+		if tm.FirstUUID != tm.ThreadID {
+			t.Errorf("thread %q: FirstUUID fallback should equal ThreadID, got %q", tm.ThreadID, tm.FirstUUID)
+		}
+	}
+}
+
 // TestPartitionThreads_Degenerate exercises degenerate input that must not
 // panic: zero turns, and a set of all-orphan turns (each has a ParentUUID
 // pointing outside the set, or no UUID at all).

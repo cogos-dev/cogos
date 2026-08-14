@@ -562,6 +562,83 @@ func TestResolveConversationURI_BoundedHash(t *testing.T) {
 	})
 }
 
+// TestComputeSliceHash_StableAcrossThreadFields verifies that content_hash
+// does not change when ThreadID/ThreadRole go from unset to set on otherwise
+// identical turn content — the #557 review's finding that adding the new
+// omitempty fields to ResolvedTurn silently changed the hash of unchanged
+// conversation content, breaking verification of any citation already
+// issued against a bounded slice.
+func TestComputeSliceHash_StableAcrossThreadFields(t *testing.T) {
+	base := ResolvedTurn{
+		SessionID: "sess",
+		TurnIndex: 0,
+		UUID:      "u1",
+		Role:      "user",
+		Timestamp: "2026-06-10T12:00:00Z",
+		IDAnchor:  "#id-u1",
+		Text:      "hello",
+	}
+	withoutThreads := base
+	withThreads := base
+	withThreads.ThreadID = "u1"
+	withThreads.ThreadRole = "main"
+
+	hashA, err := computeSliceHash([]ResolvedTurn{withoutThreads})
+	if err != nil {
+		t.Fatalf("computeSliceHash (no thread fields): %v", err)
+	}
+	hashB, err := computeSliceHash([]ResolvedTurn{withThreads})
+	if err != nil {
+		t.Fatalf("computeSliceHash (with thread fields): %v", err)
+	}
+	if hashA != hashB {
+		t.Errorf("content_hash changed when only ThreadID/ThreadRole differed: %q vs %q", hashA, hashB)
+	}
+}
+
+// TestResolveQuery_ThreadRoleFilter_MasksUnindexedSessions verifies that a
+// thread_role= query surfaces SessionsMissingThreadIndex when it silently
+// excludes a session with no Threads metadata yet, so a caller can tell
+// "did not match" apart from "not yet indexed for threads" (#557 review
+// masked-observable finding).
+func TestResolveQuery_ThreadRoleFilter_MasksUnindexedSessions(t *testing.T) {
+	t.Run("session with no Threads is counted, not silently dropped", func(t *testing.T) {
+		idx := buildTestIndex(t) // test-session-1 has no Threads populated
+		slice, err := ResolveConversationURI("cog:conversations?thread_role=main", idx)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if slice.Count != 0 {
+			t.Errorf("Count: want 0 (no session has Threads), got %d", slice.Count)
+		}
+		if slice.SessionsMissingThreadIndex != 1 {
+			t.Errorf("SessionsMissingThreadIndex: want 1, got %d", slice.SessionsMissingThreadIndex)
+		}
+	})
+
+	t.Run("fully-indexed session reports zero missing", func(t *testing.T) {
+		idx := buildTestIndexWithThreads(t) // threaded-session has Threads populated
+		slice, err := ResolveConversationURI("cog:conversations?thread_role=main", idx)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if slice.SessionsMissingThreadIndex != 0 {
+			t.Errorf("SessionsMissingThreadIndex: want 0, got %d", slice.SessionsMissingThreadIndex)
+		}
+	})
+
+	t.Run("no thread_role filter never counts missing sessions", func(t *testing.T) {
+		idx := buildTestIndex(t)
+		slice, err := ResolveConversationURI("cog:conversations", idx)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if slice.SessionsMissingThreadIndex != 0 {
+			t.Errorf("SessionsMissingThreadIndex: want 0 when thread_role= not set, got %d", slice.SessionsMissingThreadIndex)
+		}
+	})
+}
+
 // ─── Resolution level tests ────────────────────────────────────────────────────
 
 func TestResolveConversationURI_ResLevels(t *testing.T) {

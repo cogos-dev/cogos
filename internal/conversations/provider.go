@@ -1329,11 +1329,15 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	}
 	meta.SourceTailHash = tailHash
 
-	// Partition the assembled turn list into threads (parentUuid DAG
+	// Bridge each turn's ParentUUID past any run of records ParseSession saw
+	// but that never became a Turn (see bridgeDroppedParents' doc comment),
+	// then partition the assembled turn list into threads (parentUuid DAG
 	// components) as a post-processing step over the in-memory turn list —
 	// does not touch SourceOffset/SourceTailHash/watermark fields. See
 	// threads.go's doc comment for the mechanisms this covers.
+	bridgeDroppedParents(turns, meta.rawParents)
 	meta.Threads = PartitionThreads(turns)
+	meta.rawParents = nil // parse-time scratch space only; never persisted
 
 	return meta, turns, nil
 }
