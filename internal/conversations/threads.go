@@ -43,6 +43,15 @@ package conversations
 
 import "fmt"
 
+// threadBridgeSchemaVersion is the current SessionMeta.ThreadBridgeVersion /
+// Turn.ParentBridged persistence scheme. Bump this whenever the meaning or
+// completeness of Turn.ParentBridged changes in a way that makes an
+// old-schema projection's bridged bits untrustworthy — indexSessionIncremental
+// declines its fast path whenever a session's stored ThreadBridgeVersion
+// doesn't match, forcing one full re-parse that backfills both fields. See
+// SessionMeta.ThreadBridgeVersion's doc comment (types.go).
+const threadBridgeSchemaVersion = 1
+
 // bridgeDroppedParents rewrites turns[i].ParentUUID, in place, to splice
 // across any run of records that ParseSession saw but that never became a
 // Turn. rawParents is the full uuid -> parentUuid graph parser.go records
@@ -93,6 +102,16 @@ func bridgeDroppedParents(turns []Turn, rawParents map[string]string) map[string
 			}
 			if surviving[next] {
 				turns[i].ParentUUID = next
+				// Persist the bridge on the turn itself, not just in the
+				// returned map: the map is this call's scratch space and
+				// covers only the uuids bridgeDroppedParents actually
+				// walked THIS call (tail-only on an incremental cycle — see
+				// indexSessionIncremental). Turn.ParentBridged survives to
+				// disk and to the next cycle's prevTurns, so a turn bridged
+				// in an earlier cycle is still recognized as bridged (not a
+				// fresh direct child) once it's part of a later cycle's
+				// PREFIX. See Turn.ParentBridged's doc comment (types.go).
+				turns[i].ParentBridged = true
 				if turns[i].UUID != "" {
 					bridged[turns[i].UUID] = true
 				}
@@ -163,19 +182,29 @@ func resolveCompactBoundaryFallbacks(rawParents map[string]string, compactBounda
 //     starts its own.
 //
 // bridged names the turn UUIDs whose ParentUUID was rewritten by
-// bridgeDroppedParents (see its doc comment) — i.e. this turn's real JSONL
-// parent was a dropped record (most commonly a tool_result-only user
-// record), not the surviving parent it now points at directly. A bridged
-// child is never treated as a branch point and never competes with a
-// sibling for "first child" status: ordinary (including parallel) tool-call
-// structure routinely leaves one assistant turn with both a direct
-// surviving child AND a second child reached only by bridging through a
-// dropped tool_result — that is not a conversational fork, and counting the
-// bridged child toward the branch tally fragmented real multi-thousand-turn
-// sessions into a handful-of-messages "main" thread plus large
-// "unknown-fork" threads. Pass nil when the caller performed no bridging
-// (e.g. synthetic test fixtures) — every child is then treated as direct,
-// preserving the original genuine-fork detection.
+// bridgeDroppedParents THIS call (see its doc comment) — i.e. this turn's
+// real JSONL parent was a dropped record (most commonly a tool_result-only
+// user record), not the surviving parent it now points at directly. A
+// child is treated as bridged when EITHER this map says so OR the turn's
+// own ParentBridged field is set — the latter is what lets a turn bridged
+// in an EARLIER indexing cycle (now part of the PREFIX passed to
+// indexSessionIncremental, whose own bridgeDroppedParents call only walked
+// this cycle's tail-only rawParents and so never re-added it to this map)
+// still be recognized as bridged rather than misread as a fresh direct
+// child. See Turn.ParentBridged's doc comment (types.go) and the #557
+// round-5 review BLOCKING finding this closes.
+//
+// A bridged child is never treated as a branch point and never competes
+// with a sibling for "first child" status: ordinary (including parallel)
+// tool-call structure routinely leaves one assistant turn with both a
+// direct surviving child AND a second child reached only by bridging
+// through a dropped tool_result — that is not a conversational fork, and
+// counting the bridged child toward the branch tally fragmented real
+// multi-thousand-turn sessions into a handful-of-messages "main" thread
+// plus large "unknown-fork" threads. Pass nil when the caller performed no
+// bridging (e.g. synthetic test fixtures that don't set ParentBridged
+// either) — every child is then treated as direct, preserving the original
+// genuine-fork detection.
 //
 // Degenerate input (0 turns, or turns missing a UUID) does not panic: a turn
 // without a UUID becomes the root of a synthetic thread keyed by its index
@@ -219,7 +248,7 @@ func PartitionThreads(turns []Turn, bridged map[string]bool) []ThreadMeta {
 		}
 		var direct []int
 		for _, kidIdx := range kids {
-			if bridged[turns[kidIdx].UUID] {
+			if bridged[turns[kidIdx].UUID] || turns[kidIdx].ParentBridged {
 				continue // reached only by splicing across a dropped record — not a fork
 			}
 			direct = append(direct, kidIdx)

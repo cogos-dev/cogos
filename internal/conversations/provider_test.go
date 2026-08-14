@@ -1197,6 +1197,281 @@ func TestIndexSessionIncremental_ThreadsMatchFullReparse(t *testing.T) {
 	}
 }
 
+// TestIndexSessionIncremental_ThreadsMatchFullReparse_PrefixBridgedEdge is
+// the #557 round-5 review BLOCKING regression fixture. Unlike
+// TestIndexSessionIncremental_ThreadsMatchFullReparse above — whose prefix
+// (u1, a1) contains no bridged edge, so `bridged` is empty on both the
+// prefix and the incremental passes and the fixture cannot distinguish
+// correct behavior from the bug — this fixture's PREFIX itself contains a
+// bridged edge (u2 reaches a1 only by splicing across a dropped
+// tool-result-only record), and the TAIL then gives a1 a second, ordinary
+// DIRECT child (u3).
+//
+// Without persisting bridged-ness on the turn itself (Turn.ParentBridged),
+// indexSessionIncremental's own bridgeDroppedParents call only ever sees
+// this cycle's tail-only rawParents — u2's ParentUUID was already resolved
+// to "a1" in the PREVIOUS cycle, so this cycle's call skips it entirely
+// (see bridgeDroppedParents' doc comment) and the returned `bridged` map
+// never mentions u2. PartitionThreads then sees TWO apparently-direct
+// children of a1 (u2 and u3) and wrongly promotes u3 to its own branch
+// root — precisely the reviewer-measured failure mode (152/193 corpus
+// sessions diverged from a full re-parse). A from-byte-0 full re-parse of
+// the identical final file, by contrast, always has bridgeDroppedParents
+// see the WHOLE file, correctly excludes u2 from the direct-children tally,
+// and produces exactly one thread. This test fails without
+// Turn.ParentBridged actually persisting across the incremental boundary.
+func TestIndexSessionIncremental_ThreadsMatchFullReparse_PrefixBridgedEdge(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "99999999-1111-2222-3333-444444444444"
+
+	prefixLines := []string{
+		makeUserRecord("u1", "", sid, "question one", "2026-07-01T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "answer one (calls a tool)", "2026-07-01T10:01:00Z"),
+		makeToolResultOnlyUserRecord("tr1", "a1", sid, "2026-07-01T10:02:00Z"),
+		makeUserRecord("u2", "tr1", sid, "question two (continues after the tool result)", "2026-07-01T10:03:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, prefixLines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (cycle 1): %v", err)
+	}
+	if len(turns1) != 3 {
+		t.Fatalf("expected 3 turns after cycle 1 (u1, a1, u2), got %d", len(turns1))
+	}
+	if len(meta1.Threads) != 1 {
+		t.Fatalf("test setup: expected 1 thread after cycle 1, got %d: %+v", len(meta1.Threads), meta1.Threads)
+	}
+	var u2Prefix *Turn
+	for i := range turns1 {
+		if turns1[i].UUID == "u2" {
+			u2Prefix = &turns1[i]
+		}
+	}
+	if u2Prefix == nil || u2Prefix.ParentUUID != "a1" {
+		t.Fatalf("test setup: expected u2 bridged to a1 after cycle 1, got %+v", u2Prefix)
+	}
+	if !u2Prefix.ParentBridged {
+		t.Fatalf("test setup: expected u2.ParentBridged=true after cycle 1 (bridged past tr1)")
+	}
+
+	// Append a tail that gives a1 an ORDINARY, unbridged second child (u3) —
+	// a genuine sibling of the already-bridged u2, not a fork of it.
+	tailLines := []string{
+		makeUserRecord("u3", "a1", sid, "question three (a real second child of a1)", "2026-07-01T10:04:00Z"),
+		makeAssistantRecord("a3", "u3", sid, "answer three", "2026-07-01T10:05:00Z"),
+	}
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + strings.Join(tailLines, "\n")); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	meta2, turns2, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used")
+	}
+	if len(turns2) != 5 {
+		t.Fatalf("expected 5 turns (u1, a1, u2, u3, a3) after the incremental cycle, got %d", len(turns2))
+	}
+
+	if len(meta2.Threads) != 1 {
+		t.Fatalf("want 1 thread from the incremental cycle (u2's PREFIX-cycle bridged edge must still be "+
+			"honored, so u3 is recognized as a1's only DIRECT child rather than wrongly promoted to a "+
+			"branch root), got %d: %+v", len(meta2.Threads), meta2.Threads)
+	}
+	tm := meta2.Threads[0]
+	if tm.Role != ThreadRoleMain {
+		t.Errorf("Role: want main, got %q", tm.Role)
+	}
+	if tm.MessageCount != 5 {
+		t.Errorf("MessageCount: want 5, got %d", tm.MessageCount)
+	}
+	if tm.ThreadID != "u1" {
+		t.Errorf("ThreadID: want u1, got %q", tm.ThreadID)
+	}
+
+	// u2's ParentBridged bit must have survived the round trip through the
+	// prefix (this is the field under test).
+	var u2, u3 *Turn
+	for i := range turns2 {
+		switch turns2[i].UUID {
+		case "u2":
+			u2 = &turns2[i]
+		case "u3":
+			u3 = &turns2[i]
+		}
+	}
+	if u2 == nil || !u2.ParentBridged {
+		t.Errorf("u2.ParentBridged: want true (carried forward from the prefix cycle), got %+v", u2)
+	}
+	if u3 == nil || u3.ParentBridged {
+		t.Errorf("u3.ParentBridged: want false (an ordinary direct child, never bridged), got %+v", u3)
+	}
+
+	// Cross-check against a from-byte-0 full re-parse of the same final
+	// file: the incremental path must not diverge from what a full parse
+	// would produce.
+	fullMeta, fullTurns, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (full re-parse): %v", err)
+	}
+	if len(fullTurns) != len(turns2) {
+		t.Fatalf("full re-parse turn count %d != incremental turn count %d", len(fullTurns), len(turns2))
+	}
+	if len(fullMeta.Threads) != len(meta2.Threads) {
+		t.Fatalf("full re-parse thread count %d != incremental thread count %d — "+
+			"the incremental path fragmented what a full re-parse sees as one continuous thread",
+			len(fullMeta.Threads), len(meta2.Threads))
+	}
+	if fullMeta.Threads[0].ThreadID != meta2.Threads[0].ThreadID ||
+		fullMeta.Threads[0].MessageCount != meta2.Threads[0].MessageCount ||
+		fullMeta.Threads[0].Role != meta2.Threads[0].Role {
+		t.Errorf("incremental Threads %+v != full re-parse Threads %+v", meta2.Threads[0], fullMeta.Threads[0])
+	}
+}
+
+// TestIndexSessionIncremental_DeclinesOnStaleThreadBridgeVersion is the
+// version-gate half of the #557 round-5 review BLOCKING fix: a prevMeta
+// persisted before ThreadBridgeVersion/Turn.ParentBridged existed (the
+// zero-value default) must not be trusted as "no turn in this session was
+// ever bridged" — that's indistinguishable, on a zero value alone, from
+// "this projection predates the field entirely". The incremental fast path
+// must decline once, forcing a full re-parse that backfills both fields.
+func TestIndexSessionIncremental_DeclinesOnStaleThreadBridgeVersion(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "88887777-6666-5555-4444-333322221111"
+
+	lines := []string{
+		makeUserRecord("u1", "", sid, "first message", "2026-07-05T10:00:00Z"),
+		makeAssistantRecord("a1", "u1", sid, "first answer", "2026-07-05T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, lines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (cycle 1): %v", err)
+	}
+	if meta1.ThreadBridgeVersion != threadBridgeSchemaVersion {
+		t.Fatalf("test setup: expected indexSession to stamp ThreadBridgeVersion=%d, got %d",
+			threadBridgeSchemaVersion, meta1.ThreadBridgeVersion)
+	}
+
+	// Simulate a projection persisted before this field existed: on-disk
+	// JSON simply lacks the key, which decodes as the int zero value.
+	staleMeta := meta1
+	staleMeta.ThreadBridgeVersion = 0
+
+	thirdLine := makeUserRecord("u2", "a1", sid, "second message", "2026-07-05T10:02:00Z")
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + thirdLine); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	_, _, used, err := indexSessionIncremental(path, sid, 8192, staleMeta, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if used {
+		t.Fatalf("expected the incremental fast path to decline on a stale ThreadBridgeVersion")
+	}
+
+	// The self-heal: the caller's fallback to indexSession recovers all 3
+	// turns AND backfills the current version.
+	meta2, turns2, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (fallback): %v", err)
+	}
+	if len(turns2) != 3 {
+		t.Errorf("expected the full re-parse fallback to recover 3 turns, got %d", len(turns2))
+	}
+	if meta2.ThreadBridgeVersion != threadBridgeSchemaVersion {
+		t.Errorf("expected the fallback full re-parse to backfill ThreadBridgeVersion=%d, got %d",
+			threadBridgeSchemaVersion, meta2.ThreadBridgeVersion)
+	}
+}
+
+// TestIndexSessionIncremental_CustomTitleFromPrefixSurvivesTailAITitle is
+// the #557 round-5 review MEDIUM regression fixture: an operator-chosen
+// custom-title recorded in the PREFIX must not be overwritten by an
+// ai-title record appearing in a later incremental cycle's TAIL. Before the
+// fix, hasCustomTitle was a ParseSession-local variable that reset to false
+// on every call, so the tail's ai-title record always won.
+func TestIndexSessionIncremental_CustomTitleFromPrefixSurvivesTailAITitle(t *testing.T) {
+	dir := t.TempDir()
+	const sid = "77776666-5555-4444-3333-222211110000"
+
+	prefixLines := []string{
+		makeUserRecord("u1", "", sid, "question one", "2026-07-10T10:00:00Z"),
+		makeCustomTitleRecord(sid, "OPERATOR CHOSEN"),
+		makeAssistantRecord("a1", "u1", sid, "answer one", "2026-07-10T10:01:00Z"),
+	}
+	path := writeJSONLFixture(t, dir, sid, prefixLines)
+
+	meta1, turns1, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (cycle 1): %v", err)
+	}
+	if meta1.Title != "OPERATOR CHOSEN" || !meta1.TitleIsCustom {
+		t.Fatalf("test setup: expected custom title after cycle 1, got Title=%q TitleIsCustom=%v",
+			meta1.Title, meta1.TitleIsCustom)
+	}
+
+	tailLines := []string{
+		makeAITitleRecord(sid, "auto generated"),
+		makeUserRecord("u2", "a1", sid, "question two", "2026-07-10T10:03:00Z"),
+	}
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := af.WriteString("\n" + strings.Join(tailLines, "\n")); err != nil {
+		af.Close()
+		t.Fatalf("append tail: %v", err)
+	}
+	af.Close()
+
+	meta2, _, used, err := indexSessionIncremental(path, sid, 8192, meta1, turns1)
+	if err != nil {
+		t.Fatalf("indexSessionIncremental: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected the incremental fast path to be used")
+	}
+	if meta2.Title != "OPERATOR CHOSEN" {
+		t.Errorf("Title: want the operator-chosen prefix title to survive the tail ai-title, got %q", meta2.Title)
+	}
+	if !meta2.TitleIsCustom {
+		t.Errorf("TitleIsCustom: want true to survive across the incremental cycle, got false")
+	}
+
+	// Cross-check against a from-byte-0 full re-parse of the same final
+	// file: it must land on the same title (the custom-title record is
+	// still in the file, ahead of the ai-title record).
+	fullMeta, _, err := indexSession(path, sid, 8192)
+	if err != nil {
+		t.Fatalf("indexSession (full re-parse): %v", err)
+	}
+	if fullMeta.Title != "OPERATOR CHOSEN" {
+		t.Errorf("full re-parse Title: want OPERATOR CHOSEN, got %q", fullMeta.Title)
+	}
+	if meta2.Title != fullMeta.Title {
+		t.Errorf("incremental Title %q != full re-parse Title %q", meta2.Title, fullMeta.Title)
+	}
+}
+
 // TestProviderApplyPlan_WatermarkAdvancesAcrossCycles is the end-to-end
 // counterpart to TestIndexSessionIncremental_ReadsOnlyAppendedTail: it drives
 // the same watermark logic through LoadConfig/FetchLive/ComputePlan/ApplyPlan

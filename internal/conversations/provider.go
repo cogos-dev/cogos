@@ -1344,6 +1344,13 @@ func indexSession(sourcePath, sessionID string, maxTurnLen int) (SessionMeta, []
 	meta.rawParents = nil              // parse-time scratch space only; never persisted
 	meta.compactBoundaryFallback = nil // parse-time scratch space only; never persisted
 
+	// A full parse always sees the WHOLE file, so bridgeDroppedParents just
+	// ran with complete rawParents and every turn's ParentBridged is
+	// authoritative — stamp the current schema version so a later
+	// incremental cycle can trust it (see SessionMeta.ThreadBridgeVersion's
+	// doc comment).
+	meta.ThreadBridgeVersion = threadBridgeSchemaVersion
+
 	return meta, turns, nil
 }
 
@@ -1426,6 +1433,23 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 	// discard every already-indexed turn instead of self-healing via a full
 	// re-parse. Decline and let the caller fall back to indexSession.
 	if len(prevTurns) != prevMeta.TurnCount {
+		return SessionMeta{}, nil, false, nil
+	}
+
+	// prevMeta must have been produced under the current
+	// ThreadBridgeVersion, or its turns' ParentBridged bits (and prevMeta's
+	// own Threads) cannot be trusted as inputs to this cycle's
+	// PartitionThreads call below. Zero is the default for any projection
+	// persisted before ThreadBridgeVersion/ParentBridged existed — every
+	// prevTurns[i].ParentBridged would read as false regardless of whether
+	// that turn was actually bridged, which is indistinguishable from "no
+	// turn in this session was ever bridged" rather than "this projection
+	// predates the field". Decline so the caller's full re-parse fallback
+	// self-heals — bridgeDroppedParents sees the WHOLE file on that pass
+	// and recomputes ParentBridged for every turn from scratch — and stamps
+	// the current version so subsequent incremental cycles can trust it.
+	// See SessionMeta.ThreadBridgeVersion's doc comment (types.go).
+	if prevMeta.ThreadBridgeVersion != threadBridgeSchemaVersion {
 		return SessionMeta{}, nil, false, nil
 	}
 
@@ -1569,6 +1593,14 @@ func indexSessionIncremental(sourcePath, sessionID string, maxTurnLen int, prevM
 	meta.Threads = PartitionThreads(combined, bridged)
 	meta.rawParents = nil              // parse-time scratch space only; never persisted
 	meta.compactBoundaryFallback = nil // parse-time scratch space only; never persisted
+
+	// meta.ThreadBridgeVersion already equals threadBridgeSchemaVersion
+	// here (the guard above declined the fast path otherwise, and meta was
+	// seeded from prevMeta), but stamp it explicitly rather than relying on
+	// that carry-through — this is the one place a future version bump
+	// would need to update if the incremental path ever gained its own
+	// distinct persistence requirements.
+	meta.ThreadBridgeVersion = threadBridgeSchemaVersion
 
 	return meta, combined, true, nil
 }

@@ -347,3 +347,55 @@ func TestPartitionThreads_MutualParentCycleCollapsesToOneThread(t *testing.T) {
 		t.Errorf("all three turns must share one ThreadID, got %q, %q, %q", turns[0].ThreadID, turns[1].ThreadID, turns[2].ThreadID)
 	}
 }
+
+// TestResolveCompactBoundaryFallbacks_PrefersResolvableLogicalParent is the
+// #557 round-5 review coverage fixture for the precedence guard at
+// resolveCompactBoundaryFallbacks: "logicalParentUuid names a real record —
+// leave it" (threads.go). Before this test, replacing that guard so the
+// nearest-preceding-record fallback applied UNCONDITIONALLY to every
+// mid-file compact_boundary — even one whose logicalParentUuid already
+// resolves to a real record in the file — left the whole package suite
+// green. This test constructs a compact_boundary whose logicalParentUuid
+// DOES resolve (it names a uuid present in rawParents) and asserts
+// rawParents is left untouched, even though a fallback candidate is also
+// available and would produce a different (wrong) result if applied.
+func TestResolveCompactBoundaryFallbacks_PrefersResolvableLogicalParent(t *testing.T) {
+	rawParents := map[string]string{
+		"cb1":           "real-parent", // logicalParentUuid override recorded by parser.go
+		"real-parent":   "u0",          // "real-parent" is itself a real record in the file
+		"u0":            "",
+		"fallback-uuid": "u0", // the nearest-preceding-record candidate — must NOT be used here
+	}
+	compactBoundaryFallback := map[string]string{
+		"cb1": "fallback-uuid",
+	}
+
+	resolveCompactBoundaryFallbacks(rawParents, compactBoundaryFallback)
+
+	if got := rawParents["cb1"]; got != "real-parent" {
+		t.Errorf("rawParents[%q]: want %q (logicalParentUuid resolves to a real record — the primary "+
+			"hypothesis must win over the fallback), got %q", "cb1", "real-parent", got)
+	}
+}
+
+// TestResolveCompactBoundaryFallbacks_FallsBackWhenUnresolvable is the
+// companion case: when logicalParentUuid names a uuid absent from the whole
+// file, the fallback candidate MUST be applied. Together with the test
+// above, this pins down both directions of the precedence guard.
+func TestResolveCompactBoundaryFallbacks_FallsBackWhenUnresolvable(t *testing.T) {
+	rawParents := map[string]string{
+		"cb1":           "ghost-absent-from-file",
+		"fallback-uuid": "u0",
+		"u0":            "",
+	}
+	compactBoundaryFallback := map[string]string{
+		"cb1": "fallback-uuid",
+	}
+
+	resolveCompactBoundaryFallbacks(rawParents, compactBoundaryFallback)
+
+	if got := rawParents["cb1"]; got != "fallback-uuid" {
+		t.Errorf("rawParents[%q]: want %q (logicalParentUuid is unresolvable — the fallback must apply), got %q",
+			"cb1", "fallback-uuid", got)
+	}
+}

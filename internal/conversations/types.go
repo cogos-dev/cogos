@@ -114,6 +114,20 @@ type SessionMeta struct {
 	// Title is the session AI-generated title when present.
 	Title string `json:"title,omitempty"`
 
+	// TitleIsCustom is true once an explicit custom-title record has been
+	// seen for this session — an operator-chosen rename that must never be
+	// overwritten by a later ai-title record, regardless of which appeared
+	// first in the stream. This lives on SessionMeta (persisted), not as a
+	// ParseSession-local variable, because indexSessionIncremental seeds
+	// meta.Title from prevMeta but a fresh ParseSession call has no memory
+	// of a custom-title record seen in an earlier cycle's PREFIX: a
+	// ParseSession-local flag resets to false on every incremental tail
+	// parse, so an ai-title record appearing in the tail would silently
+	// overwrite an operator-chosen title recorded in the prefix (#557
+	// round-5 review MEDIUM finding). See the "ai-title"/"custom-title"
+	// cases in ParseSession (parser.go).
+	TitleIsCustom bool `json:"title_is_custom,omitempty"`
+
 	// Threads is the DAG partition of this session's turns, computed by
 	// PartitionThreads (threads.go). Nil for two structurally different
 	// reasons, which callers reading SessionsMissingThreadIndex /
@@ -131,6 +145,27 @@ type SessionMeta struct {
 	//     re-touching an ingest source will ever populate Threads for it
 	//     under the current schema.
 	Threads []ThreadMeta `json:"threads,omitempty"`
+
+	// ThreadBridgeVersion records which persisted-bridged-edge schema
+	// produced Threads and each Turn's ParentBridged flag (see Turn's doc
+	// comment). indexSession always stamps the current
+	// threadBridgeSchemaVersion (threads.go) after a full re-parse.
+	// indexSessionIncremental refuses its fast path whenever
+	// prevMeta.ThreadBridgeVersion != threadBridgeSchemaVersion — zero is
+	// the default for any projection persisted before this field existed,
+	// so an old on-disk turns projection (Turn.ParentBridged never written,
+	// meaning false-for-every-turn) does not silently masquerade as "no
+	// turn in this session was ever bridged". Declining forces exactly one
+	// full re-parse, which recomputes bridged-ness for every turn from
+	// scratch (bridgeDroppedParents sees the WHOLE file, not just a tail)
+	// and backfills both this field and Turn.ParentBridged — the same
+	// one-time lazy-migration posture as SourceOffset/SourceTailHash. See
+	// #557 round-5 review BLOCKING finding: without this, an incrementally
+	// re-indexed session's bridged set was reconstructed only from the
+	// current cycle's tail-only rawParents, so a prefix turn bridged in an
+	// earlier cycle looked like a fresh direct child of its parent and
+	// could wrongly trip the branch-point rule in PartitionThreads.
+	ThreadBridgeVersion int `json:"thread_bridge_version,omitempty"`
 
 	// rawParents is parse-time scratch space: the uuid -> parentUuid edge for
 	// EVERY record ParseSession saw, including records that never became a
@@ -250,6 +285,23 @@ type Turn struct {
 	// parentUuid DAG) this turn belongs to, as computed by PartitionThreads.
 	// Empty for turns not yet run through partitioning.
 	ThreadID string `json:"thread_id,omitempty"`
+
+	// ParentBridged is true when this turn's ParentUUID was rewritten by
+	// bridgeDroppedParents (threads.go) to splice past one or more records
+	// that ParseSession saw but that never became a Turn — most commonly a
+	// tool_result-only user record from ordinary (including parallel)
+	// tool-call structure. Persisted (unlike the bridged map
+	// bridgeDroppedParents also returns, which is parse-call-local scratch
+	// space) so PartitionThreads can tell a bridged edge from a genuine
+	// branch point on turns that were bridged in an EARLIER indexing cycle
+	// and now only appear in the PREFIX passed to
+	// indexSessionIncremental — bridgeDroppedParents leaves an
+	// already-resolved ParentUUID untouched on a later cycle, so a
+	// prefix-only bridged map can never be reconstructed from that cycle's
+	// tail-only rawParents alone. See ThreadBridgeVersion (SessionMeta) for
+	// how a projection persisted before this field existed is kept from
+	// silently reading as false-for-every-turn.
+	ParentBridged bool `json:"parent_bridged,omitempty"`
 
 	// Provenance declares how this turn's content was obtained, for records
 	// that did not come from a direct JSONL parse. Empty is the default for

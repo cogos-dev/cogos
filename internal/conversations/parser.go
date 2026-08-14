@@ -164,12 +164,6 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 	// never names itself as its own predecessor.
 	var lastUUID string
 
-	// hasCustomTitle tracks whether an explicit custom-title record has been
-	// seen, regardless of stream order relative to ai-title records: an
-	// operator-chosen title always wins over the auto-generated one. See the
-	// ai-title/custom-title cases below.
-	hasCustomTitle := false
-
 	seenUUIDs := make(map[string]struct{})
 	turnIndex := 0
 	for scanner.Scan() {
@@ -249,8 +243,16 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 		case "ai-title":
 			// Extract the session title from the ai-title record. Never
 			// overrides an explicit custom-title, regardless of which
-			// appeared first in the stream — see hasCustomTitle above.
-			if !hasCustomTitle {
+			// appeared first in the stream — see meta.TitleIsCustom's doc
+			// comment (types.go). meta.TitleIsCustom is read here rather
+			// than a ParseSession-local flag because a custom-title record
+			// seen in an EARLIER indexing cycle's prefix must still block
+			// an ai-title record parsed from a LATER cycle's tail (#557
+			// round-5 review MEDIUM finding): indexSessionIncremental seeds
+			// meta from prevMeta before calling ParseSession, so
+			// meta.TitleIsCustom already carries that history forward,
+			// whereas a local var would reset to false on every call.
+			if !meta.TitleIsCustom {
 				var t rawAITitle
 				if err := json.Unmarshal(line, &t); err == nil && t.AITitle != "" {
 					meta.Title = t.AITitle
@@ -259,11 +261,12 @@ func ParseSession(r io.Reader, sessionID string, maxTurnLen int, meta *SessionMe
 
 		case "custom-title":
 			// An operator-chosen title always wins over ai-title, whether
-			// this record was seen before or after one.
+			// this record was seen before or after one, and whether it was
+			// recorded in this call or an earlier indexing cycle.
 			var t rawCustomTitle
 			if err := json.Unmarshal(line, &t); err == nil && t.CustomTitle != "" {
 				meta.Title = t.CustomTitle
-				hasCustomTitle = true
+				meta.TitleIsCustom = true
 			}
 
 		case "user":

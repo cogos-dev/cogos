@@ -563,5 +563,15 @@ func sliceToMap(slice *ResolvedSlice) map[string]any {
 	if slice.SessionsMissingThreadIndex > 0 {
 		m["sessions_missing_thread_index"] = slice.SessionsMissingThreadIndex
 	}
+	// SessionsThreadIndexNotApplicable is documented (uri_resolver.go) as
+	// existing precisely so a caller watching sessions_missing_thread_index
+	// trend to zero can tell "still pending" apart from "will never
+	// resolve" — an ingest-sourced session has no parentUuid to partition,
+	// ever. Both MCP call sites reach sliceToMap; omitting this field meant
+	// that distinction never reached the caller it was written for (#557
+	// round-5 review LOW finding).
+	if slice.SessionsThreadIndexNotApplicable > 0 {
+		m["sessions_thread_index_not_applicable"] = slice.SessionsThreadIndexNotApplicable
+	}
 	return m
 }

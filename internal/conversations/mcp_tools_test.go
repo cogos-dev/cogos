@@ -389,3 +389,59 @@ func TestGetConversationTurn_IncludesSessionThreadList(t *testing.T) {
 		t.Errorf("threads[m-sub-u1]: want role=subagent-sidechain count=2, got %+v (present=%v)", got, ok)
 	}
 }
+
+// TestSliceToMap_EmitsSessionsThreadIndexNotApplicable is the #557 round-5
+// review LOW regression fixture: ResolvedSlice.SessionsThreadIndexNotApplicable
+// is documented (uri_resolver.go) as existing precisely so a caller watching
+// sessions_missing_thread_index trend to zero can tell "still pending" apart
+// from "will never resolve" — but sliceToMap only ever emitted
+// sessions_missing_thread_index. Both cog_search_conversations (uri mode)
+// and cog_get_conversation_turn (uri mode) go through sliceToMap, so the
+// distinction never reached either MCP surface it was written for.
+func TestSliceToMap_EmitsSessionsThreadIndexNotApplicable(t *testing.T) {
+	slice := &ResolvedSlice{
+		URI:                              "cog:conversations?thread_role=main",
+		ResolvedAt:                       time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC),
+		Count:                            3,
+		Sources:                          []string{"cc"},
+		Bounded:                          true,
+		SessionsMissingThreadIndex:       2,
+		SessionsThreadIndexNotApplicable: 5,
+		Turns:                            nil,
+	}
+
+	m := sliceToMap(slice)
+
+	got, ok := m["sessions_thread_index_not_applicable"]
+	if !ok {
+		t.Fatalf("sliceToMap output missing key %q entirely: %+v", "sessions_thread_index_not_applicable", m)
+	}
+	if got != 5 {
+		t.Errorf("sessions_thread_index_not_applicable: want 5, got %v", got)
+	}
+	// The existing counter must still be present and unaffected.
+	if m["sessions_missing_thread_index"] != 2 {
+		t.Errorf("sessions_missing_thread_index: want 2, got %v", m["sessions_missing_thread_index"])
+	}
+}
+
+// TestSliceToMap_OmitsSessionsThreadIndexNotApplicableWhenZero verifies the
+// omitempty-style behavior sliceToMap gives every other optional counter:
+// a zero SessionsThreadIndexNotApplicable must not appear in the output map
+// at all (matching sessions_missing_thread_index's existing > 0 guard).
+func TestSliceToMap_OmitsSessionsThreadIndexNotApplicableWhenZero(t *testing.T) {
+	slice := &ResolvedSlice{
+		URI:        "cog:conversations",
+		ResolvedAt: time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC),
+		Count:      1,
+		Sources:    []string{"cc"},
+		Bounded:    true,
+	}
+
+	m := sliceToMap(slice)
+
+	if _, ok := m["sessions_thread_index_not_applicable"]; ok {
+		t.Errorf("sessions_thread_index_not_applicable: want absent when zero, got %v",
+			m["sessions_thread_index_not_applicable"])
+	}
+}
