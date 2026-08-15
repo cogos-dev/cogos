@@ -160,9 +160,19 @@ var maxReadCacheTotalBytes int64 = 512 * 1024 * 1024
 // content, which is ground truth and must never be reclaimed on a timer.  A
 // global default would have to pick one of those and be wrong for the other.
 //
-// A bus with no entry here keeps every archive forever, which is the historical
-// behaviour: this map is opt-in, so adding retention can never silently delete
-// history for a bus nobody considered.
+// "chat" and "mcp" are listed here with the busArchiveKeepAll sentinel rather
+// than being left out of the map. Before myrgic/cogos#562, an absent entry
+// meant "keep everything" — the map's only fallback — so chat/MCP's
+// never-prune guarantee was true only as an accident of every OTHER
+// undeclared bus also defaulting to unlimited. #562 tightened that fallback
+// to defaultArchiveRetention below (undeclared buses were the actual growth
+// driver: 691 buses on one node, all but three families falling through to
+// "keep forever"), which means "must never be reclaimed on a timer" can no
+// longer be true by default — it has to be a DECLARATION, same as every
+// other bus's retention, or these would start getting pruned like everything
+// else. Any other bus family with the same ground-truth property must be
+// added here explicitly; the fallback below is deliberately not safe for
+// that case.
 //
 // Exposed as a var (not const) so tests can override it without build-tag
 // gymnastics; reset to the default in t.Cleanup.
@@ -170,14 +180,48 @@ var busArchiveRetention = map[string]int{
 	"traces":         8,
 	"kernel_proprio": 8,
 	"peer_awareness": 8,
+	"chat":           busArchiveKeepAll,
+	"mcp":            busArchiveKeepAll,
 }
 
-// busArchiveKeepAll is the sentinel returned for buses with no declared
-// retention: keep every archive.
+// busArchiveKeepAll is the sentinel a bus family declares (see
+// busArchiveRetention's "chat"/"mcp" entries) to opt OUT of pruning
+// entirely. It is no longer archiveRetentionFor's fallback for undeclared
+// buses — see defaultArchiveRetention.
 const busArchiveKeepAll = -1
 
-// archiveRetentionFor reports how many rotated archives to keep for busID, or
-// busArchiveKeepAll when the bus has declared no retention.
+// defaultArchiveRetention is archiveRetentionFor's fallback for any bus with
+// no entry in busArchiveRetention (myrgic/cogos#562). Before this, an
+// undeclared bus kept every archive forever; on one node that meant 691
+// buses, all but three families undeclared, accumulating 960 MB across 15
+// archives with nothing ever reclaiming the excess and no bound on how much
+// further it could grow.
+//
+// The design constraint this satisfies (per the #562 issue and operator
+// ruling it cites) is retention DECLARED PER WRITER, not imposed globally —
+// this is not a global override of busArchiveRetention, it is what applies
+// specifically to a bus that declared nothing. A bus with real reason to
+// keep everything (conversation content, ground truth — see "chat"/"mcp"
+// above) still can, by adding an explicit busArchiveKeepAll entry; silence
+// is no longer read as that choice.
+//
+// 8 matches the value already vetted for traces/kernel_proprio/
+// peer_awareness — not a new number invented for this fallback, the same
+// order of magnitude already judged acceptable for disposable-instrumentation
+// buses, which is the more likely shape of an undeclared bus (the deliberately
+// unbounded families are now explicit opt-outs, not silent fallthrough). At
+// the 64 MB rotation threshold (eventsFileMaxBytes) that bounds any one
+// undeclared bus's archive footprint at 512 MB — conservative relative to
+// "unlimited", not aggressive relative to "delete promptly": a bus has to
+// actually rotate 9 times past new content before this ever removes a byte.
+//
+// Exposed as a var for the same reason as busArchiveRetention.
+var defaultArchiveRetention = 8
+
+// archiveRetentionFor reports how many rotated archives to keep for busID:
+// an explicit busArchiveRetention entry (including busArchiveKeepAll, "keep
+// everything," for a bus that declared that) if one matches, otherwise
+// defaultArchiveRetention.
 //
 // Bus IDs reaching this function are prefixed by producer ("bus_traces",
 // "bus_chat_<uuid>"), so the lookup matches on the prefix-stripped name and
@@ -194,27 +238,19 @@ func archiveRetentionFor(busID string) int {
 			return n
 		}
 	}
-	return busArchiveKeepAll
+	return defaultArchiveRetention
 }
 
-// pruneBusArchives removes the oldest rotated archives for busID, keeping the
-// newest keep of them.  Archives are named events.<RFC3339-ish-UTC>.jsonl, so
-// lexical order over the filename is chronological order and no stat calls are
-// needed to sort.  The live events.jsonl is never a candidate.
-//
-// Callers must NOT hold m.mu: this does directory I/O and unlinks, and holding
-// the bus lock across it would stall every unrelated bus operation.  Errors are
-// logged and swallowed — failing to reclaim disk must never fail an append that
-// has already been durably written.
-func (m *BusSessionManager) pruneBusArchives(busID string, keep int) {
-	if keep < 0 {
-		return
-	}
-	busDir := filepath.Join(m.BusesDir(), pathsafe.SanitizeComponent(busID))
+// listBusArchiveFiles returns busDir's rotated events.<ts>.jsonl archive
+// filenames (never the live events.jsonl), sorted lexically — which is also
+// chronological order for the RFC3339-ish-UTC timestamp format the rotation
+// path names them with, so no stat calls are needed to order them. Shared by
+// pruneBusArchives and SweepBusArchives so the two can never disagree about
+// what counts as a prunable archive.
+func listBusArchiveFiles(busDir string) ([]string, error) {
 	entries, err := os.ReadDir(busDir)
 	if err != nil {
-		slog.Warn("bus: archive prune could not read bus dir", "err", err, "bus_id", busID)
-		return
+		return nil, err
 	}
 	var archives []string
 	for _, e := range entries {
@@ -226,10 +262,31 @@ func (m *BusSessionManager) pruneBusArchives(busID string, keep int) {
 			archives = append(archives, n)
 		}
 	}
+	sort.Strings(archives)
+	return archives, nil
+}
+
+// pruneBusArchives removes the oldest rotated archives for busID, keeping the
+// newest keep of them.  The live events.jsonl is never a candidate (excluded
+// by listBusArchiveFiles).
+//
+// Callers must NOT hold m.mu: this does directory I/O and unlinks, and holding
+// the bus lock across it would stall every unrelated bus operation.  Errors are
+// logged and swallowed — failing to reclaim disk must never fail an append that
+// has already been durably written.
+func (m *BusSessionManager) pruneBusArchives(busID string, keep int) {
+	if keep < 0 {
+		return
+	}
+	busDir := filepath.Join(m.BusesDir(), pathsafe.SanitizeComponent(busID))
+	archives, err := listBusArchiveFiles(busDir)
+	if err != nil {
+		slog.Warn("bus: archive prune could not read bus dir", "err", err, "bus_id", busID)
+		return
+	}
 	if len(archives) <= keep {
 		return
 	}
-	sort.Strings(archives) // lexical == chronological for the timestamp format
 	for _, n := range archives[:len(archives)-keep] {
 		if err := os.Remove(filepath.Join(busDir, n)); err != nil {
 			slog.Warn("bus: archive prune failed", "err", err, "bus_id", busID, "file", n)
@@ -237,6 +294,95 @@ func (m *BusSessionManager) pruneBusArchives(busID string, keep int) {
 		}
 		slog.Info("bus: pruned rotated archive", "bus_id", busID, "file", n, "keep", keep)
 	}
+}
+
+// ArchiveSweepEntry reports one bus's archive-retention state from a single
+// SweepBusArchives pass.
+type ArchiveSweepEntry struct {
+	// BusID is the bus directory name under BusesDir() (== the sanitized
+	// busID; see pathsafe.SanitizeComponent's idempotence, which is what
+	// makes it safe to feed this straight back into pruneBusArchives /
+	// archiveRetentionFor without re-deriving the original raw busID).
+	BusID string
+	// Declared is archiveRetentionFor(BusID)'s result: the number of
+	// archives this bus is allowed to keep, or busArchiveKeepAll (-1) if it
+	// has explicitly opted out of pruning entirely.
+	Declared int
+	// Archives is how many rotated events.<ts>.jsonl files existed for this
+	// bus BEFORE this pass ran (or would still exist, in dry-run mode).
+	Archives int
+	// Pruned is how many archives this pass removed — or, when dryRun is
+	// true, how many it WOULD have removed had dryRun been false. Always the
+	// oldest Pruned of Archives, per pruneBusArchives' selection order.
+	Pruned int
+}
+
+// SweepBusArchives walks every bus directory under BusesDir() and applies
+// (dryRun=false) or only reports (dryRun=true) archive-retention pruning,
+// using the exact same per-bus declaration (archiveRetentionFor) and
+// selection order (listBusArchiveFiles, oldest-first) as the automatic prune
+// AppendEvent already runs on every rotation.
+//
+// Exists to close two gaps the automatic per-rotation prune cannot, by
+// construction, reach on its own:
+//   - BACKLOG: a bus that already holds more archives than its declared
+//     retention only sheds the excess the next time IT rotates. Tightening
+//     defaultArchiveRetention (#562) does not, by itself, touch a single
+//     byte already on disk for a previously-undeclared bus — it only
+//     changes what happens at that bus's NEXT rotation.
+//   - COVERAGE: a bus can go quiet (its writer deregisters, its session
+//     ends) while still sitting on an archive pile that exceeds its
+//     retention. Nothing calls pruneBusArchives for it again if it never
+//     rotates again.
+//
+// dryRun=true performs no filesystem mutation whatsoever — it only counts
+// what pruneBusArchives would remove. Deletion is irreversible and this can
+// run across an entire, possibly-unfamiliar bus store (691 buses on the
+// node that motivated #562); computing and returning the report before ever
+// unlinking anything is what makes a live run something a caller can choose
+// to do only after inspecting a dry run first, not a leap of faith.
+//
+// Deliberately NOT wired to run on any timer, tick, or request path by this
+// change — every other bus operation in this file is caller-invoked or
+// fires off an already-observable action (an append, a rotation); a sweep
+// that walks and possibly deletes across the ENTIRE bus store is exactly the
+// kind of mechanism that should not become a wire the operator did not
+// choose to run. It is exported so an explicit, observable caller (an
+// operator tool, a one-off maintenance invocation) can use it; adding that
+// invocation is left to whoever decides the store needs a backlog sweep now,
+// with the dry-run report available to check first.
+func (m *BusSessionManager) SweepBusArchives(dryRun bool) ([]ArchiveSweepEntry, error) {
+	dirEntries, err := os.ReadDir(m.BusesDir())
+	if err != nil {
+		return nil, fmt.Errorf("read buses dir: %w", err)
+	}
+	var report []ArchiveSweepEntry
+	for _, de := range dirEntries {
+		if !de.IsDir() {
+			continue // registry.json and any stray files live beside the per-bus dirs
+		}
+		busID := de.Name()
+		keep := archiveRetentionFor(busID)
+		archives, err := listBusArchiveFiles(filepath.Join(m.BusesDir(), busID))
+		if err != nil {
+			slog.Warn("bus: archive sweep could not read bus dir", "err", err, "bus_id", busID)
+			continue
+		}
+		pruned := 0
+		if keep >= 0 && len(archives) > keep {
+			pruned = len(archives) - keep
+		}
+		if pruned > 0 && !dryRun {
+			m.pruneBusArchives(busID, keep)
+		}
+		report = append(report, ArchiveSweepEntry{
+			BusID:    busID,
+			Declared: keep,
+			Archives: len(archives),
+			Pruned:   pruned,
+		})
+	}
+	return report, nil
 }
 
 // BusBlock is the wire format for bus events. Alias to the canonical
