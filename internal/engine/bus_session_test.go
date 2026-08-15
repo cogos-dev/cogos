@@ -7,9 +7,12 @@ package engine
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1667,5 +1670,106 @@ func TestReadEventsSince_TotalBytesAccountingSurvivesResets(t *testing.T) {
 			t.Fatalf("round %d ReadEventsSince(fn) after remove: %v", round, err)
 		}
 		assertNoDrift("round file-not-exist")
+	}
+}
+
+// TestReadEventsSince_ConcurrentAcrossBusesUnderEvictionPressure exercises
+// ReadEventsSince from many goroutines against many buses simultaneously,
+// with the LRU and global-byte-budget bounds forced tiny so eviction fires
+// continuously while parses are in flight for the buses being evicted.
+//
+// This is the exact interleaving cog-review's request_changes on PR #564
+// (head 62fff01) found: evictReadCacheLocked reads (and, via
+// readCacheTotalBytes, permanently retires) a busReadCache's bytes field
+// under only readCacheMetaMu, while a concurrent ReadEventsSince call for
+// that same bus grows that same field under only the per-bus lock
+// (readCacheLockFor) — two non-overlapping lock domains over the same
+// memory. Must pass under `go test -race`.
+//
+// It also asserts the accounting property TestReadEventsSince_*
+// (BoundedByTotalBytes, TotalBytesAccountingSurvivesResets) check serially:
+// after the storm settles, readCacheTotalBytes must equal the actual sum of
+// cache.bytes over every still-live entry (sumLiveReadCacheBytes). This is
+// what catches the SECOND-ORDER bug even when the race detector doesn't
+// fire on a given run: a parse in flight when its entry is evicted keeps
+// crediting readCacheTotalBytes for a cache object no longer reachable from
+// mgr.readCache, and since that object can never be evicted again, those
+// bytes can never be subtracted back out — the global budget drifts upward
+// under sustained concurrent polling, silently defeating the cap this PR
+// exists to add.
+func TestReadEventsSince_ConcurrentAcrossBusesUnderEvictionPressure(t *testing.T) {
+	// Not parallel: mutates package-level bounds.
+	root := t.TempDir()
+	originalBuses := maxReadCacheBuses
+	originalBytesPerBus := maxReadCacheBytesPerBus
+	originalEventsPerBus := maxReadCacheEventsPerBus
+	originalTotal := maxReadCacheTotalBytes
+	maxReadCacheBuses = 4          // small: LRU eviction fires on almost every distinct-bus touch
+	maxReadCacheBytesPerBus = 2000 // high enough that per-bus caps rarely trip on their own...
+	maxReadCacheEventsPerBus = 1_000_000
+	maxReadCacheTotalBytes = 3000 // ...but the GLOBAL total (many buses combined) trips constantly
+	t.Cleanup(func() {
+		maxReadCacheBuses = originalBuses
+		maxReadCacheBytesPerBus = originalBytesPerBus
+		maxReadCacheEventsPerBus = originalEventsPerBus
+		maxReadCacheTotalBytes = originalTotal
+	})
+
+	mgr := NewBusSessionManager(root)
+
+	const numBuses = 24
+	const eventsPerBus = 5
+	busIDs := make([]string, numBuses)
+	for i := range busIDs {
+		id := fmt.Sprintf("conc-bus-%02d", i)
+		busIDs[i] = id
+		for j := 0; j < eventsPerBus; j++ {
+			if _, err := mgr.AppendEvent(id, "m", "tester", map[string]interface{}{
+				"blob": strings.Repeat("z", 150),
+				"j":    j,
+			}); err != nil {
+				t.Fatalf("AppendEvent(%s): %v", id, err)
+			}
+		}
+	}
+
+	const numWorkers = 32
+	const itersPerWorker = 150
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		go func(seed int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(seed)))
+			for i := 0; i < itersPerWorker; i++ {
+				id := busIDs[rng.Intn(numBuses)]
+				cursor := 0
+				if rng.Intn(3) == 0 {
+					cursor = rng.Intn(eventsPerBus + 1)
+				}
+				if _, err := mgr.ReadEventsSince(id, cursor); err != nil {
+					t.Errorf("ReadEventsSince(%s, %d): %v", id, cursor, err)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if got, want := mgr.readCacheTotalBytes.Load(), sumLiveReadCacheBytes(mgr); got != want {
+		t.Errorf("after concurrent storm: readCacheTotalBytes = %d, actual sum over live entries = %d — accounting drift", got, want)
+	}
+
+	// Every bus must still read back correctly regardless of how much
+	// eviction/re-parsing happened underneath the storm — eviction (at any
+	// bound) must never lose data, only force a future re-parse.
+	for _, id := range busIDs {
+		events, err := mgr.ReadEventsSince(id, 0)
+		if err != nil {
+			t.Fatalf("ReadEventsSince(%s) after storm: %v", id, err)
+		}
+		if len(events) != eventsPerBus {
+			t.Errorf("bus %s: got %d events after storm, want %d", id, len(events), eventsPerBus)
+		}
 	}
 }
