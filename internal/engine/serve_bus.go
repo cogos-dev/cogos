@@ -335,6 +335,13 @@ func (s *Server) handleBusRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBusEvents serves GET /v1/bus/{bus_id}/events with query params.
+//
+// This is the polling hot path #561 named directly: params.After (from
+// ?after= / ?after_seq=) is a poller's cursor, so it's passed straight
+// into ReadEventsSince instead of pulling the whole bus history through
+// ReadEvents and filtering After client-side afterward. A request with no
+// after param gets After==0, which is ReadEventsSince's "everything" case
+// — byte-identical to the old ReadEvents(busID) call this replaces.
 func (s *Server) handleBusEvents(w http.ResponseWriter, r *http.Request, busID string) {
 	mgr := s.busSessions
 	w.Header().Set("Content-Type", "application/json")
@@ -343,13 +350,14 @@ func (s *Server) handleBusEvents(w http.ResponseWriter, r *http.Request, busID s
 		return
 	}
 
-	events, err := mgr.ReadEvents(busID)
+	params := parseBusEventQuery(r)
+
+	events, err := mgr.ReadEventsSince(busID, params.After)
 	if err != nil {
 		_, _ = w.Write([]byte("[]"))
 		return
 	}
 
-	params := parseBusEventQuery(r)
 	filtered := filterBusEvents(events, params)
 	// Match root: return "[]" (not null) when empty.
 	if filtered == nil {

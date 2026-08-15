@@ -19,10 +19,12 @@ package engine
 
 import (
 	"bufio"
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -43,6 +45,107 @@ import (
 // events.jsonl is opened.  Exposed as a var (not const) so tests can override
 // it without build-tag gymnastics; reset to the default in t.Cleanup.
 var eventsFileMaxBytes int64 = 64 * 1024 * 1024 // 64 MB
+
+// maxReadCacheBuses bounds how many buses' busReadCache entries
+// ReadEventsSince keeps resident at once. Without a cap, readCache grows
+// with the number of distinct buses ever read — one fully-parsed event
+// history plus a seen map[int]bool each — and never shrinks; on a node with
+// hundreds of buses that is an unbounded-memory trade for the unbounded-CPU
+// bug this cache exists to fix (#561). Least-recently-*touched* bus is
+// evicted once the count would exceed this. Exposed as a var so tests can
+// shrink it without needing hundreds of buses to exercise eviction.
+//
+// Kept alongside maxReadCacheTotalBytes below, not superseded by it:
+// maxReadCacheTotalBytes is what actually bounds retained memory now, but a
+// large number of buses each holding only a small busReadCache still costs
+// real per-entry overhead the byte accounting doesn't model — a map entry,
+// a *sync.Mutex, a seen map header, an LRU list element — so this remains a
+// cheap O(1) guard against unbounded entry COUNT even when every individual
+// entry is tiny (myrgic/cogos#561 follow-up review).
+var maxReadCacheBuses = 256
+
+// maxReadCacheEventsPerBus bounds how many parsed events a single bus's
+// busReadCache entry may retain. A bus is normally bounded by
+// eventsFileMaxBytes (rotation clears its cache), but a very high volume of
+// small events can still accumulate a large in-memory parsed slice before
+// rotation triggers on byte size. Once a bus's cache would exceed this,
+// the entry is dropped after answering the current call — see
+// ReadEventsSince. Exposed as a var for the same reason as
+// maxReadCacheBuses.
+//
+// This is a COUNT bound, not a memory bound, and does not by itself prevent
+// unbounded cache growth: a single oversized event is count=1, sits far
+// under this cap, and stays resident indefinitely (myrgic/cogos#561 review).
+// Kept anyway, alongside maxReadCacheBytesPerBus below, as a cheap guard on
+// the seen map's growth under high EVENT VOLUME (many small events), which
+// the byte cap doesn't directly limit — a large number of tiny events could
+// stay under the byte cap while still growing seen unboundedly. The byte cap
+// is what actually bounds retained memory; this one bounds entry count in
+// the dedup map. Nothing on the write path bounds a single event's payload
+// size — that's myrgic/cogos#565, not this cache.
+var maxReadCacheEventsPerBus = 50_000
+
+// maxReadCacheBytesPerBus bounds the approximate retained size, in bytes, of
+// a single bus's busReadCache.events. maxReadCacheEventsPerBus above counts
+// EVENTS, not bytes: a single event with an oversized payload is count=1,
+// far under that cap, and would sit resident in the cache indefinitely with
+// no path ever reclaiming it (myrgic/cogos#561 review). This cap closes that
+// gap by tracking the sum of each retained line's raw byte length (the
+// length already in hand during the scan in ReadEventsSince, not a deep
+// measurement of the parsed struct's heap footprint) as events are folded
+// into the cache, and resetting the entry — same as the count cap — once the
+// running total would exceed this bound.
+//
+// Default matches eventsFileMaxBytes (64 MB): a bus's cache is normally kept
+// bounded by rotation at that same threshold (rotation clears the cache — see
+// the file-identity check in ReadEventsSince), so capping the cache at the
+// same size means it can never retain meaningfully more parsed data than an
+// un-rotated live file already would, whether that data arrived as many
+// small events or one event that alone crosses the line. Exposed as a var
+// for the same reason as maxReadCacheBuses.
+//
+// Ingress-side bounding of a single event's payload size is deliberately out
+// of scope here — that is myrgic/cogos#565. This cap only bounds what the
+// READ cache retains after the fact.
+//
+// Kept alongside maxReadCacheTotalBytes below, not superseded by it: the
+// global budget bounds the sum across all buses, but without a per-bus
+// ceiling too, one pathological bus could alone consume the entire global
+// budget and starve every other bus's cache via LRU eviction. This cap
+// keeps that failure localized to one bus no matter how the global budget
+// is sized.
+var maxReadCacheBytesPerBus int64 = 64 * 1024 * 1024
+
+// maxReadCacheTotalBytes bounds the sum of busReadCache.bytes across EVERY
+// cached bus combined, and is enforced by evicting least-recently-used
+// buses (via evictReadCacheLocked, the same path maxReadCacheBuses uses),
+// not by resetting one bus's own entry.
+//
+// The three bounds above this one are each individually defensible but
+// compose MULTIPLICATIVELY: maxReadCacheBuses (256) times
+// maxReadCacheBytesPerBus (64 MiB) is a 16 GiB worst case, on a kernel
+// whose actual RSS runs a few GB and sawtooths under normal operation. A
+// ceiling nobody would ever want to actually reach isn't doing protective
+// work — it's a bound in name only (myrgic/cogos#561 review). This field
+// closes that gap by capping the total directly, so the real worst case is
+// this number, full stop, regardless of how many buses are involved or how
+// the per-bus caps are configured.
+//
+// Default: 512 MiB. Chosen against the kernel's actual working set, not as
+// a round theoretical number: the #561 issue's own pprof evidence describes
+// a 1.3 GB on-disk bus store under ~30 concurrent pollers, and a kernel RSS
+// in the low-single-digit GB range. 512 MiB is a small, real fraction of
+// that RSS (so it cannot itself become the sawtooth's next driver) while
+// still being generous relative to typical per-bus cache size: at the
+// 64 MiB per-bus cap, 8 simultaneously-maxed-out buses exhaust it, which is
+// headroom enough for the observed ~30-poller concurrency (most buses in
+// practice run far smaller than the pathological per-bus cap; only a
+// minority approach it at once). If this number needs raising later, that
+// should be a deliberate call against a fresh RSS measurement, not a guess.
+//
+// Exposed as a var (not const) so tests can shrink it without needing
+// hundreds of MB of fixture data to exercise eviction.
+var maxReadCacheTotalBytes int64 = 512 * 1024 * 1024
 
 // busArchiveRetention declares, per bus, how many rotated events.<ts>.jsonl
 // archives to keep.  Rotation without retention grows without bound: on one
@@ -230,6 +333,122 @@ type BusSessionManager struct {
 	// contention (the original #505 symptom: a continuous storm of
 	// "skipping registry seq update" lines).
 	registrySeqSkipCount atomic.Int64
+
+	// readCacheMetaMu guards readCache, readCacheLocks, readCacheLRU, and
+	// readCacheLRUIdx (the maps/list themselves), PLUS one *busReadCache
+	// field specifically: bytes — see settleReadCacheBytes and
+	// evictReadCacheLocked, the ONLY two functions that ever read or write
+	// that field; nothing else in this file touches cache.bytes directly,
+	// including ReadEventsSince itself (its per-bus cap check uses
+	// settleReadCacheBytes's return value instead — myrgic/cogos#561
+	// review). Every other *busReadCache field (offset, events, seen, fi) is
+	// guarded solely by that bus's own per-bus lock (acquireReadCache),
+	// never by this one — see ReadEventsSince's Concurrency doc comment for
+	// why bytes is the odd one out (eviction needs to read it without taking
+	// the per-bus lock of every entry it might evict). Held only for
+	// map/list bookkeeping plus that one field, never across file I/O.
+	readCacheMetaMu sync.Mutex
+	// readCache holds, per bus, the incrementally-extended parse state
+	// ReadEventsSince uses to avoid re-scanning a bus's entire history on
+	// every call. See busReadCache and ReadEventsSince's doc comment (#561).
+	// Bounded to maxReadCacheBuses entries via readCacheLRU (LRU eviction)
+	// — see ReadEventsSince.
+	readCache map[string]*busReadCache
+	// readCacheLocks holds one *sync.Mutex per bus, serializing concurrent
+	// ReadEventsSince/ReadEvents calls against the SAME bus's cache (so two
+	// pollers hitting the same busy bus at once don't double-scan the same
+	// delta) without serializing reads across DIFFERENT buses. Entries are
+	// evicted in lockstep with readCache — see ReadEventsSince.
+	readCacheLocks map[string]*sync.Mutex
+	// readCacheLRU tracks bus-cache recency, most-recently-touched at the
+	// front, for the eviction maxReadCacheBuses enforces. readCacheLRUIdx is
+	// the busID -> element index into it. Both are readCache/readCacheLocks
+	// bookkeeping, guarded by readCacheMetaMu exactly like those maps.
+	readCacheLRU    *list.List
+	readCacheLRUIdx map[string]*list.Element
+
+	// readCacheTotalBytes is the running sum of busReadCache.bytes across
+	// every cached bus combined — the value maxReadCacheTotalBytes bounds.
+	// Maintained INCREMENTALLY: every site that changes a per-bus
+	// cache.bytes (settleReadCacheBytes for growth/reset, and
+	// evictReadCacheLocked for eviction) applies the same delta here, so
+	// enforcing the global budget never requires walking every live entry
+	// and re-summing (that would reintroduce an O(cached buses) cost on the
+	// read path this whole cache exists to avoid).
+	//
+	// atomic.Int64 rather than plain int64: the CHEAP OVER-BUDGET CHECK in
+	// ReadEventsSince (`if m.readCacheTotalBytes.Load() > ...`) reads this
+	// lock-free, on every call, specifically so the common under-budget
+	// path never pays for readCacheMetaMu. Every WRITE to it, however — in
+	// settleReadCacheBytes and evictReadCacheLocked — happens while
+	// readCacheMetaMu IS held; the atomic type is about letting the cheap
+	// pre-check skip the lock on read, not about letting cache.bytes
+	// mutations skip it on write (an earlier version of this cache did
+	// exactly that — mutated cache.bytes under only the per-bus lock — and
+	// that's precisely what raced against evictReadCacheLocked's read under
+	// only readCacheMetaMu; myrgic/cogos#564 review). See
+	// settleReadCacheBytes's doc comment for the fix and the full lock
+	// discipline.
+	readCacheTotalBytes atomic.Int64
+}
+
+// busReadCache is one bus's incremental ReadEventsSince state: everything
+// parsed from events.jsonl so far, plus the byte offset that content ends
+// at, so the next call can Seek there and parse only what's new instead of
+// re-reading the file from byte 0.
+//
+// events is de-duped by Seq and kept in the order encountered (== Seq
+// order for a well-formed file, since AppendEvent hands out strictly
+// increasing per-file Seq values) — the exact contract ReadEvents has
+// always had, just built up across calls instead of rebuilt on every one.
+type busReadCache struct {
+	offset int64 // bytes of events.jsonl already folded into events; always a line boundary
+	events []BusBlock
+	seen   map[int]bool // seq -> true, same dedup semantics ReadEvents documents
+
+	// bytes is the running sum of raw line length (pre-JSON-Unmarshal, the
+	// length already in hand during ReadEventsSince's scan) for every event
+	// currently folded into events. An approximation of retained memory, not
+	// an exact heap measurement of the parsed BusBlock — see
+	// maxReadCacheBytesPerBus's doc comment for why that's the deliberately
+	// simple, correct-enough source. Reset to 0 wherever events/seen/offset
+	// are reset (rotation, missing file, or the bound check in
+	// ReadEventsSince), so it never drifts from what events actually holds.
+	//
+	// UNLIKE every other field on this struct: guarded by readCacheMetaMu,
+	// not by this bus's per-bus lock — see settleReadCacheBytes and
+	// evictReadCacheLocked, the ONLY two places anywhere in this file that
+	// read or write it, and BusSessionManager's readCacheMetaMu doc comment
+	// for why (evictReadCacheLocked reads it without taking a per-bus lock;
+	// myrgic/cogos#564 review). No other line — not even inside
+	// ReadEventsSince itself — reads or writes this field directly: the one
+	// place ReadEventsSince needs the current value (its per-bus cap check)
+	// gets it from settleReadCacheBytes's return value instead, captured
+	// under readCacheMetaMu the same as every other access
+	// (myrgic/cogos#561 review, the follow-up that closed this exact gap —
+	// a prior revision of this fix DID read cache.bytes directly there,
+	// under only the per-bus lock, which is precisely the discipline this
+	// comment claims never happens; see settleReadCacheBytes's doc comment
+	// for the return-value contract that replaced it).
+	//
+	// Every WRITE additionally happens nested inside the writer's own
+	// per-bus lock: settleReadCacheBytes, the only writer, is only ever
+	// called from within ReadEventsSince while it holds that bus's per-bus
+	// lock across the whole call. That nesting isn't what makes writes
+	// safe — readCacheMetaMu alone already fully serializes every access to
+	// this field, writes and reads alike, against every other access
+	// including evictReadCacheLocked's cross-bus reads — it's simply also
+	// true of every write site today, so a future writer that somehow
+	// dropped the per-bus lock would still be safe, but one that dropped
+	// readCacheMetaMu would not be.
+	bytes int64
+
+	// fi is the os.FileInfo captured from the last events.jsonl this cache
+	// was built against — the file-identity check ReadEventsSince uses to
+	// detect rotation (see os.SameFile there). nil means "no known prior
+	// identity" (a fresh cache, or the file didn't exist last time), which
+	// os.SameFile safely treats as "not the same file" without panicking.
+	fi os.FileInfo
 }
 
 // NewBusSessionManager constructs a manager rooted at workspaceRoot.
@@ -241,6 +460,10 @@ func NewBusSessionManager(workspaceRoot string) *BusSessionManager {
 		lastHash:         make(map[string]string),
 		generation:       make(map[string]int64),
 		registeredActive: make(map[string]bool),
+		readCache:        make(map[string]*busReadCache),
+		readCacheLocks:   make(map[string]*sync.Mutex),
+		readCacheLRU:     list.New(),
+		readCacheLRUIdx:  make(map[string]*list.Element),
 	}
 }
 
@@ -946,42 +1169,584 @@ func (m *BusSessionManager) recordRegistrySeqSkip(busID, reason string) {
 	}
 }
 
-// ReadEvents reads all events from a bus. De-dups by seq (file may have
-// duplicates from crash recovery).
-func (m *BusSessionManager) ReadEvents(busID string) ([]BusBlock, error) {
+// acquireReadCache returns busID's per-bus lock, ALREADY LOCKED, together
+// with the *busReadCache that lock now guards — fetching or creating both
+// as one indivisible unit, and retrying if eviction raced the acquisition.
+//
+// Why this can't just be "fetch/create the lock, lock.Lock(), THEN
+// fetch/create the cache entry" as two independent trips through
+// readCacheMetaMu (an earlier version of this cache did exactly that, via
+// a since-removed readCacheLockFor helper): there is an UNBOUNDED gap
+// between those two steps — lock.Lock() can block for as long as the
+// previous holder takes. If eviction runs during that gap
+// (evictReadCacheLocked deletes both readCacheLocks[busID] and
+// readCache[busID] together), a caller that already fetched the OLD lock
+// reference and is now just waiting to acquire it ends up, once it finally
+// does, creating a fresh cache entry under a lock that is no longer
+// registered in readCacheLocks. A THIRD caller arriving after eviction then
+// fetches the lock fresh, finds no entry, and gets handed a DIFFERENT new
+// lock — which it can acquire immediately, uncontended, and then fetch the
+// SAME fresh cache entry the first caller is still using. Two goroutines
+// now mutate one *busReadCache under two different mutexes: no actual
+// exclusion. (Caught by
+// TestReadEventsSince_ConcurrentAcrossBusesUnderEvictionPressure under
+// -race while validating the myrgic/cogos#564 review fix — a different
+// manifestation of the same root cause, eviction desynchronizing per-bus
+// lock identity from cache identity, not a new unrelated defect.)
+//
+// The fix: after acquiring a candidate lock, re-verify — under
+// readCacheMetaMu, atomically with the cache fetch/create — that this lock
+// is STILL the one registered for busID. If eviction replaced it while we
+// were blocked, our lock is stale: release it and retry, which will either
+// find the newly-registered canonical lock (installed by whoever raced us)
+// or install one itself. Whoever's verification succeeds fetches/creates
+// the cache entry in that SAME critical section, so no third party can
+// register yet another competing lock in between. Bounded retries in
+// practice: eviction is rare relative to reads, and each retry either wins
+// or converges on a lock everyone else agrees is canonical.
+func (m *BusSessionManager) acquireReadCache(busID string) (*sync.Mutex, *busReadCache) {
+	for {
+		m.readCacheMetaMu.Lock()
+		lock, ok := m.readCacheLocks[busID]
+		if !ok {
+			lock = &sync.Mutex{}
+			m.readCacheLocks[busID] = lock
+		}
+		m.readCacheMetaMu.Unlock()
+
+		lock.Lock()
+
+		m.readCacheMetaMu.Lock()
+		if m.readCacheLocks[busID] != lock {
+			// Evicted (and possibly already replaced by a competing
+			// acquirer) while we were blocked acquiring it — stale; retry
+			// against whatever is canonical now.
+			m.readCacheMetaMu.Unlock()
+			lock.Unlock()
+			continue
+		}
+		cache := m.readCache[busID]
+		if cache == nil {
+			cache = &busReadCache{seen: make(map[int]bool)}
+			m.readCache[busID] = cache
+		}
+		m.touchReadCacheLRU(busID)
+		m.readCacheMetaMu.Unlock()
+		return lock, cache
+	}
+}
+
+// touchReadCacheLRU marks busID most-recently-used and evicts the
+// least-recently-used bus cache(s) if that pushes the tracked set past
+// maxReadCacheBuses. Must be called with readCacheMetaMu held.
+//
+// Bounds readCache (#561 follow-up): without this, readCache retains one
+// fully-parsed event history plus a seen map[int]bool per bus FOREVER —
+// across hundreds of buses that never stop being polled even after they go
+// quiet, that is an unbounded-memory trade for the unbounded-CPU bug this
+// cache exists to fix. An LRU cap on bus COUNT is the simplest mechanism
+// that actually bounds the failure mode observed in practice (many buses,
+// each individually cache-bounded already by rotation — see
+// maxReadCacheEventsPerBus below for the case rotation doesn't cover): it
+// needs no TTL clock, no background sweep, and eviction is driven by the
+// same call path that would otherwise grow the map, so it can't fall behind.
+func (m *BusSessionManager) touchReadCacheLRU(busID string) {
+	if el, ok := m.readCacheLRUIdx[busID]; ok {
+		m.readCacheLRU.MoveToFront(el)
+		return
+	}
+	m.readCacheLRUIdx[busID] = m.readCacheLRU.PushFront(busID)
+
+	for m.readCacheLRU.Len() > maxReadCacheBuses {
+		back := m.readCacheLRU.Back()
+		if back == nil {
+			break
+		}
+		oldest := back.Value.(string)
+		if oldest == busID {
+			// maxReadCacheBuses < 1 (misconfigured); never evict the entry
+			// we were just asked to touch.
+			break
+		}
+		m.evictReadCacheLocked(oldest)
+	}
+}
+
+// evictReadCacheLocked drops busID's cache entry, per-bus lock, and LRU
+// bookkeeping. Must be called with readCacheMetaMu held.
+//
+// Safe at any moment: busReadCache is purely a derived memoization of
+// events.jsonl, never its own source of truth. Dropping an entry costs the
+// next reader of busID a full re-parse from offset 0 — same cost the
+// pre-#561 implementation always paid — but produces byte-identical results,
+// because ReadEventsSince rebuilds a nil/zero-value cache exactly the way it
+// rebuilds one after a detected rotation. If another goroutine is
+// concurrently mid-read for busID (holding the lock this deletes from
+// readCacheLocks via its own already-fetched pointer), eviction here doesn't
+// disturb it: it finishes against its own private lock and cache objects,
+// and any future caller for busID simply gets a freshly created lock+cache
+// pair. No shared mutable state crosses that split, so this cannot race.
+func (m *BusSessionManager) evictReadCacheLocked(busID string) {
+	// Decrement the global total BEFORE deleting the entry — this is the
+	// only place readCacheTotalBytes and readCache/readCacheLRU bookkeeping
+	// are guaranteed to change together, so it's where accounting drift
+	// would first show up if this line were ever dropped (see the
+	// accounting test in bus_session_test.go).
+	if c, ok := m.readCache[busID]; ok {
+		m.readCacheTotalBytes.Add(-c.bytes)
+	}
+	delete(m.readCache, busID)
+	delete(m.readCacheLocks, busID)
+	if el, ok := m.readCacheLRUIdx[busID]; ok {
+		m.readCacheLRU.Remove(el)
+		delete(m.readCacheLRUIdx, busID)
+	}
+}
+
+// enforceReadCacheTotalBudgetLocked evicts least-recently-used bus caches
+// (via evictReadCacheLocked, so cache/lock/LRU bookkeeping and the global
+// byte total all move together) until readCacheTotalBytes fits within
+// maxReadCacheTotalBytes, or until there is nothing left to evict. Must be
+// called with readCacheMetaMu held.
+//
+// Unlike touchReadCacheLRU, this does NOT special-case "never evict the
+// entry we were just asked to touch": if a single bus's own growth is what
+// pushed the total over budget, evicting that bus (freeing it back to a
+// clean, offset-0 state for its next read) is the correct outcome, not a
+// degenerate one — it's the same self-reset behavior the per-bus caps in
+// ReadEventsSince already apply, just decided here for the global total
+// instead of a single bus's local bound.
+func (m *BusSessionManager) enforceReadCacheTotalBudgetLocked() {
+	for m.readCacheTotalBytes.Load() > maxReadCacheTotalBytes {
+		back := m.readCacheLRU.Back()
+		if back == nil {
+			break
+		}
+		m.evictReadCacheLocked(back.Value.(string))
+	}
+}
+
+// settleReadCacheBytes is the ONLY place ANY code touches a busReadCache's
+// bytes field or m.readCacheTotalBytes — it takes readCacheMetaMu itself,
+// briefly, rather than requiring the caller to (contrast the *Locked
+// helpers above, which assume it's already held). No other line in this
+// file reads or writes cache.bytes directly; a caller that needs its
+// current value — the per-bus cap check in ReadEventsSince is the only one
+// — uses this method's return value instead of touching the field itself.
+// See that return-value contract below.
+//
+// This closes the race myrgic/cogos#564's review confirmed: ReadEventsSince
+// used to mutate cache.bytes (in the parse loop, and in each of the
+// rotation / file-not-exist / per-bus-cap reset branches) while holding
+// only the per-bus lock, while evictReadCacheLocked reads that same field
+// while holding only readCacheMetaMu — two non-overlapping lock domains
+// over the same memory, an unsynchronized concurrent read/write. Every
+// mutation of cache.bytes now happens here, under readCacheMetaMu, the same
+// lock evictReadCacheLocked already holds when it reads c.bytes — so the
+// two can no longer race, by construction. cache.offset/.events/.seen/.fi
+// are NOT covered by this helper and don't need to be: evictReadCacheLocked
+// never reads them, only .bytes, so they're safe exactly as before, guarded
+// solely by the per-bus lock (acquireReadCache) ReadEventsSince already
+// holds across the whole call.
+//
+// Liveness check, i.e. the "generation" mechanism: eviction never mutates a
+// *busReadCache in place, it only unlinks busID from m.readCache (see
+// evictReadCacheLocked) — so `m.readCache[busID] == cache` is exactly "is
+// this still the live entry a future caller would see," with no separate
+// epoch counter needed: every fresh busReadCache{} allocation is its own
+// generation, and pointer identity distinguishes it from both a prior
+// (evicted) and a later (recreated) generation for the same busID. If
+// cache was evicted out from under an in-flight parse, this helper is a
+// no-op: it does NOT credit newBytes to m.readCacheTotalBytes, and does NOT
+// double-subtract on a reset (evictReadCacheLocked already did the one true
+// subtraction for this instance at eviction time — this instance can never
+// be evicted again, since nothing reachable from m.readCache points to it).
+// Discarding here, rather than committing anyway, is what prevents the
+// second-order bug the review also flagged: an evicted-but-still-parsing
+// cache crediting m.readCacheTotalBytes for bytes that can never be
+// subtracted back out, drifting the global budget upward forever under
+// sustained concurrent polling.
+//
+// reset=true clears cache's parsed content back to empty (the rotation /
+// file-not-exist / per-bus-cap paths); reset=false commits newBytes as
+// growth (the parse loop, called once per ReadEventsSince call with the
+// total bytes newly folded in, not once per line — keeping this critical
+// section O(1) per call, not O(events), so concurrent parses of different
+// buses stay concurrent: the expensive file I/O and JSON unmarshal work
+// above happens entirely outside readCacheMetaMu, exactly as before).
+//
+// Return value (myrgic/cogos#561 review, the follow-up to #564): the
+// post-commit cache.bytes for cache's CURRENT generation, still read under
+// readCacheMetaMu before it's released — so ReadEventsSince's per-bus cap
+// check can compare against it without a second, out-of-discipline read of
+// the field itself. If cache was evicted out from under the caller (the
+// liveness check above found `m.readCache[busID] != cache`), this returns
+// -1 instead of cache's stale, never-credited field value: -1 is not a
+// value cache.bytes can ever legitimately hold (it only ever holds
+// non-negative sums), so it's an unambiguous "this generation is no longer
+// live, its cap can't be usefully checked or re-tripped" signal, and the
+// caller treats it as "skip the cap check entirely" rather than, say,
+// clamping to 0 (which would read as "under budget" and mask real growth,
+// or worse invite re-deriving a bytes figure from a struct nothing can
+// reach again). An evicted cache is already unreachable from m.readCache —
+// no future caller will ever see it — so resetting it again would only
+// waste cycles zeroing fields nobody will read; -1 lets the caller skip
+// that redundant reset outright instead of performing it and discarding
+// the result.
+func (m *BusSessionManager) settleReadCacheBytes(busID string, cache *busReadCache, newBytes int64, reset bool) int64 {
+	m.readCacheMetaMu.Lock()
+	committed := int64(-1)
+	if m.readCache[busID] == cache {
+		if reset {
+			m.readCacheTotalBytes.Add(-cache.bytes)
+			cache.bytes = 0
+		} else if newBytes != 0 {
+			cache.bytes += newBytes
+			m.readCacheTotalBytes.Add(newBytes)
+		}
+		committed = cache.bytes
+	}
+	m.readCacheMetaMu.Unlock()
+
+	if reset {
+		// Not covered by the lock above (evictReadCacheLocked never reads
+		// these) — safe under the per-bus lock alone, same as always. Reset
+		// unconditionally, even if the entry above was already evicted: a
+		// still-in-flight caller (e.g. mid-rotation-handling) keeps using
+		// this same *busReadCache locally for the rest of its own call —
+		// see ReadEventsSince — and needs offset/events/seen to reflect a
+		// clean slate regardless of whether this instance is still reachable
+		// from m.readCache.
+		cache.offset = 0
+		cache.events = nil
+		cache.seen = make(map[int]bool)
+	}
+	return committed
+}
+
+// ReadEventsSince returns busID's events with Seq > afterSeq, de-duped by
+// Seq, in Seq-ascending order. afterSeq <= 0 returns the full history —
+// the same contract ReadEvents(busID) has always had (it is now a thin
+// wrapper: ReadEventsSince(busID, 0)). A cursor at or beyond the bus's
+// current tip returns an empty, non-nil-error slice rather than erroring.
+//
+// Fixes #561: the naive implementation this replaced re-opened
+// events.jsonl and re-Unmarshal'd every line on every call — O(entire bus
+// history) per poll, measured at ~50% of kernel CPU against a 1.3 GB bus
+// store with ~30 live pollers (see the issue's pprof evidence). This
+// method instead maintains a per-bus busReadCache: the byte offset through
+// which the file has already been parsed, plus the de-duped events parsed
+// so far. Each call Seeks to that offset and only reads/Unmarshal's the
+// bytes appended since the LAST call against this manager for this bus —
+// so a steady-state poller pays for the handful of new events since its
+// last poll, not the whole file, regardless of which caller (or which
+// cursor value) triggers the read: ReadEvents(busID) and every
+// ReadEventsSince(busID, N) for this bus all share the same cache, so the
+// full-history callers benefit too, not just the cursor-aware ones.
+//
+// Concurrency: a per-bus lock (acquireReadCache) serializes cache access
+// for the SAME bus without serializing reads across different buses, and
+// is held across the incremental file read — safe because it's a strict
+// subset of a single bus's read path, never nested with m.mu (the append
+// lock), so it cannot introduce a new deadlock ordering with AppendEvent.
+// The file I/O and JSON unmarshal work — the expensive part — runs
+// entirely under just this per-bus lock, so concurrent parses of DIFFERENT
+// buses stay genuinely concurrent; nothing here serializes them on each
+// other.
+//
+// Lock discipline (myrgic/cogos#564 review; this is the fix for the race
+// that PR's review confirmed, tightened again by the myrgic/cogos#561
+// review): busReadCache.bytes is the ONE field on the cache struct that
+// eviction (evictReadCacheLocked) also touches, so it's the one field
+// guarded by readCacheMetaMu instead of the per-bus lock — every read or
+// write of it, on either side, happens under readCacheMetaMu, and ONLY
+// inside settleReadCacheBytes or evictReadCacheLocked; this method itself
+// never reads or writes cache.bytes directly, not even in its own per-bus
+// cap check below, which instead uses settleReadCacheBytes's return value
+// (a prior revision of this fix read the field directly there, under only
+// the per-bus lock — the #561 review is what closed that gap; see
+// settleReadCacheBytes's doc comment for the return-value contract).
+// Writes are additionally always nested inside the writer's own per-bus
+// lock too, since settleReadCacheBytes is only ever called from within this
+// method while it holds that lock — true of every write site today, but
+// incidental to correctness: readCacheMetaMu alone is what actually
+// serializes every access. Every other field (offset, events, seen, fi)
+// stays guarded solely by the per-bus lock, exactly as before, since
+// eviction never reads them. Ordering when both locks are held: the
+// per-bus lock is always OUTER (held for the whole call), readCacheMetaMu
+// always INNER and brief (a handful of field/map operations, never file
+// I/O) — this method already established that order for the initial
+// fetch+touchLRU below; settleReadCacheBytes's internal locking follows
+// the same order. touchReadCacheLRU / evictReadCacheLocked /
+// enforceReadCacheTotalBudgetLocked are NEVER called while holding a
+// per-bus lock that isn't this call's own, so readCacheMetaMu never waits
+// on a per-bus lock — only the reverse — which is what makes this
+// ordering deadlock-free.
+//
+// Generation / liveness: settleReadCacheBytes distinguishes "my cache
+// entry is still the one a future caller would see" from "it was evicted
+// out from under me while I was parsing" by pointer identity
+// (m.readCache[busID] == cache) rather than a separate counter field —
+// eviction never mutates a *busReadCache in place, only unlinks it from
+// m.readCache, so each fresh allocation is its own generation. If evicted,
+// settleReadCacheBytes discards the accumulated byte delta instead of
+// crediting it to m.readCacheTotalBytes: this call still returns the
+// correct result (computed from cache.events, which IS still valid/complete
+// for this call), it just isn't persisted for reuse — see
+// settleReadCacheBytes's doc comment for why crediting it anyway would
+// drift the global budget upward forever (the object becomes unreachable
+// from m.readCache, so nothing can ever evict — and thus decrement — it
+// again).
+//
+// Rotation: detected by FILE IDENTITY (os.SameFile, i.e. device+inode on
+// Darwin/Linux), not by size. An earlier version of this cache compared
+// fi.Size() < cache.offset, which is a false negative whenever the fresh
+// post-rotation file has already grown back to or past the stale cached
+// offset before the next read for that bus — the code would then Seek to a
+// meaningless byte offset in the brand-new file and silently discard every
+// event before it, with cache.offset re-syncing afterward so the loss was
+// never surfaced (#561 review). Identity survives growth: AppendEvent's
+// rotation path renames the old file away and os.Create's a genuinely new
+// one, so the inode always changes at rotation regardless of how much the
+// fresh file has grown by the time this next reads it. os.SameFile returns
+// false (never panics) whenever either side's identity can't be determined
+// — including cache.fi's zero value on a bus's very first read — so an
+// unknown identity is conservatively treated as "assume rotation, do a full
+// re-read" rather than trusting a stale offset. The old size-shrink check
+// is kept as a cheap secondary signal, not the primary one.
+//
+// Bounding: readCache is capped at maxReadCacheBuses distinct buses (LRU
+// eviction, touchReadCacheLRU), at maxReadCacheEventsPerBus parsed events
+// per bus, at maxReadCacheBytesPerBus retained bytes per bus, and at
+// maxReadCacheTotalBytes retained bytes SUMMED ACROSS EVERY BUS COMBINED
+// (all checked below) — see maxReadCacheBuses's doc comment for why an
+// unbounded cache is the same class of bug #561 fixes, just in memory
+// instead of CPU, and maxReadCacheBytesPerBus's doc comment for why the
+// count cap alone doesn't close it (a single oversized event is count=1).
+// The global total exists because the three per-dimension bounds above
+// compose MULTIPLICATIVELY (maxReadCacheBuses x maxReadCacheBytesPerBus is
+// a worst case in the tens of GB) — see maxReadCacheTotalBytes's doc
+// comment for the budget figure and its justification. Evicting a cache
+// entry is always safe: see evictReadCacheLocked.
+//
+// Aliasing (deliberately NOT deep-copied, see #561 review's unverified
+// note): the returned []BusBlock is a fresh slice (copy() below), but each
+// element's Payload (a map) and Prev (a slice) are shallow-copied struct
+// fields, so every caller's returned events alias the SAME Payload map /
+// Prev backing array held in cache.events — and thus each other, across
+// every past and future caller of this bus. A real deep copy here would
+// mean re-walking and re-allocating every returned event's Payload map on
+// every call, which for a full-history caller (ReadEvents == afterSeq 0)
+// is exactly the O(entire bus history)-per-call cost class #561 exists to
+// eliminate — it would erode the fix for the callers most likely to invoke
+// it repeatedly (sessions.go, peer_awareness_query.go, session_fork.go all
+// call ReadEvents to recompute full state). Deferred rather than fixed:
+// audited as of this PR, no caller mutates a returned event's Payload or
+// Prev in place. THE INVARIANT ANY FUTURE CALLER MUST HOLD: treat returned
+// BusBlock.Payload/.Prev as read-only. Mutating either in place corrupts
+// the shared cache for every other past/future reader of this bus without
+// holding acquireReadCache's lock — i.e. a data race plus cross-caller
+// state leakage. A caller that needs to mutate must copy Payload/Prev
+// itself first.
+func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBlock, error) {
 	if !validPathComponent(busID) {
 		return nil, fmt.Errorf("invalid bus_id %q", busID)
 	}
 	eventsFile := m.EventsPath(busID)
+
+	lock, cache := m.acquireReadCache(busID)
+	defer lock.Unlock()
+
 	f, err := os.Open(eventsFile)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// No file yet — nothing to cache either (a stale cache here
+			// would mean the bus's events.jsonl was removed out from under
+			// us, which EnsureBus/AppendEvent never do apart from the
+			// rotation rename+recreate handled below).
+			m.settleReadCacheBytes(busID, cache, 0, true)
+			cache.fi = nil
 			return nil, nil
 		}
 		return nil, fmt.Errorf("open events file: %w", err)
 	}
 	defer f.Close()
 
-	var events []BusBlock
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
-	seen := make(map[int]bool)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-		var block BusBlock
-		if err := json.Unmarshal([]byte(line), &block); err != nil {
-			continue
-		}
-		if seen[block.Seq] {
-			continue
-		}
-		seen[block.Seq] = true
-		events = append(events, block)
+	fi, statErr := f.Stat()
+	if statErr != nil {
+		return nil, fmt.Errorf("stat events file: %w", statErr)
 	}
 
-	return events, nil
+	// File-identity check is primary: a rotation always swaps in a new
+	// inode (see the doc comment above), and unlike a size comparison this
+	// isn't fooled by the fresh file growing past the stale offset before
+	// we get here. os.SameFile safely returns false — it never panics —
+	// when cache.fi is nil (no prior identity recorded yet), which is
+	// exactly the conservative "unknown means treat as rotated" behavior
+	// wanted; on a genuinely fresh cache this is a costless no-op since
+	// cache.offset is already 0.
+	rotated := !os.SameFile(cache.fi, fi)
+
+	// Cheap secondary signal, kept as a backstop: a file that has SHRUNK
+	// relative to what we've already parsed cannot be a pure continuation
+	// of the cache even in the (implausible) case identity matched.
+	if !rotated && fi.Size() < cache.offset {
+		rotated = true
+	}
+
+	if rotated {
+		m.settleReadCacheBytes(busID, cache, 0, true)
+	}
+	cache.fi = fi
+
+	var newBytes int64
+	if fi.Size() > cache.offset {
+		if _, err := f.Seek(cache.offset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("seek events file: %w", err)
+		}
+		reader := bufio.NewReaderSize(f, 256*1024)
+		var consumed int64
+		for {
+			lineBytes, readErr := reader.ReadBytes('\n')
+			if n := len(lineBytes); n > 0 && lineBytes[n-1] == '\n' {
+				consumed += int64(n)
+				if line := lineBytes[:n-1]; len(line) > 0 {
+					var block BusBlock
+					if err := json.Unmarshal(line, &block); err == nil {
+						if !cache.seen[block.Seq] {
+							cache.seen[block.Seq] = true
+							cache.events = append(cache.events, block)
+							// Accumulated locally, not committed to
+							// cache.bytes/m.readCacheTotalBytes here — see
+							// settleReadCacheBytes below and its doc comment
+							// (myrgic/cogos#564 review).
+							newBytes += int64(len(line))
+						}
+					}
+					// Malformed lines are silently skipped — same as the
+					// scanner-based implementation this replaced.
+				}
+			}
+			if readErr != nil {
+				// EOF (almost always io.EOF) with no trailing newline on
+				// the final chunk means a concurrent AppendEvent's write is
+				// either in flight or was torn. Deliberately do NOT count
+				// those trailing bytes as consumed: the next call re-reads
+				// from the same offset and picks up the completed line
+				// once the writer finishes, exactly as a fresh full scan
+				// starting from byte 0 would have.
+				break
+			}
+		}
+		cache.offset += consumed
+	}
+
+	// result's elements alias cache.events' Payload maps / Prev slices —
+	// read-only for every caller; see the aliasing paragraph in this
+	// method's doc comment.
+	var result []BusBlock
+	if afterSeq <= 0 {
+		result = make([]BusBlock, len(cache.events))
+		copy(result, cache.events)
+	} else {
+		// cache.events is Seq-ascending, so the wanted suffix starts at the
+		// first entry past afterSeq. Linear scan, not binary search: the
+		// steady-state caller (a poller) supplies a cursor near the tail, so
+		// this is typically a handful of comparisons, not a real search cost.
+		start := len(cache.events)
+		for i, e := range cache.events {
+			if e.Seq > afterSeq {
+				start = i
+				break
+			}
+		}
+		result = make([]BusBlock, len(cache.events)-start)
+		copy(result, cache.events[start:])
+	}
+
+	// Commit this call's newly parsed bytes (myrgic/cogos#564 review fix).
+	// See settleReadCacheBytes's doc comment for the full argument: this is
+	// the ONLY place cache.bytes/m.readCacheTotalBytes are mutated for
+	// growth, it takes readCacheMetaMu itself (briefly, O(1) — not once per
+	// line), and it silently discards newBytes instead of crediting it if
+	// this bus's entry was evicted while we were parsing above, which is
+	// what stops the global budget from drifting upward for an entry
+	// nothing can ever evict (and thus decrement) again.
+	//
+	// committedBytes captures the post-commit total settleReadCacheBytes
+	// just read under readCacheMetaMu, so the per-bus cap check right below
+	// can use THIS value instead of re-reading cache.bytes itself outside
+	// that lock (myrgic/cogos#561 review, the follow-up to #564: an earlier
+	// version of this fix committed growth here but then read cache.bytes
+	// directly in the cap check below, under only the per-bus lock —
+	// contradicting the very discipline settleReadCacheBytes exists to
+	// enforce). -1 means "no fresh commit to check against this call": either
+	// newBytes was 0 (nothing grew, so cache.bytes can't have newly crossed
+	// the cap — see the growth/cap-check pairing note below), or the entry
+	// was evicted out from under this call (see settleReadCacheBytes's
+	// return-value doc comment) — the cap check below treats both the same
+	// way, by skipping.
+	committedBytes := int64(-1)
+	if newBytes != 0 {
+		committedBytes = m.settleReadCacheBytes(busID, cache, newBytes, false)
+	}
+
+	// Per-bus event-count and byte bounds (#561 follow-up). A bus normally
+	// stays bounded by eventsFileMaxBytes (rotation clears its cache — see
+	// the identity check above), but two failure modes slip past that:
+	//
+	//   - a very high volume of small events can accumulate a large parsed
+	//     slice (and a large seen map) before the byte-size threshold is
+	//     ever crossed on the underlying file — bounded by
+	//     maxReadCacheEventsPerBus, a cheap guard on entry/seen-map count.
+	//   - a single oversized event's payload sits at count=1, far under the
+	//     count cap, and would otherwise stay resident indefinitely — this
+	//     is what maxReadCacheBytesPerBus closes (myrgic/cogos#561 review).
+	//     Ingress-side bounding of a single event's payload size is a
+	//     separate concern, not fixed here — see myrgic/cogos#565.
+	//
+	// Either bound tripping drops the entry so the NEXT read starts clean
+	// and re-parses from offset 0. Safe to do after result is already
+	// computed: this call's answer was built from the cache as it stood a
+	// moment ago, so resetting it now cannot change what's returned here
+	// (see evictReadCacheLocked's doc comment for the same argument in the
+	// LRU case — this is the identical invariant, applied per-bus instead
+	// of across buses).
+	//
+	// Gated on committedBytes >= 0, i.e. this call actually committed a
+	// fresh cache.bytes value above: len(cache.events) can only grow in the
+	// same parse loop that accumulates newBytes (the append and the
+	// newBytes += are the same branch — see the loop above), so if newBytes
+	// was 0 this call, neither len(cache.events) nor cache.bytes changed and
+	// nothing new could have crossed either cap; if the entry was evicted,
+	// it's already unreachable from m.readCache and resetting it again would
+	// only spend cycles zeroing fields nothing will ever read.
+	if committedBytes >= 0 && (len(cache.events) > maxReadCacheEventsPerBus || committedBytes > maxReadCacheBytesPerBus) {
+		m.settleReadCacheBytes(busID, cache, 0, true)
+	}
+
+	// Global byte budget (#561 follow-up: composition ceiling — see
+	// maxReadCacheTotalBytes's doc comment). Checked after result is
+	// already computed, same as the per-bus caps just above: whatever gets
+	// evicted here, including possibly THIS bus's own entry, cannot change
+	// what this call returns, only what the next read of an affected bus
+	// has to re-parse. Cheap-check the atomic total before taking
+	// readCacheMetaMu so the common (under-budget) path never pays for the
+	// lock.
+	if m.readCacheTotalBytes.Load() > maxReadCacheTotalBytes {
+		m.readCacheMetaMu.Lock()
+		m.enforceReadCacheTotalBudgetLocked()
+		m.readCacheMetaMu.Unlock()
+	}
+
+	return result, nil
+}
+
+// ReadEvents reads all events from a bus. De-dups by seq (file may have
+// duplicates from crash recovery). Equivalent to ReadEventsSince(busID, 0)
+// — kept as its own name because most callers want "everything", and that
+// reads better at those call sites than a literal 0 cursor would. See
+// ReadEventsSince for the caching behaviour this now shares.
+func (m *BusSessionManager) ReadEvents(busID string) ([]BusBlock, error) {
+	return m.ReadEventsSince(busID, 0)
 }
