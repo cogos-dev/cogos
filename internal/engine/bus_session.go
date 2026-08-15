@@ -337,13 +337,16 @@ type BusSessionManager struct {
 	// readCacheMetaMu guards readCache, readCacheLocks, readCacheLRU, and
 	// readCacheLRUIdx (the maps/list themselves), PLUS one *busReadCache
 	// field specifically: bytes — see settleReadCacheBytes and
-	// evictReadCacheLocked. Every other *busReadCache field (offset, events,
-	// seen, fi) is guarded solely by that bus's own per-bus lock
-	// (acquireReadCache), never by this one — see ReadEventsSince's
-	// Concurrency doc comment for why bytes is the odd one out (eviction
-	// needs to read it without taking the per-bus lock of every entry it
-	// might evict). Held only for map/list bookkeeping plus that one field,
-	// never across file I/O.
+	// evictReadCacheLocked, the ONLY two functions that ever read or write
+	// that field; nothing else in this file touches cache.bytes directly,
+	// including ReadEventsSince itself (its per-bus cap check uses
+	// settleReadCacheBytes's return value instead — myrgic/cogos#561
+	// review). Every other *busReadCache field (offset, events, seen, fi) is
+	// guarded solely by that bus's own per-bus lock (acquireReadCache),
+	// never by this one — see ReadEventsSince's Concurrency doc comment for
+	// why bytes is the odd one out (eviction needs to read it without taking
+	// the per-bus lock of every entry it might evict). Held only for
+	// map/list bookkeeping plus that one field, never across file I/O.
 	readCacheMetaMu sync.Mutex
 	// readCache holds, per bus, the incrementally-extended parse state
 	// ReadEventsSince uses to avoid re-scanning a bus's entire history on
@@ -413,10 +416,31 @@ type busReadCache struct {
 	// ReadEventsSince), so it never drifts from what events actually holds.
 	//
 	// UNLIKE every other field on this struct: guarded by readCacheMetaMu,
-	// not by this bus's per-bus lock — see settleReadCacheBytes, the only
-	// place ReadEventsSince ever touches it, and BusSessionManager's
-	// readCacheMetaMu doc comment for why (evictReadCacheLocked reads it
-	// without taking a per-bus lock; myrgic/cogos#564 review).
+	// not by this bus's per-bus lock — see settleReadCacheBytes and
+	// evictReadCacheLocked, the ONLY two places anywhere in this file that
+	// read or write it, and BusSessionManager's readCacheMetaMu doc comment
+	// for why (evictReadCacheLocked reads it without taking a per-bus lock;
+	// myrgic/cogos#564 review). No other line — not even inside
+	// ReadEventsSince itself — reads or writes this field directly: the one
+	// place ReadEventsSince needs the current value (its per-bus cap check)
+	// gets it from settleReadCacheBytes's return value instead, captured
+	// under readCacheMetaMu the same as every other access
+	// (myrgic/cogos#561 review, the follow-up that closed this exact gap —
+	// a prior revision of this fix DID read cache.bytes directly there,
+	// under only the per-bus lock, which is precisely the discipline this
+	// comment claims never happens; see settleReadCacheBytes's doc comment
+	// for the return-value contract that replaced it).
+	//
+	// Every WRITE additionally happens nested inside the writer's own
+	// per-bus lock: settleReadCacheBytes, the only writer, is only ever
+	// called from within ReadEventsSince while it holds that bus's per-bus
+	// lock across the whole call. That nesting isn't what makes writes
+	// safe — readCacheMetaMu alone already fully serializes every access to
+	// this field, writes and reads alike, against every other access
+	// including evictReadCacheLocked's cross-bus reads — it's simply also
+	// true of every write site today, so a future writer that somehow
+	// dropped the per-bus lock would still be safe, but one that dropped
+	// readCacheMetaMu would not be.
 	bytes int64
 
 	// fi is the os.FileInfo captured from the last events.jsonl this cache
@@ -1302,10 +1326,14 @@ func (m *BusSessionManager) enforceReadCacheTotalBudgetLocked() {
 	}
 }
 
-// settleReadCacheBytes is the ONLY place ReadEventsSince ever touches a
-// busReadCache's bytes field or m.readCacheTotalBytes — it takes
-// readCacheMetaMu itself, briefly, rather than requiring the caller to
-// (contrast the *Locked helpers above, which assume it's already held).
+// settleReadCacheBytes is the ONLY place ANY code touches a busReadCache's
+// bytes field or m.readCacheTotalBytes — it takes readCacheMetaMu itself,
+// briefly, rather than requiring the caller to (contrast the *Locked
+// helpers above, which assume it's already held). No other line in this
+// file reads or writes cache.bytes directly; a caller that needs its
+// current value — the per-bus cap check in ReadEventsSince is the only one
+// — uses this method's return value instead of touching the field itself.
+// See that return-value contract below.
 //
 // This closes the race myrgic/cogos#564's review confirmed: ReadEventsSince
 // used to mutate cache.bytes (in the parse loop, and in each of the
@@ -1346,8 +1374,28 @@ func (m *BusSessionManager) enforceReadCacheTotalBudgetLocked() {
 // section O(1) per call, not O(events), so concurrent parses of different
 // buses stay concurrent: the expensive file I/O and JSON unmarshal work
 // above happens entirely outside readCacheMetaMu, exactly as before).
-func (m *BusSessionManager) settleReadCacheBytes(busID string, cache *busReadCache, newBytes int64, reset bool) {
+//
+// Return value (myrgic/cogos#561 review, the follow-up to #564): the
+// post-commit cache.bytes for cache's CURRENT generation, still read under
+// readCacheMetaMu before it's released — so ReadEventsSince's per-bus cap
+// check can compare against it without a second, out-of-discipline read of
+// the field itself. If cache was evicted out from under the caller (the
+// liveness check above found `m.readCache[busID] != cache`), this returns
+// -1 instead of cache's stale, never-credited field value: -1 is not a
+// value cache.bytes can ever legitimately hold (it only ever holds
+// non-negative sums), so it's an unambiguous "this generation is no longer
+// live, its cap can't be usefully checked or re-tripped" signal, and the
+// caller treats it as "skip the cap check entirely" rather than, say,
+// clamping to 0 (which would read as "under budget" and mask real growth,
+// or worse invite re-deriving a bytes figure from a struct nothing can
+// reach again). An evicted cache is already unreachable from m.readCache —
+// no future caller will ever see it — so resetting it again would only
+// waste cycles zeroing fields nobody will read; -1 lets the caller skip
+// that redundant reset outright instead of performing it and discarding
+// the result.
+func (m *BusSessionManager) settleReadCacheBytes(busID string, cache *busReadCache, newBytes int64, reset bool) int64 {
 	m.readCacheMetaMu.Lock()
+	committed := int64(-1)
 	if m.readCache[busID] == cache {
 		if reset {
 			m.readCacheTotalBytes.Add(-cache.bytes)
@@ -1356,6 +1404,7 @@ func (m *BusSessionManager) settleReadCacheBytes(busID string, cache *busReadCac
 			cache.bytes += newBytes
 			m.readCacheTotalBytes.Add(newBytes)
 		}
+		committed = cache.bytes
 	}
 	m.readCacheMetaMu.Unlock()
 
@@ -1372,6 +1421,7 @@ func (m *BusSessionManager) settleReadCacheBytes(busID string, cache *busReadCac
 		cache.events = nil
 		cache.seen = make(map[int]bool)
 	}
+	return committed
 }
 
 // ReadEventsSince returns busID's events with Seq > afterSeq, de-duped by
@@ -1405,11 +1455,22 @@ func (m *BusSessionManager) settleReadCacheBytes(busID string, cache *busReadCac
 // other.
 //
 // Lock discipline (myrgic/cogos#564 review; this is the fix for the race
-// that PR's review confirmed): busReadCache.bytes is the ONE field on the
-// cache struct that eviction (evictReadCacheLocked) also touches, so it's
-// the one field guarded by readCacheMetaMu instead of the per-bus lock —
-// every read or write of it, on either side, happens under readCacheMetaMu
-// (see settleReadCacheBytes). Every other field (offset, events, seen, fi)
+// that PR's review confirmed, tightened again by the myrgic/cogos#561
+// review): busReadCache.bytes is the ONE field on the cache struct that
+// eviction (evictReadCacheLocked) also touches, so it's the one field
+// guarded by readCacheMetaMu instead of the per-bus lock — every read or
+// write of it, on either side, happens under readCacheMetaMu, and ONLY
+// inside settleReadCacheBytes or evictReadCacheLocked; this method itself
+// never reads or writes cache.bytes directly, not even in its own per-bus
+// cap check below, which instead uses settleReadCacheBytes's return value
+// (a prior revision of this fix read the field directly there, under only
+// the per-bus lock — the #561 review is what closed that gap; see
+// settleReadCacheBytes's doc comment for the return-value contract).
+// Writes are additionally always nested inside the writer's own per-bus
+// lock too, since settleReadCacheBytes is only ever called from within this
+// method while it holds that lock — true of every write site today, but
+// incidental to correctness: readCacheMetaMu alone is what actually
+// serializes every access. Every other field (offset, events, seen, fi)
 // stays guarded solely by the per-bus lock, exactly as before, since
 // eviction never reads them. Ordering when both locks are held: the
 // per-bus lock is always OUTER (held for the whole call), readCacheMetaMu
@@ -1611,8 +1672,23 @@ func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBl
 	// this bus's entry was evicted while we were parsing above, which is
 	// what stops the global budget from drifting upward for an entry
 	// nothing can ever evict (and thus decrement) again.
+	//
+	// committedBytes captures the post-commit total settleReadCacheBytes
+	// just read under readCacheMetaMu, so the per-bus cap check right below
+	// can use THIS value instead of re-reading cache.bytes itself outside
+	// that lock (myrgic/cogos#561 review, the follow-up to #564: an earlier
+	// version of this fix committed growth here but then read cache.bytes
+	// directly in the cap check below, under only the per-bus lock —
+	// contradicting the very discipline settleReadCacheBytes exists to
+	// enforce). -1 means "no fresh commit to check against this call": either
+	// newBytes was 0 (nothing grew, so cache.bytes can't have newly crossed
+	// the cap — see the growth/cap-check pairing note below), or the entry
+	// was evicted out from under this call (see settleReadCacheBytes's
+	// return-value doc comment) — the cap check below treats both the same
+	// way, by skipping.
+	committedBytes := int64(-1)
 	if newBytes != 0 {
-		m.settleReadCacheBytes(busID, cache, newBytes, false)
+		committedBytes = m.settleReadCacheBytes(busID, cache, newBytes, false)
 	}
 
 	// Per-bus event-count and byte bounds (#561 follow-up). A bus normally
@@ -1636,7 +1712,16 @@ func (m *BusSessionManager) ReadEventsSince(busID string, afterSeq int) ([]BusBl
 	// (see evictReadCacheLocked's doc comment for the same argument in the
 	// LRU case — this is the identical invariant, applied per-bus instead
 	// of across buses).
-	if len(cache.events) > maxReadCacheEventsPerBus || cache.bytes > maxReadCacheBytesPerBus {
+	//
+	// Gated on committedBytes >= 0, i.e. this call actually committed a
+	// fresh cache.bytes value above: len(cache.events) can only grow in the
+	// same parse loop that accumulates newBytes (the append and the
+	// newBytes += are the same branch — see the loop above), so if newBytes
+	// was 0 this call, neither len(cache.events) nor cache.bytes changed and
+	// nothing new could have crossed either cap; if the entry was evicted,
+	// it's already unreachable from m.readCache and resetting it again would
+	// only spend cycles zeroing fields nothing will ever read.
+	if committedBytes >= 0 && (len(cache.events) > maxReadCacheEventsPerBus || committedBytes > maxReadCacheBytesPerBus) {
 		m.settleReadCacheBytes(busID, cache, 0, true)
 	}
 
