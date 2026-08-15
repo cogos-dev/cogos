@@ -191,3 +191,106 @@ func TestRankFilesBySalienceEmptyDir(t *testing.T) {
 		t.Errorf("got %d scores; want 0", len(scores))
 	}
 }
+
+// ── Churn (COG_SALIENCE_CHURN) parity between the single-file and batch
+// paths ──────────────────────────────────────────────────────────────────
+//
+// #563 unified computeFileSalienceWithRepo (single-file) and
+// RankFilesBySalience (batch, via batchCollectStats/batchComputeScores) onto
+// the same underlying walk. Before this, batch mode hardcoded churn to 0
+// regardless of COG_SALIENCE_CHURN ("Churn requires c.Stats() which is
+// expensive; skip in batch mode") while the single-file path honored the
+// env var. These tests pin the unified behavior: both paths agree exactly,
+// including churn, when the env var is set — and both stay at 0 by default.
+
+func makeChurnRepo(t *testing.T) (root, filePath string) {
+	t.Helper()
+	root = t.TempDir()
+	repo, err := git.PlainInit(root, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+
+	filePath = filepath.Join(root, "churn.md")
+	write := func(content string) {
+		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	commit := func(msg string) {
+		if _, err := wt.Add("churn.md"); err != nil {
+			t.Fatalf("git add: %v", err)
+		}
+		sig := &object.Signature{Name: "Test", Email: "test@cogos.test", When: time.Now()}
+		if _, err := wt.Commit(msg, &git.CommitOptions{Author: sig, Committer: sig}); err != nil {
+			t.Fatalf("git commit: %v", err)
+		}
+	}
+
+	write("line1\n")
+	commit("init")
+	write("line1\nline2\nline3\nline4\nline5\n")
+	commit("grow")
+
+	return root, filePath
+}
+
+func TestChurnEnabled_BatchAndSingleFileAgree(t *testing.T) {
+	// t.Setenv is incompatible with t.Parallel.
+	t.Setenv("COG_SALIENCE_CHURN", "1")
+	root, filePath := makeChurnRepo(t)
+	cfg := DefaultSalienceConfig()
+
+	single, err := ComputeFileSalience(root, filePath, 90, cfg)
+	if err != nil {
+		t.Fatalf("ComputeFileSalience: %v", err)
+	}
+	if single.TotalChanges <= 0 {
+		t.Errorf("single-file TotalChanges = %d; want > 0 with COG_SALIENCE_CHURN=1", single.TotalChanges)
+	}
+	if single.Churn <= 0 {
+		t.Errorf("single-file Churn = %.4f; want > 0", single.Churn)
+	}
+
+	scores, err := RankFilesBySalience(root, root, 0, 90, cfg)
+	if err != nil {
+		t.Fatalf("RankFilesBySalience: %v", err)
+	}
+	var batchScore float64
+	found := false
+	for _, fs := range scores {
+		if fs.Path == filePath {
+			batchScore, found = fs.Score, true
+		}
+	}
+	if !found {
+		t.Fatalf("churn.md missing from RankFilesBySalience results: %+v", scores)
+	}
+
+	const eps = 1e-9
+	if diff := batchScore - single.Total; diff < -eps || diff > eps {
+		t.Errorf("batch score = %.9f; want %.9f (must match the single-file path exactly, including churn)",
+			batchScore, single.Total)
+	}
+}
+
+func TestChurnDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	root, filePath := makeChurnRepo(t)
+	cfg := DefaultSalienceConfig()
+
+	single, err := ComputeFileSalience(root, filePath, 90, cfg)
+	if err != nil {
+		t.Fatalf("ComputeFileSalience: %v", err)
+	}
+	if single.TotalChanges != 0 {
+		t.Errorf("TotalChanges = %d; want 0 (COG_SALIENCE_CHURN unset)", single.TotalChanges)
+	}
+	if single.Churn != 0 {
+		t.Errorf("Churn = %.4f; want 0 (COG_SALIENCE_CHURN unset)", single.Churn)
+	}
+}

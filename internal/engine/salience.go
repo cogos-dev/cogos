@@ -108,12 +108,29 @@ func ComputeFileSalience(repoPath, filePath string, daysWindow int, cfg *Salienc
 	return computeFileSalienceWithRepo(repo, repoPath, filePath, daysWindow, cfg)
 }
 
+// salienceChurnEnabled reports whether COG_SALIENCE_CHURN opts into the
+// per-commit line-churn signal (an extra c.Stats() patch computation per
+// commit visited). Off by default — churn contributes 0 to the score unless
+// this is set.
+func salienceChurnEnabled() bool {
+	v := strings.ToLower(os.Getenv("COG_SALIENCE_CHURN"))
+	return v == "1" || v == "true"
+}
+
 // computeFileSalienceWithRepo is the inner implementation that accepts a pre-opened
 // repo handle. This avoids re-parsing pack indexes for every file in a batch.
+//
+// #563: this used to run its own repo.Log(PathFilter) walk via go-git's
+// commitPathIter, which diffs every commit between HEAD and the *next
+// path-matching commit* before ever consulting daysWindow — so a file with
+// no touches in the window (or a sparse touch history) forced a walk of the
+// full remaining commit graph, repeated per file, per consolidation pass.
+// It now delegates to batchCollectStats (a single date-bounded walk, cutoff
+// checked before any per-commit diff) with a one-entry scope, so a single
+// call costs at most one full walk of the commits within daysWindow rather
+// than an unbounded walk of the whole history. See RankFilesBySalience for
+// the same bound applied across many files in one shared walk.
 func computeFileSalienceWithRepo(repo *git.Repository, repoPath, filePath string, daysWindow int, cfg *SalienceConfig) (*SalienceScore, error) {
-	enableChurn := strings.ToLower(os.Getenv("COG_SALIENCE_CHURN")) == "1" ||
-		strings.ToLower(os.Getenv("COG_SALIENCE_CHURN")) == "true"
-
 	relPath := filePath
 	if filepath.IsAbs(filePath) {
 		if rel, err := filepath.Rel(repoPath, filePath); err == nil {
@@ -125,67 +142,31 @@ func computeFileSalienceWithRepo(repo *git.Repository, repoPath, filePath string
 	}
 	relPath = filepath.ToSlash(relPath)
 
-	cutoff := time.Now().AddDate(0, 0, -daysWindow)
-
-	iter, err := repo.Log(&git.LogOptions{
-		PathFilter: func(path string) bool { return path == relPath },
-	})
-	if err != nil {
-		return nil, fmt.Errorf("git log: %w", err)
-	}
-	defer iter.Close()
-
-	var (
-		commitCount   int
-		totalChanges  int
-		lastTimestamp time.Time
-		authors       = make(map[string]bool)
-	)
-
-	err = iter.ForEach(func(c *object.Commit) error {
-		if c.Author.When.Before(cutoff) {
-			return storer.ErrStop
-		}
-		commitCount++
-		authors[c.Author.Email] = true
-		if lastTimestamp.IsZero() || c.Author.When.After(lastTimestamp) {
-			lastTimestamp = c.Author.When
-		}
-		if enableChurn {
-			if stats, err := c.Stats(); err == nil {
-				for _, stat := range stats {
-					if stat.Name == relPath {
-						totalChanges += stat.Addition + stat.Deletion
-						break
-					}
-				}
-			}
-		}
-		return nil
-	})
+	stats, err := batchCollectStats(repo, map[string]string{relPath: filePath}, daysWindow)
 	if err != nil {
 		return nil, fmt.Errorf("iterate commits: %w", err)
 	}
 
-	if commitCount == 0 {
+	acc := stats[relPath]
+	if acc == nil || acc.commitCount == 0 {
 		return &SalienceScore{}, nil
 	}
 
-	daysAgo := int(time.Since(lastTimestamp).Hours() / 24)
+	daysAgo := int(time.Since(acc.lastTimestamp).Hours() / 24)
 	recency := computeDecay(cfg.DecayModel, daysAgo, cfg.HalfLife)
 
-	frequency := float64(commitCount) / 10.0
+	frequency := float64(acc.commitCount) / 10.0
 	if frequency > 1.0 {
 		frequency = 1.0
 	}
 
-	avgChanges := float64(totalChanges) / float64(commitCount)
+	avgChanges := float64(acc.totalChanges) / float64(acc.commitCount)
 	churn := avgChanges / 100.0
 	if churn > 1.0 {
 		churn = 1.0
 	}
 
-	authorship := float64(len(authors)) / 5.0
+	authorship := float64(len(acc.authors)) / 5.0
 	if authorship > 1.0 {
 		authorship = 1.0
 	}
@@ -201,9 +182,9 @@ func computeFileSalienceWithRepo(repo *git.Repository, repoPath, filePath string
 		Churn:         churn,
 		Authorship:    authorship,
 		Total:         total,
-		CommitCount:   commitCount,
-		TotalChanges:  totalChanges,
-		UniqueAuthors: len(authors),
+		CommitCount:   acc.commitCount,
+		TotalChanges:  acc.totalChanges,
+		UniqueAuthors: len(acc.authors),
 		DaysAgo:       daysAgo,
 	}, nil
 }
@@ -211,6 +192,7 @@ func computeFileSalienceWithRepo(repo *git.Repository, repoPath, filePath string
 // fileAccum accumulates git history stats for a single file during a batch log walk.
 type fileAccum struct {
 	commitCount   int
+	totalChanges  int // line churn (additions+deletions); only populated when salienceChurnEnabled()
 	lastTimestamp time.Time
 	authors       map[string]bool
 }
@@ -266,10 +248,18 @@ func RankFilesBySalience(repoPath, scope string, limit, daysWindow int, cfg *Sal
 }
 
 // batchCollectStats walks the git log once and accumulates per-file stats for
-// all files in the scope set. Only examines commits within the daysWindow.
+// all files in the scope set. Only examines commits within the daysWindow —
+// the cutoff is checked before any per-commit diff runs, so the walk never
+// descends past daysWindow regardless of how sparsely (or never) the scope
+// files were touched before that point.
+//
+// When salienceChurnEnabled() is true, also accumulates per-file line churn
+// via one c.Stats() call per commit in the window, shared across every file
+// in scope — one patch computation per commit total, not one per file.
 func batchCollectStats(repo *git.Repository, relToAbs map[string]string, daysWindow int) (map[string]*fileAccum, error) {
 	cutoff := time.Now().AddDate(0, 0, -daysWindow)
 	stats := make(map[string]*fileAccum)
+	enableChurn := salienceChurnEnabled()
 
 	iter, err := repo.Log(&git.LogOptions{
 		Order: git.LogOrderCommitterTime,
@@ -289,6 +279,16 @@ func batchCollectStats(repo *git.Repository, relToAbs map[string]string, daysWin
 		author := c.Author.Email
 		when := c.Author.When
 
+		var churn map[string]int
+		if enableChurn {
+			if fileStats, err := c.Stats(); err == nil {
+				churn = make(map[string]int, len(fileStats))
+				for _, s := range fileStats {
+					churn[s.Name] = s.Addition + s.Deletion
+				}
+			}
+		}
+
 		for _, relPath := range changed {
 			if _, inScope := relToAbs[relPath]; !inScope {
 				continue
@@ -302,6 +302,9 @@ func batchCollectStats(repo *git.Repository, relToAbs map[string]string, daysWin
 			acc.authors[author] = true
 			if acc.lastTimestamp.IsZero() || when.After(acc.lastTimestamp) {
 				acc.lastTimestamp = when
+			}
+			if churn != nil {
+				acc.totalChanges += churn[relPath]
 			}
 		}
 		return nil
@@ -368,8 +371,14 @@ func batchComputeScores(stats map[string]*fileAccum, relToAbs map[string]string,
 			frequency = 1.0
 		}
 
-		// Churn requires c.Stats() which is expensive; skip in batch mode.
-		churn := 0.0
+		// acc.totalChanges is only populated when salienceChurnEnabled();
+		// otherwise this is 0, same as before batchCollectStats gained
+		// churn support.
+		avgChanges := float64(acc.totalChanges) / float64(acc.commitCount)
+		churn := avgChanges / 100.0
+		if churn > 1.0 {
+			churn = 1.0
+		}
 
 		authorship := float64(len(acc.authors)) / 5.0
 		if authorship > 1.0 {
