@@ -250,6 +250,56 @@ func TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees(t *testing.T) {
 	}
 }
 
+// TestIndexFreshnessCatchesStaleNonMemSubtree is the regression test for
+// doctorIndexFreshness's original .cog/mem-only scan scope: IndexWorkspace's
+// actual walk covers the whole .cog/ tree (walkRoots in
+// sdk/constellation/indexer.go), so an edit landing in a different indexed
+// subtree (.cog/adr here) after the last reindex must still surface as a
+// freshness gap, not silently OK because .cog/mem itself looks fine.
+func TestIndexFreshnessCatchesStaleNonMemSubtree(t *testing.T) {
+	root := t.TempDir()
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve tempdir symlinks: %v", err)
+	}
+	root = resolvedRoot
+
+	writeCogdoc(t, root, ".cog/mem/semantic/sentinel.cog.md", "Sentinel", "content")
+
+	c, err := constellation.Open(root)
+	if err != nil {
+		skipIfNoFTS5(t, err)
+		t.Fatalf("constellation.Open: %v", err)
+	}
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("IndexWorkspace: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// An edit lands in .cog/adr (indexed by the base .cog/ walk, no
+	// cogdocs.yaml required) well after the reindex above, without
+	// triggering a reindex.
+	adrPath := filepath.Join(root, ".cog", "adr", "new.cog.md")
+	if err := os.MkdirAll(filepath.Dir(adrPath), 0755); err != nil {
+		t.Fatalf("mkdir adr: %v", err)
+	}
+	if err := os.WriteFile(adrPath, []byte("# new adr\n"), 0644); err != nil {
+		t.Fatalf("write adr file: %v", err)
+	}
+	future := time.Now().Add(3 * time.Hour)
+	if err := os.Chtimes(adrPath, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	report := RunDoctor(root, DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "index health", "index freshness")
+	if check.Status != StatusWarn {
+		t.Fatalf("index freshness = %s, want WARN (a .cog/adr file postdates the last reindex by 3h); detail=%s", check.Status, check.Detail)
+	}
+}
+
 // TestStoreLivenessFlagsDeadStore verifies a SQLite store whose mtime is
 // older than the stale threshold is flagged WARN/DEAD, and a fresh one is OK.
 func TestStoreLivenessFlagsDeadStore(t *testing.T) {

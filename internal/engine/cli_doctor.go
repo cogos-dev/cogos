@@ -989,11 +989,28 @@ func doctorIndexFreshness(g *DoctorGroup, db *sql.DB, root string) {
 		return
 	}
 
-	memDir := filepath.Join(root, ".cog", "mem")
+	// Scan the whole .cog/ tree, not just .cog/mem: IndexWorkspace's base walk
+	// root (walkRoots in sdk/constellation/indexer.go) covers all of .cog/
+	// (.cog/adr, .cog/hooks, etc, not only .cog/mem), so a freshness check
+	// scoped to .cog/mem alone can report OK/fresh while a genuinely stale
+	// edit sits in some other indexed subtree -- exactly the silent-false-OK
+	// shape this command exists to rule out. This still does not cover
+	// cogdocs.yaml requiredPaths declared outside .cog/ (an unconfirmed,
+	// config-dependent case a reviewer flagged separately).
+	cogDir := filepath.Join(root, ".cog")
 	var newestMtime time.Time
 	found := false
-	_ = filepath.WalkDir(memDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".md") {
+	_ = filepath.WalkDir(cogDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".state" {
+				return fs.SkipDir // matches IndexWorkspace's own .state skip
+			}
+			return nil
+		}
+		if !strings.HasSuffix(p, ".md") {
 			return nil
 		}
 		info, statErr := d.Info()
@@ -1007,7 +1024,7 @@ func doctorIndexFreshness(g *DoctorGroup, db *sql.DB, root string) {
 		return nil
 	})
 	if !found {
-		g.add("index freshness", StatusUnknown, fmt.Sprintf("no markdown files found under %s", memDir))
+		g.add("index freshness", StatusUnknown, fmt.Sprintf("no markdown files found under %s", cogDir))
 		return
 	}
 
