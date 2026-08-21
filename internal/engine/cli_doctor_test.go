@@ -34,27 +34,21 @@ func writeCogdoc(t *testing.T, workspaceRoot, relPath, title, body string) {
 
 // buildFixtureWorkspace creates a workspace with an indexed constellation.db
 // containing at least one document with a distinctive title, plus an
-// unindexed .cog/hooks tree (a plain .md file that is never passed to
-// IndexWorkspace's default mem/docs/adr scope) to exercise the
-// documents-vs-files check.
+// unindexed .cog/hooks tree (a *.cog.md cogdoc written AFTER IndexWorkspace
+// runs, so it genuinely never got indexed) to exercise the documents-vs-files
+// check. It must be *.cog.md, not a plain .md: IndexWorkspace only ever
+// indexes files with that exact suffix (indexer.go:129), so a plain .md
+// sibling is invisible to the indexer for a structural reason (never
+// eligible in the first place) rather than the "on disk but not yet
+// reindexed" staleness this fixture means to simulate -- and, since
+// IndexWorkspace's base walk covers the whole .cog/ tree, writing a *.cog.md
+// file BEFORE indexing would just get it indexed, defeating the fixture.
 func buildFixtureWorkspace(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 
 	writeCogdoc(t, root, ".cog/mem/semantic/distinctive-sentinel-doc.cog.md",
 		"Distinctive Sentinel Document", "This document contains the word RECOGNIZABLE for the negative control.")
-
-	// A markdown file sitting under a tree IndexWorkspace does not walk by
-	// default (nothing outside .cog/mem is indexed unless declared via
-	// cogdocs.yaml), simulating the .cog/hooks / .cog/lib unindexed-tree
-	// finding from the issue.
-	unindexedDir := filepath.Join(root, ".cog", "hooks")
-	if err := os.MkdirAll(unindexedDir, 0755); err != nil {
-		t.Fatalf("mkdir hooks: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(unindexedDir, "note.md"), []byte("# unindexed\n"), 0644); err != nil {
-		t.Fatalf("write hooks note: %v", err)
-	}
 
 	c, err := constellation.Open(root)
 	if err != nil {
@@ -67,6 +61,12 @@ func buildFixtureWorkspace(t *testing.T) string {
 	if err := c.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+
+	// Written after the index above ran, so it is a real, indexable cogdoc
+	// that genuinely never got indexed -- simulating the .cog/hooks /
+	// .cog/lib unindexed-tree finding from the issue.
+	writeCogdoc(t, root, ".cog/hooks/note.cog.md", "Unindexed Hook Note", "never reindexed")
+
 	return root
 }
 
@@ -229,6 +229,65 @@ func TestDocsVsFilesCountsCorrectlyThroughSymlinkedRoot(t *testing.T) {
 	}
 }
 
+// TestLikeEscapeCharDoesNotCollideWithBackslashSeparator pins the choice of
+// '!' (not the conventional '\') as countDocsUnderPrefix's SQL ESCAPE
+// character. On Windows, filepath.Separator IS '\', so if '\' were also the
+// ESCAPE char, the pattern's own trailing separator-then-wildcard ('\' +
+// '%') would parse as an ESCAPE'd literal '%' rather than "separator,
+// then anything" -- making the query match nothing on Windows regardless of
+// index health. This can't literally run under GOOS=windows here, so it
+// isolates the SQL mechanism directly against a document path containing a
+// literal backslash (as any real Windows path would), built the same way
+// countDocsUnderPrefix builds its pattern.
+func TestLikeEscapeCharDoesNotCollideWithBackslashSeparator(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "escape-fixture-*.db")
+	if err != nil {
+		t.Fatalf("create temp db: %v", err)
+	}
+	f.Close()
+	db, err := sql.Open("sqlite3", f.Name())
+	if err != nil {
+		if strings.Contains(err.Error(), "no such module: fts5") {
+			t.Skip("FTS5 not available (build with -tags fts5)")
+		}
+		t.Fatalf("open fixture db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE documents (id TEXT PRIMARY KEY, path TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	// Shaped like a real Windows document path: backslash separators, same
+	// as filepath.Join produces under GOOS=windows.
+	winPath := `C:\workspace\.cog\mem\note.cog.md`
+	if _, err := db.Exec(`INSERT INTO documents (id, path) VALUES ('d1', ?)`, winPath); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	prefix := `C:\workspace\.cog\mem`
+	// Mirrors countDocsUnderPrefix's own pattern construction, with a
+	// literal '\' standing in for filepath.Separator on Windows.
+	pattern := escapeLikePattern(prefix) + `\` + "%"
+
+	var gotFixed int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM documents WHERE path LIKE ? ESCAPE '!'`, pattern).Scan(&gotFixed); err != nil {
+		t.Fatalf("query with ESCAPE '!': %v", err)
+	}
+	if gotFixed != 1 {
+		t.Errorf("Windows-shaped prefix match with ESCAPE '!' = %d, want 1 (separator+wildcard must not be swallowed as an escaped literal '%%')", gotFixed)
+	}
+
+	// Documents the regression this guards against: the SAME pattern under
+	// the conventional ESCAPE '\' collides, because '\' is both the
+	// appended path separator and the declared escape character.
+	var gotBroken int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM documents WHERE path LIKE ? ESCAPE '\'`, pattern).Scan(&gotBroken); err != nil {
+		t.Fatalf("query with ESCAPE '\\': %v", err)
+	}
+	if gotBroken != 0 {
+		t.Fatalf("test assumption broken: ESCAPE '\\' unexpectedly matched %d row(s) -- the collision this test documents may no longer reproduce this way", gotBroken)
+	}
+}
+
 // TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees is the regression test for
 // the countDocsUnderPrefix LIKE-pattern bug: a bare `prefix+"%"` pattern
 // matches any sibling subtree whose name merely starts with the same
@@ -250,17 +309,6 @@ func TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees(t *testing.T) {
 	}
 	root = resolvedRoot
 
-	// .cog/adr has one file on disk that is NOT a *.cog.md file, so it is
-	// never indexed by IndexWorkspace -- this subtree must report 0 rows /
-	// UNINDEXED on its own.
-	adrDir := filepath.Join(root, ".cog", "adr")
-	if err := os.MkdirAll(adrDir, 0755); err != nil {
-		t.Fatalf("mkdir adr: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(adrDir, "plain.md"), []byte("# not indexable\n"), 0644); err != nil {
-		t.Fatalf("write plain.md: %v", err)
-	}
-
 	// .cog/adr-legacy is a distinct, indexed subtree that shares "adr" as a
 	// literal name prefix. Under the pre-fix bare-prefix LIKE pattern, this
 	// row's path also matches `path LIKE '.../.cog/adr%'` and would get
@@ -279,6 +327,13 @@ func TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
+
+	// .cog/adr gets its *.cog.md file AFTER the index above ran, so it is a
+	// real, indexable cogdoc that genuinely has zero rows in the DB -- not a
+	// plain .md, which IndexWorkspace was never going to index regardless
+	// (indexer.go:129 only ever considers the *.cog.md suffix) and so
+	// wouldn't be counted as "on disk" at all by the fix under test here.
+	writeCogdoc(t, root, ".cog/adr/new.cog.md", "New ADR", "not yet reindexed")
 
 	report := RunDoctor(root, DoctorOptions{SkipNetwork: true})
 	check := findCheck(t, report, "index health", "documents vs files on disk")

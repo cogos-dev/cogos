@@ -950,13 +950,20 @@ func doctorDocsVsFiles(g *DoctorGroup, db *sql.DB, root string) {
 	}
 }
 
+// countMarkdownFiles counts *.cog.md files under dir -- the exact suffix
+// sdk/constellation/indexer.go:129 requires for a file to be indexable at
+// all. Counting plain *.md (any file ending in the substring ".md", which
+// ".cog.md" itself also matches) would count files the indexer never looks
+// at -- an ordinary README.md sitting in a .cog subdirectory, for example --
+// and doctorDocsVsFiles would then report that subtree as false
+// UNINDEXED/partial for content that was never eligible for indexing.
 func countMarkdownFiles(dir string) int {
 	n := 0
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if !d.IsDir() && strings.HasSuffix(p, ".md") {
+		if !d.IsDir() && strings.HasSuffix(p, ".cog.md") {
 			n++
 		}
 		return nil
@@ -975,17 +982,26 @@ func countDocsUnderPrefix(db *sql.DB, prefix string) (int, error) {
 	// silently merges two subtrees' document counts. Same hazard the project
 	// already called out and avoided once in sdk/constellation/indexer.go's
 	// removed prefix-DELETE.
+	//
+	// The ESCAPE character below is deliberately '!', not the conventional
+	// '\': on Windows, filepath.Separator IS '\', so declaring '\' as the
+	// escape char would make the trailing separator+wildcard this pattern
+	// appends collide with it -- 'prefix\%' would parse as an ESCAPE'd
+	// literal '%' rather than separator-then-wildcard, making this query
+	// return 0 for every subtree on Windows regardless of index health. '!'
+	// is neither path separator this codebase runs on.
 	pattern := escapeLikePattern(prefix) + string(filepath.Separator) + "%"
-	err := db.QueryRow(`SELECT COUNT(*) FROM documents WHERE path LIKE ? ESCAPE '\'`, pattern).Scan(&n)
+	err := db.QueryRow(`SELECT COUNT(*) FROM documents WHERE path LIKE ? ESCAPE '!'`, pattern).Scan(&n)
 	return n, err
 }
 
 // escapeLikePattern escapes SQL LIKE metacharacters (%, _, and the escape
 // character itself) in a literal string so it can be used as a LIKE prefix
 // without a literal underscore or percent sign in a real path acting as an
-// unintended wildcard. Pair with `ESCAPE '\'` in the query.
+// unintended wildcard. Pair with `ESCAPE '!'` in the query -- see
+// countDocsUnderPrefix for why '!' rather than the conventional '\'.
 func escapeLikePattern(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	r := strings.NewReplacer(`!`, `!!`, `%`, `!%`, `_`, `!_`)
 	return r.Replace(s)
 }
 
@@ -1022,7 +1038,11 @@ func doctorIndexFreshness(g *DoctorGroup, db *sql.DB, root string) {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(p, ".md") {
+		// Only *.cog.md is ever indexed (indexer.go:129); an ordinary
+		// non-cogdoc *.md file's mtime is not a signal the index should be
+		// judged against -- editing a README shouldn't produce a false
+		// freshness-gap WARN for content the indexer never looks at.
+		if !strings.HasSuffix(p, ".cog.md") {
 			return nil
 		}
 		info, statErr := d.Info()
