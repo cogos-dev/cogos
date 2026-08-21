@@ -892,7 +892,19 @@ func doctorIndexHealth(report *DoctorReport, root string, opts DoctorOptions) {
 }
 
 func doctorDocsVsFiles(g *DoctorGroup, db *sql.DB, root string) {
+	// documents.path in the constellation DB is stored only after
+	// filepath.EvalSymlinks resolution (walkRoots in
+	// sdk/constellation/indexer.go resolves cogRoot the same way, with the
+	// same fallback-to-unresolved on error). Building the LIKE prefix below
+	// from the raw, unresolved root would never match a real row on any
+	// workspace whose path traverses a symlink (macOS /tmp -> /private/tmp,
+	// /var/folders temp dirs, a symlinked home/workspace mount), silently
+	// reporting every populated .cog subtree as false UNINDEXED. Mirror the
+	// indexer's own resolution exactly.
 	cogDir := filepath.Join(root, ".cog")
+	if resolved, err := filepath.EvalSymlinks(cogDir); err == nil {
+		cogDir = resolved
+	}
 	entries, err := os.ReadDir(cogDir)
 	if err != nil {
 		g.add("documents vs files on disk", StatusUnknown, fmt.Sprintf("read %s: %v", cogDir, err))

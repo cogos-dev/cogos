@@ -181,6 +181,54 @@ func TestDocsVsFilesFlagsUnindexedTree(t *testing.T) {
 	}
 }
 
+// TestDocsVsFilesCountsCorrectlyThroughSymlinkedRoot is the regression test
+// for the countDocsUnderPrefix symlink-resolution bug: documents.path in the
+// constellation DB is stored only after filepath.EvalSymlinks resolution
+// (walkRoots in sdk/constellation/indexer.go), so doctorDocsVsFiles must
+// resolve the workspace root itself before building its LIKE prefix, not
+// rely on the caller having already done so. Deliberately passes the RAW,
+// unresolved t.TempDir() root -- unlike TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees
+// below and TestIndexFreshnessCatchesStaleNonMemSubtree, which resolve up
+// front only so their own path-string assertions are exact -- so this test
+// exercises the resolution the fix adds. On macOS, t.TempDir() itself
+// traverses a symlink (/var/folders -> /private/var/folders), which is
+// exactly the failure shape a symlinked workspace mount, NFS home, or macOS
+// /tmp hits in production.
+func TestDocsVsFilesCountsCorrectlyThroughSymlinkedRoot(t *testing.T) {
+	root := t.TempDir() // intentionally NOT resolved -- see comment above
+
+	writeCogdoc(t, root, ".cog/mem/semantic/sentinel.cog.md", "Sentinel", "content")
+
+	c, err := constellation.Open(root)
+	if err != nil {
+		skipIfNoFTS5(t, err)
+		t.Fatalf("constellation.Open: %v", err)
+	}
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("IndexWorkspace: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	report := RunDoctor(root, DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "index health", "documents vs files on disk")
+
+	var memLine string
+	for _, line := range strings.Split(check.Detail, "\n") {
+		if strings.HasPrefix(line, ".cog/mem:") {
+			memLine = line
+			break
+		}
+	}
+	if memLine == "" {
+		t.Fatalf("no .cog/mem: line found in detail:\n%s", check.Detail)
+	}
+	if strings.Contains(memLine, "0 indexed") || strings.Contains(memLine, "UNINDEXED") {
+		t.Errorf(".cog/mem line = %q, want a nonzero indexed count -- the sentinel doc IS indexed; an unresolved-symlink prefix mismatch would falsely report 0. Full detail:\n%s", memLine, check.Detail)
+	}
+}
+
 // TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees is the regression test for
 // the countDocsUnderPrefix LIKE-pattern bug: a bare `prefix+"%"` pattern
 // matches any sibling subtree whose name merely starts with the same
