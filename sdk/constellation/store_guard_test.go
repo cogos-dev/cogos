@@ -237,6 +237,59 @@ func TestPreserveCorruptStore_CollisionAppendsNumericSuffix(t *testing.T) {
 	}
 }
 
+// TestPreserveCorruptStore_QuarantineCollisionDoesNotOverwriteStranded
+// exercises a narrower hazard than the ".corrupt-<ts>" collision above: a
+// ".guard-tmp" quarantine name left behind by an earlier run that crashed
+// mid-guard (after quarantining a sidecar, before resolving it either way)
+// is itself unresolved evidence, and a later run's quarantine step must not
+// silently os.Rename over it.
+func TestPreserveCorruptStore_QuarantineCollisionDoesNotOverwriteStranded(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "constellation.db")
+	makeSmallSQLiteDB(t, dbPath)
+
+	strandedWal := dbPath + "-wal" + quarantineTag
+	strandedContent := []byte("stranded wal bytes from a run that crashed mid-guard")
+	if err := os.WriteFile(strandedWal, strandedContent, 0644); err != nil {
+		t.Fatalf("seed stranded quarantine file: %v", err)
+	}
+
+	liveWalContent := []byte("live wal content for the current run")
+	if err := os.WriteFile(dbPath+"-wal", liveWalContent, 0644); err != nil {
+		t.Fatalf("write live wal fixture: %v", err)
+	}
+	corruptMidFile(t, dbPath)
+
+	preserved, _, err := PreserveCorruptStore(dbPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if preserved == "" {
+		t.Fatalf("expected preservation")
+	}
+
+	// The stranded file must be untouched, byte-identical, at its original name.
+	gotStranded, err := os.ReadFile(strandedWal)
+	if err != nil {
+		t.Fatalf("stranded quarantine file disappeared: %v", err)
+	}
+	if !bytes.Equal(gotStranded, strandedContent) {
+		t.Fatalf("stranded quarantine file was overwritten: got %q want %q", gotStranded, strandedContent)
+	}
+
+	// The live wal must still be preserved somewhere, byte-identical, just not
+	// at the collided name.
+	suffix := preserved[len(dbPath):]
+	walTarget := dbPath + "-wal" + suffix
+	gotWal, err := os.ReadFile(walTarget)
+	if err != nil {
+		t.Fatalf("expected live wal preserved at %s: %v", walTarget, err)
+	}
+	if !bytes.Equal(gotWal, liveWalContent) {
+		t.Fatalf("preserved wal content mismatch: got %q want %q", gotWal, liveWalContent)
+	}
+}
+
 // TestPreserveCorruptStore_CollisionViaPublicAPI drives the same collision
 // path through PreserveCorruptStore itself (not the unexported rename
 // helper), so the numeric-suffix behavior is also verified through the

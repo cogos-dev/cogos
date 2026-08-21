@@ -51,10 +51,15 @@ var sidecarSuffixes = []string{walSuffix, shmSuffix}
 const quarantineTag = ".guard-tmp"
 
 // sidecarQuarantine records where one sidecar file (identified by suffix,
-// e.g. "-wal") was moved to during quarantine, or that it was not present at
-// all (quarantinedPath == "").
+// e.g. "-wal") lived before quarantine (orig) and where it was moved to
+// during quarantine (quarantinedPath == "" if it was not present at all).
+// Both are recorded explicitly — rather than reconstructed later by
+// trimming quarantinedPath — because quarantinedPath can itself carry a
+// numeric collision suffix (see quarantineSidecars) that would make a
+// simple TrimSuffix wrong.
 type sidecarQuarantine struct {
 	suffix          string
+	orig            string
 	quarantinedPath string
 }
 
@@ -157,25 +162,29 @@ func checkStoreIntegrity(dbPath string) error {
 }
 
 // quarantineSidecars renames any existing "<dbPath>-wal"/"<dbPath>-shm" out
-// of the way (to "<original>.guard-tmp") before the main file is opened for
-// its integrity check. If renaming a later sidecar fails, everything already
-// quarantined in this call is best-effort restored before returning the
-// error, so a partial failure never leaves a sidecar stranded under a
+// of the way (to "<original>.guard-tmp", collision-bumped — see
+// nextFreeName) before the main file is opened for its integrity check. The
+// collision bump matters here specifically: a ".guard-tmp" name left behind
+// by an earlier run that crashed mid-guard (after quarantining, before
+// resolving) is itself unresolved evidence — a fresh quarantine must never
+// silently os.Rename over it. If renaming a later sidecar fails, everything
+// already quarantined in this call is best-effort restored before returning
+// the error, so a partial failure never leaves a sidecar stranded under a
 // ".guard-tmp" name.
 func quarantineSidecars(dbPath string) ([]sidecarQuarantine, error) {
 	done := make([]sidecarQuarantine, 0, len(sidecarSuffixes))
 	for _, suffix := range sidecarSuffixes {
 		orig := dbPath + suffix
 		if _, statErr := os.Stat(orig); statErr != nil {
-			done = append(done, sidecarQuarantine{suffix: suffix})
+			done = append(done, sidecarQuarantine{suffix: suffix, orig: orig})
 			continue
 		}
-		tmp := orig + quarantineTag
+		tmp := nextFreeName(orig + quarantineTag)
 		if err := os.Rename(orig, tmp); err != nil {
 			_ = restoreSidecars(done) // best-effort — we're already failing
 			return nil, fmt.Errorf("rename %s -> %s: %w", orig, tmp, err)
 		}
-		done = append(done, sidecarQuarantine{suffix: suffix, quarantinedPath: tmp})
+		done = append(done, sidecarQuarantine{suffix: suffix, orig: orig, quarantinedPath: tmp})
 	}
 	return done, nil
 }
@@ -188,9 +197,8 @@ func restoreSidecars(qs []sidecarQuarantine) error {
 		if q.quarantinedPath == "" {
 			continue
 		}
-		orig := strings.TrimSuffix(q.quarantinedPath, quarantineTag)
-		if err := os.Rename(q.quarantinedPath, orig); err != nil {
-			return fmt.Errorf("rename %s -> %s: %w", q.quarantinedPath, orig, err)
+		if err := os.Rename(q.quarantinedPath, q.orig); err != nil {
+			return fmt.Errorf("rename %s -> %s: %w", q.quarantinedPath, q.orig, err)
 		}
 	}
 	return nil
@@ -216,28 +224,37 @@ func preserveCorruptStore(dbPath string, quarantined []sidecarQuarantine) (strin
 		if q.quarantinedPath == "" {
 			continue
 		}
-		origSidecar := strings.TrimSuffix(q.quarantinedPath, quarantineTag)
-		if _, err := renameAside(q.quarantinedPath, origSidecar, ts); err != nil {
-			return mainTarget, fmt.Errorf("main file preserved at %s, but sidecar %s: %w", mainTarget, origSidecar, err)
+		if _, err := renameAside(q.quarantinedPath, q.orig, ts); err != nil {
+			return mainTarget, fmt.Errorf("main file preserved at %s, but sidecar %s: %w", mainTarget, q.orig, err)
 		}
 	}
 
 	return mainTarget, nil
 }
 
-// renameAside renames src (the file's current location — which may be a
-// quarantined temp path) to "<targetBase>.corrupt-<ts>", appending "-1",
-// "-2", ... if that name is already taken. It always uses os.Rename — never
-// os.Remove — so the original bytes are preserved, not deleted.
-func renameAside(src, targetBase, ts string) (string, error) {
-	base := targetBase + ".corrupt-" + ts
+// nextFreeName returns base, or base with a numeric suffix ("-1", "-2", ...)
+// appended, whichever is the first name that does not currently exist on
+// disk. Used both for the final ".corrupt-<ts>" targets (renameAside) and
+// for the transient ".guard-tmp" quarantine name (quarantineSidecars) — in
+// both cases a same-name collision must bump rather than silently overwrite
+// whatever is already there.
+func nextFreeName(base string) string {
 	target := base
 	for n := 1; ; n++ {
 		if _, err := os.Stat(target); os.IsNotExist(err) {
-			break
+			return target
 		}
 		target = fmt.Sprintf("%s-%d", base, n)
 	}
+}
+
+// renameAside renames src (the file's current location — which may be a
+// quarantined temp path) to "<targetBase>.corrupt-<ts>", appending "-1",
+// "-2", ... if that name is already taken (see nextFreeName). It always uses
+// os.Rename — never os.Remove — so the original bytes are preserved, not
+// deleted.
+func renameAside(src, targetBase, ts string) (string, error) {
+	target := nextFreeName(targetBase + ".corrupt-" + ts)
 	if err := os.Rename(src, target); err != nil {
 		return "", fmt.Errorf("rename %s -> %s: %w", src, target, err)
 	}
