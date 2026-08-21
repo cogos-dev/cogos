@@ -1204,6 +1204,34 @@ func TestDuplicateToolsetRegistrationsDoesNotCollapseGenericLaunchers(t *testing
 	}
 }
 
+// TestDuplicateToolsetRegistrationsDoesNotCollapseNpxLaunchersOnIncidentalURL
+// pins a cog-review-flagged false positive: mcpEntryTarget's npx-wrapper
+// normalization is documented (and, per
+// TestDuplicateToolsetRegistrationsNormalizesNpxMcpRemoteWrapper above,
+// tested) to apply ONLY to the `npx mcp-remote <url>` bridge shape. It must
+// not treat ANY URL-shaped argument of ANY npx-launched server as the
+// mount target -- two unrelated npx packages that each happen to take a
+// URL-shaped flag of their own (--api-base, --callback, ...) sharing that
+// incidental value must not collapse onto the same target and get flagged
+// as a duplicate registration.
+func TestDuplicateToolsetRegistrationsDoesNotCollapseNpxLaunchersOnIncidentalURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeFile(t, filepath.Join(home, ".claude.json"), `{
+		"mcpServers": {
+			"tool-a": {"command": "npx", "args": ["some-tool-mcp", "--api-base", "https://api.example.com/v1"]},
+			"tool-b": {"command": "npx", "args": ["unrelated-tool-mcp", "--callback", "https://api.example.com/v1"]}
+		}
+	}`)
+
+	report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
+	if check.Status != StatusOK {
+		t.Fatalf("two DIFFERENT npx-launched packages sharing an incidental URL-shaped flag = %s, want OK; detail=%s", check.Status, check.Detail)
+	}
+}
+
 // TestDuplicateToolsetRegistrationsCatchesIdenticalGenericLauncherArgs is the
 // paired positive case: the SAME command AND args registered twice (the
 // live-evidence "blender" shape -- ~/.claude.json's project scope and Claude
@@ -1312,11 +1340,29 @@ func TestRedactMCPTargetStripsQueryAndUserinfo(t *testing.T) {
 			input: "uvx blender-mcp",
 			want:  "uvx blender-mcp",
 		},
+		{
+			// cog-review-flagged regression: a malformed percent-escape
+			// inside the userinfo itself (an invalid escape in the
+			// password) makes net/url.Parse fail on this string entirely
+			// (its own userinfo unescaper returns an EscapeError), so the
+			// old code's Parse-then-clear-User approach fell through to
+			// `return s` with the raw credential still attached. The fix
+			// strips userinfo via string slicing before Parse is ever
+			// attempted, independent of whether Parse subsequently
+			// succeeds.
+			name:  "userinfo with malformed percent-escape stripped even though url.Parse fails",
+			input: "https://user:p%2@host/mcp",
+			want:  "https://host/mcp",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := redactMCPTarget(tc.input); got != tc.want {
+			got := redactMCPTarget(tc.input)
+			if got != tc.want {
 				t.Errorf("redactMCPTarget(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			if strings.Contains(got, "p%2") || strings.Contains(got, "hunter2") {
+				t.Errorf("redactMCPTarget(%q) = %q, credential leaked into output", tc.input, got)
 			}
 		})
 	}

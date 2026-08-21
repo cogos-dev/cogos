@@ -1595,9 +1595,18 @@ func mcpEntryTarget(def map[string]any) (string, bool) {
 		}
 	}
 	if base := filepath.Base(cmd); base == "npx" || base == "npx.cmd" {
-		for _, s := range args {
-			if strings.Contains(s, "://") {
-				return s, true
+		// Only the documented `npx mcp-remote <url>` bridge shape targets its
+		// URL argument -- args[0] must be the mcp-remote package literally.
+		// Matching ANY URL-shaped argument for ANY npx-launched server would
+		// collide two unrelated packages that merely happen to take a
+		// URL-shaped flag (e.g. --api-base, --callback) of their own, which
+		// is exactly the generic-launcher false-positive this function's own
+		// doc comment says the command+args design exists to avoid.
+		if len(args) > 0 && args[0] == "mcp-remote" {
+			for _, s := range args[1:] {
+				if strings.Contains(s, "://") {
+					return s, true
+				}
 			}
 		}
 	}
@@ -1626,6 +1635,26 @@ func redactMCPTarget(target string) string {
 	if i := strings.IndexAny(s, "?#"); i >= 0 {
 		s = s[:i]
 	}
+
+	// Strip any userinfo (user:pass@host) via plain string slicing BEFORE
+	// attempting url.Parse, and independently of whether Parse below
+	// succeeds. A malformed percent-escape inside the credential itself
+	// (e.g. "https://user:p%2@host/mcp") makes net/url's own userinfo
+	// unescaper return an error, so a Parse-then-clear-User approach loses
+	// the credential silently on exactly the URLs where redaction matters
+	// most -- Parse failing must never mean the credential survives into
+	// the string this function returns.
+	if schemeEnd := strings.Index(s, "://"); schemeEnd >= 0 {
+		authorityStart := schemeEnd + len("://")
+		authority := s[authorityStart:]
+		if slash := strings.IndexByte(authority, '/'); slash >= 0 {
+			authority = authority[:slash]
+		}
+		if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+			s = s[:authorityStart] + authority[at+1:] + s[authorityStart+len(authority):]
+		}
+	}
+
 	if u, err := neturl.Parse(s); err == nil {
 		u.User = nil
 		return u.String()
