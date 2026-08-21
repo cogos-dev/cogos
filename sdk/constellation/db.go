@@ -16,6 +16,16 @@ type Constellation struct {
 	embedClient *EmbedClient // optional — set via SetEmbedClient for async embedding on write
 }
 
+// StorePath returns the path to the constellation SQLite store for a
+// workspace root. This is the single source of truth for that path — callers
+// that need to inspect the store file directly (e.g. the reindex command's
+// corruption guard, which must run before Open would otherwise create a
+// fresh file in its place) derive it from here rather than reconstructing
+// ".cog/.state/constellation.db" themselves.
+func StorePath(workspaceRoot string) string {
+	return filepath.Join(workspaceRoot, ".cog", ".state", "constellation.db")
+}
+
 // Open opens the constellation database at the workspace root.
 // Creates the database and schema if it doesn't exist.
 func Open(workspaceRoot string) (*Constellation, error) {
@@ -26,7 +36,7 @@ func Open(workspaceRoot string) (*Constellation, error) {
 		return nil, fmt.Errorf("failed to create state directory: %w", err)
 	}
 
-	dbPath := filepath.Join(stateDir, "constellation.db")
+	dbPath := StorePath(workspaceRoot)
 
 	// Open database with WAL mode for concurrent access
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
