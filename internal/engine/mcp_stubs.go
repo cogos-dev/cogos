@@ -213,8 +213,9 @@ func searchMemoryFTS(dbPath, workspaceRoot, query string, limit int, sector stri
 	}
 	defer db.Close()
 
-	// Build the FTS5 query. Convert bare terms into an OR query so each
-	// word is matched independently (matching the constellation SDK behaviour).
+	// Build the FTS5 query: user-quoted spans become phrase terms, bare
+	// terms default to AND (so multi-word queries stay selective), and a
+	// bare uppercase OR token is honored as the FTS5 OR operator.
 	ftsQuery := buildFTSQuery(query)
 
 	// Build SQL with optional sector filter.
@@ -295,33 +296,163 @@ func searchMemoryFTS(dbPath, workspaceRoot, query string, limit int, sector stri
 	}, nil
 }
 
-// buildFTSQuery converts a plain search string into an FTS5 query.
-// All terms are double-quoted to prevent FTS5 syntax errors from special
-// characters like leading '-' or 'type:' prefixes.
-// Multi-word queries become OR-joined quoted terms so each word matches
-// independently, matching the constellation SDK behaviour.
+// ftsToken is one unit produced by tokenizeFTSQuery: either a search operand
+// (a bare word or a user-quoted phrase) or the literal FTS5 OR operator.
+type ftsToken struct {
+	text   string // sanitized content, without wrapping quotes (empty for op tokens)
+	phrase bool   // true if this operand came from a user-quoted "..." span
+	op     bool   // true if this token is the literal OR operator
+}
+
+// buildFTSQuery converts a plain search string into an FTS5 MATCH query.
+//
+//   - A user-supplied double-quoted span ("spirit over letter") is preserved
+//     as a single FTS5 phrase term, so a true phrase search is expressible.
+//   - Bare (unquoted) multi-word terms default to AND, keeping multi-word
+//     search selective instead of matching any document containing any one
+//     word.
+//   - A bare uppercase OR token between terms is honored as the FTS5 OR
+//     operator, so broadening a search is still possible.
+//   - A lone bare word (no quotes, no OR) is left unquoted, preserving the
+//     original broader single-term token match.
+//   - Outside quoted phrases, FTS5 special characters that could produce a
+//     syntax error (leading '-', column-filter ':') are stripped from each
+//     term, and terms are individually double-quoted so stray FTS5 syntax
+//     in user input cannot escape its term. Unbalanced quotes never crash
+//     the query: any text after an unterminated '"' is treated as bare
+//     words instead of being dropped or erroring.
 func buildFTSQuery(raw string) string {
-	words := strings.Fields(strings.TrimSpace(raw))
-	if len(words) == 0 {
+	if strings.TrimSpace(raw) == "" {
 		return raw
 	}
-	// Single-word: pass through unquoted (token match, broader results).
-	// Strip FTS5 special chars that would cause parse errors (leading dash,
-	// column-filter colon, double-quotes).
-	if len(words) == 1 {
-		w := words[0]
-		w = strings.ReplaceAll(w, `"`, "")
-		w = strings.TrimLeft(w, "-")
-		w = strings.ReplaceAll(w, ":", "")
-		return w
+
+	toks := trimDanglingFTSOperators(tokenizeFTSQuery(raw))
+	if len(toks) == 0 {
+		return ""
 	}
-	// Multi-word: phrase-quote each term and join with OR.
-	parts := make([]string, len(words))
-	for i, w := range words {
-		w = strings.ReplaceAll(w, `"`, "")
-		parts[i] = `"` + w + `"`
+
+	operandCount := 0
+	for _, t := range toks {
+		if !t.op {
+			operandCount++
+		}
 	}
-	return strings.Join(parts, " OR ")
+
+	var out []string
+	prevOperand := false
+	for _, t := range toks {
+		if t.op {
+			out = append(out, "OR")
+			prevOperand = false
+			continue
+		}
+		if prevOperand {
+			out = append(out, "AND")
+		}
+		if !t.phrase && operandCount == 1 {
+			// Sole bare term: keep the legacy unquoted, broader token match.
+			out = append(out, t.text)
+		} else {
+			out = append(out, `"`+t.text+`"`)
+		}
+		prevOperand = true
+	}
+	return strings.Join(out, " ")
+}
+
+// tokenizeFTSQuery splits a raw search string into an ordered sequence of
+// operand and operator tokens, honoring double-quoted phrase spans.
+func tokenizeFTSQuery(raw string) []ftsToken {
+	var toks []ftsToken
+	i, n := 0, len(raw)
+	for i < n {
+		for i < n && isFTSQuerySpace(raw[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		if raw[i] == '"' {
+			rest := raw[i+1:]
+			j := strings.IndexByte(rest, '"')
+			if j == -1 {
+				// Unbalanced quote: no closing '"' anywhere in the rest of
+				// the string. Fall back to treating the remainder as bare
+				// words rather than dropping it or producing invalid FTS5
+				// syntax.
+				for _, w := range strings.Fields(rest) {
+					if tok, ok := sanitizeFTSBareWord(w); ok {
+						toks = append(toks, tok)
+					}
+				}
+				break
+			}
+			phrase := strings.TrimSpace(rest[:j])
+			phrase = strings.ReplaceAll(phrase, `"`, "")
+			if phrase != "" {
+				toks = append(toks, ftsToken{text: phrase, phrase: true})
+			}
+			i = i + 1 + j + 1
+			continue
+		}
+		k := i
+		for k < n && !isFTSQuerySpace(raw[k]) && raw[k] != '"' {
+			k++
+		}
+		word := raw[i:k]
+		i = k
+		if word == "OR" {
+			toks = append(toks, ftsToken{op: true})
+			continue
+		}
+		if tok, ok := sanitizeFTSBareWord(word); ok {
+			toks = append(toks, tok)
+		}
+	}
+	return toks
+}
+
+// sanitizeFTSBareWord strips FTS5 special characters (embedded quotes,
+// leading '-', column-filter ':') from a bare (non-phrase) word. Returns
+// false if nothing is left after sanitizing.
+func sanitizeFTSBareWord(w string) (ftsToken, bool) {
+	w = strings.ReplaceAll(w, `"`, "")
+	w = strings.TrimLeft(w, "-")
+	w = strings.ReplaceAll(w, ":", "")
+	if w == "" {
+		return ftsToken{}, false
+	}
+	return ftsToken{text: w}, true
+}
+
+// trimDanglingFTSOperators drops OR tokens that have no operand on both
+// sides (leading, trailing, or doubled), which would otherwise render as
+// invalid FTS5 syntax.
+func trimDanglingFTSOperators(toks []ftsToken) []ftsToken {
+	var out []ftsToken
+	for _, t := range toks {
+		if t.op && (len(out) == 0 || out[len(out)-1].op) {
+			continue // no left operand yet
+		}
+		out = append(out, t)
+	}
+	for len(out) > 0 && out[len(out)-1].op {
+		out = out[:len(out)-1] // no right operand
+	}
+	return out
+}
+
+// isFTSQuerySpace reports whether b is a whitespace byte for the purposes
+// of tokenizing an FTS5 search string. Byte-level scanning is safe for
+// UTF-8 input here: multi-byte continuation bytes are always >= 0x80 and
+// never match an ASCII delimiter.
+func isFTSQuerySpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
 }
 
 // pathToMemURI converts an absolute filesystem path to a cog: URI.
