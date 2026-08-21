@@ -63,8 +63,9 @@ func (c *Constellation) QueryRelevant(anchor, goal string, limit int) ([]Node, e
 	// Extract keywords from anchor and goal
 	keywords := extractKeywords(anchor, goal)
 
-	// Build FTS5 query (OR of keywords)
-	query := strings.Join(keywords, " OR ")
+	// Build FTS5 query: OR-join extracted keywords, individually quoted
+	// for syntax safety (see buildKeywordFTSQuery).
+	query := buildKeywordFTSQuery(keywords)
 
 	return c.Search(query, limit)
 }
@@ -113,8 +114,9 @@ func (c *Constellation) QueryRelevantWithSubstance(anchor, goal string, maxCandi
 		return nil, nil
 	}
 
-	// Build FTS5 query (OR of keywords)
-	ftsQuery := strings.Join(keywords, " OR ")
+	// Build FTS5 query: OR-join extracted keywords, individually quoted
+	// for syntax safety (see buildKeywordFTSQuery).
+	ftsQuery := buildKeywordFTSQuery(keywords)
 
 	// Query with substance metrics included
 	querySQL := `
@@ -223,7 +225,9 @@ func (c *Constellation) QueryRelevantWithEmbedding(anchor, goal string, maxCandi
 		return nil, nil
 	}
 
-	ftsQuery := strings.Join(keywords, " OR ")
+	// Build FTS5 query: OR-join extracted keywords, individually quoted
+	// for syntax safety (see buildKeywordFTSQuery).
+	ftsQuery := buildKeywordFTSQuery(keywords)
 
 	// Query with substance metrics + embedding BLOBs
 	querySQL := `
@@ -749,4 +753,38 @@ func extractKeywords(anchor, goal string) []string {
 	}
 
 	return keywords
+}
+
+// buildKeywordFTSQuery joins already-extracted keywords into an FTS5 MATCH
+// query. Each keyword is individually double-quoted (stripping any embedded
+// quote so a keyword can never inject stray FTS5 syntax), and the terms are
+// OR-joined.
+//
+// This deliberately keeps OR rather than adopting the AND-default fix
+// applied to buildFTSQuery in internal/engine/mcp_stubs.go: that fix targets
+// a typed search-box query, where a specific 2-3 word phrase like "spirit
+// over letter" OR-joined into effectively "spirit OR over OR letter" turns
+// a precise request into a near-corpus-wide match -- a real usability bug.
+// extractKeywords(anchor, goal) is not that. It dedupes every non-stopword
+// token >=3 chars out of two free-text strings with no cap, so realistic
+// multi-sentence anchor/goal input yields 8-15+ keywords; QueryRelevant and
+// friends feed the OR-matched candidates through maxCandidates/maxResults
+// and (for the *WithSubstance/*WithEmbedding variants) substance-ratio and
+// embedding-similarity re-ranking -- a recall-then-rank pipeline, not a
+// direct return-to-user search. AND-joining that many keywords would
+// require literally all of them to co-occur in one document, collapsing
+// the candidate pool toward zero for any anchor/goal text that isn't
+// already a near-verbatim quote of the target document, which would starve
+// the ranking stages of anything to rank. OR keeps the existing
+// recall-then-rank contract intact; only the syntax-safety quoting is new.
+func buildKeywordFTSQuery(keywords []string) string {
+	quoted := make([]string, 0, len(keywords))
+	for _, kw := range keywords {
+		kw = strings.ReplaceAll(kw, `"`, "")
+		if kw == "" {
+			continue
+		}
+		quoted = append(quoted, `"`+kw+`"`)
+	}
+	return strings.Join(quoted, " OR ")
 }

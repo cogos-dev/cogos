@@ -5,7 +5,9 @@
 //     (regression guard against the rowid-based JOIN bug that silently returned
 //     zero rows because documents uses a TEXT primary key).
 //   - sector filter narrows results correctly.
-//   - buildFTSQuery escapes multi-word queries correctly.
+//   - buildFTSQuery preserves user-quoted phrases, defaults multi-word
+//     queries to AND, honors an explicit bare OR token, and never produces
+//     invalid FTS5 syntax from hostile or malformed input.
 package engine
 
 import (
@@ -168,19 +170,91 @@ func TestSearchMemoryFTS_SectorFilter(t *testing.T) {
 }
 
 // TestBuildFTSQuery covers the query builder used by searchMemoryFTS.
+//
+// Regression guard for cogos#568 finding 4: multi-word queries used to
+// become an OR across every term (maximally unselective, and user-supplied
+// double quotes were silently stripped so a phrase search was inexpressible).
+// These cases pin the fix: quoted phrases are preserved, multi-word queries
+// default to AND, and a bare uppercase OR token still broadens the search.
 func TestBuildFTSQuery(t *testing.T) {
 	tests := []struct {
+		name  string
 		input string
 		want  string
 	}{
-		{"claude", "claude"},
-		{"claude code", `"claude" OR "code"`},
-		{"  spaced  query  ", `"spaced" OR "query"`},
+		// Single bare word: unchanged legacy behaviour (unquoted, broader
+		// token match).
+		{"single word", "claude", "claude"},
+
+		// Multi-word bare queries now default to AND instead of OR.
+		{"and default, two words", "claude code", `"claude" AND "code"`},
+		{"and default, extra whitespace", "  spaced  query  ", `"spaced" AND "query"`},
+		{"and default, three words", "spirit over letter", `"spirit" AND "over" AND "letter"`},
+
+		// A fully user-quoted phrase becomes a single FTS5 phrase term.
+		{"quoted phrase", `"spirit over letter"`, `"spirit over letter"`},
+		// A user-quoted single word still renders as a phrase term (not the
+		// unquoted single-word shortcut, which only applies to bare input).
+		{"quoted single word", `"claude"`, `"claude"`},
+
+		// Explicit bare OR is honored as the FTS5 OR operator.
+		{"explicit or", "spirit OR letter", `"spirit" OR "letter"`},
+		{"explicit or, three terms", "spirit OR letter OR law", `"spirit" OR "letter" OR "law"`},
+
+		// A quoted phrase mixed with a bare term still defaults to AND.
+		{"mixed phrase and term", `"spirit over" letter`, `"spirit over" AND "letter"`},
+		{"mixed term and phrase", `letter "spirit over"`, `"letter" AND "spirit over"`},
+
+		// Unbalanced quotes must not crash or produce invalid FTS5 syntax;
+		// the remainder after an unterminated quote falls back to bare
+		// words.
+		{"unbalanced quote, single word", `"spirit`, "spirit"},
+		{"unbalanced quote, multi word", `foo "bar baz`, `"foo" AND "bar" AND "baz"`},
+
+		// FTS5 special characters are stripped outside quoted phrases so
+		// hostile input cannot produce a syntax error.
+		{"leading dash single word", "-secret", "secret"},
+		{"column filter colon", "type:foo bar", `"typefoo" AND "bar"`},
+		// The '"' inside foo"bar terminates the bare word "foo" and opens a
+		// new (unbalanced) quoted span, so "bar baz" falls back to bare
+		// words rather than merging with "foo".
+		{"embedded quote in bare word", `foo"bar baz`, `"foo" AND "bar" AND "baz"`},
+
+		// Dangling OR operators (no operand on one side) are dropped rather
+		// than emitted as invalid FTS5 syntax.
+		{"lone or", "OR", ""},
+		{"trailing or", "foo OR", "foo"},
+		{"leading or", "OR foo", "foo"},
+
+		// A sole bare term that is itself the literal (case-sensitive)
+		// FTS5 reserved keyword AND or NOT must be quoted, not passed
+		// through unquoted like an ordinary single word, or it produces
+		// invalid FTS5 syntax (no operand on either side of the operator).
+		{"sole term literal AND", "AND", `"AND"`},
+		{"sole term literal NOT", "NOT", `"NOT"`},
+		{"sole term literal NEAR", "NEAR", `"NEAR"`},
+		{"sole term dash-AND reduces to reserved word", "-AND", `"AND"`},
+		{"sole term lowercase and is not reserved", "and", "and"},
+		{"sole term mixed-case And is not reserved", "And", "And"},
+		{"sole term lowercase near is not reserved", "near", "near"},
+
+		// Empty / whitespace-only input passes through unchanged.
+		{"empty string", "", ""},
+		{"whitespace only", "   ", "   "},
+
+		// Degenerate quoted spans with no content still produce a valid
+		// FTS5 query (an explicit empty-phrase operand) instead of an
+		// empty string, which would error out of FTS5 and silently fall
+		// back to the naive grep path.
+		{"quote-space-quote", `" "`, `""`},
+		{"two empty quote pairs", `"" ""`, `"" AND ""`},
 	}
 	for _, tc := range tests {
-		got := buildFTSQuery(tc.input)
-		if got != tc.want {
-			t.Errorf("buildFTSQuery(%q) = %q; want %q", tc.input, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildFTSQuery(tc.input)
+			if got != tc.want {
+				t.Errorf("buildFTSQuery(%q) = %q; want %q", tc.input, got, tc.want)
+			}
+		})
 	}
 }
