@@ -22,6 +22,7 @@ package engine
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/myrgic/cogos/sdk/constellation"
@@ -58,17 +59,48 @@ func runReindexCmd(args []string, defaultWorkspace string) {
 		}
 	}
 
+	if err := runReindex(root, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// runReindex is the testable core of runReindexCmd: everything after
+// workspace-root resolution, taking an io.Writer for progress/warning
+// output instead of writing straight to os.Stderr and calling os.Exit. This
+// lets tests exercise the corrupt-store-preservation path (and its logging)
+// without forking a subprocess or bringing down the test binary on error.
+//
+// SPEC (issue #571 item 2): nothing in the kernel may destroy a SQLite store
+// it could not read. Before Open is allowed to create a fresh constellation
+// store in place of an existing one, PreserveCorruptStore checks the
+// existing file's integrity (PRAGMA quick_check, bounded) and — only if that
+// check fails or the file cannot be opened as a database — renames it (and
+// any WAL/SHM sidecars) aside instead of letting Open silently overwrite it.
+// A healthy existing file is left untouched; Open's current
+// open-or-create-and-migrate behavior is unchanged for that case.
+func runReindex(root string, out io.Writer) error {
+	dbPath := constellation.StorePath(root)
+
+	preserved, reason, err := constellation.PreserveCorruptStore(dbPath)
+	if err != nil {
+		return fmt.Errorf("preserve corrupt store: %w", err)
+	}
+	if preserved != "" {
+		fmt.Fprintf(out, "WARNING: existing constellation store at %s failed integrity check: %s\n", dbPath, reason)
+		fmt.Fprintf(out, "WARNING: preserved corrupt store at %s -- building a fresh index in its place\n", preserved)
+	}
+
 	c, err := constellation.Open(root)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: open constellation: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("open constellation: %w", err)
 	}
 	defer c.Close()
 
-	fmt.Fprintf(os.Stderr, "reindexing workspace %s ...\n", root)
+	fmt.Fprintf(out, "reindexing workspace %s ...\n", root)
 	if err := c.IndexWorkspace(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: index workspace: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("index workspace: %w", err)
 	}
-	fmt.Fprintln(os.Stderr, "reindex complete")
+	fmt.Fprintln(out, "reindex complete")
+	return nil
 }
