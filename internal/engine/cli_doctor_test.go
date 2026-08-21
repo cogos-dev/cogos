@@ -58,6 +58,7 @@ func buildFixtureWorkspace(t *testing.T) string {
 
 	c, err := constellation.Open(root)
 	if err != nil {
+		skipIfNoFTS5(t, err)
 		t.Fatalf("constellation.Open: %v", err)
 	}
 	if err := c.IndexWorkspace(); err != nil {
@@ -67,6 +68,18 @@ func buildFixtureWorkspace(t *testing.T) string {
 		t.Fatalf("close: %v", err)
 	}
 	return root
+}
+
+// skipIfNoFTS5 skips the current test when err is the well-known
+// constellation.Open failure produced by a build without the fts5 tag ("go
+// test ./..." with no build tags, as CI runs it). Any other error still
+// fails the test via the caller's own t.Fatalf. Mirrors the pattern in
+// mcp_stubs_test.go and sdk/constellation/indexer_hardening_test.go.
+func skipIfNoFTS5(t *testing.T, err error) {
+	t.Helper()
+	if err != nil && strings.Contains(err.Error(), "no such module: fts5") {
+		t.Skip("FTS5 not available (build with -tags fts5)")
+	}
 }
 
 func findCheck(t *testing.T, report *DoctorReport, group, name string) *DoctorCheck {
@@ -105,6 +118,7 @@ func TestNegativeControlNeverReportsOKOnEmptyDB(t *testing.T) {
 	root := t.TempDir()
 	c, err := constellation.Open(root) // creates an empty, schema-only db
 	if err != nil {
+		skipIfNoFTS5(t, err)
 		t.Fatalf("constellation.Open: %v", err)
 	}
 	if err := c.Close(); err != nil {
@@ -189,6 +203,36 @@ func TestStoreLivenessFlagsDeadStore(t *testing.T) {
 	}
 	if !strings.Contains(check.Detail, "DEAD") {
 		t.Errorf("expected DEAD label in detail, got: %s", check.Detail)
+	}
+}
+
+// TestStoreLivenessReportsUnknownOnUnreadableStore pins the UNKNOWN-not-OK
+// contract this command advertises: a store whose row count cannot be
+// established (corrupt file here; permission-denied is the same code path)
+// must never render OK, even though its last-write age looks fresh.
+func TestStoreLivenessReportsUnknownOnUnreadableStore(t *testing.T) {
+	root := buildFixtureWorkspace(t)
+
+	corruptPath := filepath.Join(root, ".cog", ".state", "corrupt.db")
+	if err := os.MkdirAll(filepath.Dir(corruptPath), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(corruptPath, []byte("not a sqlite database"), 0644); err != nil {
+		t.Fatalf("write corrupt db: %v", err)
+	}
+	// Fresh mtime so the staleness case never masks the row-count failure.
+	now := time.Now()
+	if err := os.Chtimes(corruptPath, now, now); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	report := RunDoctor(root, DoctorOptions{SkipNetwork: true, StaleDays: 30})
+	check := findCheck(t, report, "store liveness", "store: "+corruptPath)
+	if check.Status == StatusOK {
+		t.Fatalf("store liveness reported OK for an unreadable store (detail=%s); must be UNKNOWN, never OK", check.Detail)
+	}
+	if check.Status != StatusUnknown {
+		t.Errorf("store liveness for an unreadable store = %s, want UNKNOWN; detail=%s", check.Status, check.Detail)
 	}
 }
 

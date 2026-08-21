@@ -1133,7 +1133,14 @@ func doctorOneStore(g *DoctorGroup, path string, staleDays int) {
 	switch {
 	case age > time.Duration(staleDays)*24*time.Hour:
 		g.add("store: "+rel, StatusWarn, "DEAD (stale beyond "+fmt.Sprintf("%d", staleDays)+"d): "+detail)
-	case tableErr == nil && rowCount == 0:
+	case tableErr != nil:
+		// Row count could not be established (corrupt file, permission
+		// denied, etc.). The last-write age above is a genuine measurement
+		// (os.Stat, no db open required), but liveness itself is unverified
+		// -- report UNKNOWN rather than falling through to OK, per the
+		// never-report-unverified-as-OK contract this command advertises.
+		g.add("store: "+rel, StatusUnknown, detail)
+	case rowCount == 0:
 		g.add("store: "+rel, StatusWarn, "empty store: "+detail)
 	default:
 		g.add("store: "+rel, StatusOK, detail)
