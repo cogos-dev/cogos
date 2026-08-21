@@ -1105,7 +1105,7 @@ func TestDuplicateToolsetRegistrationsNormalizesNpxMcpRemoteWrapper(t *testing.T
 	writeFile(t, filepath.Join(home, ".claude.json"), `{
 		"mcpServers": {"browseros": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}}
 	}`)
-	writeFile(t, filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), `{
+	writeFile(t, claudeDesktopConfigPath(home), `{
 		"mcpServers": {"browserOS": {"command": "npx", "args": ["mcp-remote", "http://127.0.0.1:9000/mcp"]}}
 	}`)
 
@@ -1176,7 +1176,7 @@ func TestDuplicateToolsetRegistrationsCatchesIdenticalGenericLauncherArgs(t *tes
 	writeFile(t, filepath.Join(home, ".claude.json"), `{
 		"mcpServers": {"blender": {"command": "uvx", "args": ["blender-mcp"]}}
 	}`)
-	writeFile(t, filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), `{
+	writeFile(t, claudeDesktopConfigPath(home), `{
 		"mcpServers": {"blender": {"command": "uvx", "args": ["blender-mcp"]}}
 	}`)
 
@@ -1184,6 +1184,131 @@ func TestDuplicateToolsetRegistrationsCatchesIdenticalGenericLauncherArgs(t *tes
 	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
 	if check.Status != StatusWarn {
 		t.Fatalf("identical command+args registered in two scopes = %s, want WARN; detail=%s", check.Status, check.Detail)
+	}
+}
+
+// TestClaudeDesktopConfigPathIsPlatformAware pins the cog-review-flagged
+// gap: Claude Desktop's config path was hardcoded to the macOS location
+// with no runtime.GOOS branching, so the cross-scope duplicate this check
+// exists to catch went silently unscanned on Windows/Linux. Exercises all
+// three OS branches directly via the *ForGOOS variant rather than relying
+// on the host's actual GOOS, so this test's coverage doesn't itself depend
+// on which platform CI happens to run it on.
+func TestClaudeDesktopConfigPathIsPlatformAware(t *testing.T) {
+	home := "/home/tester"
+	cases := []struct {
+		goos string
+		env  map[string]string
+		want string
+	}{
+		{"darwin", nil, filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")},
+		{"linux", nil, filepath.Join(home, ".config", "Claude", "claude_desktop_config.json")},
+		{"windows", map[string]string{"APPDATA": `C:\Users\tester\AppData\Roaming`}, filepath.Join(`C:\Users\tester\AppData\Roaming`, "Claude", "claude_desktop_config.json")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.goos, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if got := claudeDesktopConfigPathForGOOS(home, tc.goos); got != tc.want {
+				t.Errorf("claudeDesktopConfigPathForGOOS(%q, %q) = %q, want %q", home, tc.goos, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClaudeCodeManagedSettingsPathIsPlatformAware is the same coverage for
+// the machine-wide managed-settings.json scope.
+func TestClaudeCodeManagedSettingsPathIsPlatformAware(t *testing.T) {
+	cases := []struct {
+		goos string
+		env  map[string]string
+		want string
+	}{
+		{"darwin", nil, filepath.Join(string(filepath.Separator), "Library", "Application Support", "ClaudeCode", "managed-settings.json")},
+		{"linux", nil, filepath.Join(string(filepath.Separator), "etc", "claude-code", "managed-settings.json")},
+		{"windows", map[string]string{"ProgramData": `C:\ProgramData`}, filepath.Join(`C:\ProgramData`, "ClaudeCode", "managed-settings.json")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.goos, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if got := claudeCodeManagedSettingsPathForGOOS(tc.goos); got != tc.want {
+				t.Errorf("claudeCodeManagedSettingsPathForGOOS(%q) = %q, want %q", tc.goos, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRedactMCPTargetStripsQueryAndUserinfo pins the cog-review-flagged
+// credential leak: an http MCP registration's URL can carry an auth token
+// in its query string or userinfo, and doctor's report is built to be
+// shared/logged/pasted for diagnosis, so the raw target must never reach
+// the report text.
+func TestRedactMCPTargetStripsQueryAndUserinfo(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "query string token stripped",
+			input: "https://mcp.example.com/sse?token=SECRET123",
+			want:  "https://mcp.example.com/sse",
+		},
+		{
+			name:  "userinfo stripped",
+			input: "https://user:hunter2@mcp.example.com/sse",
+			want:  "https://mcp.example.com/sse",
+		},
+		{
+			name:  "no query, no userinfo -- unchanged",
+			input: "http://127.0.0.1:9000/mcp",
+			want:  "http://127.0.0.1:9000/mcp",
+		},
+		{
+			name:  "non-URL stdio target passes through unchanged",
+			input: "uvx blender-mcp",
+			want:  "uvx blender-mcp",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactMCPTarget(tc.input); got != tc.want {
+				t.Errorf("redactMCPTarget(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDuplicateToolsetRegistrationsNeverPrintsRawSecretToken is the
+// end-to-end regression test for the cog-review credential-leak finding:
+// two registrations of the same server, each embedding a DIFFERENT
+// query-string token (the realistic per-registration-credential shape),
+// must still collide as the same target (grouping happens on the redacted
+// form) AND the report text must never contain either raw token.
+func TestDuplicateToolsetRegistrationsNeverPrintsRawSecretToken(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeFile(t, filepath.Join(home, ".claude.json"), `{
+		"mcpServers": {"remote-a": {"type": "http", "url": "https://mcp.example.com/sse?token=SECRET_TOKEN_ONE"}}
+	}`)
+	writeFile(t, claudeDesktopConfigPath(home), `{
+		"mcpServers": {"remote-b": {"type": "http", "url": "https://mcp.example.com/sse?token=SECRET_TOKEN_TWO"}}
+	}`)
+
+	report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
+	if check.Status != StatusWarn {
+		t.Fatalf("same endpoint, different query tokens, in two scopes = %s, want WARN (redacted grouping should still collide them); detail=%s", check.Status, check.Detail)
+	}
+	if strings.Contains(check.Detail, "SECRET_TOKEN_ONE") || strings.Contains(check.Detail, "SECRET_TOKEN_TWO") {
+		t.Fatalf("report detail contains a raw query-string token -- credential leak:\n%s", check.Detail)
+	}
+	if !strings.Contains(check.Detail, "https://mcp.example.com/sse") {
+		t.Errorf("expected the redacted (no-query) target named in detail:\n%s", check.Detail)
 	}
 }
 

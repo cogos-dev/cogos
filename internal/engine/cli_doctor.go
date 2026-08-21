@@ -93,6 +93,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1578,6 +1579,32 @@ func mcpEntryTarget(def map[string]any) (string, bool) {
 	return cmd, true
 }
 
+// redactMCPTarget strips whatever part of an mcpEntryTarget result could
+// carry a credential before it is ever grouped or displayed by
+// doctorDuplicateToolsets. An http/sse MCP registration's URL routinely
+// carries an auth token in its query string (?token=..., ?key=...) or
+// userinfo (https://user:pass@host/...) -- doctor's report is built to be
+// pasted/logged/shared for diagnosis, so printing that raw would leak it.
+// Non-URL (stdio command+args) targets pass through unchanged; see
+// doctorDuplicateToolsets' doc comment for why that half is not in scope
+// here. Query string and fragment are stripped via plain string slicing
+// BEFORE any url.Parse attempt, so a malformed URL that fails to parse
+// still gets its query stripped rather than being returned raw.
+func redactMCPTarget(target string) string {
+	if !strings.Contains(target, "://") {
+		return target
+	}
+	s := target
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	if u, err := neturl.Parse(s); err == nil {
+		u.User = nil
+		return u.String()
+	}
+	return s
+}
+
 // toAnyMap coerces a decoded JSON or YAML value to map[string]any. YAML
 // decoded via gopkg.in/yaml.v3 into `any` already produces map[string]any
 // for mapping nodes (unlike yaml.v2's map[interface{}]interface{}), so this
@@ -1699,30 +1726,84 @@ func collectMCPRegistrations(home string) (regs []mcpRegistration, unreadable []
 	// front; found by the hunt the issue asked for when the twin wasn't in
 	// ~/.claude/plugins or managed-settings.json (see doctorDuplicateToolsets
 	// doc comment and the PR body for the hunt result).
-	desktopCfg := filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
-	if data, err := os.ReadFile(desktopCfg); err == nil {
-		var top map[string]any
-		if err := json.Unmarshal(data, &top); err != nil {
-			noteBad("Claude Desktop config", desktopCfg, err)
-		} else {
-			collectMCPServersFrom(top["mcpServers"], "Claude Desktop config", &regs)
+	if desktopCfg := claudeDesktopConfigPath(home); desktopCfg != "" {
+		if data, err := os.ReadFile(desktopCfg); err == nil {
+			var top map[string]any
+			if err := json.Unmarshal(data, &top); err != nil {
+				noteBad("Claude Desktop config", desktopCfg, err)
+			} else {
+				collectMCPServersFrom(top["mcpServers"], "Claude Desktop config", &regs)
+			}
 		}
 	}
 
 	// Enterprise managed-settings.json (org policy scope) -- checked per the
 	// issue's explicit hunt list; not present on a personal-machine install,
 	// so this scope contributes nothing here but is not skipped in code.
-	managedPath := string(filepath.Separator) + filepath.Join("Library", "Application Support", "ClaudeCode", "managed-settings.json")
-	if data, err := os.ReadFile(managedPath); err == nil {
-		var top map[string]any
-		if err := json.Unmarshal(data, &top); err != nil {
-			noteBad("managed-settings.json", managedPath, err)
-		} else {
-			collectMCPServersFrom(top["mcpServers"], "managed-settings.json (org policy)", &regs)
+	if managedPath := claudeCodeManagedSettingsPath(); managedPath != "" {
+		if data, err := os.ReadFile(managedPath); err == nil {
+			var top map[string]any
+			if err := json.Unmarshal(data, &top); err != nil {
+				noteBad("managed-settings.json", managedPath, err)
+			} else {
+				collectMCPServersFrom(top["mcpServers"], "managed-settings.json (org policy)", &regs)
+			}
 		}
 	}
 
 	return regs, unreadable
+}
+
+// claudeDesktopConfigPath returns Claude Desktop's config path for the
+// current OS, per Anthropic's documented install layout. Falls back to the
+// macOS path (this codebase's primary target, and this check's own
+// development/verification platform) for any GOOS this doctor does not
+// specifically know, rather than returning empty and silently skipping the
+// scope everywhere unrecognized. Thin wrapper over
+// claudeDesktopConfigPathForGOOS so tests can exercise all three branches
+// deterministically regardless of the host running the test.
+func claudeDesktopConfigPath(home string) string {
+	return claudeDesktopConfigPathForGOOS(home, runtime.GOOS)
+}
+
+func claudeDesktopConfigPathForGOOS(home, goos string) string {
+	switch goos {
+	case "windows":
+		appData := os.Getenv("APPDATA")
+		if appData == "" {
+			return "" // no reliable fallback: %APPDATA% absent means we cannot locate this scope at all
+		}
+		return filepath.Join(appData, "Claude", "claude_desktop_config.json")
+	case "linux":
+		return filepath.Join(home, ".config", "Claude", "claude_desktop_config.json")
+	default: // darwin and anything else
+		return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+	}
+}
+
+// claudeCodeManagedSettingsPath returns Claude Code's enterprise
+// managed-settings.json path for the current OS, per Anthropic's documented
+// managed-policy locations. Unlike claudeDesktopConfigPath this is a
+// machine-wide (not per-user) path with no $HOME component. Thin wrapper
+// over claudeCodeManagedSettingsPathForGOOS, same test-determinism reason as
+// claudeDesktopConfigPath above.
+func claudeCodeManagedSettingsPath() string {
+	return claudeCodeManagedSettingsPathForGOOS(runtime.GOOS)
+}
+
+func claudeCodeManagedSettingsPathForGOOS(goos string) string {
+	switch goos {
+	case "windows":
+		programData := os.Getenv("ProgramData")
+		if programData == "" {
+			programData = `C:\ProgramData`
+		}
+		return filepath.Join(programData, "ClaudeCode", "managed-settings.json")
+	case "linux":
+		return filepath.Join(string(filepath.Separator), "etc", "claude-code", "managed-settings.json")
+	default: // darwin and anything else
+		return filepath.Join(string(filepath.Separator), "Library", "Application Support", "ClaudeCode", "managed-settings.json")
+	}
 }
 
 // doctorDuplicateToolsets WARNs when the SAME target (URL or resolved
@@ -1757,9 +1838,27 @@ func doctorDuplicateToolsets(g *DoctorGroup, home string) {
 		return
 	}
 
+	// Group AND display by the REDACTED target, never the raw one: an http
+	// MCP registration's URL routinely carries an auth token in its query
+	// string (?token=..., ?key=...), and this report is built to be shared
+	// -- pasted into an issue, logged from `--lint` in CI/cron, piped
+	// through --json -- exactly the #568 narrative this PR itself cites.
+	// Printing the raw target would leak that token into whatever the
+	// report lands in. Grouping on the redacted form is also more CORRECT,
+	// not just safer: two registrations of the same server that happen to
+	// embed different per-registration tokens in their query string are
+	// still the same double-mounted toolset and must still collide.
+	//
+	// Stdio command+args targets (mcpEntryTarget's non-URL branch) are
+	// displayed as-is -- args in the registrations this check was built
+	// against are package names and flags (uvx blender-mcp, npx -y
+	// mcp-markdown-viewer), not secrets; secrets in a stdio MCP server's
+	// config live in its "env" map, which this check never reads or
+	// displays at all.
 	byTarget := map[string][]mcpRegistration{}
 	for _, r := range regs {
-		byTarget[r.Target] = append(byTarget[r.Target], r)
+		key := redactMCPTarget(r.Target)
+		byTarget[key] = append(byTarget[key], r)
 	}
 	var targets []string
 	for t := range byTarget {
