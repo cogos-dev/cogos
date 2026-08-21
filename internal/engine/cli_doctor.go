@@ -1326,28 +1326,25 @@ func doctorStoreLiveness(report *DoctorReport, root string, opts DoctorOptions) 
 // stricter regexp, so any file carrying this marker anywhere in its name is
 // surfaced regardless of the exact timestamp format used to produce it.
 //
-// IMPORTANT: this repository does not currently contain any code that
-// writes a file matching this marker — the reindex-replace rename-aside
-// logic (issue item 2's other half, in cli_reindex.go) is out of scope for
-// this PR per this lane's ground rules, and a repo-wide search at the time
-// this shipped found no such logic anywhere else either. In real usage
-// today doctorCorruptFiles will therefore always report OK, because nothing
-// yet produces the marker it looks for. This check ships anyway,
-// deliberately ahead of its producer, for two reasons: (1) it is cheap and
-// harmless while unused (one WalkDir, unconditional, no false positives
-// possible on a marker nothing writes), and (2) it makes the doctor-side
-// half of item 2 land now rather than blocking on an unrelated PR against
-// cli_reindex.go. It becomes load-bearing the moment that reindex change
-// ships, or if an operator manually preserves a corrupt store this way.
+// The producer is `preserveCorruptStore`/`renameAside` in
+// sdk/constellation/store_guard.go, invoked as constellation.PreserveCorruptStore
+// from this package's runReindex (cli_reindex.go) -- shipped in #572, which
+// landed on main after this branch's own merge-base, so it predates this
+// check reaching main even though the two PRs were developed concurrently.
+// `cogos reindex` against a corrupted constellation.db therefore already
+// produces a *.corrupt-* file today: this check is load-bearing on the very
+// first real corruption a user hits, not speculative or "ahead of its
+// producer."
 const corruptFileMarker = ".corrupt-"
 
 // doctorCorruptFiles enumerates *.corrupt-* files under cogDir so a store
 // preserved by this naming convention doesn't rot silently — the same
-// anti-sprawl philosophy as the binary-sprawl check, and forward-looking
-// per corruptFileMarker's doc comment above (nothing in this repository
-// currently produces such a file). This runs unconditionally (not gated
-// behind --deep): finding a corpse that already exists on disk costs one
-// WalkDir, unlike producing a fresh one via quick_check.
+// anti-sprawl philosophy as the binary-sprawl check, surfacing exactly what
+// `cogos reindex`'s corruption-safe rename-aside path (see
+// corruptFileMarker's doc comment above) already leaves behind today. This
+// runs unconditionally (not gated behind --deep): finding a corpse that
+// already exists on disk costs one WalkDir, unlike producing a fresh one via
+// quick_check.
 func doctorCorruptFiles(g *DoctorGroup, cogDir string) {
 	var found []string
 	var walkErrs []string
