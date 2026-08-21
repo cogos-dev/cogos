@@ -23,8 +23,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 // quickCheckTimeout bounds how long PRAGMA quick_check may run against an
@@ -157,29 +155,37 @@ func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, e
 //
 //   - context.DeadlineExceeded: quick_check itself did not finish within
 //     quickCheckTimeout (a large store, a loaded disk).
-//   - sqlite3.ErrBusy / sqlite3.ErrLocked (including their extended forms,
-//     e.g. ErrBusyRecovery): the read-only connection's own
-//     _busy_timeout (busyTimeout) expired waiting on a lock — for example a daemon
+//   - SQLITE_BUSY / SQLITE_LOCKED (including extended forms like
+//     SQLITE_BUSY_RECOVERY): the read-only connection's own _busy_timeout
+//     (busyTimeout) expired waiting on a lock — for example a daemon
 //     mid-WAL-recovery or mid-checkpoint holding the file briefly. This is
 //     the sibling of the timeout case above, caught in review: a lock a
 //     legitimate concurrent connection is holding is not evidence the file
 //     is corrupt, it is evidence the check arrived at a bad moment.
 //
+// The busy/locked case is detected by matching sqlite3_errstr's own message
+// text ("database is locked" for BUSY, "database table is locked" for
+// LOCKED — both contain "locked") rather than importing
+// github.com/mattn/go-sqlite3's typed sqlite3.Error/ErrBusy/ErrLocked: that
+// package's error types live in cgo-gated source, unavailable when
+// CGO_ENABLED=0 (as it is for this module's Windows cross-compile CI job,
+// which builds every package including this one but never runs it) —
+// referencing them there is a compile error, not a behavior difference, and
+// broke that job when tried. String matching needs nothing beyond the
+// stdlib and behaves identically wherever this actually runs (cgo is always
+// enabled on the platforms this code is really exercised on).
+//
 // Any other error (quick_check reporting an explicit non-"ok" result, or an
-// open/prepare failure that is not a busy/locked code — "file is not a
+// open/prepare failure that is not a busy/locked message — "file is not a
 // database" being the common one) is a genuine corruption finding.
 func isInconclusive(err error) bool {
+	if err == nil {
+		return false
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-	var sqliteErr sqlite3.Error
-	if errors.As(err, &sqliteErr) {
-		switch sqliteErr.Code {
-		case sqlite3.ErrBusy, sqlite3.ErrLocked:
-			return true
-		}
-	}
-	return false
+	return strings.Contains(strings.ToLower(err.Error()), "locked")
 }
 
 // checkStoreIntegrity opens path read-only (through the SQLite driver, WAL-

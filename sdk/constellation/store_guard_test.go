@@ -11,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
 // makeSmallSQLiteDB creates a real, valid SQLite database file at path with a
@@ -545,12 +543,19 @@ func TestIsInconclusive(t *testing.T) {
 	}{
 		{"deadline exceeded direct", context.DeadlineExceeded, true},
 		{"deadline exceeded wrapped", fmt.Errorf("cannot open as a database: %w", context.DeadlineExceeded), true},
-		{"sqlite busy", sqlite3.Error{Code: sqlite3.ErrBusy}, true},
-		{"sqlite busy wrapped", fmt.Errorf("cannot open as a database: %w", sqlite3.Error{Code: sqlite3.ErrBusy}), true},
-		{"sqlite busy recovery (extended)", sqlite3.Error{Code: sqlite3.ErrBusy, ExtendedCode: sqlite3.ErrBusyRecovery}, true},
-		{"sqlite locked", sqlite3.Error{Code: sqlite3.ErrLocked}, true},
+		// Message text as sqlite3_errstr actually produces it for these
+		// codes (see the driver's error.go) -- SQLITE_BUSY -> "database is
+		// locked", SQLITE_LOCKED -> "database table is locked". Matched by
+		// substring rather than the driver's typed sqlite3.Error, which
+		// lives in cgo-gated source unavailable on this module's
+		// CGO_ENABLED=0 Windows cross-compile CI job (see isInconclusive's
+		// doc comment).
+		{"busy message", errors.New("database is locked"), true},
+		{"busy message wrapped", fmt.Errorf("cannot open as a database: %w", errors.New("database is locked")), true},
+		{"locked message (table)", errors.New("database table is locked"), true},
+		{"locked message uppercase", errors.New("Database Is LOCKED"), true},
 		{"not a database (genuine corruption)", errors.New("file is not a database"), false},
-		{"sqlite corrupt code (genuine corruption)", sqlite3.Error{Code: sqlite3.ErrCorrupt}, false},
+		{"malformed disk image (genuine corruption)", errors.New("database disk image is malformed"), false},
 		{"nil", nil, false},
 	}
 	for _, tc := range cases {
@@ -603,9 +608,8 @@ func TestPreserveCorruptStore_RealLockContentionIsNotTreatedAsCorruption(t *test
 	if err == nil {
 		t.Fatalf("expected an operational error from lock contention, got preserved=%q reason=%q err=nil", preserved, reason)
 	}
-	var sqliteErr sqlite3.Error
-	if !errors.As(err, &sqliteErr) || sqliteErr.Code != sqlite3.ErrBusy {
-		t.Fatalf("expected err to wrap a sqlite3.Error{Code: ErrBusy}, got: %v", err)
+	if !strings.Contains(strings.ToLower(err.Error()), "locked") {
+		t.Fatalf("expected err to mention a lock (SQLITE_BUSY's message is \"database is locked\"), got: %v", err)
 	}
 	if preserved != "" || reason != "" {
 		t.Fatalf("lock contention must not be reported as a corruption finding, got preserved=%q reason=%q", preserved, reason)
