@@ -2,8 +2,10 @@
 //
 // Usage:
 //
-//	cogos doctor [--workspace PATH] [--json] [--stale-days N]
-//	             [--scan-dir DIR ...] [--config FILE ...] [--skip-network]
+//	cogos doctor [--workspace PATH] [--json] [--stale-days N] [--deep]
+//	             [--context-budget-kb N] [--scan-dir DIR ...]
+//	             [--config FILE ...] [--skip-network]
+//	             [--lint [--severity-min warn|fail]]
 //
 // doctor compares the local install and workspace against what a healthy
 // install should look like. It exists because every failure mode it checks
@@ -11,7 +13,9 @@
 // empty search result still exits 0, a dead SQLite store still answers
 // queries. See myrgic/cogos#568 for the incident that motivated it — a
 // working session spent diagnosing a phantom FTS bug that was actually a
-// 79-day-old binary shadowing the real one on PATH.
+// 79-day-old binary shadowing the real one on PATH. myrgic/cogos#571 adds
+// the lint exit contract, --deep store corruption checking, *.corrupt-*
+// enumeration, and the context-construction check group below.
 //
 // # Output contract
 //
@@ -31,22 +35,65 @@
 //	           nothing, and silently defaulting to "OK" is exactly the
 //	           failure class this command exists to close off.
 //
-// Exit code: 0 unless at least one check reports FAIL, in which case doctor
-// exits 1. WARN and UNKNOWN do not affect the exit code — they are surfaced
-// in the report for a human to read, not treated as build-breaking.
+// # Exit contract
+//
+// Two postures, chosen deliberately per #571 rather than replacing one with
+// the other:
+//
+//	cogos doctor              (advisory, DEFAULT): exit 0 unless at least one
+//	                           check reports FAIL, in which case exit 1. This
+//	                           is the exact contract #570 shipped and documented
+//	                           first; kept unchanged by default so scripts and
+//	                           habits built against `cog doctor && echo ok`
+//	                           keep working. WARN/UNKNOWN never affect this
+//	                           exit code.
+//
+//	cogos doctor --lint        (gate, OPT-IN): exit 0 = no finding at or above
+//	  [--severity-min warn|fail]  --severity-min (default "warn"); exit 1 = at
+//	                           least one finding meets it; exit 2 = the
+//	                           command failed before a report was produced at
+//	                           all — never conflated with "produced a report
+//	                           full of findings". UNKNOWN always counts as
+//	                           meeting the warn threshold (an observation
+//	                           doctor could not perform is never a
+//	                           lintable-clean state); at the fail threshold
+//	                           only FAIL counts, since UNKNOWN is explicitly
+//	                           not evidence of breakage.
+//
+// Bad flags exit 2 UNCONDITIONALLY, in every invocation, with or without
+// --lint — not a --lint-specific behavior. This isn't new in #571: fs is a
+// flag.ExitOnError FlagSet, and the stdlib's Parse calls os.Exit(2) itself
+// on any parse error before ever returning one (ErrHelp — "-h" — is the one
+// exception, exiting 0); this has been true since #570. What IS --lint-
+// specific pre-report failure is everything downstream of a successful
+// parse: an unresolvable workspace, or an invalid --severity-min value.
+//
+// The issue text describes the *advisory* posture itself changing ("exit 0
+// once a report is produced, regardless of findings"). That would break the
+// documented #570 contract for anyone already gating CI/cron on the bare
+// `cog doctor` exit code, so this ships the reconciliation instead: the old
+// any-FAIL contract stays the default, and the new threshold-gate contract
+// is what --lint opts into. `--lint` is the correct command for "advisory
+// run for a human" vs "gate for CI/cron" the issue is actually asking to
+// distinguish; a caller that wants FAIL-only gating uses `--lint
+// --severity-min fail`, which is exactly today's any-FAIL contract made
+// explicit and requested on purpose rather than inherited by default.
 //
 // cli_*.go files may import sdk/constellation; see the package-boundary note
 // in cli_reindex.go.
 package engine
 
 import (
+	"context"
 	"database/sql"
 	"debug/buildinfo"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -94,12 +141,41 @@ type DoctorReport struct {
 	Groups      []DoctorGroup `json:"groups"`
 }
 
-// ExitCode implements the output contract: non-zero iff any check FAILed.
+// ExitCode implements the default ADVISORY output contract: non-zero iff any
+// check FAILed. This is the #570 contract, unchanged by #571 — see the
+// package doc comment's "Exit contract" section for why the lint-threshold
+// contract lives in --lint / LintFindings instead of replacing this.
 func (r *DoctorReport) ExitCode() int {
 	if r.hasStatus(StatusFail) {
 		return 1
 	}
 	return 0
+}
+
+// LintFindings reports whether at least one check in r meets or exceeds min
+// (StatusWarn or StatusFail — the two --severity-min values `cogos doctor
+// --lint` accepts). At the warn threshold, WARN, UNKNOWN, and FAIL all
+// count: an observation doctor could not perform (UNKNOWN) is never a
+// lintable-clean state. At the fail threshold, only FAIL counts — UNKNOWN is
+// explicitly not evidence the system is broken, so it must not gate a
+// fail-only check.
+func (r *DoctorReport) LintFindings(min DoctorStatus) bool {
+	for _, g := range r.Groups {
+		for _, c := range g.Checks {
+			if lintMeetsThreshold(c.Status, min) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func lintMeetsThreshold(status, min DoctorStatus) bool {
+	if min == StatusFail {
+		return status == StatusFail
+	}
+	// Default / warn threshold.
+	return status == StatusWarn || status == StatusUnknown || status == StatusFail
 }
 
 func (r *DoctorReport) hasStatus(s DoctorStatus) bool {
@@ -147,6 +223,21 @@ type DoctorOptions struct {
 	// ReleaseRepo is the "owner/repo" GitHub slug used for the
 	// published-tag check. Defaults to "myrgic/cogos".
 	ReleaseRepo string
+	// Deep runs PRAGMA quick_check against every discovered SQLite store
+	// (store liveness group). Off by default: quick_check is a full page
+	// scan, and the constellation.db this checks against on a working
+	// substrate runs ~978MB — not free, hence opt-in.
+	Deep bool
+	// DeepTimeout bounds each store's quick_check (per #571: "bounded: use a
+	// context timeout ~30s per store and report UNKNOWN on timeout, never
+	// OK"). Defaults to 30s; exposed on DoctorOptions rather than hardcoded
+	// so tests can drive the timeout path deterministically without a real
+	// 30s wait.
+	DeepTimeout time.Duration
+	// ContextBudgetKB is the WARN threshold, in KB, for a single
+	// always-loaded context file (context-construction group). Defaults to
+	// 64.
+	ContextBudgetKB int
 }
 
 func (o *DoctorOptions) normalize() {
@@ -155,6 +246,12 @@ func (o *DoctorOptions) normalize() {
 	}
 	if o.ReleaseRepo == "" {
 		o.ReleaseRepo = "myrgic/cogos"
+	}
+	if o.DeepTimeout <= 0 {
+		o.DeepTimeout = 30 * time.Second
+	}
+	if o.ContextBudgetKB <= 0 {
+		o.ContextBudgetKB = 64
 	}
 }
 
@@ -169,6 +266,10 @@ func runDoctorCmd(args []string, defaultWorkspace string) {
 	staleDays := fs.Int("stale-days", 30, "Days since last write before a SQLite store is flagged DEAD")
 	skipNetwork := fs.Bool("skip-network", false, "Skip the published-tag network lookup (report UNKNOWN instead)")
 	releaseRepo := fs.String("release-repo", "myrgic/cogos", "owner/repo GitHub slug used for the published-tag check")
+	deep := fs.Bool("deep", false, "Run PRAGMA quick_check against every discovered SQLite store (FAIL on corruption). Off by default: a full page scan is not free against a large store.")
+	contextBudgetKB := fs.Int("context-budget-kb", 64, "WARN threshold, in KB, for a single always-loaded context file")
+	lint := fs.Bool("lint", false, "Lint mode: exit by --severity-min threshold instead of the default any-FAIL contract (see the full exit contract above)")
+	severityMin := fs.String("severity-min", "warn", "Lint threshold with --lint: \"warn\" or \"fail\". UNKNOWN always meets \"warn\"; only FAIL meets \"fail\".")
 	var scanDirs stringListFlag
 	fs.Var(&scanDirs, "scan-dir", "Extra directory to scan for stray cogos/cog binaries (repeatable)")
 	var configFiles stringListFlag
@@ -177,21 +278,49 @@ func runDoctorCmd(args []string, defaultWorkspace string) {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: cogos doctor [flags]\n\n")
 		fmt.Fprintf(os.Stderr, "Compares the local install and workspace against what a healthy install\n")
-		fmt.Fprintf(os.Stderr, "should look like: install integrity, config coherence, index health, and\n")
-		fmt.Fprintf(os.Stderr, "SQLite store liveness.\n\n")
+		fmt.Fprintf(os.Stderr, "should look like: install integrity, config coherence, index health,\n")
+		fmt.Fprintf(os.Stderr, "SQLite store liveness, and context-construction hygiene.\n\n")
 		fmt.Fprintf(os.Stderr, "Output contract:\n")
 		fmt.Fprintf(os.Stderr, "  OK       checked, property holds\n")
 		fmt.Fprintf(os.Stderr, "  WARN     checked, holds with a caveat worth a human's attention\n")
 		fmt.Fprintf(os.Stderr, "  FAIL     checked, property does NOT hold\n")
 		fmt.Fprintf(os.Stderr, "  UNKNOWN  could not be checked (never reported as OK)\n\n")
-		fmt.Fprintf(os.Stderr, "Exit code: 0 unless any check reports FAIL (then 1). WARN/UNKNOWN do not\n")
-		fmt.Fprintf(os.Stderr, "affect the exit code.\n\n")
+		fmt.Fprintf(os.Stderr, "Exit contract (two postures, see the cli_doctor.go package doc for full rationale):\n")
+		fmt.Fprintf(os.Stderr, "  Bad flags always exit 2, with or without --lint (the stdlib flag package's own\n")
+		fmt.Fprintf(os.Stderr, "  behavior, unchanged since #570 -- not itself part of either posture below).\n")
+		fmt.Fprintf(os.Stderr, "  cogos doctor              (advisory, DEFAULT) exit 0 unless a check reports FAIL,\n")
+		fmt.Fprintf(os.Stderr, "                            then 1. WARN/UNKNOWN never affect this exit code. This\n")
+		fmt.Fprintf(os.Stderr, "                            is the exact #570 contract, unchanged by default.\n")
+		fmt.Fprintf(os.Stderr, "  cogos doctor --lint       (gate, opt-in) exit 0 = no finding at/above\n")
+		fmt.Fprintf(os.Stderr, "    [--severity-min X]      --severity-min (default warn); exit 1 = at least one\n")
+		fmt.Fprintf(os.Stderr, "                            finding meets it; exit 2 = a resolvable-workspace or\n")
+		fmt.Fprintf(os.Stderr, "                            --severity-min failure before a report was produced.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		fs.PrintDefaults()
 	}
 
+	// fs is flag.ExitOnError: Parse calls os.Exit(2) itself on any parse
+	// error (ErrHelp/"-h" is the sole exception, exiting 0) before this line
+	// could ever observe a non-nil err -- see the flag package source. Bad
+	// flags have therefore always exited 2 unconditionally, regardless of
+	// --lint, since #570; this check is defensive, not reachable in
+	// practice, and deliberately does NOT branch on *lint the way the
+	// downstream pre-report-failure checks below do.
 	if err := fs.Parse(args); err != nil {
-		os.Exit(1)
+		os.Exit(2)
+	}
+
+	minStatus := StatusWarn
+	if *lint {
+		switch strings.ToLower(strings.TrimSpace(*severityMin)) {
+		case "", "warn":
+			minStatus = StatusWarn
+		case "fail":
+			minStatus = StatusFail
+		default:
+			fmt.Fprintf(os.Stderr, "error: --severity-min must be \"warn\" or \"fail\", got %q\n", *severityMin)
+			os.Exit(2)
+		}
 	}
 
 	root := *workspace
@@ -200,6 +329,9 @@ func runDoctorCmd(args []string, defaultWorkspace string) {
 		root, err = reconcileResolveWorkspace()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: resolve workspace: %v\n", err)
+			if *lint {
+				os.Exit(2) // pre-report failure under --lint's three-posture contract
+			}
 			os.Exit(1)
 		}
 	}
@@ -210,6 +342,8 @@ func runDoctorCmd(args []string, defaultWorkspace string) {
 		StaleDays:        *staleDays,
 		SkipNetwork:      *skipNetwork,
 		ReleaseRepo:      *releaseRepo,
+		Deep:             *deep,
+		ContextBudgetKB:  *contextBudgetKB,
 	}
 
 	report := RunDoctor(root, opts)
@@ -222,6 +356,20 @@ func runDoctorCmd(args []string, defaultWorkspace string) {
 		printDoctorReport(os.Stdout, report)
 	}
 
+	if *lint {
+		// This status line is diagnostic, not part of the report: it always
+		// goes to stderr, never stdout, regardless of --json. Writing it to
+		// stdout after enc.Encode(report) above would append a plain-text
+		// line onto the encoded JSON stream on the SAME fd, corrupting it
+		// for exactly the machine-consumption (CI/cron, piped through jq)
+		// use case --lint exists to serve.
+		if report.LintFindings(minStatus) {
+			fmt.Fprintf(os.Stderr, "lint: severity-min=%s, finding(s) at/above threshold, exit 1\n", minStatus)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "lint: severity-min=%s, no finding at/above threshold, exit 0\n", minStatus)
+		os.Exit(0)
+	}
 	os.Exit(report.ExitCode())
 }
 
@@ -291,6 +439,7 @@ func RunDoctor(root string, opts DoctorOptions) *DoctorReport {
 	doctorConfigCoherence(report, root, opts)
 	doctorIndexHealth(report, root, opts)
 	doctorStoreLiveness(report, root, opts)
+	doctorContextConstruction(report, root, opts)
 
 	return report
 }
@@ -1150,6 +1299,8 @@ func doctorStoreLiveness(report *DoctorReport, root string, opts DoctorOptions) 
 		return
 	}
 
+	doctorCorruptFiles(g, cogDir)
+
 	var dbFiles []string
 	_ = filepath.WalkDir(cogDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -1169,11 +1320,88 @@ func doctorStoreLiveness(report *DoctorReport, root string, opts DoctorOptions) 
 	g.add("store discovery", StatusOK, fmt.Sprintf("%d SQLite store(s) found", len(dbFiles)))
 
 	for _, path := range dbFiles {
-		doctorOneStore(g, path, opts.StaleDays)
+		doctorOneStore(g, path, opts.StaleDays, opts.Deep, opts.DeepTimeout)
 	}
 }
 
-func doctorOneStore(g *DoctorGroup, path string, staleDays int) {
+// corruptFileMarker is the naming convention "<name>.corrupt-<timestamp>"
+// that #571 item 2 specifies for a corruption-safe reindex-replace: rename,
+// never unlink, a store that fails its integrity check, so corrupt data
+// stays evidence instead of becoming garbage. Matched as a plain substring
+// (mirroring the shell glob `*.corrupt-*` the issue specifies) rather than a
+// stricter regexp, so any file carrying this marker anywhere in its name is
+// surfaced regardless of the exact timestamp format used to produce it.
+//
+// The producer is `preserveCorruptStore`/`renameAside` in
+// sdk/constellation/store_guard.go, invoked as constellation.PreserveCorruptStore
+// from this package's runReindex (cli_reindex.go) -- shipped in #572, which
+// landed on main after this branch's own merge-base, so it predates this
+// check reaching main even though the two PRs were developed concurrently.
+// `cogos reindex` against a corrupted constellation.db therefore already
+// produces a *.corrupt-* file today: this check is load-bearing on the very
+// first real corruption a user hits, not speculative or "ahead of its
+// producer."
+const corruptFileMarker = ".corrupt-"
+
+// doctorCorruptFiles enumerates *.corrupt-* files under cogDir so a store
+// preserved by this naming convention doesn't rot silently — the same
+// anti-sprawl philosophy as the binary-sprawl check, surfacing exactly what
+// `cogos reindex`'s corruption-safe rename-aside path (see
+// corruptFileMarker's doc comment above) already leaves behind today. This
+// runs unconditionally (not gated behind --deep): finding a corpse that
+// already exists on disk costs one WalkDir, unlike producing a fresh one via
+// quick_check.
+func doctorCorruptFiles(g *DoctorGroup, cogDir string) {
+	var found []string
+	var walkErrs []string
+	walkErr := filepath.WalkDir(cogDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A path under cogDir could not be visited (permission denied,
+			// vanished mid-walk, etc). Record it and keep walking the rest of
+			// the tree so a single bad subdirectory doesn't blind the whole
+			// check -- but this walk can no longer certify "no *.corrupt-*
+			// files anywhere under cogDir", only "none found among the paths
+			// we could reach". Never let that partial result present as OK.
+			walkErrs = append(walkErrs, fmt.Sprintf("%s: %v", p, err))
+			return nil
+		}
+		if !d.IsDir() && strings.Contains(d.Name(), corruptFileMarker) {
+			found = append(found, p)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		// WalkDir itself only surfaces a top-level error here if the
+		// callback returns non-nil, which it never does above; guarded
+		// anyway so a future change to this callback can't silently regress
+		// back to swallowing it.
+		walkErrs = append(walkErrs, fmt.Sprintf("%s: %v", cogDir, walkErr))
+	}
+
+	if len(walkErrs) > 0 {
+		sort.Strings(walkErrs)
+		detail := fmt.Sprintf(
+			"could not fully walk %s -- %d path(s) unreadable, so the absence of *.corrupt-* files under them is unverified (never reported as OK):\n%s",
+			cogDir, len(walkErrs), strings.Join(walkErrs, "\n"))
+		if len(found) > 0 {
+			sort.Strings(found)
+			detail = fmt.Sprintf("%s\nfound within the reachable portion of the tree, despite the incomplete walk:\n%s", detail, strings.Join(found, "\n"))
+		}
+		g.add("preserved corrupt stores", StatusUnknown, detail)
+		return
+	}
+
+	if len(found) == 0 {
+		g.add("preserved corrupt stores", StatusOK, "no *.corrupt-* files found under "+cogDir)
+		return
+	}
+	sort.Strings(found)
+	g.add("preserved corrupt stores", StatusWarn, fmt.Sprintf(
+		"%d file(s) matching the *.corrupt-* preserved-corpse naming convention found (corrupt data is evidence, not garbage — do not delete without inspecting):\n%s",
+		len(found), strings.Join(found, "\n")))
+}
+
+func doctorOneStore(g *DoctorGroup, path string, staleDays int, deep bool, deepTimeout time.Duration) {
 	rel := path
 	info, statErr := os.Stat(path)
 	if statErr != nil {
@@ -1188,6 +1416,10 @@ func doctorOneStore(g *DoctorGroup, path string, staleDays int) {
 		return
 	}
 	defer db.Close()
+
+	if deep {
+		doctorQuickCheck(g, db, path, deepTimeout)
+	}
 
 	rowCount, tableErr := sumRowCounts(db)
 
@@ -1213,6 +1445,36 @@ func doctorOneStore(g *DoctorGroup, path string, staleDays int) {
 	default:
 		g.add("store: "+rel, StatusOK, detail)
 	}
+}
+
+// doctorQuickCheck runs `PRAGMA quick_check` against an already-opened,
+// read-only store handle, bounded by timeout. Per #571 item 2: corruption is
+// a FAIL (the store is genuinely broken, not merely untidy); a timeout is
+// UNKNOWN, never OK — quick_check not finishing in time is not evidence the
+// store is healthy, only that this run couldn't verify it. A generic query
+// error (permission, already-corrupt-enough-to-not-open) is likewise
+// UNKNOWN, matching the row-count path's own never-OK-when-unverified rule
+// just above it in doctorOneStore.
+func doctorQuickCheck(g *DoctorGroup, db *sql.DB, path string, timeout time.Duration) {
+	name := "quick check: " + path
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var result string
+	err := db.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&result)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			g.add(name, StatusUnknown, fmt.Sprintf("PRAGMA quick_check timed out after %s (never treated as OK)", timeout))
+			return
+		}
+		g.add(name, StatusUnknown, fmt.Sprintf("PRAGMA quick_check: %v", err))
+		return
+	}
+	if result != "ok" {
+		g.add(name, StatusFail, fmt.Sprintf("PRAGMA quick_check reports corruption: %s", result))
+		return
+	}
+	g.add(name, StatusOK, "PRAGMA quick_check: ok")
 }
 
 // sumRowCounts sums row counts across every non-internal, non-FTS-shadow
@@ -1259,4 +1521,774 @@ func sumRowCounts(db *sql.DB) (int64, error) {
 		total += n
 	}
 	return total, nil
+}
+
+// ---------------------------------------------------------------------------
+// Group 5: Context construction (myrgic/cogos#571 item 3)
+//
+// Claude Code's `/doctor` audits the *context economics* of an installation:
+// unused extensions vs their context cost, oversized always-loaded memory
+// files, duplicate config. The same drift class exists on a CogOS seat and
+// nothing observed it before this group. Every check here is observation
+// only — nothing in this group writes to any config file.
+// ---------------------------------------------------------------------------
+
+func doctorContextConstruction(report *DoctorReport, root string, opts DoctorOptions) {
+	g := report.addGroup("context construction")
+	home, homeErr := os.UserHomeDir()
+	if homeErr != nil || home == "" {
+		g.add("context construction", StatusUnknown, fmt.Sprintf("could not resolve home directory: %v", homeErr))
+		return
+	}
+
+	doctorDuplicateToolsets(g, home)
+	doctorDuplicatePermissions(g, home)
+	doctorContextBudget(g, home, opts.ContextBudgetKB)
+	doctorDeadHooks(g, home)
+}
+
+// -- 5a: duplicate toolset registrations across every config scope ---------
+
+// mcpRegistration is one MCP server name as registered in one config scope,
+// normalized to the target it actually mounts.
+type mcpRegistration struct {
+	Name   string
+	Scope  string
+	Target string
+}
+
+// mcpEntryTarget normalizes an MCP server definition (the {"command":...,
+// "args":[...]} / {"type":"http","url":...} shape shared by Claude Code,
+// Claude Desktop, and Hermes config) to the single string that identifies
+// what it actually mounts: the URL for an http/sse server, or command+args
+// joined for a stdio server — with one deliberate exception. A definition
+// shaped like `command: npx, args: [mcp-remote, <url>]` (the wrapper Claude
+// Desktop uses to mount an http MCP server through a stdio bridge) targets
+// the URL argument alone, not the npx binary or the rest of its args: two
+// such entries pointing at different URLs are NOT the same toolset even
+// though "npx" is identical, and — the concrete case this check exists to
+// catch (#571 live evidence) — an entry using this wrapper and an entry
+// using a plain {"url": ...} registration for the SAME address ARE the same
+// toolset even though neither their "command" nor their shape matches
+// literally.
+//
+// Command+args (rather than the bare command alone) matters for any generic
+// package-runner command — "uvx", "npx", "python3" and similar are
+// legitimately shared by many UNRELATED MCP servers; using the bare command
+// as the target would flag every uvx-launched server as a duplicate of
+// every other one. `uvx blender-mcp` and `uvx some-other-tool` share a
+// command and must NOT collide; two registrations that share command AND
+// every arg (the real live-evidence "blender" case this check was
+// validated against, registered identically in two scopes) legitimately
+// should.
+func mcpEntryTarget(def map[string]any) (string, bool) {
+	if url, ok := def["url"].(string); ok && url != "" {
+		return url, true
+	}
+	cmd, _ := def["command"].(string)
+	if cmd == "" {
+		return "", false
+	}
+	var args []string
+	if raw, ok := def["args"].([]any); ok {
+		for _, a := range raw {
+			if s, ok := a.(string); ok {
+				args = append(args, s)
+			}
+		}
+	}
+	if base := filepath.Base(cmd); base == "npx" || base == "npx.cmd" {
+		// Only the documented `npx mcp-remote <url>` bridge shape targets its
+		// URL argument -- the package name must be "mcp-remote" literally.
+		// Matching ANY URL-shaped argument for ANY npx-launched server would
+		// collide two unrelated packages that merely happen to take a
+		// URL-shaped flag (e.g. --api-base, --callback) of their own, which
+		// is exactly the generic-launcher false-positive this function's own
+		// doc comment says the command+args design exists to avoid.
+		//
+		// The package name is not always args[0]: npx accepts its own flags
+		// first, most commonly "-y"/"--yes" to skip the install-confirmation
+		// prompt (`npx -y mcp-remote <url>`), so skip any leading
+		// "-"-prefixed args to find it.
+		pkgIdx := -1
+		for i, a := range args {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			pkgIdx = i
+			break
+		}
+		if pkgIdx >= 0 && args[pkgIdx] == "mcp-remote" {
+			for _, s := range args[pkgIdx+1:] {
+				if strings.Contains(s, "://") {
+					return s, true
+				}
+			}
+		}
+	}
+	if len(args) > 0 {
+		return cmd + " " + strings.Join(args, " "), true
+	}
+	return cmd, true
+}
+
+// redactMCPTarget strips whatever part of an mcpEntryTarget result could
+// carry a credential before it is ever grouped or displayed by
+// doctorDuplicateToolsets. An http/sse MCP registration's URL routinely
+// carries an auth token in its query string (?token=..., ?key=...) or
+// userinfo (https://user:pass@host/...) -- doctor's report is built to be
+// pasted/logged/shared for diagnosis, so printing that raw would leak it.
+// Non-URL (stdio command+args) targets pass through unchanged; see
+// doctorDuplicateToolsets' doc comment for why that half is not in scope
+// here. Query string and fragment are stripped via plain string slicing
+// BEFORE any url.Parse attempt, so a malformed URL that fails to parse
+// still gets its query stripped rather than being returned raw.
+func redactMCPTarget(target string) string {
+	if !strings.Contains(target, "://") {
+		return target
+	}
+	s := target
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+
+	// Strip any userinfo (user:pass@host) via plain string slicing BEFORE
+	// attempting url.Parse, and independently of whether Parse below
+	// succeeds. A malformed percent-escape inside the credential itself
+	// (e.g. "https://user:p%2@host/mcp") makes net/url's own userinfo
+	// unescaper return an error, so a Parse-then-clear-User approach loses
+	// the credential silently on exactly the URLs where redaction matters
+	// most -- Parse failing must never mean the credential survives into
+	// the string this function returns.
+	if schemeEnd := strings.Index(s, "://"); schemeEnd >= 0 {
+		authorityStart := schemeEnd + len("://")
+		authority := s[authorityStart:]
+		if slash := strings.IndexByte(authority, '/'); slash >= 0 {
+			authority = authority[:slash]
+		}
+		if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+			s = s[:authorityStart] + authority[at+1:] + s[authorityStart+len(authority):]
+		}
+	}
+
+	if u, err := neturl.Parse(s); err == nil {
+		u.User = nil
+		return u.String()
+	}
+	return s
+}
+
+// mcpProjectScopeRe matches the scope label collectMCPRegistrations gives a
+// ~/.claude.json PER-PROJECT mcpServers block ("~/.claude.json (project:
+// <path>)"), as opposed to every other scope this doctor reads (user-level
+// ~/.claude.json, ~/.mcp.json, settings*.json, Hermes profiles, Claude
+// Desktop, managed-settings.json) -- all of which are always active
+// regardless of which project (if any) a session is in.
+var mcpProjectScopeRe = regexp.MustCompile(`^~/\.claude\.json \(project: (.+)\)$`)
+
+// mcpRegistrationProject reports the project path a scope names, if it
+// names one at all.
+func mcpRegistrationProject(scope string) (project string, isProjectScoped bool) {
+	m := mcpProjectScopeRe.FindStringSubmatch(scope)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// mcpRegistrationsGenuinelyCoLoad reports whether at least two of the given
+// same-target registrations could actually be loaded into the SAME running
+// session together -- the premise doctorDuplicateToolsets' "double context
+// cost per session" WARN message asserts. Only one ~/.claude.json project's
+// mcpServers block ever applies to a given session (whichever project that
+// session is rooted in); every other scope this doctor reads is always
+// active alongside it. So:
+//   - two registrations in DIFFERENT projects, and nowhere else, never
+//     co-load -- not a real collision, regardless of how many distinct
+//     projects register the same target this way.
+//   - a registration in ANY project co-loads with every non-project-scoped
+//     registration (that project's session always has the global scopes
+//     active too) -- a real collision.
+//   - two non-project-scoped registrations always co-load with each other
+//     -- a real collision.
+//   - two registrations that share the SAME project (two differently-named
+//     entries in one project's mcpServers block both resolving to this
+//     target) co-load within that one project's own sessions -- a real
+//     collision.
+func mcpRegistrationsGenuinelyCoLoad(regs []mcpRegistration) bool {
+	projectCounts := map[string]int{}
+	nonProjectScoped := 0
+	for _, r := range regs {
+		if proj, ok := mcpRegistrationProject(r.Scope); ok {
+			projectCounts[proj]++
+		} else {
+			nonProjectScoped++
+		}
+	}
+	if nonProjectScoped >= 2 {
+		return true
+	}
+	if nonProjectScoped >= 1 && len(projectCounts) >= 1 {
+		return true
+	}
+	for _, n := range projectCounts {
+		if n >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+// toAnyMap coerces a decoded JSON or YAML value to map[string]any. YAML
+// decoded via gopkg.in/yaml.v3 into `any` already produces map[string]any
+// for mapping nodes (unlike yaml.v2's map[interface{}]interface{}), so this
+// is a plain type assertion, not a conversion — kept as a named helper so
+// every registration-scope walker below reads the same way.
+func toAnyMap(v any) (map[string]any, bool) {
+	m, ok := v.(map[string]any)
+	return m, ok
+}
+
+// collectMCPServersFrom walks one already-decoded "mcpServers"-shaped object
+// (name -> definition) and appends a registration per name with a
+// resolvable target, tagged with scope.
+func collectMCPServersFrom(obj any, scope string, out *[]mcpRegistration) {
+	ms, ok := toAnyMap(obj)
+	if !ok {
+		return
+	}
+	names := make([]string, 0, len(ms))
+	for name := range ms {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic scan order; map[target] grouping below re-sorts anyway
+	for _, name := range names {
+		def, ok := toAnyMap(ms[name])
+		if !ok {
+			continue
+		}
+		if target, ok := mcpEntryTarget(def); ok {
+			*out = append(*out, mcpRegistration{Name: name, Scope: scope, Target: target})
+		}
+	}
+}
+
+// collectMCPRegistrations gathers every MCP server registration this doctor
+// can read, across every scope named in #571 item 3a, plus the scope hunt
+// the issue asked for explicitly (the "browserOS" twin): ~/.claude.json
+// top-level AND per-project, ~/.mcp.json, ~/.claude/settings*.json (if they
+// carry mcpServers), ~/.hermes/profiles/*/config.yaml, Claude Desktop's own
+// config (found during the hunt — see doc comment above doctorDuplicateToolsets),
+// and the enterprise managed-settings.json path (present on none of the
+// machines this shipped against, but checked per the issue). unreadable
+// notes a scope that exists but could not be parsed, distinct from a scope
+// that simply is not present on this machine (silently skipped, per the
+// "missing = not listed" convention this whole command uses).
+func collectMCPRegistrations(home string) (regs []mcpRegistration, unreadable []string) {
+	noteBad := func(scope, path string, err error) {
+		unreadable = append(unreadable, fmt.Sprintf("%s (%s): %v", scope, path, err))
+	}
+
+	// ~/.claude.json: top-level mcpServers + every projects.<path>.mcpServers.
+	claudeJSON := filepath.Join(home, ".claude.json")
+	if data, err := os.ReadFile(claudeJSON); err == nil {
+		var top map[string]any
+		if err := json.Unmarshal(data, &top); err != nil {
+			noteBad("~/.claude.json", claudeJSON, err)
+		} else {
+			collectMCPServersFrom(top["mcpServers"], "~/.claude.json (user)", &regs)
+			if projects, ok := toAnyMap(top["projects"]); ok {
+				projPaths := make([]string, 0, len(projects))
+				for p := range projects {
+					projPaths = append(projPaths, p)
+				}
+				sort.Strings(projPaths)
+				for _, p := range projPaths {
+					if proj, ok := toAnyMap(projects[p]); ok {
+						collectMCPServersFrom(proj["mcpServers"], "~/.claude.json (project: "+p+")", &regs)
+					}
+				}
+			}
+		}
+	}
+
+	// ~/.mcp.json
+	mcpJSON := filepath.Join(home, ".mcp.json")
+	if data, err := os.ReadFile(mcpJSON); err == nil {
+		var top map[string]any
+		if err := json.Unmarshal(data, &top); err != nil {
+			noteBad("~/.mcp.json", mcpJSON, err)
+		} else {
+			collectMCPServersFrom(top["mcpServers"], "~/.mcp.json", &regs)
+		}
+	}
+
+	// ~/.claude/settings.json + settings.local.json, if they carry mcpServers.
+	for _, sf := range []struct{ path, label string }{
+		{filepath.Join(home, ".claude", "settings.json"), "~/.claude/settings.json"},
+		{filepath.Join(home, ".claude", "settings.local.json"), "~/.claude/settings.local.json"},
+	} {
+		data, err := os.ReadFile(sf.path)
+		if err != nil {
+			continue // not present -- not an error, just nothing to add
+		}
+		var top map[string]any
+		if err := json.Unmarshal(data, &top); err != nil {
+			noteBad(sf.label, sf.path, err)
+			continue
+		}
+		collectMCPServersFrom(top["mcpServers"], sf.label, &regs)
+	}
+
+	// ~/.hermes/profiles/*/config.yaml: mcp_servers (Hermes' own key name).
+	for _, cfgPath := range globQuiet(filepath.Join(home, ".hermes", "profiles", "*", "config.yaml")) {
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			noteBad("hermes profile", cfgPath, err)
+			continue
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal(data, &doc); err != nil {
+			noteBad("hermes profile", cfgPath, err)
+			continue
+		}
+		profile := filepath.Base(filepath.Dir(cfgPath))
+		collectMCPServersFrom(doc["mcp_servers"], "~/.hermes/profiles/"+profile+"/config.yaml", &regs)
+	}
+
+	// Claude Desktop's own config. Not one of the scopes #571 named up
+	// front; found by the hunt the issue asked for when the twin wasn't in
+	// ~/.claude/plugins or managed-settings.json (see doctorDuplicateToolsets
+	// doc comment and the PR body for the hunt result).
+	if desktopCfg := claudeDesktopConfigPath(home); desktopCfg != "" {
+		if data, err := os.ReadFile(desktopCfg); err == nil {
+			var top map[string]any
+			if err := json.Unmarshal(data, &top); err != nil {
+				noteBad("Claude Desktop config", desktopCfg, err)
+			} else {
+				collectMCPServersFrom(top["mcpServers"], "Claude Desktop config", &regs)
+			}
+		}
+	}
+
+	// Enterprise managed-settings.json (org policy scope) -- checked per the
+	// issue's explicit hunt list; not present on a personal-machine install,
+	// so this scope contributes nothing here but is not skipped in code.
+	if managedPath := claudeCodeManagedSettingsPath(); managedPath != "" {
+		if data, err := os.ReadFile(managedPath); err == nil {
+			var top map[string]any
+			if err := json.Unmarshal(data, &top); err != nil {
+				noteBad("managed-settings.json", managedPath, err)
+			} else {
+				collectMCPServersFrom(top["mcpServers"], "managed-settings.json (org policy)", &regs)
+			}
+		}
+	}
+
+	return regs, unreadable
+}
+
+// claudeDesktopConfigPath returns Claude Desktop's config path for the
+// current OS, per Anthropic's documented install layout. Falls back to the
+// macOS path (this codebase's primary target, and this check's own
+// development/verification platform) for any GOOS this doctor does not
+// specifically know, rather than returning empty and silently skipping the
+// scope everywhere unrecognized. Thin wrapper over
+// claudeDesktopConfigPathForGOOS so tests can exercise all three branches
+// deterministically regardless of the host running the test.
+func claudeDesktopConfigPath(home string) string {
+	return claudeDesktopConfigPathForGOOS(home, runtime.GOOS)
+}
+
+func claudeDesktopConfigPathForGOOS(home, goos string) string {
+	switch goos {
+	case "windows":
+		appData := os.Getenv("APPDATA")
+		if appData == "" {
+			return "" // no reliable fallback: %APPDATA% absent means we cannot locate this scope at all
+		}
+		return filepath.Join(appData, "Claude", "claude_desktop_config.json")
+	case "linux":
+		return filepath.Join(home, ".config", "Claude", "claude_desktop_config.json")
+	default: // darwin and anything else
+		return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+	}
+}
+
+// claudeCodeManagedSettingsPath returns Claude Code's enterprise
+// managed-settings.json path for the current OS, per Anthropic's documented
+// managed-policy locations. Unlike claudeDesktopConfigPath this is a
+// machine-wide (not per-user) path with no $HOME component. Thin wrapper
+// over claudeCodeManagedSettingsPathForGOOS, same test-determinism reason as
+// claudeDesktopConfigPath above.
+func claudeCodeManagedSettingsPath() string {
+	return claudeCodeManagedSettingsPathForGOOS(runtime.GOOS)
+}
+
+func claudeCodeManagedSettingsPathForGOOS(goos string) string {
+	switch goos {
+	case "windows":
+		programData := os.Getenv("ProgramData")
+		if programData == "" {
+			programData = `C:\ProgramData`
+		}
+		return filepath.Join(programData, "ClaudeCode", "managed-settings.json")
+	case "linux":
+		return filepath.Join(string(filepath.Separator), "etc", "claude-code", "managed-settings.json")
+	default: // darwin and anything else
+		return filepath.Join(string(filepath.Separator), "Library", "Application Support", "ClaudeCode", "managed-settings.json")
+	}
+}
+
+// doctorDuplicateToolsets WARNs when the SAME target (URL or resolved
+// command, per mcpEntryTarget) is registered under 2+ names or 2+ scopes --
+// the harder case a single-file inspection or the existing "MCP server-name
+// generations" check (doctorConfigCoherence, string-prefix drift on names
+// within one merged config load) cannot see, because it never normalizes
+// past the literal name or looks across every scope Claude Code / Claude
+// Desktop / Hermes each maintain independently.
+//
+// Live evidence this check was built against (darkstar, 2026-08-21): the
+// target http://127.0.0.1:9000/mcp is mounted THREE separate ways --
+// "browseros" in ~/.claude.json's user scope (type:http, direct url),
+// "browseros" again in ~/.hermes/profiles/darkstar/config.yaml's mcp_servers
+// (same name, different scope), and "browserOS" in Claude Desktop's
+// claude_desktop_config.json via the `npx mcp-remote <url>` stdio-bridge
+// shape mcpEntryTarget normalizes through. The twin the issue asked doctor
+// to hunt for was not in ~/.claude/plugins (no matches) or
+// /Library/Application Support/ClaudeCode/managed-settings.json (does not
+// exist on this machine) -- it was in Claude Desktop's own config, a scope
+// outside the issue's original list, found by exhausting "any other config
+// the harness reads" and confirmed by this session's own deferred-tool
+// listing carrying both `mcp__browserOS__*` and `mcp__browseros__*`.
+func doctorDuplicateToolsets(g *DoctorGroup, home string) {
+	regs, unreadable := collectMCPRegistrations(home)
+	if len(unreadable) > 0 {
+		sort.Strings(unreadable)
+		g.add("duplicate toolset scopes (unreadable)", StatusUnknown, strings.Join(unreadable, "\n"))
+	}
+	if len(regs) == 0 {
+		g.add("duplicate toolset registrations", StatusUnknown, "no MCP server registration found in any scanned scope")
+		return
+	}
+
+	// Group AND display by the REDACTED target, never the raw one: an http
+	// MCP registration's URL routinely carries an auth token in its query
+	// string (?token=..., ?key=...), and this report is built to be shared
+	// -- pasted into an issue, logged from `--lint` in CI/cron, piped
+	// through --json -- exactly the #568 narrative this PR itself cites.
+	// Printing the raw target would leak that token into whatever the
+	// report lands in. Grouping on the redacted form is also more CORRECT,
+	// not just safer: two registrations of the same server that happen to
+	// embed different per-registration tokens in their query string are
+	// still the same double-mounted toolset and must still collide.
+	//
+	// Stdio command+args targets (mcpEntryTarget's non-URL branch) are
+	// displayed as-is -- args in the registrations this check was built
+	// against are package names and flags (uvx blender-mcp, npx -y
+	// mcp-markdown-viewer), not secrets; secrets in a stdio MCP server's
+	// config live in its "env" map, which this check never reads or
+	// displays at all.
+	byTarget := map[string][]mcpRegistration{}
+	for _, r := range regs {
+		key := redactMCPTarget(r.Target)
+		byTarget[key] = append(byTarget[key], r)
+	}
+	var targets []string
+	for t := range byTarget {
+		targets = append(targets, t)
+	}
+	sort.Strings(targets)
+
+	var dupLines []string
+	for _, t := range targets {
+		// Dedup identical (name, scope) pairs (a glob or double scan could
+		// otherwise double-count the same registration).
+		seen := map[string]bool{}
+		var uniq []mcpRegistration
+		for _, r := range byTarget[t] {
+			key := r.Name + "|" + r.Scope
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			uniq = append(uniq, r)
+		}
+		if len(uniq) < 2 {
+			continue
+		}
+		if !mcpRegistrationsGenuinelyCoLoad(uniq) {
+			// Every registration at this target is confined to a DIFFERENT
+			// ~/.claude.json project scope (or a single project scope with
+			// no other registration anywhere), so no single session ever
+			// loads more than one of them together -- see
+			// mcpRegistrationsGenuinelyCoLoad's doc comment. Not a
+			// duplicate this check should warn about.
+			continue
+		}
+		var parts []string
+		for _, r := range uniq {
+			parts = append(parts, fmt.Sprintf("%q in %s", r.Name, r.Scope))
+		}
+		dupLines = append(dupLines, fmt.Sprintf("%s:\n    %s", t, strings.Join(parts, "\n    ")))
+	}
+
+	if len(dupLines) == 0 {
+		g.add("duplicate toolset registrations", StatusOK, fmt.Sprintf(
+			"%d distinct MCP target(s) across %d scanned scope-registration(s); none double-mounted", len(targets), len(regs)))
+		return
+	}
+	g.add("duplicate toolset registrations", StatusWarn, fmt.Sprintf(
+		"%d target(s) registered under 2+ names/scopes (double context cost per session):\n%s",
+		len(dupLines), strings.Join(dupLines, "\n")))
+}
+
+// -- 5b: duplicate permission entries across settings.json / settings.local.json --
+
+// loadPermissionEntries reads the allow/deny/ask lists from a Claude Code
+// settings file. A missing file returns an empty map and a nil error (not
+// having a settings.local.json is normal, not a defect); a present-but-
+// unparseable file returns an error the caller reports as UNKNOWN.
+func loadPermissionEntries(path string) (map[string][]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string][]string{}, nil
+		}
+		return nil, err
+	}
+	var top map[string]any
+	if err := json.Unmarshal(data, &top); err != nil {
+		return nil, err
+	}
+	perms, ok := toAnyMap(top["permissions"])
+	if !ok {
+		return map[string][]string{}, nil
+	}
+	out := map[string][]string{}
+	for _, list := range []string{"allow", "deny", "ask"} {
+		raw, ok := perms[list].([]any)
+		if !ok {
+			continue
+		}
+		for _, e := range raw {
+			if s, ok := e.(string); ok {
+				out[list] = append(out[list], s)
+			}
+		}
+	}
+	return out, nil
+}
+
+// doctorDuplicatePermissions WARNs on exact-string permission entries
+// present in both settings.json and settings.local.json's allow/deny/ask
+// lists -- #568's sweep found the same mcp__cogos-v3__... line duplicated
+// across both; nothing before this check ever re-verified that finding
+// stayed fixed.
+func doctorDuplicatePermissions(g *DoctorGroup, home string) {
+	sjPath := filepath.Join(home, ".claude", "settings.json")
+	slPath := filepath.Join(home, ".claude", "settings.local.json")
+	sj, sjErr := loadPermissionEntries(sjPath)
+	sl, slErr := loadPermissionEntries(slPath)
+	if sjErr != nil || slErr != nil {
+		var msgs []string
+		if sjErr != nil {
+			msgs = append(msgs, fmt.Sprintf("%s: %v", sjPath, sjErr))
+		}
+		if slErr != nil {
+			msgs = append(msgs, fmt.Sprintf("%s: %v", slPath, slErr))
+		}
+		g.add("duplicate permission entries", StatusUnknown, strings.Join(msgs, "\n"))
+		return
+	}
+
+	var dupes []string
+	for _, list := range []string{"allow", "deny", "ask"} {
+		slSet := map[string]bool{}
+		for _, s := range sl[list] {
+			slSet[s] = true
+		}
+		for _, s := range sj[list] {
+			if slSet[s] {
+				dupes = append(dupes, fmt.Sprintf("%s: %s", list, s))
+			}
+		}
+	}
+	dupes = dedupeStrings(dupes)
+	if len(dupes) == 0 {
+		g.add("duplicate permission entries", StatusOK, "no exact-string permission entry appears in both settings.json and settings.local.json")
+		return
+	}
+	sort.Strings(dupes)
+	g.add("duplicate permission entries", StatusWarn, fmt.Sprintf(
+		"%d entry(ies) duplicated across settings.json and settings.local.json:\n%s", len(dupes), strings.Join(dupes, "\n")))
+}
+
+// -- 5c: always-loaded file budgets -----------------------------------------
+
+// doctorContextBudget lists the size of every always-loaded context file
+// this doctor knows about: ~/.claude/CLAUDE.md, every
+// ~/.claude/projects/*/memory/MEMORY.md, and CLAUDE.md at the root (and
+// .claude/ subdir) of every project ~/.claude.json has a "projects" entry
+// for. A file over thresholdKB is called out; a missing file is simply not
+// listed (absence is not a defect here); a present-but-unreadable file is
+// UNKNOWN, never silently skipped the same way a missing one is.
+func doctorContextBudget(g *DoctorGroup, home string, thresholdKB int) {
+	var candidates []string
+	candidates = append(candidates, filepath.Join(home, ".claude", "CLAUDE.md"))
+	candidates = append(candidates, globQuiet(filepath.Join(home, ".claude", "projects", "*", "memory", "MEMORY.md"))...)
+
+	if data, err := os.ReadFile(filepath.Join(home, ".claude.json")); err == nil {
+		var top map[string]any
+		if json.Unmarshal(data, &top) == nil {
+			if projects, ok := toAnyMap(top["projects"]); ok {
+				for p := range projects {
+					candidates = append(candidates,
+						filepath.Join(p, "CLAUDE.md"),
+						filepath.Join(p, ".claude", "CLAUDE.md"))
+				}
+			}
+		}
+	}
+
+	candidates = dedupeStrings(candidates)
+	sort.Strings(candidates)
+
+	var lines []string
+	var unknowns []string
+	overBudget := 0
+	listed := 0
+	var totalBytes int64
+	for _, f := range candidates {
+		info, err := os.Stat(f)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // not always-loaded on this machine -- not listed, not a defect
+			}
+			unknowns = append(unknowns, fmt.Sprintf("%s: %v", f, err))
+			continue
+		}
+		listed++
+		totalBytes += info.Size()
+		kb := float64(info.Size()) / 1024
+		tag := ""
+		if kb > float64(thresholdKB) {
+			overBudget++
+			tag = fmt.Sprintf(" [OVER %dKB BUDGET]", thresholdKB)
+		}
+		lines = append(lines, fmt.Sprintf("%s: %.1fKB%s", f, kb, tag))
+	}
+
+	if len(unknowns) > 0 {
+		sort.Strings(unknowns)
+		g.add("always-loaded file budgets (unreadable)", StatusUnknown, strings.Join(unknowns, "\n"))
+	}
+	if listed == 0 {
+		g.add("always-loaded file budgets", StatusUnknown, "no always-loaded context file found at any known location")
+		return
+	}
+
+	detail := fmt.Sprintf("threshold=%dKB; %d file(s), %.1fKB total:\n%s",
+		thresholdKB, listed, float64(totalBytes)/1024, strings.Join(lines, "\n"))
+	if overBudget > 0 {
+		g.add("always-loaded file budgets", StatusWarn, detail)
+	} else {
+		g.add("always-loaded file budgets", StatusOK, detail)
+	}
+}
+
+// -- 5d: dead hook commands ---------------------------------------------------
+
+// doctorDeadHooks WARNs, naming the hook event and the missing path, when a
+// hook command configured in settings.json / settings.local.json references
+// an executable/script path that no longer exists on disk. Hook commands in
+// this codebase's own settings are compound shell-like strings (hookrun.py
+// wrapping a target script, e.g. `python3 "<hookrun.py>" <label> python3
+// "<target.py>" <event>`), so this reuses pathLikeRe -- the same anchored
+// path-substring extractor doctorConfigCoherence already validated against
+// false positives from URLs/model IDs -- rather than a naive first-token
+// split, so every absolute path embedded in the command gets checked, not
+// just the first.
+func doctorDeadHooks(g *DoctorGroup, home string) {
+	files := []struct{ path, label string }{
+		{filepath.Join(home, ".claude", "settings.json"), "settings.json"},
+		{filepath.Join(home, ".claude", "settings.local.json"), "settings.local.json"},
+	}
+
+	var dead []string
+	var unknowns []string
+	checkedAny := false
+	for _, f := range files {
+		data, err := os.ReadFile(f.path)
+		if err != nil {
+			continue // not present -- nothing to check, not a defect
+		}
+		checkedAny = true
+		var top map[string]any
+		if err := json.Unmarshal(data, &top); err != nil {
+			unknowns = append(unknowns, fmt.Sprintf("%s: %v", f.path, err))
+			continue
+		}
+		hooksField, ok := toAnyMap(top["hooks"])
+		if !ok {
+			continue
+		}
+		events := make([]string, 0, len(hooksField))
+		for ev := range hooksField {
+			events = append(events, ev)
+		}
+		sort.Strings(events)
+		for _, event := range events {
+			matchers, ok := hooksField[event].([]any)
+			if !ok {
+				continue
+			}
+			for _, rm := range matchers {
+				mm, ok := toAnyMap(rm)
+				if !ok {
+					continue
+				}
+				hooksList, ok := mm["hooks"].([]any)
+				if !ok {
+					continue
+				}
+				for _, rh := range hooksList {
+					hh, ok := toAnyMap(rh)
+					if !ok {
+						continue
+					}
+					cmd, _ := hh["command"].(string)
+					if cmd == "" {
+						continue
+					}
+					for _, m := range pathLikeRe.FindAllString(cmd, -1) {
+						p := expandHome(m, home)
+						if !looksLikeRealPath(p) {
+							continue
+						}
+						if _, err := os.Stat(p); err != nil {
+							dead = append(dead, fmt.Sprintf("%s (%s): %s", event, f.label, p))
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(unknowns) > 0 {
+		sort.Strings(unknowns)
+		g.add("dead hook commands (unreadable)", StatusUnknown, strings.Join(unknowns, "\n"))
+	}
+	if !checkedAny {
+		g.add("dead hook commands", StatusUnknown, "no settings.json/settings.local.json found to check")
+		return
+	}
+	dead = dedupeStrings(dead)
+	if len(dead) == 0 {
+		g.add("dead hook commands", StatusOK, "every path referenced by a configured hook command exists on disk")
+		return
+	}
+	sort.Strings(dead)
+	g.add("dead hook commands", StatusWarn, fmt.Sprintf(
+		"%d hook-referenced path(s) do not exist on disk:\n%s", len(dead), strings.Join(dead, "\n")))
 }
