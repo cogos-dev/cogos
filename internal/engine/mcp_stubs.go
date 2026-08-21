@@ -314,7 +314,10 @@ type ftsToken struct {
 //   - A bare uppercase OR token between terms is honored as the FTS5 OR
 //     operator, so broadening a search is still possible.
 //   - A lone bare word (no quotes, no OR) is left unquoted, preserving the
-//     original broader single-term token match.
+//     original broader single-term token match -- except the literal
+//     (case-sensitive) FTS5 reserved keywords AND/NOT, which are quoted
+//     like any other term so a query of exactly "AND" or "NOT" cannot
+//     produce invalid FTS5 syntax.
 //   - Outside quoted phrases, FTS5 special characters that could produce a
 //     syntax error (leading '-', column-filter ':') are stripped from each
 //     term, and terms are individually double-quoted so stray FTS5 syntax
@@ -353,8 +356,15 @@ func buildFTSQuery(raw string) string {
 		if prevOperand {
 			out = append(out, "AND")
 		}
-		if !t.phrase && operandCount == 1 {
+		if !t.phrase && operandCount == 1 && t.text != "AND" && t.text != "NOT" {
 			// Sole bare term: keep the legacy unquoted, broader token match.
+			// Excludes the literal (case-sensitive) FTS5 reserved keywords
+			// AND/NOT, which are only special unquoted: an unquoted lone
+			// "AND" or "NOT" (e.g. from a query of exactly "AND", or "-AND"
+			// after sanitizeFTSBareWord strips the leading dash) is invalid
+			// FTS5 syntax with no operand on either side and errors the
+			// query instead of matching literally, the same crash class
+			// already handled for a lone "OR" via trimDanglingFTSOperators.
 			out = append(out, t.text)
 		} else {
 			out = append(out, `"`+t.text+`"`)

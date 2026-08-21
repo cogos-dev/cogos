@@ -226,6 +226,16 @@ func TestBuildFTSQuery(t *testing.T) {
 		{"trailing or", "foo OR", "foo"},
 		{"leading or", "OR foo", "foo"},
 
+		// A sole bare term that is itself the literal (case-sensitive)
+		// FTS5 reserved keyword AND or NOT must be quoted, not passed
+		// through unquoted like an ordinary single word, or it produces
+		// invalid FTS5 syntax (no operand on either side of the operator).
+		{"sole term literal AND", "AND", `"AND"`},
+		{"sole term literal NOT", "NOT", `"NOT"`},
+		{"sole term dash-AND reduces to reserved word", "-AND", `"AND"`},
+		{"sole term lowercase and is not reserved", "and", "and"},
+		{"sole term mixed-case And is not reserved", "And", "And"},
+
 		// Empty / whitespace-only input passes through unchanged.
 		{"empty string", "", ""},
 		{"whitespace only", "   ", "   "},
