@@ -1678,6 +1678,67 @@ func redactMCPTarget(target string) string {
 	return s
 }
 
+// mcpProjectScopeRe matches the scope label collectMCPRegistrations gives a
+// ~/.claude.json PER-PROJECT mcpServers block ("~/.claude.json (project:
+// <path>)"), as opposed to every other scope this doctor reads (user-level
+// ~/.claude.json, ~/.mcp.json, settings*.json, Hermes profiles, Claude
+// Desktop, managed-settings.json) -- all of which are always active
+// regardless of which project (if any) a session is in.
+var mcpProjectScopeRe = regexp.MustCompile(`^~/\.claude\.json \(project: (.+)\)$`)
+
+// mcpRegistrationProject reports the project path a scope names, if it
+// names one at all.
+func mcpRegistrationProject(scope string) (project string, isProjectScoped bool) {
+	m := mcpProjectScopeRe.FindStringSubmatch(scope)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// mcpRegistrationsGenuinelyCoLoad reports whether at least two of the given
+// same-target registrations could actually be loaded into the SAME running
+// session together -- the premise doctorDuplicateToolsets' "double context
+// cost per session" WARN message asserts. Only one ~/.claude.json project's
+// mcpServers block ever applies to a given session (whichever project that
+// session is rooted in); every other scope this doctor reads is always
+// active alongside it. So:
+//   - two registrations in DIFFERENT projects, and nowhere else, never
+//     co-load -- not a real collision, regardless of how many distinct
+//     projects register the same target this way.
+//   - a registration in ANY project co-loads with every non-project-scoped
+//     registration (that project's session always has the global scopes
+//     active too) -- a real collision.
+//   - two non-project-scoped registrations always co-load with each other
+//     -- a real collision.
+//   - two registrations that share the SAME project (two differently-named
+//     entries in one project's mcpServers block both resolving to this
+//     target) co-load within that one project's own sessions -- a real
+//     collision.
+func mcpRegistrationsGenuinelyCoLoad(regs []mcpRegistration) bool {
+	projectCounts := map[string]int{}
+	nonProjectScoped := 0
+	for _, r := range regs {
+		if proj, ok := mcpRegistrationProject(r.Scope); ok {
+			projectCounts[proj]++
+		} else {
+			nonProjectScoped++
+		}
+	}
+	if nonProjectScoped >= 2 {
+		return true
+	}
+	if nonProjectScoped >= 1 && len(projectCounts) >= 1 {
+		return true
+	}
+	for _, n := range projectCounts {
+		if n >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
 // toAnyMap coerces a decoded JSON or YAML value to map[string]any. YAML
 // decoded via gopkg.in/yaml.v3 into `any` already produces map[string]any
 // for mapping nodes (unlike yaml.v2's map[interface{}]interface{}), so this
@@ -1954,6 +2015,15 @@ func doctorDuplicateToolsets(g *DoctorGroup, home string) {
 			uniq = append(uniq, r)
 		}
 		if len(uniq) < 2 {
+			continue
+		}
+		if !mcpRegistrationsGenuinelyCoLoad(uniq) {
+			// Every registration at this target is confined to a DIFFERENT
+			// ~/.claude.json project scope (or a single project scope with
+			// no other registration anywhere), so no single session ever
+			// loads more than one of them together -- see
+			// mcpRegistrationsGenuinelyCoLoad's doc comment. Not a
+			// duplicate this check should warn about.
 			continue
 		}
 		var parts []string

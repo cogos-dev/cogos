@@ -1158,6 +1158,82 @@ mcp_servers:
 	}
 }
 
+// TestDuplicateToolsetRegistrationsOKAcrossDifferentProjects pins a
+// cog-review-flagged false positive: two DIFFERENT ~/.claude.json projects
+// independently registering the same MCP server under the same name is a
+// normal, intentional pattern (a team checking the same server into
+// multiple project configs) -- and it is never actually "double context
+// cost per session", because only one project's mcpServers block ever
+// applies to a given session. This must not WARN.
+func TestDuplicateToolsetRegistrationsOKAcrossDifferentProjects(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeFile(t, filepath.Join(home, ".claude.json"), `{
+		"projects": {
+			"/repo-a": {"mcpServers": {"github": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}}},
+			"/repo-b": {"mcpServers": {"github": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}}}
+		}
+	}`)
+
+	report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
+	if check.Status != StatusOK {
+		t.Fatalf("same target registered independently in two DIFFERENT projects = %s, want OK (never co-loaded in one session); detail=%s", check.Status, check.Detail)
+	}
+}
+
+// TestDuplicateToolsetRegistrationsWarnsWhenProjectDuplicatesUserScope is
+// the paired positive case: a project-scoped registration DOES genuinely
+// collide with a non-project-scoped registration of the same target,
+// because every session rooted in that project has BOTH the project's own
+// mcpServers block AND the always-active user-level one loaded together.
+func TestDuplicateToolsetRegistrationsWarnsWhenProjectDuplicatesUserScope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeFile(t, filepath.Join(home, ".claude.json"), `{
+		"mcpServers": {"github": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}},
+		"projects": {
+			"/repo-a": {"mcpServers": {"github-again": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}}}
+		}
+	}`)
+
+	report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
+	if check.Status != StatusWarn {
+		t.Fatalf("project scope duplicating the always-active user scope = %s, want WARN (genuinely co-loaded); detail=%s", check.Status, check.Detail)
+	}
+	if !strings.Contains(check.Detail, "~/.claude.json (user)") || !strings.Contains(check.Detail, "~/.claude.json (project: /repo-a)") {
+		t.Errorf("expected both scope labels named in detail:\n%s", check.Detail)
+	}
+}
+
+// TestDuplicateToolsetRegistrationsWarnsWithinSameProject is the third
+// case: two DIFFERENTLY-NAMED entries within the SAME project's mcpServers
+// block resolving to the same target genuinely co-load within that
+// project's own sessions, regardless of whether any other project or scope
+// is involved at all.
+func TestDuplicateToolsetRegistrationsWarnsWithinSameProject(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeFile(t, filepath.Join(home, ".claude.json"), `{
+		"projects": {
+			"/repo-a": {"mcpServers": {
+				"github": {"type": "http", "url": "http://127.0.0.1:9000/mcp"},
+				"github-dup": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}
+			}}
+		}
+	}`)
+
+	report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
+	if check.Status != StatusWarn {
+		t.Fatalf("two differently-named entries within the SAME project = %s, want WARN; detail=%s", check.Status, check.Detail)
+	}
+}
+
 // TestDuplicateToolsetRegistrationsNormalizesNpxMcpRemoteWrapper pins the
 // harder normalization case: a stdio `npx mcp-remote <url>` bridge (the
 // shape Claude Desktop's config uses to mount an http MCP server) must
