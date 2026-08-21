@@ -232,9 +232,11 @@ func TestBuildFTSQuery(t *testing.T) {
 		// invalid FTS5 syntax (no operand on either side of the operator).
 		{"sole term literal AND", "AND", `"AND"`},
 		{"sole term literal NOT", "NOT", `"NOT"`},
+		{"sole term literal NEAR", "NEAR", `"NEAR"`},
 		{"sole term dash-AND reduces to reserved word", "-AND", `"AND"`},
 		{"sole term lowercase and is not reserved", "and", "and"},
 		{"sole term mixed-case And is not reserved", "And", "And"},
+		{"sole term lowercase near is not reserved", "near", "near"},
 
 		// Empty / whitespace-only input passes through unchanged.
 		{"empty string", "", ""},

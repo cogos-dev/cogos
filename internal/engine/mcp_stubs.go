@@ -315,9 +315,9 @@ type ftsToken struct {
 //     operator, so broadening a search is still possible.
 //   - A lone bare word (no quotes, no OR) is left unquoted, preserving the
 //     original broader single-term token match -- except the literal
-//     (case-sensitive) FTS5 reserved keywords AND/NOT, which are quoted
-//     like any other term so a query of exactly "AND" or "NOT" cannot
-//     produce invalid FTS5 syntax.
+//     (case-sensitive) FTS5 reserved keywords AND/NOT/NEAR, which are
+//     quoted like any other term so a query of exactly "AND" or "NOT"
+//     cannot produce invalid FTS5 syntax (see isFTSReservedBareWord).
 //   - Outside quoted phrases, FTS5 special characters that could produce a
 //     syntax error (leading '-', column-filter ':') are stripped from each
 //     term, and terms are individually double-quoted so stray FTS5 syntax
@@ -356,7 +356,7 @@ func buildFTSQuery(raw string) string {
 		if prevOperand {
 			out = append(out, "AND")
 		}
-		if !t.phrase && operandCount == 1 && t.text != "AND" && t.text != "NOT" {
+		if !t.phrase && operandCount == 1 && !isFTSReservedBareWord(t.text) {
 			// Sole bare term: keep the legacy unquoted, broader token match.
 			// Excludes the literal (case-sensitive) FTS5 reserved keywords
 			// AND/NOT, which are only special unquoted: an unquoted lone
@@ -365,6 +365,10 @@ func buildFTSQuery(raw string) string {
 			// FTS5 syntax with no operand on either side and errors the
 			// query instead of matching literally, the same crash class
 			// already handled for a lone "OR" via trimDanglingFTSOperators.
+			// NEAR is quoted too, out of caution: unlike AND/NOT/OR it is
+			// not actually reserved unless followed by '(' (a bare "NEAR"
+			// is empirically a valid, harmless literal-token match), but
+			// quoting it changes nothing observable and costs nothing.
 			out = append(out, t.text)
 		} else {
 			out = append(out, `"`+t.text+`"`)
@@ -466,6 +470,20 @@ func trimDanglingFTSOperators(toks []ftsToken) []ftsToken {
 func isFTSQuerySpace(b byte) bool {
 	switch b {
 	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+// isFTSReservedBareWord reports whether w is one of FTS5's reserved query
+// keywords (AND, NOT, NEAR), matched case-sensitively as FTS5 itself does
+// (lowercase/mixed-case "and"/"or"/"near" etc. are ordinary search terms).
+// buildFTSQuery's sole-bare-term fast path uses this to fall back to
+// quoting instead of emitting an unquoted reserved word.
+func isFTSReservedBareWord(w string) bool {
+	switch w {
+	case "AND", "NOT", "NEAR":
 		return true
 	default:
 		return false
