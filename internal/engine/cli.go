@@ -58,6 +58,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "  coherence   Check workspace coherence (graded git-distance score)\n")
 	fmt.Fprintf(w, "  rates       Print the kernel clock-constant rate-ratio table\n")
 	fmt.Fprintf(w, "  reindex     Rebuild the FTS5 constellation index from scratch\n")
+	fmt.Fprintf(w, "  doctor      Diagnose install/config/index/store health (OK/WARN/FAIL/UNKNOWN)\n")
 	fmt.Fprintf(w, "  debug       Fetch a live pprof profile from the running daemon (heap, goroutines)\n")
 	fmt.Fprintf(w, "  spine       Show the decision manifold (gravity/inertia field over ADRs/RFCs)\n")
 	fmt.Fprintf(w, "  mcp         MCP server sub-commands (serve, ...)\n")
@@ -168,6 +169,9 @@ func Main() {
 			return
 		case "reindex":
 			runReindexCmd(args[1:], *workspace)
+			return
+		case "doctor":
+			runDoctorCmd(args[1:], *workspace)
 			return
 		case "debug":
 			runDebugCmd(args[1:], *workspace, *port)
