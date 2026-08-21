@@ -19,7 +19,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -36,113 +38,134 @@ const quickCheckTimeout = 30 * time.Second
 // timestamp (see preserveCorruptStore) rather than left behind or deleted:
 // the WAL in particular may hold the last valid pages that never made it
 // into the main file, so it is part of the evidence, not disposable.
-const (
-	walSuffix = "-wal"
-	shmSuffix = "-shm"
-)
-
-var sidecarSuffixes = []string{walSuffix, shmSuffix}
-
-// quarantineTag marks a sidecar file moved out of the way while its main
-// file's integrity is being checked (see quarantineSidecars). It is always
-// resolved back to either the original name (healthy — restoreSidecars) or
-// a final ".corrupt-<ts>" name (corrupt — preserveCorruptStore) before
-// PreserveCorruptStore returns; it should never be visible afterward.
-const quarantineTag = ".guard-tmp"
-
-// sidecarQuarantine records where one sidecar file (identified by suffix,
-// e.g. "-wal") lived before quarantine (orig) and where it was moved to
-// during quarantine (quarantinedPath == "" if it was not present at all).
-// Both are recorded explicitly — rather than reconstructed later by
-// trimming quarantinedPath — because quarantinedPath can itself carry a
-// numeric collision suffix (see quarantineSidecars) that would make a
-// simple TrimSuffix wrong.
-type sidecarQuarantine struct {
-	suffix          string
-	orig            string
-	quarantinedPath string
-}
+var sidecarSuffixes = []string{"-wal", "-shm"}
 
 // PreserveCorruptStore inspects the SQLite store file at dbPath, if any, and
-// renames it — along with any WAL/SHM sidecars — out of the way when it
-// fails an integrity check or cannot be opened as a database at all. It
-// never unlinks anything; a failed file is moved, not deleted, so it remains
-// available as forensic evidence.
+// renames it — along with any WAL/SHM sidecars present at that moment — out
+// of the way when it fails an integrity check or cannot be opened as a
+// database at all. It never unlinks anything; a failed file is moved, not
+// deleted, so it remains available as forensic evidence.
 //
-// Before running the check, any existing WAL/SHM sidecars are quarantined
-// (renamed aside) first: opening even a read-only connection against a main
-// file with mismatched or unreadable sidecars can make SQLite silently
-// unlink them as part of its own WAL-recovery/consistency handling —
-// observed empirically against this exact driver (see the sidecar test in
-// store_guard_test.go). Quarantining first means the integrity check never
-// has sidecars in place to react to; they are restored unchanged afterward
-// if the store turns out healthy, or carried into the final preserved
-// filenames if it does not — either way nothing already on disk before this
-// function ran is ever silently deleted.
+// The integrity check runs against a private byte-copy of dbPath (see
+// snapshotForCheck), never against the live file, and a healthy result
+// touches nothing at all — no rename, no sidecar interaction of any kind.
+// This is deliberate, not incidental: "cogos reindex" is documented (see
+// cli_reindex.go's doc comment and the drift-detection log line in
+// mcp_stubs.go) as the routine remedy a user runs in another terminal WHILE
+// the daemon keeps its own live WAL connection open on this same file —
+// nothing stops or locks the daemon first. In that steady state the -wal/-
+// shm sidecars are the daemon's live working files, not corruption leftovers,
+// and an earlier version of this guard that opened the live file (or
+// quarantined its sidecars) before deciding whether it was even unhealthy
+// could race that connection: SQLite recreating a sidecar mid-check, then
+// a later "restore" step blindly renaming over it, would silently discard
+// live WAL frames — an undisclosed data-loss path on the most common
+// invocation. Checking a copy sidesteps that class of race entirely: the
+// live file and its sidecars are only ever touched, via plain os.Rename, at
+// the point this function has already proven — from the copy — that the
+// main file is corrupt and is about to be replaced anyway.
 //
 // Return values:
 //   - preservedPath == "" and err == nil: either dbPath does not exist yet,
-//     or the existing file is healthy. No action was taken beyond the
-//     transient quarantine-and-restore of any sidecars; the caller's normal
-//     open-or-create behavior proceeds unchanged.
+//     or the existing file is healthy. Nothing was touched; the caller's
+//     normal open-or-create behavior proceeds unchanged.
 //   - preservedPath != "": an existing file failed the check and was
 //     renamed to preservedPath. reason explains why (quick_check's report,
 //     an "empty file" finding, or the underlying open/scan error) — the
 //     caller should log both loudly before rebuilding fresh.
-//   - err != nil: a filesystem operation itself failed (stat/rename).
-//     This is distinct from a corruption finding, which is always reported
-//     through preservedPath/reason with err == nil.
+//   - err != nil: a filesystem operation itself failed (stat/snapshot/
+//     rename). This is distinct from a corruption finding, which is always
+//     reported through preservedPath/reason with err == nil.
 func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, err error) {
-	if _, statErr := os.Stat(dbPath); statErr != nil {
+	info, statErr := os.Stat(dbPath)
+	if statErr != nil {
 		if os.IsNotExist(statErr) {
 			return "", "", nil // nothing to preserve — fresh build proceeds normally
 		}
 		return "", "", fmt.Errorf("stat %s: %w", dbPath, statErr)
 	}
 
-	quarantined, qerr := quarantineSidecars(dbPath)
-	if qerr != nil {
-		return "", "", fmt.Errorf("quarantine sidecars for %s: %w", dbPath, qerr)
-	}
-
-	checkErr := checkStoreIntegrity(dbPath)
-	if checkErr == nil {
-		if restoreErr := restoreSidecars(quarantined); restoreErr != nil {
-			return "", "", fmt.Errorf("restore sidecars for healthy store %s: %w", dbPath, restoreErr)
+	// A zero-byte file is treated as failed integrity even though SQLite
+	// itself would happily accept it as a valid empty database: an existing
+	// 0-byte file at a store path is much more likely to be the leftovers
+	// of an interrupted write than a deliberately-created empty store (a
+	// fresh workspace has no file at all — Open creates it lazily), and
+	// there is nothing lost by routing it through the same
+	// preserve-and-rebuild path as any other unreadable file. No snapshot
+	// is needed to reach that verdict.
+	var checkErr error
+	if info.Size() == 0 {
+		checkErr = fmt.Errorf("store file is empty (0 bytes)")
+	} else {
+		snapshot, snapErr := snapshotForCheck(dbPath)
+		if snapErr != nil {
+			return "", "", fmt.Errorf("snapshot %s for integrity check: %w", dbPath, snapErr)
 		}
-		return "", "", nil // healthy — replacement behavior unchanged
+		// snapshot is our own private scratch copy, never anything the user
+		// owns — os.Remove here is unrelated to the "never unlink the store"
+		// rule, which is about dbPath itself.
+		defer os.Remove(snapshot)
+		checkErr = checkStoreIntegrity(snapshot)
 	}
 
-	target, renameErr := preserveCorruptStore(dbPath, quarantined)
+	if checkErr == nil {
+		return "", "", nil // healthy — nothing was touched
+	}
+
+	target, renameErr := preserveCorruptStore(dbPath)
 	if renameErr != nil {
 		return "", "", fmt.Errorf("preserve corrupt store %s (integrity failure: %v): %w", dbPath, checkErr, renameErr)
 	}
 	return target, checkErr.Error(), nil
 }
 
-// checkStoreIntegrity opens dbPath read-only and runs a bounded
-// PRAGMA quick_check. It returns nil only when the file opens cleanly and
-// quick_check reports "ok". Callers must have already quarantined any
-// WAL/SHM sidecars before calling this (see the PreserveCorruptStore doc
-// comment for why).
+// snapshotForCheck copies dbPath's current bytes to a private temp file in
+// the same directory and returns its path; the caller is responsible for
+// removing it. Copying (rather than opening dbPath directly, even
+// read-only) means the integrity check never touches the live file or its
+// sidecars — see the PreserveCorruptStore doc comment for why that matters
+// against a concurrently open daemon connection. The plain os.Open+io.Copy
+// used here takes no SQLite-level locks, so it cannot contend with one
+// either.
 //
-// A zero-byte file is treated as failed integrity even though SQLite itself
-// would happily accept it as a valid empty database: an existing 0-byte file
-// at a store path is much more likely to be the leftovers of an interrupted
-// write than a deliberately-created empty store (a fresh workspace has no
-// file at all — Open creates it lazily), and there is nothing lost by
-// routing it through the same preserve-and-rebuild path as any other
-// unreadable file.
-func checkStoreIntegrity(dbPath string) error {
-	info, err := os.Stat(dbPath)
+// Trade-off, accepted deliberately: a copy of a large store (a live
+// constellation.db can be hundreds of MB) costs extra I/O and disk space for
+// the moment the copy exists, and a copy taken mid-write could in principle
+// capture a torn snapshot that fails quick_check even though the live store
+// is fine. Both failure directions land on the safe side of the rule this
+// guard exists to enforce: a spurious "corrupt" verdict costs an unnecessary
+// preserve-and-rebuild cycle, never data loss.
+func snapshotForCheck(dbPath string) (string, error) {
+	src, err := os.Open(dbPath)
 	if err != nil {
-		return fmt.Errorf("stat: %w", err)
+		return "", fmt.Errorf("open %s for snapshot: %w", dbPath, err)
 	}
-	if info.Size() == 0 {
-		return fmt.Errorf("store file is empty (0 bytes)")
-	}
+	defer src.Close()
 
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro&_busy_timeout=5000")
+	dst, err := os.CreateTemp(filepath.Dir(dbPath), ".reindex-integrity-check-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create snapshot temp file: %w", err)
+	}
+	tmpPath := dst.Name()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("copy %s to snapshot: %w", dbPath, err)
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("close snapshot file: %w", err)
+	}
+	return tmpPath, nil
+}
+
+// checkStoreIntegrity opens path read-only and runs a bounded
+// PRAGMA quick_check. It returns nil only when the file opens cleanly and
+// quick_check reports "ok". Always called against a snapshotForCheck copy,
+// never the live store file — see the PreserveCorruptStore doc comment.
+func checkStoreIntegrity(path string) error {
+	db, err := sql.Open("sqlite3", path+"?mode=ro&_busy_timeout=5000")
 	if err != nil {
 		return fmt.Errorf("open read-only: %w", err)
 	}
@@ -161,102 +184,53 @@ func checkStoreIntegrity(dbPath string) error {
 	return nil
 }
 
-// quarantineSidecars renames any existing "<dbPath>-wal"/"<dbPath>-shm" out
-// of the way (to "<original>.guard-tmp", collision-bumped — see
-// nextFreeName) before the main file is opened for its integrity check. The
-// collision bump matters here specifically: a ".guard-tmp" name left behind
-// by an earlier run that crashed mid-guard (after quarantining, before
-// resolving) is itself unresolved evidence — a fresh quarantine must never
-// silently os.Rename over it. If renaming a later sidecar fails, everything
-// already quarantined in this call is best-effort restored before returning
-// the error, so a partial failure never leaves a sidecar stranded under a
-// ".guard-tmp" name.
-func quarantineSidecars(dbPath string) ([]sidecarQuarantine, error) {
-	done := make([]sidecarQuarantine, 0, len(sidecarSuffixes))
-	for _, suffix := range sidecarSuffixes {
-		orig := dbPath + suffix
-		if _, statErr := os.Stat(orig); statErr != nil {
-			done = append(done, sidecarQuarantine{suffix: suffix, orig: orig})
-			continue
-		}
-		tmp := nextFreeName(orig + quarantineTag)
-		if err := os.Rename(orig, tmp); err != nil {
-			_ = restoreSidecars(done) // best-effort — we're already failing
-			return nil, fmt.Errorf("rename %s -> %s: %w", orig, tmp, err)
-		}
-		done = append(done, sidecarQuarantine{suffix: suffix, orig: orig, quarantinedPath: tmp})
-	}
-	return done, nil
-}
-
-// restoreSidecars renames every quarantined sidecar back to its original
-// name. Called when the main file turns out healthy, so the sidecars —
-// untouched throughout — end up exactly where they started.
-func restoreSidecars(qs []sidecarQuarantine) error {
-	for _, q := range qs {
-		if q.quarantinedPath == "" {
-			continue
-		}
-		if err := os.Rename(q.quarantinedPath, q.orig); err != nil {
-			return fmt.Errorf("rename %s -> %s: %w", q.quarantinedPath, q.orig, err)
-		}
-	}
-	return nil
-}
-
-// preserveCorruptStore renames dbPath — and any quarantined -wal/-shm
-// sidecars — to "<original name>.corrupt-<UTC timestamp>", appending a
-// numeric suffix if that exact name is already taken. All files in the
+// preserveCorruptStore renames dbPath — and any -wal/-shm sidecars present
+// at this moment — to "<original name>.corrupt-<UTC timestamp>", appending
+// a numeric suffix if that exact name is already taken. All files in the
 // group share one timestamp (computed once) so the preserved set reads as
 // one coherent snapshot; each file's target name is resolved independently
 // so a same-second collision on just the sidecar doesn't block preserving
-// the main file.
-func preserveCorruptStore(dbPath string, quarantined []sidecarQuarantine) (string, error) {
+// the main file. Only reached once PreserveCorruptStore has already proven,
+// from an isolated copy, that dbPath is corrupt — so this is a single
+// forward-only move per file (rename to its final resting place), never a
+// quarantine-then-restore round trip that could race a concurrent writer.
+func preserveCorruptStore(dbPath string) (string, error) {
 	ts := time.Now().UTC().Format("20060102T150405Z")
 
-	mainTarget, err := renameAside(dbPath, dbPath, ts)
+	mainTarget, err := renameAside(dbPath, ts)
 	if err != nil {
-		_ = restoreSidecars(quarantined) // bail cleanly — nothing was preserved
 		return "", err
 	}
 
-	for _, q := range quarantined {
-		if q.quarantinedPath == "" {
-			continue
+	for _, suffix := range sidecarSuffixes {
+		sidecar := dbPath + suffix
+		if _, statErr := os.Stat(sidecar); statErr != nil {
+			continue // sidecar not present right now — nothing to preserve
 		}
-		if _, err := renameAside(q.quarantinedPath, q.orig, ts); err != nil {
-			return mainTarget, fmt.Errorf("main file preserved at %s, but sidecar %s: %w", mainTarget, q.orig, err)
+		if _, err := renameAside(sidecar, ts); err != nil {
+			return mainTarget, fmt.Errorf("main file preserved at %s, but sidecar %s: %w", mainTarget, sidecar, err)
 		}
 	}
 
 	return mainTarget, nil
 }
 
-// nextFreeName returns base, or base with a numeric suffix ("-1", "-2", ...)
-// appended, whichever is the first name that does not currently exist on
-// disk. Used both for the final ".corrupt-<ts>" targets (renameAside) and
-// for the transient ".guard-tmp" quarantine name (quarantineSidecars) — in
-// both cases a same-name collision must bump rather than silently overwrite
-// whatever is already there.
-func nextFreeName(base string) string {
+// renameAside renames path to "<path>.corrupt-<ts>", appending "-1", "-2",
+// ... if that exact name already exists, so a collision bumps rather than
+// silently overwriting whatever preserved corpse is already there. Always
+// uses os.Rename — never os.Remove — so the original bytes are preserved,
+// not deleted.
+func renameAside(path, ts string) (string, error) {
+	base := path + ".corrupt-" + ts
 	target := base
 	for n := 1; ; n++ {
 		if _, err := os.Stat(target); os.IsNotExist(err) {
-			return target
+			break
 		}
 		target = fmt.Sprintf("%s-%d", base, n)
 	}
-}
-
-// renameAside renames src (the file's current location — which may be a
-// quarantined temp path) to "<targetBase>.corrupt-<ts>", appending "-1",
-// "-2", ... if that name is already taken (see nextFreeName). It always uses
-// os.Rename — never os.Remove — so the original bytes are preserved, not
-// deleted.
-func renameAside(src, targetBase, ts string) (string, error) {
-	target := nextFreeName(targetBase + ".corrupt-" + ts)
-	if err := os.Rename(src, target); err != nil {
-		return "", fmt.Errorf("rename %s -> %s: %w", src, target, err)
+	if err := os.Rename(path, target); err != nil {
+		return "", fmt.Errorf("rename %s -> %s: %w", path, target, err)
 	}
 	return target, nil
 }

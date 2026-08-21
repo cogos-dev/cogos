@@ -210,7 +210,7 @@ func TestPreserveCorruptStore_CollisionAppendsNumericSuffix(t *testing.T) {
 		t.Fatalf("seed collision file: %v", err)
 	}
 
-	target, err := renameAside(dbPath, dbPath, ts)
+	target, err := renameAside(dbPath, ts)
 	if err != nil {
 		t.Fatalf("renameAside: %v", err)
 	}
@@ -228,65 +228,12 @@ func TestPreserveCorruptStore_CollisionAppendsNumericSuffix(t *testing.T) {
 	// bump just created) must bump again to "-2".
 	makeSmallSQLiteDB(t, dbPath)
 	corruptMidFile(t, dbPath)
-	target2, err := renameAside(dbPath, dbPath, ts)
+	target2, err := renameAside(dbPath, ts)
 	if err != nil {
 		t.Fatalf("renameAside second call: %v", err)
 	}
 	if target2 != collision+"-2" {
 		t.Fatalf("expected second collision to bump to %s, got %s", collision+"-2", target2)
-	}
-}
-
-// TestPreserveCorruptStore_QuarantineCollisionDoesNotOverwriteStranded
-// exercises a narrower hazard than the ".corrupt-<ts>" collision above: a
-// ".guard-tmp" quarantine name left behind by an earlier run that crashed
-// mid-guard (after quarantining a sidecar, before resolving it either way)
-// is itself unresolved evidence, and a later run's quarantine step must not
-// silently os.Rename over it.
-func TestPreserveCorruptStore_QuarantineCollisionDoesNotOverwriteStranded(t *testing.T) {
-	root := t.TempDir()
-	dbPath := filepath.Join(root, "constellation.db")
-	makeSmallSQLiteDB(t, dbPath)
-
-	strandedWal := dbPath + "-wal" + quarantineTag
-	strandedContent := []byte("stranded wal bytes from a run that crashed mid-guard")
-	if err := os.WriteFile(strandedWal, strandedContent, 0644); err != nil {
-		t.Fatalf("seed stranded quarantine file: %v", err)
-	}
-
-	liveWalContent := []byte("live wal content for the current run")
-	if err := os.WriteFile(dbPath+"-wal", liveWalContent, 0644); err != nil {
-		t.Fatalf("write live wal fixture: %v", err)
-	}
-	corruptMidFile(t, dbPath)
-
-	preserved, _, err := PreserveCorruptStore(dbPath)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if preserved == "" {
-		t.Fatalf("expected preservation")
-	}
-
-	// The stranded file must be untouched, byte-identical, at its original name.
-	gotStranded, err := os.ReadFile(strandedWal)
-	if err != nil {
-		t.Fatalf("stranded quarantine file disappeared: %v", err)
-	}
-	if !bytes.Equal(gotStranded, strandedContent) {
-		t.Fatalf("stranded quarantine file was overwritten: got %q want %q", gotStranded, strandedContent)
-	}
-
-	// The live wal must still be preserved somewhere, byte-identical, just not
-	// at the collided name.
-	suffix := preserved[len(dbPath):]
-	walTarget := dbPath + "-wal" + suffix
-	gotWal, err := os.ReadFile(walTarget)
-	if err != nil {
-		t.Fatalf("expected live wal preserved at %s: %v", walTarget, err)
-	}
-	if !bytes.Equal(gotWal, liveWalContent) {
-		t.Fatalf("preserved wal content mismatch: got %q want %q", gotWal, liveWalContent)
 	}
 }
 
@@ -354,15 +301,16 @@ func TestPreserveCorruptStore_SidecarsPreservedCoherently(t *testing.T) {
 	if _, err := os.Stat(shmPath); !os.IsNotExist(err) {
 		t.Fatalf("shm sidecar should have been renamed away, stat err = %v", err)
 	}
-	// And no ".guard-tmp" quarantine name should be left dangling — the
-	// quarantine is an internal transient, never a visible end state.
+	// And no leftover ".reindex-integrity-check-*.tmp" snapshot file should
+	// be left dangling — snapshotForCheck's temp copy is an internal
+	// transient (cleaned up via defer os.Remove), never a visible end state.
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
 	}
 	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), quarantineTag) {
-			t.Fatalf("dangling quarantine file left behind: %s", e.Name())
+		if strings.Contains(e.Name(), "integrity-check") {
+			t.Fatalf("dangling snapshot temp file left behind: %s", e.Name())
 		}
 	}
 
@@ -387,11 +335,11 @@ func TestPreserveCorruptStore_SidecarsPreservedCoherently(t *testing.T) {
 	}
 }
 
-// TestPreserveCorruptStore_SidecarsRestoredUnchangedWhenHealthy verifies the
-// other half of the quarantine mechanism: a healthy store's sidecars survive
-// the quarantine-for-checking round trip byte-identical and back at their
-// original names, since PreserveCorruptStore must leave a healthy store's
-// on-disk layout completely unchanged.
+// TestPreserveCorruptStore_SidecarsRestoredUnchangedWhenHealthy verifies
+// that a healthy store's sidecars survive PreserveCorruptStore completely
+// untouched and byte-identical: the integrity check runs against a private
+// copy (snapshotForCheck), so a healthy verdict means the live file and its
+// sidecars were never opened, renamed, or otherwise interacted with at all.
 func TestPreserveCorruptStore_SidecarsRestoredUnchangedWhenHealthy(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "constellation.db")
@@ -441,5 +389,54 @@ func TestPreserveCorruptStore_SidecarsRestoredUnchangedWhenHealthy(t *testing.T)
 			names[i] = e.Name()
 		}
 		t.Fatalf("expected exactly db+wal+shm (3 files), got %v", names)
+	}
+}
+
+// TestPreserveCorruptStore_LeavesLiveWALConnectionUndisturbed is the direct
+// regression test for the concurrency hazard this design was changed to
+// eliminate: cogos reindex is documented (cli_reindex.go, and the
+// drift-detection log line in mcp_stubs.go) as the routine remedy a user
+// runs in another terminal WHILE the daemon keeps its own live WAL
+// connection open on the same store — nothing stops or locks it first. This
+// test holds a real, live WAL-mode connection open (standing in for the
+// daemon) across a PreserveCorruptStore call against the same healthy file,
+// then proves that connection still works afterward: a write through the
+// SAME still-open handle succeeding is only possible if nothing about the
+// file's on-disk identity or its sidecars was disturbed underneath it.
+func TestPreserveCorruptStore_LeavesLiveWALConnectionUndisturbed(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "constellation.db")
+
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		t.Fatalf("open live connection: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE probe (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO probe (val) VALUES ('before')`); err != nil {
+		t.Fatalf("insert before: %v", err)
+	}
+
+	preserved, reason, err := PreserveCorruptStore(dbPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if preserved != "" || reason != "" {
+		t.Fatalf("expected no-op against a live healthy connection, got preserved=%q reason=%q", preserved, reason)
+	}
+
+	// The live connection must still work: a fresh write and read through
+	// the SAME still-open handle must succeed.
+	if _, err := db.Exec(`INSERT INTO probe (val) VALUES ('after')`); err != nil {
+		t.Fatalf("insert after PreserveCorruptStore: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probe`).Scan(&count); err != nil {
+		t.Fatalf("select after PreserveCorruptStore: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 rows (before + after), got %d", count)
 	}
 }
