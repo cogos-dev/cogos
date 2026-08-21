@@ -1350,8 +1350,16 @@ const corruptFileMarker = ".corrupt-"
 // WalkDir, unlike producing a fresh one via quick_check.
 func doctorCorruptFiles(g *DoctorGroup, cogDir string) {
 	var found []string
-	_ = filepath.WalkDir(cogDir, func(p string, d fs.DirEntry, err error) error {
+	var walkErrs []string
+	walkErr := filepath.WalkDir(cogDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			// A path under cogDir could not be visited (permission denied,
+			// vanished mid-walk, etc). Record it and keep walking the rest of
+			// the tree so a single bad subdirectory doesn't blind the whole
+			// check -- but this walk can no longer certify "no *.corrupt-*
+			// files anywhere under cogDir", only "none found among the paths
+			// we could reach". Never let that partial result present as OK.
+			walkErrs = append(walkErrs, fmt.Sprintf("%s: %v", p, err))
 			return nil
 		}
 		if !d.IsDir() && strings.Contains(d.Name(), corruptFileMarker) {
@@ -1359,6 +1367,26 @@ func doctorCorruptFiles(g *DoctorGroup, cogDir string) {
 		}
 		return nil
 	})
+	if walkErr != nil {
+		// WalkDir itself only surfaces a top-level error here if the
+		// callback returns non-nil, which it never does above; guarded
+		// anyway so a future change to this callback can't silently regress
+		// back to swallowing it.
+		walkErrs = append(walkErrs, fmt.Sprintf("%s: %v", cogDir, walkErr))
+	}
+
+	if len(walkErrs) > 0 {
+		sort.Strings(walkErrs)
+		detail := fmt.Sprintf(
+			"could not fully walk %s -- %d path(s) unreadable, so the absence of *.corrupt-* files under them is unverified (never reported as OK):\n%s",
+			cogDir, len(walkErrs), strings.Join(walkErrs, "\n"))
+		if len(found) > 0 {
+			sort.Strings(found)
+			detail = fmt.Sprintf("%s\nfound within the reachable portion of the tree, despite the incomplete walk:\n%s", detail, strings.Join(found, "\n"))
+		}
+		g.add("preserved corrupt stores", StatusUnknown, detail)
+		return
+	}
 
 	if len(found) == 0 {
 		g.add("preserved corrupt stores", StatusOK, "no *.corrupt-* files found under "+cogDir)

@@ -1041,6 +1041,46 @@ func TestCorruptFileEnumerationOKWhenNoneFound(t *testing.T) {
 	}
 }
 
+// TestCorruptFileEnumerationUnknownOnUnreadableSubdir pins the fix for a
+// defect the exact class this command exists to eliminate: doctorCorruptFiles
+// used to swallow filepath.WalkDir errors (`if err != nil { return nil }`),
+// so a *.cog* subtree it could not fully read -- one directory alone chmod
+// 0o000'd, say -- still produced "OK, no *.corrupt-* files found", even
+// though the walk never actually looked inside that subtree. A partial walk
+// must report UNKNOWN, naming the unreadable path, never OK.
+func TestCorruptFileEnumerationUnknownOnUnreadableSubdir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits are not enforced, cannot fixture an unreadable directory")
+	}
+
+	root := t.TempDir()
+	stateDir := filepath.Join(root, ".cog", ".state")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	blocked := filepath.Join(stateDir, "blocked")
+	if err := os.MkdirAll(blocked, 0755); err != nil {
+		t.Fatalf("mkdir blocked: %v", err)
+	}
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatalf("chmod 000: %v", err)
+	}
+	t.Cleanup(func() {
+		// t.TempDir()'s own cleanup needs to remove blocked's contents;
+		// restore permissions first or that removal fails too.
+		_ = os.Chmod(blocked, 0o755)
+	})
+
+	report := RunDoctor(root, DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "store liveness", "preserved corrupt stores")
+	if check.Status != StatusUnknown {
+		t.Fatalf("corrupt-file check with an unreadable subdirectory = %s, want UNKNOWN (never OK); detail=%s", check.Status, check.Detail)
+	}
+	if !strings.Contains(check.Detail, blocked) {
+		t.Errorf("expected the unreadable path %s named in detail:\n%s", blocked, check.Detail)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // #571 item 3: context-construction check group
 //
@@ -1351,6 +1391,77 @@ func TestDuplicatePermissionEntriesOKWhenNoOverlap(t *testing.T) {
 	check := findCheck(t, report, "context construction", "duplicate permission entries")
 	if check.Status != StatusOK {
 		t.Fatalf("no overlapping entries = %s, want OK; detail=%s", check.Status, check.Detail)
+	}
+}
+
+// TestDuplicatePermissionEntriesUnknownOnMalformedSettings pins the same
+// never-OK-when-unverified contract for loadPermissionEntries /
+// doctorDuplicatePermissions: a settings file that exists but is not valid
+// JSON cannot be compared for duplicates -- "no duplicates found" would be a
+// claim about content this check never actually read. A missing file is
+// fine (nothing to compare, so it degenerates to an empty entry set); a
+// present-but-corrupt one must report UNKNOWN and name the broken file,
+// never fall through to OK.
+func TestDuplicatePermissionEntriesUnknownOnMalformedSettings(t *testing.T) {
+	table := []struct {
+		name           string
+		settingsJSON   string
+		settingsLocal  string
+		writeLocalFile bool
+	}{
+		{
+			name:           "malformed settings.json, missing settings.local.json",
+			settingsJSON:   `{"permissions": {"allow": ["WebSearch",`, // truncated/invalid JSON
+			writeLocalFile: false,
+		},
+		{
+			name:           "valid settings.json, malformed settings.local.json",
+			settingsJSON:   `{"permissions": {"allow": ["WebSearch"]}}`,
+			settingsLocal:  `not json at all`,
+			writeLocalFile: true,
+		},
+	}
+
+	for _, tc := range table {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+
+			sjPath := filepath.Join(home, ".claude", "settings.json")
+			writeFile(t, sjPath, tc.settingsJSON)
+			var slPath string
+			if tc.writeLocalFile {
+				slPath = filepath.Join(home, ".claude", "settings.local.json")
+				writeFile(t, slPath, tc.settingsLocal)
+			}
+
+			report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+			check := findCheck(t, report, "context construction", "duplicate permission entries")
+			if check.Status != StatusUnknown {
+				t.Fatalf("malformed settings file = %s, want UNKNOWN (never OK-no-duplicates); detail=%s", check.Status, check.Detail)
+			}
+			if !strings.Contains(check.Detail, sjPath) && (slPath == "" || !strings.Contains(check.Detail, slPath)) {
+				t.Errorf("expected the broken file's path named in detail (sjPath=%s slPath=%s):\n%s", sjPath, slPath, check.Detail)
+			}
+		})
+	}
+}
+
+// TestDuplicatePermissionEntriesOKWhenSettingsFilesMissing is the companion
+// negative case: absence of a settings file is normal (not everyone has a
+// settings.local.json), and must not be confused with the unreadable/corrupt
+// case above -- both currently report through the same sjErr/slErr path in
+// doctorDuplicatePermissions, so this pins that a plain "file not found"
+// still resolves to OK rather than UNKNOWN.
+func TestDuplicatePermissionEntriesOKWhenSettingsFilesMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Neither settings.json nor settings.local.json is written.
+
+	report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "context construction", "duplicate permission entries")
+	if check.Status != StatusOK {
+		t.Fatalf("no settings files present = %s, want OK; detail=%s", check.Status, check.Detail)
 	}
 }
 
