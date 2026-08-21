@@ -338,10 +338,9 @@ func TestPreserveCorruptStore_SidecarRenameMechanism_Direct(t *testing.T) {
 // and garbage sidecars), not a hypothetical. The main corrupt file is still
 // always preserved regardless — only a stale, already-orphaned sidecar can
 // be lost, and only in the already-confirmed-corrupt case; a healthy store's
-// legitimate sidecars are a completely different code path (see
-// TestPreserveCorruptStore_SidecarsRestoredUnchangedWhenHealthy and
-// TestPreserveCorruptStore_LeavesLiveWALConnectionUndisturbed, neither of
-// which is affected by this).
+// legitimate sidecars are a completely different code path — see
+// TestPreserveCorruptStore_LeavesLiveWALConnectionUndisturbed below, which
+// is not affected by this.
 func TestPreserveCorruptStore_StaleSidecarsMayNotSurviveConfirmedCorruption(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "constellation.db")
@@ -408,9 +407,18 @@ func TestPreserveCorruptStore_StaleSidecarsMayNotSurviveConfirmedCorruption(t *t
 // connection open on the same store — nothing stops or locks it first. This
 // test holds a real, live WAL-mode connection open (standing in for the
 // daemon) across a PreserveCorruptStore call against the same healthy file,
-// then proves that connection still works afterward: a write through the
-// SAME still-open handle succeeding is only possible if nothing about the
-// file's on-disk identity or its sidecars was disturbed underneath it.
+// and checks two levels: the -wal file's bytes — the actual data-bearing
+// sidecar, holding committed frames not yet checkpointed into the main file
+// — are byte-identical on disk before and after (so a future change that
+// made the read-only check checkpoint/truncate/rewrite it would be caught,
+// even though the resulting bytes might still parse as a valid WAL); and
+// the live connection itself keeps working afterward. (The -shm file is
+// deliberately NOT compared byte-for-byte: it is SQLite's shared
+// WAL-index/read-mark bookkeeping, which every reader connection that joins
+// a WAL-mode database legitimately updates as part of normal MVCC
+// coordination — a second connection's read-only quick_check touching it is
+// expected, harmless behavior, confirmed empirically, not evidence of
+// anything being disturbed.)
 func TestPreserveCorruptStore_LeavesLiveWALConnectionUndisturbed(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "constellation.db")
@@ -427,12 +435,37 @@ func TestPreserveCorruptStore_LeavesLiveWALConnectionUndisturbed(t *testing.T) {
 		t.Fatalf("insert before: %v", err)
 	}
 
+	walPath := dbPath + "-wal"
+	shmPath := dbPath + "-shm"
+	walBefore, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("read wal sidecar before check: %v", err)
+	}
+	if _, err := os.Stat(shmPath); err != nil {
+		t.Fatalf("shm sidecar missing before check: %v", err)
+	}
+
 	preserved, reason, err := PreserveCorruptStore(dbPath)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if preserved != "" || reason != "" {
 		t.Fatalf("expected no-op against a live healthy connection, got preserved=%q reason=%q", preserved, reason)
+	}
+
+	// The wal file's bytes on disk must be byte-identical to what they were
+	// right before the check — not merely present, but untouched.
+	walAfter, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("read wal sidecar after check: %v", err)
+	}
+	if !bytes.Equal(walBefore, walAfter) {
+		t.Fatalf("wal sidecar bytes changed across a healthy check against a live connection (before %d bytes, after %d bytes)", len(walBefore), len(walAfter))
+	}
+	// The shm file is only checked for presence (see the doc comment above
+	// for why its bytes are expected to legitimately change).
+	if _, err := os.Stat(shmPath); err != nil {
+		t.Fatalf("shm sidecar missing after check: %v", err)
 	}
 
 	// The live connection must still work: a fresh write and read through
