@@ -63,8 +63,9 @@ func (c *Constellation) QueryRelevant(anchor, goal string, limit int) ([]Node, e
 	// Extract keywords from anchor and goal
 	keywords := extractKeywords(anchor, goal)
 
-	// Build FTS5 query (OR of keywords)
-	query := strings.Join(keywords, " OR ")
+	// Build FTS5 query: AND-join extracted keywords so the search stays
+	// selective (see buildKeywordFTSQuery).
+	query := buildKeywordFTSQuery(keywords)
 
 	return c.Search(query, limit)
 }
@@ -113,8 +114,9 @@ func (c *Constellation) QueryRelevantWithSubstance(anchor, goal string, maxCandi
 		return nil, nil
 	}
 
-	// Build FTS5 query (OR of keywords)
-	ftsQuery := strings.Join(keywords, " OR ")
+	// Build FTS5 query: AND-join extracted keywords so the search stays
+	// selective (see buildKeywordFTSQuery).
+	ftsQuery := buildKeywordFTSQuery(keywords)
 
 	// Query with substance metrics included
 	querySQL := `
@@ -223,7 +225,9 @@ func (c *Constellation) QueryRelevantWithEmbedding(anchor, goal string, maxCandi
 		return nil, nil
 	}
 
-	ftsQuery := strings.Join(keywords, " OR ")
+	// Build FTS5 query: AND-join extracted keywords so the search stays
+	// selective (see buildKeywordFTSQuery).
+	ftsQuery := buildKeywordFTSQuery(keywords)
 
 	// Query with substance metrics + embedding BLOBs
 	querySQL := `
@@ -749,4 +753,29 @@ func extractKeywords(anchor, goal string) []string {
 	}
 
 	return keywords
+}
+
+// buildKeywordFTSQuery joins already-extracted keywords into an FTS5 MATCH
+// query. Each keyword is individually double-quoted (stripping any embedded
+// quote so a keyword can never inject stray FTS5 syntax) and the terms are
+// left space-separated, which FTS5 treats as an implicit AND.
+//
+// This mirrors the AND-default fix applied to buildFTSQuery in
+// internal/engine/mcp_stubs.go: unconditionally OR-joining every keyword
+// (the prior behavior here, and the one that comment used to cite as the
+// reason mcp_stubs.go also OR-joined) is the same maximally-unselective
+// pattern -- for extractKeywords' typical anchor/goal input (a handful of
+// keywords) it turned every relevance query into "any document containing
+// any one word", discarding the BM25 ranking's ability to prefer documents
+// that actually cover the query as a whole.
+func buildKeywordFTSQuery(keywords []string) string {
+	quoted := make([]string, 0, len(keywords))
+	for _, kw := range keywords {
+		kw = strings.ReplaceAll(kw, `"`, "")
+		if kw == "" {
+			continue
+		}
+		quoted = append(quoted, `"`+kw+`"`)
+	}
+	return strings.Join(quoted, " ")
 }

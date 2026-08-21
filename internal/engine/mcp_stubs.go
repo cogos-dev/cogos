@@ -321,6 +321,10 @@ type ftsToken struct {
 //     in user input cannot escape its term. Unbalanced quotes never crash
 //     the query: any text after an unterminated '"' is treated as bare
 //     words instead of being dropped or erroring.
+//   - A degenerate quoted span with no content (`" "`, `""`) still becomes
+//     an explicit empty-phrase operand (`""`), which FTS5 accepts as a
+//     valid zero-match phrase term, rather than being dropped to an empty
+//     query string that would error out of FTS5 entirely.
 func buildFTSQuery(raw string) string {
 	if strings.TrimSpace(raw) == "" {
 		return raw
@@ -389,9 +393,12 @@ func tokenizeFTSQuery(raw string) []ftsToken {
 			}
 			phrase := strings.TrimSpace(rest[:j])
 			phrase = strings.ReplaceAll(phrase, `"`, "")
-			if phrase != "" {
-				toks = append(toks, ftsToken{text: phrase, phrase: true})
-			}
+			// Keep a degenerate quoted span (e.g. `" "` or `""`) as an
+			// explicit empty-phrase operand rather than dropping it: FTS5
+			// accepts `""` as a valid (zero-match) phrase term, so this
+			// still reaches the FTS index instead of erroring out and
+			// silently falling back to the naive grep path.
+			toks = append(toks, ftsToken{text: phrase, phrase: true})
 			i = i + 1 + j + 1
 			continue
 		}

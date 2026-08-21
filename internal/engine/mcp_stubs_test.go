@@ -229,6 +229,13 @@ func TestBuildFTSQuery(t *testing.T) {
 		// Empty / whitespace-only input passes through unchanged.
 		{"empty string", "", ""},
 		{"whitespace only", "   ", "   "},
+
+		// Degenerate quoted spans with no content still produce a valid
+		// FTS5 query (an explicit empty-phrase operand) instead of an
+		// empty string, which would error out of FTS5 and silently fall
+		// back to the naive grep path.
+		{"quote-space-quote", `" "`, `""`},
+		{"two empty quote pairs", `"" ""`, `"" AND ""`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
