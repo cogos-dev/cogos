@@ -767,6 +767,18 @@ const doctorLintHelperEnv = "CLI_DOCTOR_LINT_HELPER"
 //   - "lint-bad-severity": --lint --severity-min bogus, no workspace flag at
 //     all. Validation happens before workspace resolution or any report is
 //     produced, so this must exit 2 (pre-report failure) unconditionally.
+//   - "bad-flag-no-lint" / "bad-flag-lint": an actually-unrecognized flag
+//     (--nonexistent-flag), without and with --lint respectively. Both must
+//     exit 2, and identically so: fs is a flag.ExitOnError FlagSet, and the
+//     stdlib's own Parse calls os.Exit(2) directly on any parse error before
+//     ever returning one to our code (ErrHelp/"-h" is the sole exception,
+//     exiting 0) -- see flag.FlagSet.Parse in the standard library. Bad
+//     flags have therefore always exited 2 regardless of --lint, since
+//     #570; this pins that as the ACTUAL bad-flags path, distinct from
+//     "lint-bad-severity" above, which exercises the separate --severity-min
+//     value-validation code this PR adds (a cog-review finding on an
+//     earlier revision of this PR: --severity-min bad-value coverage does
+//     NOT exercise the genuine-parse-failure path, and vice versa).
 func TestHelperProcessDoctorLint(t *testing.T) {
 	if os.Getenv(doctorLintHelperEnv) != "1" {
 		return
@@ -794,6 +806,10 @@ func TestHelperProcessDoctorLint(t *testing.T) {
 		runDoctorCmd([]string{"--workspace", root, "--skip-network", "--lint", "--severity-min", "fail"}, root)
 	case "lint-bad-severity":
 		runDoctorCmd([]string{"--lint", "--severity-min", "bogus"}, root)
+	case "bad-flag-no-lint":
+		runDoctorCmd([]string{"--workspace", root, "--nonexistent-flag"}, root)
+	case "bad-flag-lint":
+		runDoctorCmd([]string{"--workspace", root, "--lint", "--nonexistent-flag"}, root)
 	}
 	os.Exit(99) // unreached: runDoctorCmd always calls os.Exit itself
 }
@@ -832,6 +848,8 @@ func TestDoctorLintExitCodesEndToEnd(t *testing.T) {
 		{"lint-warn", 1},
 		{"lint-fail-threshold", 0},
 		{"lint-bad-severity", 2},
+		{"bad-flag-no-lint", 2},
+		{"bad-flag-lint", 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.scenario, func(t *testing.T) {

@@ -52,13 +52,21 @@
 //	  [--severity-min warn|fail]  --severity-min (default "warn"); exit 1 = at
 //	                           least one finding meets it; exit 2 = the
 //	                           command failed before a report was produced at
-//	                           all (bad flags, unresolvable workspace) — never
-//	                           conflated with "produced a report full of
-//	                           findings". UNKNOWN always counts as meeting the
-//	                           warn threshold (an observation doctor could not
-//	                           perform is never a lintable-clean state); at
-//	                           the fail threshold only FAIL counts, since
-//	                           UNKNOWN is explicitly not evidence of breakage.
+//	                           all — never conflated with "produced a report
+//	                           full of findings". UNKNOWN always counts as
+//	                           meeting the warn threshold (an observation
+//	                           doctor could not perform is never a
+//	                           lintable-clean state); at the fail threshold
+//	                           only FAIL counts, since UNKNOWN is explicitly
+//	                           not evidence of breakage.
+//
+// Bad flags exit 2 UNCONDITIONALLY, in every invocation, with or without
+// --lint — not a --lint-specific behavior. This isn't new in #571: fs is a
+// flag.ExitOnError FlagSet, and the stdlib's Parse calls os.Exit(2) itself
+// on any parse error before ever returning one (ErrHelp — "-h" — is the one
+// exception, exiting 0); this has been true since #570. What IS --lint-
+// specific pre-report failure is everything downstream of a successful
+// parse: an unresolvable workspace, or an invalid --severity-min value.
 //
 // The issue text describes the *advisory* posture itself changing ("exit 0
 // once a report is produced, regardless of findings"). That would break the
@@ -277,19 +285,28 @@ func runDoctorCmd(args []string, defaultWorkspace string) {
 		fmt.Fprintf(os.Stderr, "  FAIL     checked, property does NOT hold\n")
 		fmt.Fprintf(os.Stderr, "  UNKNOWN  could not be checked (never reported as OK)\n\n")
 		fmt.Fprintf(os.Stderr, "Exit contract (two postures, see the cli_doctor.go package doc for full rationale):\n")
+		fmt.Fprintf(os.Stderr, "  Bad flags always exit 2, with or without --lint (the stdlib flag package's own\n")
+		fmt.Fprintf(os.Stderr, "  behavior, unchanged since #570 -- not itself part of either posture below).\n")
 		fmt.Fprintf(os.Stderr, "  cogos doctor              (advisory, DEFAULT) exit 0 unless a check reports FAIL,\n")
 		fmt.Fprintf(os.Stderr, "                            then 1. WARN/UNKNOWN never affect this exit code. This\n")
 		fmt.Fprintf(os.Stderr, "                            is the exact #570 contract, unchanged by default.\n")
 		fmt.Fprintf(os.Stderr, "  cogos doctor --lint       (gate, opt-in) exit 0 = no finding at/above\n")
 		fmt.Fprintf(os.Stderr, "    [--severity-min X]      --severity-min (default warn); exit 1 = at least one\n")
-		fmt.Fprintf(os.Stderr, "                            finding meets it; exit 2 = failed before a report was\n")
-		fmt.Fprintf(os.Stderr, "                            produced at all (bad flags, unresolvable workspace).\n\n")
+		fmt.Fprintf(os.Stderr, "                            finding meets it; exit 2 = a resolvable-workspace or\n")
+		fmt.Fprintf(os.Stderr, "                            --severity-min failure before a report was produced.\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		fs.PrintDefaults()
 	}
 
+	// fs is flag.ExitOnError: Parse calls os.Exit(2) itself on any parse
+	// error (ErrHelp/"-h" is the sole exception, exiting 0) before this line
+	// could ever observe a non-nil err -- see the flag package source. Bad
+	// flags have therefore always exited 2 unconditionally, regardless of
+	// --lint, since #570; this check is defensive, not reachable in
+	// practice, and deliberately does NOT branch on *lint the way the
+	// downstream pre-report-failure checks below do.
 	if err := fs.Parse(args); err != nil {
-		os.Exit(1)
+		os.Exit(2)
 	}
 
 	minStatus := StatusWarn
@@ -1300,20 +1317,36 @@ func doctorStoreLiveness(report *DoctorReport, root string, opts DoctorOptions) 
 	}
 }
 
-// corruptFileMarker is the marker a corruption-safe reindex-replace leaves
-// behind (per #571 item 2: rename, never unlink, a store that fails its
-// integrity check) — "<name>.corrupt-<timestamp>". Matched as a plain
-// substring, mirroring the shell glob `*.corrupt-*` the issue specifies,
-// rather than a stricter regexp: any file carrying this marker anywhere in
-// its name is a preserved corpse doctor should surface, regardless of the
-// exact timestamp format the renaming code used.
+// corruptFileMarker is the naming convention "<name>.corrupt-<timestamp>"
+// that #571 item 2 specifies for a corruption-safe reindex-replace: rename,
+// never unlink, a store that fails its integrity check, so corrupt data
+// stays evidence instead of becoming garbage. Matched as a plain substring
+// (mirroring the shell glob `*.corrupt-*` the issue specifies) rather than a
+// stricter regexp, so any file carrying this marker anywhere in its name is
+// surfaced regardless of the exact timestamp format used to produce it.
+//
+// IMPORTANT: this repository does not currently contain any code that
+// writes a file matching this marker — the reindex-replace rename-aside
+// logic (issue item 2's other half, in cli_reindex.go) is out of scope for
+// this PR per this lane's ground rules, and a repo-wide search at the time
+// this shipped found no such logic anywhere else either. In real usage
+// today doctorCorruptFiles will therefore always report OK, because nothing
+// yet produces the marker it looks for. This check ships anyway,
+// deliberately ahead of its producer, for two reasons: (1) it is cheap and
+// harmless while unused (one WalkDir, unconditional, no false positives
+// possible on a marker nothing writes), and (2) it makes the doctor-side
+// half of item 2 land now rather than blocking on an unrelated PR against
+// cli_reindex.go. It becomes load-bearing the moment that reindex change
+// ships, or if an operator manually preserves a corrupt store this way.
 const corruptFileMarker = ".corrupt-"
 
-// doctorCorruptFiles enumerates *.corrupt-* files already preserved under
-// cogDir so they don't rot silently — the same anti-sprawl philosophy as the
-// binary-sprawl check. This runs unconditionally (not gated behind --deep):
-// finding a corpse that already exists on disk costs one WalkDir, unlike
-// producing a fresh one via quick_check.
+// doctorCorruptFiles enumerates *.corrupt-* files under cogDir so a store
+// preserved by this naming convention doesn't rot silently — the same
+// anti-sprawl philosophy as the binary-sprawl check, and forward-looking
+// per corruptFileMarker's doc comment above (nothing in this repository
+// currently produces such a file). This runs unconditionally (not gated
+// behind --deep): finding a corpse that already exists on disk costs one
+// WalkDir, unlike producing a fresh one via quick_check.
 func doctorCorruptFiles(g *DoctorGroup, cogDir string) {
 	var found []string
 	_ = filepath.WalkDir(cogDir, func(p string, d fs.DirEntry, err error) error {
@@ -1332,7 +1365,7 @@ func doctorCorruptFiles(g *DoctorGroup, cogDir string) {
 	}
 	sort.Strings(found)
 	g.add("preserved corrupt stores", StatusWarn, fmt.Sprintf(
-		"%d preserved corrupt store file(s) found (renamed aside by a corruption-safe reindex rather than deleted — corrupt data is evidence, not garbage):\n%s",
+		"%d file(s) matching the *.corrupt-* preserved-corpse naming convention found (corrupt data is evidence, not garbage — do not delete without inspecting):\n%s",
 		len(found), strings.Join(found, "\n")))
 }
 
