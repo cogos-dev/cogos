@@ -357,11 +357,17 @@ func runDoctorCmd(args []string, defaultWorkspace string) {
 	}
 
 	if *lint {
+		// This status line is diagnostic, not part of the report: it always
+		// goes to stderr, never stdout, regardless of --json. Writing it to
+		// stdout after enc.Encode(report) above would append a plain-text
+		// line onto the encoded JSON stream on the SAME fd, corrupting it
+		// for exactly the machine-consumption (CI/cron, piped through jq)
+		// use case --lint exists to serve.
 		if report.LintFindings(minStatus) {
-			fmt.Fprintf(os.Stdout, "lint: severity-min=%s, finding(s) at/above threshold, exit 1\n", minStatus)
+			fmt.Fprintf(os.Stderr, "lint: severity-min=%s, finding(s) at/above threshold, exit 1\n", minStatus)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stdout, "lint: severity-min=%s, no finding at/above threshold, exit 0\n", minStatus)
+		fmt.Fprintf(os.Stderr, "lint: severity-min=%s, no finding at/above threshold, exit 0\n", minStatus)
 		os.Exit(0)
 	}
 	os.Exit(report.ExitCode())
@@ -1593,14 +1599,27 @@ func mcpEntryTarget(def map[string]any) (string, bool) {
 	}
 	if base := filepath.Base(cmd); base == "npx" || base == "npx.cmd" {
 		// Only the documented `npx mcp-remote <url>` bridge shape targets its
-		// URL argument -- args[0] must be the mcp-remote package literally.
+		// URL argument -- the package name must be "mcp-remote" literally.
 		// Matching ANY URL-shaped argument for ANY npx-launched server would
 		// collide two unrelated packages that merely happen to take a
 		// URL-shaped flag (e.g. --api-base, --callback) of their own, which
 		// is exactly the generic-launcher false-positive this function's own
 		// doc comment says the command+args design exists to avoid.
-		if len(args) > 0 && args[0] == "mcp-remote" {
-			for _, s := range args[1:] {
+		//
+		// The package name is not always args[0]: npx accepts its own flags
+		// first, most commonly "-y"/"--yes" to skip the install-confirmation
+		// prompt (`npx -y mcp-remote <url>`), so skip any leading
+		// "-"-prefixed args to find it.
+		pkgIdx := -1
+		for i, a := range args {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			pkgIdx = i
+			break
+		}
+		if pkgIdx >= 0 && args[pkgIdx] == "mcp-remote" {
+			for _, s := range args[pkgIdx+1:] {
 				if strings.Contains(s, "://") {
 					return s, true
 				}

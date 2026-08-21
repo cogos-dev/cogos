@@ -804,6 +804,8 @@ func TestHelperProcessDoctorLint(t *testing.T) {
 		runDoctorCmd([]string{"--workspace", root, "--skip-network", "--lint"}, root)
 	case "lint-fail-threshold":
 		runDoctorCmd([]string{"--workspace", root, "--skip-network", "--lint", "--severity-min", "fail"}, root)
+	case "lint-json":
+		runDoctorCmd([]string{"--workspace", root, "--skip-network", "--lint", "--json"}, root)
 	case "lint-bad-severity":
 		runDoctorCmd([]string{"--lint", "--severity-min", "bogus"}, root)
 	case "bad-flag-no-lint":
@@ -847,6 +849,7 @@ func TestDoctorLintExitCodesEndToEnd(t *testing.T) {
 		{"default", 0},
 		{"lint-warn", 1},
 		{"lint-fail-threshold", 0},
+		{"lint-json", 1},
 		{"lint-bad-severity", 2},
 		{"bad-flag-no-lint", 2},
 		{"bad-flag-lint", 2},
@@ -858,6 +861,29 @@ func TestDoctorLintExitCodesEndToEnd(t *testing.T) {
 				t.Errorf("scenario %q: exit code = %d, want %d\nstdout=%s\nstderr=%s", tc.scenario, exitCode, tc.wantExit, stdout, stderr)
 			}
 		})
+	}
+}
+
+// TestDoctorLintJSONNeverCorruptsStdout pins a cog-review-flagged defect:
+// combining --json with --lint used to write the "lint: severity-min=..."
+// status line to stdout AFTER the JSON-encoded report, on the same stream --
+// exactly the machine-consumption scenario (CI/cron piping through jq)
+// --lint is pitched for. stdout under --json --lint must be nothing but the
+// single JSON-encoded report, and the lint status line must still be
+// observable, just on stderr instead.
+func TestDoctorLintJSONNeverCorruptsStdout(t *testing.T) {
+	root := t.TempDir()
+	_, stdout, stderr := runDoctorLintHelper(t, "lint-json", root)
+
+	var report DoctorReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("--json --lint stdout is not valid JSON (%v); stdout=%q", err, stdout)
+	}
+	if strings.Contains(stdout, "lint:") {
+		t.Errorf("lint status text leaked into --json stdout:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "lint:") {
+		t.Errorf("expected the lint status line on stderr; stderr=%q", stderr)
 	}
 }
 
@@ -1153,6 +1179,36 @@ func TestDuplicateToolsetRegistrationsNormalizesNpxMcpRemoteWrapper(t *testing.T
 	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
 	if check.Status != StatusWarn {
 		t.Fatalf("npx-mcp-remote wrapper vs direct url registration = %s, want WARN; detail=%s", check.Status, check.Detail)
+	}
+	if !strings.Contains(check.Detail, `"browseros"`) || !strings.Contains(check.Detail, `"browserOS"`) {
+		t.Errorf("expected both names (browseros, browserOS) named in detail:\n%s", check.Detail)
+	}
+}
+
+// TestDuplicateToolsetRegistrationsNormalizesNpxMcpRemoteWrapperWithYesFlag
+// pins a cog-review-flagged gap in the fix above: mcpEntryTarget's
+// mcp-remote detection originally required args[0] == "mcp-remote"
+// literally, missing the extremely common `npx -y mcp-remote <url>` form
+// (the "-y"/"--yes" flag skips npx's install-confirmation prompt, so this
+// shape is what a real generated config is more likely to contain than the
+// bare no-flag form the test above covers). This must normalize to the
+// same target as a plain {"url": ...} registration exactly like the
+// no-flag case does.
+func TestDuplicateToolsetRegistrationsNormalizesNpxMcpRemoteWrapperWithYesFlag(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	writeFile(t, filepath.Join(home, ".claude.json"), `{
+		"mcpServers": {"browseros": {"type": "http", "url": "http://127.0.0.1:9000/mcp"}}
+	}`)
+	writeFile(t, claudeDesktopConfigPath(home), `{
+		"mcpServers": {"browserOS": {"command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:9000/mcp"]}}
+	}`)
+
+	report := RunDoctor(t.TempDir(), DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "context construction", "duplicate toolset registrations")
+	if check.Status != StatusWarn {
+		t.Fatalf("npx -y mcp-remote wrapper vs direct url registration = %s, want WARN; detail=%s", check.Status, check.Detail)
 	}
 	if !strings.Contains(check.Detail, `"browseros"`) || !strings.Contains(check.Detail, `"browserOS"`) {
 		t.Errorf("expected both names (browseros, browserOS) named in detail:\n%s", check.Detail)
