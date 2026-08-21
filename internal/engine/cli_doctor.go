@@ -954,8 +954,27 @@ func countMarkdownFiles(dir string) int {
 
 func countDocsUnderPrefix(db *sql.DB, prefix string) (int, error) {
 	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM documents WHERE path LIKE ?`, prefix+"%").Scan(&n)
+	// Escape LIKE metacharacters in the literal prefix and require the
+	// wildcard to start after a path separator, not immediately after the
+	// prefix text. Without both of these, a bare `prefix+"%"` pattern (a) lets
+	// any literal `_`/`%` in the real path act as an unintended wildcard, and
+	// (b) matches sibling subtrees that merely share a name prefix -- e.g.
+	// ".cog/adr" would also match every row under ".cog/adr-legacy" -- which
+	// silently merges two subtrees' document counts. Same hazard the project
+	// already called out and avoided once in sdk/constellation/indexer.go's
+	// removed prefix-DELETE.
+	pattern := escapeLikePattern(prefix) + string(filepath.Separator) + "%"
+	err := db.QueryRow(`SELECT COUNT(*) FROM documents WHERE path LIKE ? ESCAPE '\'`, pattern).Scan(&n)
 	return n, err
+}
+
+// escapeLikePattern escapes SQL LIKE metacharacters (%, _, and the escape
+// character itself) in a literal string so it can be used as a LIKE prefix
+// without a literal underscore or percent sign in a real path acting as an
+// unintended wildcard. Pair with `ESCAPE '\'` in the query.
+func escapeLikePattern(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 func doctorIndexFreshness(g *DoctorGroup, db *sql.DB, root string) {

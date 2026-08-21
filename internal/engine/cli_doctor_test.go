@@ -181,6 +181,75 @@ func TestDocsVsFilesFlagsUnindexedTree(t *testing.T) {
 	}
 }
 
+// TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees is the regression test for
+// the countDocsUnderPrefix LIKE-pattern bug: a bare `prefix+"%"` pattern
+// matches any sibling subtree whose name merely starts with the same
+// characters (".cog/adr" matches ".cog/adr-legacy/..."), merging their
+// document counts and masking a genuinely unindexed tree.
+func TestDocsVsFilesDoesNotMergeSiblingPrefixSubtrees(t *testing.T) {
+	root := t.TempDir()
+	// t.TempDir() on macOS resolves under a /var/folders symlink to
+	// /private/var/folders; the indexer resolves .cog/'s walk root via
+	// filepath.EvalSymlinks (see walkRoots), so document paths land in the
+	// database already symlink-resolved. Resolve root the same way here so
+	// the prefixes this test builds actually match what got indexed --
+	// otherwise every countDocsUnderPrefix lookup silently returns 0
+	// regardless of the LIKE-pattern fix under test, for an unrelated
+	// path-identity reason.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve tempdir symlinks: %v", err)
+	}
+	root = resolvedRoot
+
+	// .cog/adr has one file on disk that is NOT a *.cog.md file, so it is
+	// never indexed by IndexWorkspace -- this subtree must report 0 rows /
+	// UNINDEXED on its own.
+	adrDir := filepath.Join(root, ".cog", "adr")
+	if err := os.MkdirAll(adrDir, 0755); err != nil {
+		t.Fatalf("mkdir adr: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(adrDir, "plain.md"), []byte("# not indexable\n"), 0644); err != nil {
+		t.Fatalf("write plain.md: %v", err)
+	}
+
+	// .cog/adr-legacy is a distinct, indexed subtree that shares "adr" as a
+	// literal name prefix. Under the pre-fix bare-prefix LIKE pattern, this
+	// row's path also matches `path LIKE '.../.cog/adr%'` and would get
+	// double-counted against .cog/adr, masking the fact that .cog/adr itself
+	// has zero indexed documents.
+	writeCogdoc(t, root, ".cog/adr-legacy/real.cog.md", "Legacy ADR", "indexed sibling content")
+
+	c, err := constellation.Open(root)
+	if err != nil {
+		skipIfNoFTS5(t, err)
+		t.Fatalf("constellation.Open: %v", err)
+	}
+	if err := c.IndexWorkspace(); err != nil {
+		t.Fatalf("IndexWorkspace: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	report := RunDoctor(root, DoctorOptions{SkipNetwork: true})
+	check := findCheck(t, report, "index health", "documents vs files on disk")
+
+	var adrLine string
+	for _, line := range strings.Split(check.Detail, "\n") {
+		if strings.HasPrefix(line, ".cog/adr:") {
+			adrLine = line
+			break
+		}
+	}
+	if adrLine == "" {
+		t.Fatalf("no .cog/adr: line found in detail (want it distinct from .cog/adr-legacy):\n%s", check.Detail)
+	}
+	if !strings.Contains(adrLine, "0 indexed") || !strings.Contains(adrLine, "UNINDEXED") {
+		t.Errorf(".cog/adr line = %q, want 0 indexed/UNINDEXED -- .cog/adr-legacy's indexed row must not be counted against .cog/adr; full detail:\n%s", adrLine, check.Detail)
+	}
+}
+
 // TestStoreLivenessFlagsDeadStore verifies a SQLite store whose mtime is
 // older than the stale threshold is flagged WARN/DEAD, and a fresh one is OK.
 func TestStoreLivenessFlagsDeadStore(t *testing.T) {
