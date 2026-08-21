@@ -18,20 +18,24 @@ package constellation
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
 // quickCheckTimeout bounds how long PRAGMA quick_check may run against an
-// existing store before PreserveCorruptStore gives up waiting and treats the
-// file as failed integrity. A live constellation.db can be hundreds of MB;
-// this is generous headroom for that size while still failing well short of
-// a reindex invocation looking hung.
-const quickCheckTimeout = 30 * time.Second
+// existing store before PreserveCorruptStore gives up waiting. A live
+// constellation.db can be hundreds of MB; this is generous headroom for that
+// size while still failing well short of a reindex invocation looking hung.
+// A timeout is deliberately NOT treated as a corruption finding — see
+// PreserveCorruptStore.
+//
+// A var, not a const, solely so tests can deterministically force a timeout
+// (see store_guard_test.go) without depending on machine speed or a
+// multi-hundred-MB fixture.
+var quickCheckTimeout = 30 * time.Second
 
 // sidecarSuffixes are the WAL-mode sidecar files that travel with a SQLite
 // main file. They are preserved alongside a corrupt main file under the same
@@ -46,36 +50,50 @@ var sidecarSuffixes = []string{"-wal", "-shm"}
 // database at all. It never unlinks anything; a failed file is moved, not
 // deleted, so it remains available as forensic evidence.
 //
-// The integrity check runs against a private byte-copy of dbPath (see
-// snapshotForCheck), never against the live file, and a healthy result
-// touches nothing at all — no rename, no sidecar interaction of any kind.
-// This is deliberate, not incidental: "cogos reindex" is documented (see
+// The integrity check opens dbPath directly through the SQLite driver
+// (mode=ro, WAL-aware) rather than copying its bytes first. This is a
+// deliberate choice, not an oversight: cogos reindex is documented (see
 // cli_reindex.go's doc comment and the drift-detection log line in
 // mcp_stubs.go) as the routine remedy a user runs in another terminal WHILE
-// the daemon keeps its own live WAL connection open on this same file —
-// nothing stops or locks the daemon first. In that steady state the -wal/-
-// shm sidecars are the daemon's live working files, not corruption leftovers,
-// and an earlier version of this guard that opened the live file (or
-// quarantined its sidecars) before deciding whether it was even unhealthy
-// could race that connection: SQLite recreating a sidecar mid-check, then
-// a later "restore" step blindly renaming over it, would silently discard
-// live WAL frames — an undisclosed data-loss path on the most common
-// invocation. Checking a copy sidesteps that class of race entirely: the
-// live file and its sidecars are only ever touched, via plain os.Rename, at
-// the point this function has already proven — from the copy — that the
-// main file is corrupt and is about to be replaced anyway.
+// the daemon keeps its own live WAL connection open on this same file — a
+// plain os.Open+io.Copy of a file being concurrently checkpointed can
+// capture a torn, internally-inconsistent snapshot that quick_check flags as
+// corrupt even though the live store is perfectly healthy (confirmed via a
+// live-connection repro during review of an earlier version of this file).
+// SQLite's own WAL-aware read path does not have that problem — a read-only
+// connection gets the same MVCC-consistent view any other concurrent reader
+// would, which is exactly why mcp_stubs.go's searchMemoryFTSDriftRepair
+// already reads the live store the same way. A quick_check TIMEOUT is
+// likewise never treated as a corruption finding, for the identical reason:
+// folding "we couldn't determine" into "confirmed corrupt" would let a
+// slow-but-healthy check (large store, loaded disk) destroy a live good
+// store just as surely as a false-positive read would.
+//
+// Accepted trade-off: opening a store directly for the check means that if
+// the main file IS genuinely corrupt and has stale, non-matching WAL/SHM
+// sidecars sitting next to it, SQLite's own recovery logic may reclaim
+// those sidecars as an intrinsic side effect of the check itself, before
+// this function gets a chance to preserve them (preserveCorruptStore simply
+// finds nothing left to rename in that case — it does not error). This is
+// scoped tightly: it can only happen once the check has already determined
+// the main file itself is corrupt, and a live daemon's LEGITIMATE, currently
+// -matching sidecars are unaffected (a healthy main file's real sidecars
+// survive a concurrent read-only check untouched — verified empirically).
+// The main corrupt file itself is always still preserved; only a stale,
+// already-orphaned sidecar can be lost, never live good data.
 //
 // Return values:
 //   - preservedPath == "" and err == nil: either dbPath does not exist yet,
-//     or the existing file is healthy. Nothing was touched; the caller's
+//     or the existing file is healthy. Nothing was renamed; the caller's
 //     normal open-or-create behavior proceeds unchanged.
 //   - preservedPath != "": an existing file failed the check and was
 //     renamed to preservedPath. reason explains why (quick_check's report,
 //     an "empty file" finding, or the underlying open/scan error) — the
 //     caller should log both loudly before rebuilding fresh.
-//   - err != nil: a filesystem operation itself failed (stat/snapshot/
-//     rename). This is distinct from a corruption finding, which is always
-//     reported through preservedPath/reason with err == nil.
+//   - err != nil: either a filesystem operation itself failed (stat/rename),
+//     or the check could not reach a verdict at all (timeout) — both are
+//     operational failures, distinct from a corruption finding, and neither
+//     touches the file.
 func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, err error) {
 	info, statErr := os.Stat(dbPath)
 	if statErr != nil {
@@ -91,21 +109,16 @@ func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, e
 	// of an interrupted write than a deliberately-created empty store (a
 	// fresh workspace has no file at all — Open creates it lazily), and
 	// there is nothing lost by routing it through the same
-	// preserve-and-rebuild path as any other unreadable file. No snapshot
-	// is needed to reach that verdict.
+	// preserve-and-rebuild path as any other unreadable file. No check is
+	// needed to reach that verdict.
 	var checkErr error
 	if info.Size() == 0 {
 		checkErr = fmt.Errorf("store file is empty (0 bytes)")
 	} else {
-		snapshot, snapErr := snapshotForCheck(dbPath)
-		if snapErr != nil {
-			return "", "", fmt.Errorf("snapshot %s for integrity check: %w", dbPath, snapErr)
+		checkErr = checkStoreIntegrity(dbPath)
+		if checkErr != nil && errors.Is(checkErr, context.DeadlineExceeded) {
+			return "", "", fmt.Errorf("integrity check for %s did not complete within %s: %w", dbPath, quickCheckTimeout, checkErr)
 		}
-		// snapshot is our own private scratch copy, never anything the user
-		// owns — os.Remove here is unrelated to the "never unlink the store"
-		// rule, which is about dbPath itself.
-		defer os.Remove(snapshot)
-		checkErr = checkStoreIntegrity(snapshot)
 	}
 
 	if checkErr == nil {
@@ -119,53 +132,16 @@ func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, e
 	return target, checkErr.Error(), nil
 }
 
-// snapshotForCheck copies dbPath's current bytes to a private temp file in
-// the same directory and returns its path; the caller is responsible for
-// removing it. Copying (rather than opening dbPath directly, even
-// read-only) means the integrity check never touches the live file or its
-// sidecars — see the PreserveCorruptStore doc comment for why that matters
-// against a concurrently open daemon connection. The plain os.Open+io.Copy
-// used here takes no SQLite-level locks, so it cannot contend with one
-// either.
-//
-// Trade-off, accepted deliberately: a copy of a large store (a live
-// constellation.db can be hundreds of MB) costs extra I/O and disk space for
-// the moment the copy exists, and a copy taken mid-write could in principle
-// capture a torn snapshot that fails quick_check even though the live store
-// is fine. Both failure directions land on the safe side of the rule this
-// guard exists to enforce: a spurious "corrupt" verdict costs an unnecessary
-// preserve-and-rebuild cycle, never data loss.
-func snapshotForCheck(dbPath string) (string, error) {
-	src, err := os.Open(dbPath)
-	if err != nil {
-		return "", fmt.Errorf("open %s for snapshot: %w", dbPath, err)
-	}
-	defer src.Close()
-
-	dst, err := os.CreateTemp(filepath.Dir(dbPath), ".reindex-integrity-check-*.tmp")
-	if err != nil {
-		return "", fmt.Errorf("create snapshot temp file: %w", err)
-	}
-	tmpPath := dst.Name()
-
-	if _, err := io.Copy(dst, src); err != nil {
-		dst.Close()
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("copy %s to snapshot: %w", dbPath, err)
-	}
-	if err := dst.Close(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("close snapshot file: %w", err)
-	}
-	return tmpPath, nil
-}
-
-// checkStoreIntegrity opens path read-only and runs a bounded
-// PRAGMA quick_check. It returns nil only when the file opens cleanly and
-// quick_check reports "ok". Always called against a snapshotForCheck copy,
-// never the live store file — see the PreserveCorruptStore doc comment.
+// checkStoreIntegrity opens path read-only (through the SQLite driver, WAL-
+// aware — see the PreserveCorruptStore doc comment for why this must be a
+// direct open rather than a copy) and runs a bounded PRAGMA quick_check. It
+// returns nil only when the file opens cleanly and quick_check reports "ok".
+// A context-deadline error is returned like any other — callers that need
+// to treat a timeout differently from a genuine corruption finding (as
+// PreserveCorruptStore does) check the returned error with errors.Is against
+// context.DeadlineExceeded.
 func checkStoreIntegrity(path string) error {
-	db, err := sql.Open("sqlite3", path+"?mode=ro&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", path+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return fmt.Errorf("open read-only: %w", err)
 	}
@@ -190,10 +166,10 @@ func checkStoreIntegrity(path string) error {
 // group share one timestamp (computed once) so the preserved set reads as
 // one coherent snapshot; each file's target name is resolved independently
 // so a same-second collision on just the sidecar doesn't block preserving
-// the main file. Only reached once PreserveCorruptStore has already proven,
-// from an isolated copy, that dbPath is corrupt — so this is a single
-// forward-only move per file (rename to its final resting place), never a
-// quarantine-then-restore round trip that could race a concurrent writer.
+// the main file. Only reached once PreserveCorruptStore has already
+// determined dbPath is corrupt — this is a single forward-only move per
+// file (rename to its final resting place), never a quarantine-then-restore
+// round trip that could race a concurrent writer.
 func preserveCorruptStore(dbPath string) (string, error) {
 	ts := time.Now().UTC().Format("20060102T150405Z")
 
@@ -205,7 +181,8 @@ func preserveCorruptStore(dbPath string) (string, error) {
 	for _, suffix := range sidecarSuffixes {
 		sidecar := dbPath + suffix
 		if _, statErr := os.Stat(sidecar); statErr != nil {
-			continue // sidecar not present right now — nothing to preserve
+			continue // not present right now — nothing to preserve (see the
+			// PreserveCorruptStore doc comment's accepted-trade-off note)
 		}
 		if _, err := renameAside(sidecar, ts); err != nil {
 			return mainTarget, fmt.Errorf("main file preserved at %s, but sidecar %s: %w", mainTarget, sidecar, err)
