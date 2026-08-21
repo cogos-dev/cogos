@@ -5,11 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 // makeSmallSQLiteDB creates a real, valid SQLite database file at path with a
@@ -523,6 +526,102 @@ func TestPreserveCorruptStore_TimeoutIsNotTreatedAsCorruption(t *testing.T) {
 	for _, e := range entries {
 		if strings.Contains(e.Name(), ".corrupt-") {
 			t.Fatalf("unexpected .corrupt-* file after a timeout (not a corruption finding): %s", e.Name())
+		}
+	}
+}
+
+// TestIsInconclusive is a direct unit test of the classifier that decides
+// whether a checkStoreIntegrity error means "couldn't determine" (timeout,
+// busy, locked) versus "confirmed corrupt" (everything else). This is the
+// exact distinction review round 4 found incomplete: only context.
+// DeadlineExceeded was excluded, leaving SQLITE_BUSY/SQLITE_LOCKED (e.g.
+// from a daemon mid-checkpoint briefly holding a lock) to fall through to
+// "confirmed corrupt" and destroy a live healthy store.
+func TestIsInconclusive(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"deadline exceeded direct", context.DeadlineExceeded, true},
+		{"deadline exceeded wrapped", fmt.Errorf("cannot open as a database: %w", context.DeadlineExceeded), true},
+		{"sqlite busy", sqlite3.Error{Code: sqlite3.ErrBusy}, true},
+		{"sqlite busy wrapped", fmt.Errorf("cannot open as a database: %w", sqlite3.Error{Code: sqlite3.ErrBusy}), true},
+		{"sqlite busy recovery (extended)", sqlite3.Error{Code: sqlite3.ErrBusy, ExtendedCode: sqlite3.ErrBusyRecovery}, true},
+		{"sqlite locked", sqlite3.Error{Code: sqlite3.ErrLocked}, true},
+		{"not a database (genuine corruption)", errors.New("file is not a database"), false},
+		{"sqlite corrupt code (genuine corruption)", sqlite3.Error{Code: sqlite3.ErrCorrupt}, false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isInconclusive(tc.err); got != tc.want {
+				t.Fatalf("isInconclusive(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPreserveCorruptStore_RealLockContentionIsNotTreatedAsCorruption is the
+// integration-level companion to TestIsInconclusive: it forces a genuine
+// SQLITE_BUSY from the real driver (not a synthetic error) by holding an
+// exclusive lock on a healthy store from a second connection — standing in
+// for a daemon mid-checkpoint — and confirms PreserveCorruptStore surfaces
+// that as an operational error rather than renaming the healthy store away.
+// PRAGMA locking_mode=EXCLUSIVE makes the lock deterministic (taken on next
+// access, held until released) so this needs no timing-sensitive retry loop
+// and no multi-second sleep — busyTimeout is forced low purely so
+// checkStoreIntegrity's own connection gives up quickly instead of waiting
+// out the production default.
+func TestPreserveCorruptStore_RealLockContentionIsNotTreatedAsCorruption(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "constellation.db")
+
+	writer, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`CREATE TABLE probe (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := writer.Exec(`PRAGMA locking_mode=EXCLUSIVE`); err != nil {
+		t.Fatalf("set exclusive locking mode: %v", err)
+	}
+	// This statement is what actually takes and holds the exclusive lock
+	// under locking_mode=EXCLUSIVE (taken on the next access, not released
+	// on commit).
+	if _, err := writer.Exec(`INSERT INTO probe (val) VALUES ('locked')`); err != nil {
+		t.Fatalf("insert to take exclusive lock: %v", err)
+	}
+
+	prevBusyTimeout := busyTimeout
+	busyTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { busyTimeout = prevBusyTimeout })
+
+	preserved, reason, err := PreserveCorruptStore(dbPath)
+	if err == nil {
+		t.Fatalf("expected an operational error from lock contention, got preserved=%q reason=%q err=nil", preserved, reason)
+	}
+	var sqliteErr sqlite3.Error
+	if !errors.As(err, &sqliteErr) || sqliteErr.Code != sqlite3.ErrBusy {
+		t.Fatalf("expected err to wrap a sqlite3.Error{Code: ErrBusy}, got: %v", err)
+	}
+	if preserved != "" || reason != "" {
+		t.Fatalf("lock contention must not be reported as a corruption finding, got preserved=%q reason=%q", preserved, reason)
+	}
+
+	// The healthy, locked file itself must be completely untouched.
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("healthy file should be untouched after lock contention, stat err = %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".corrupt-") {
+			t.Fatalf("unexpected .corrupt-* file after lock contention (not a corruption finding): %s", e.Name())
 		}
 	}
 }

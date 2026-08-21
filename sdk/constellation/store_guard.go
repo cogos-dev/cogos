@@ -23,6 +23,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 // quickCheckTimeout bounds how long PRAGMA quick_check may run against an
@@ -36,6 +38,18 @@ import (
 // (see store_guard_test.go) without depending on machine speed or a
 // multi-hundred-MB fixture.
 var quickCheckTimeout = 30 * time.Second
+
+// busyTimeout bounds how long checkStoreIntegrity's own read-only connection
+// waits on a lock (SQLite's own retry-until-timeout, distinct from
+// quickCheckTimeout's context deadline around the whole query) before
+// surfacing SQLITE_BUSY/SQLITE_LOCKED — which isInconclusive then treats the
+// same way as a context timeout, not as corruption.
+//
+// A var for the same reason as quickCheckTimeout: tests force it low to
+// reproduce real lock contention deterministically and fast (see
+// store_guard_test.go) rather than waiting out a multi-second production
+// timeout.
+var busyTimeout = 5 * time.Second
 
 // sidecarSuffixes are the WAL-mode sidecar files that travel with a SQLite
 // main file. They are preserved alongside a corrupt main file under the same
@@ -63,11 +77,14 @@ var sidecarSuffixes = []string{"-wal", "-shm"}
 // SQLite's own WAL-aware read path does not have that problem — a read-only
 // connection gets the same MVCC-consistent view any other concurrent reader
 // would, which is exactly why mcp_stubs.go's searchMemoryFTSDriftRepair
-// already reads the live store the same way. A quick_check TIMEOUT is
-// likewise never treated as a corruption finding, for the identical reason:
-// folding "we couldn't determine" into "confirmed corrupt" would let a
-// slow-but-healthy check (large store, loaded disk) destroy a live good
-// store just as surely as a false-positive read would.
+// already reads the live store the same way. Anything that means "the check
+// itself couldn't reach a verdict" — a quick_check TIMEOUT, or the read-only
+// connection's own busy-timeout expiring on SQLITE_BUSY/SQLITE_LOCKED
+// against a lock a concurrent connection legitimately holds — is likewise
+// never treated as a corruption finding (see isInconclusive), for the
+// identical reason: folding "we couldn't determine" into "confirmed
+// corrupt" would let a slow-or-momentarily-locked-but-healthy check destroy
+// a live good store just as surely as a false-positive read would.
 //
 // Accepted trade-off: opening a store directly for the check means that if
 // the main file IS genuinely corrupt and has stale, non-matching WAL/SHM
@@ -91,9 +108,9 @@ var sidecarSuffixes = []string{"-wal", "-shm"}
 //     an "empty file" finding, or the underlying open/scan error) — the
 //     caller should log both loudly before rebuilding fresh.
 //   - err != nil: either a filesystem operation itself failed (stat/rename),
-//     or the check could not reach a verdict at all (timeout) — both are
-//     operational failures, distinct from a corruption finding, and neither
-//     touches the file.
+//     or the check could not reach a verdict at all (timeout, or busy/locked
+//     — see isInconclusive) — both are operational failures, distinct from a
+//     corruption finding, and neither touches the file.
 func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, err error) {
 	info, statErr := os.Stat(dbPath)
 	if statErr != nil {
@@ -116,8 +133,8 @@ func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, e
 		checkErr = fmt.Errorf("store file is empty (0 bytes)")
 	} else {
 		checkErr = checkStoreIntegrity(dbPath)
-		if checkErr != nil && errors.Is(checkErr, context.DeadlineExceeded) {
-			return "", "", fmt.Errorf("integrity check for %s did not complete within %s: %w", dbPath, quickCheckTimeout, checkErr)
+		if checkErr != nil && isInconclusive(checkErr) {
+			return "", "", fmt.Errorf("integrity check for %s was inconclusive (not a corruption finding): %w", dbPath, checkErr)
 		}
 	}
 
@@ -132,16 +149,50 @@ func PreserveCorruptStore(dbPath string) (preservedPath string, reason string, e
 	return target, checkErr.Error(), nil
 }
 
+// isInconclusive reports whether err means "this check could not reach a
+// verdict" rather than "this file is corrupt" — the two cases PreserveCorruptStore
+// must never conflate, since folding an inconclusive result into "confirmed
+// corrupt" would destroy a live, healthy store the guard simply failed to
+// finish examining. Two shapes count as inconclusive:
+//
+//   - context.DeadlineExceeded: quick_check itself did not finish within
+//     quickCheckTimeout (a large store, a loaded disk).
+//   - sqlite3.ErrBusy / sqlite3.ErrLocked (including their extended forms,
+//     e.g. ErrBusyRecovery): the read-only connection's own
+//     _busy_timeout (busyTimeout) expired waiting on a lock — for example a daemon
+//     mid-WAL-recovery or mid-checkpoint holding the file briefly. This is
+//     the sibling of the timeout case above, caught in review: a lock a
+//     legitimate concurrent connection is holding is not evidence the file
+//     is corrupt, it is evidence the check arrived at a bad moment.
+//
+// Any other error (quick_check reporting an explicit non-"ok" result, or an
+// open/prepare failure that is not a busy/locked code — "file is not a
+// database" being the common one) is a genuine corruption finding.
+func isInconclusive(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code {
+		case sqlite3.ErrBusy, sqlite3.ErrLocked:
+			return true
+		}
+	}
+	return false
+}
+
 // checkStoreIntegrity opens path read-only (through the SQLite driver, WAL-
 // aware — see the PreserveCorruptStore doc comment for why this must be a
 // direct open rather than a copy) and runs a bounded PRAGMA quick_check. It
 // returns nil only when the file opens cleanly and quick_check reports "ok".
-// A context-deadline error is returned like any other — callers that need
-// to treat a timeout differently from a genuine corruption finding (as
-// PreserveCorruptStore does) check the returned error with errors.Is against
-// context.DeadlineExceeded.
+// A timeout or busy/locked error is returned like any other — callers that
+// need to treat those as inconclusive rather than a genuine corruption
+// finding (as PreserveCorruptStore does) check the returned error with
+// isInconclusive.
 func checkStoreIntegrity(path string) error {
-	db, err := sql.Open("sqlite3", path+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
+	dsn := fmt.Sprintf("%s?mode=ro&_journal_mode=WAL&_busy_timeout=%d", path, busyTimeout.Milliseconds())
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return fmt.Errorf("open read-only: %w", err)
 	}
