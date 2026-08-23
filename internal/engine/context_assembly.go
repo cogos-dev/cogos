@@ -427,8 +427,14 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 				continue
 			}
 
-			combined := relevance*2.0 + salience
-			if combined < salienceFloor {
+			// Admission gate keeps the legacy scale on purpose: salienceFloor
+			// is user-configurable (config.salience_floor, default 0.3) and
+			// rescaling the value it is compared against would silently change
+			// which documents every existing workspace admits. The gate answers
+			// "is this above the noise floor at all"; ordering is a separate
+			// question, handled below.
+			gate := relevance*2.0 + salience
+			if gate < salienceFloor {
 				continue
 			}
 
@@ -441,10 +447,16 @@ func (p *Process) assembleContextInnerWithOpts(ctx context.Context, convID strin
 			}
 
 			docCandidates = append(docCandidates, FovealDoc{
-				URI:         doc.URI,
-				Path:        doc.Path,
-				Title:       doc.Title,
-				Salience:    combined,
+				URI:   doc.URI,
+				Path:  doc.Path,
+				Title: doc.Title,
+				// Sort key: relevance is the primary key, salience only breaks
+				// ties within it. Using the gate value here would let an
+				// unbounded salience (observed 4.2-4.3) outrank a perfect
+				// keyword match and evict it at the maxFovealDocs cap below —
+				// the same inversion as myrgic/cogos#578, in the path that
+				// decides what memory the model actually sees each turn.
+				Salience:    rankScore(relevance, salience, len(keywords)),
 				Relevance:   relevance,
 				RawSalience: salience,
 				Reason:      reason,

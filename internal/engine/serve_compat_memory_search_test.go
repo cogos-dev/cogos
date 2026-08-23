@@ -23,6 +23,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -313,5 +315,54 @@ func TestRankScore_RelevanceStrictlyDominatesSalience(t *testing.T) {
 	// Defensive: a negative salience must not subtract from relevance.
 	if rankScore(1.0, -5, 1) != rankScore(1.0, 0, 1) {
 		t.Error("negative salience altered the score")
+	}
+}
+
+// TestNoRankingPathUsesUnboundedSalience is a whole-class guard.
+//
+// myrgic/cogos#578 was fixed three times: handleMemorySearch, then
+// serve_foveated.go, then context_assembly.go — each found only after the
+// previous fix shipped. This test asserts the invariant across the package
+// rather than per-site, so a fourth instance cannot be introduced silently.
+//
+// It scans non-test sources for the unsound `relevance*2.0 + salience` shape
+// used as an ORDERING value. The one permitted survivor is the admission gate
+// in context_assembly.go, which deliberately keeps the legacy scale because
+// salienceFloor is user-configurable and rescaling it would change which
+// documents every existing workspace admits — it decides "above the noise
+// floor at all", never relative order.
+func TestNoRankingPathUsesUnboundedSalience(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+
+	// file -> the single variable name permitted to hold the legacy formula.
+	allowed := map[string]string{
+		"context_assembly.go": "gate", // admission threshold, not a sort key
+	}
+
+	pattern := regexp.MustCompile(`(\w+)\s*:?=\s*relevance\*2\.0 \+ salience`)
+
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") ||
+			strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		for _, m := range pattern.FindAllStringSubmatch(string(src), -1) {
+			varName := m[1]
+			if allowed[name] == varName {
+				continue
+			}
+			t.Errorf("%s: `%s := relevance*2.0 + salience` reintroduces the "+
+				"unbounded-salience ranking defect (#578). Use "+
+				"rankScore(relevance, salience, len(keywords)) so relevance "+
+				"stays the primary key.", name, varName)
+		}
 	}
 }

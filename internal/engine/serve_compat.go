@@ -31,7 +31,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -666,17 +665,15 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := 20
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
-			limit = n
-		}
-	}
-	sector := r.URL.Query().Get("sector")
+	// Request surface is deliberately unchanged: `query` only, limit fixed at
+	// the 20 this endpoint always returned. SearchMemory supports limit and
+	// sector, but exposing them here would widen a deprecated endpoint's
+	// contract inside a bugfix — a separate change if anyone wants it.
+	const limit = 20
 
 	// A retrieval error must surface as an error, not as an empty result set:
 	// the caller has to be able to tell "no matches" from "I am broken".
-	out, err := SearchMemory(s.cfg.WorkspaceRoot, query, limit, sector)
+	out, err := SearchMemory(s.cfg.WorkspaceRoot, query, limit, "")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("memory search failed: %v", err),
 			http.StatusInternalServerError)
