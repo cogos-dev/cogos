@@ -22,6 +22,35 @@ import (
 	"time"
 )
 
+// rankScore combines query relevance with attentional salience so that
+// relevance strictly dominates.
+//
+// The naive shape `relevance*2.0 + salience` is unsound: queryRelevance is
+// bounded by 1.0 (max contribution 2.0) while Field().Score() is unbounded and
+// observed at 4.2–4.3 on a real corpus. A perfectly-matching document loses to
+// a non-matching, frequently-touched one, which is how GET /memory/search ended
+// up returning byte-identical results for unrelated queries (myrgic/cogos#578).
+//
+// Instead relevance is the primary key and salience is a bounded tiebreaker
+// *within* a relevance level.
+//
+// The bound matters. queryRelevance returns matches/numKeywords, so with n
+// keywords the smallest gap between two distinct relevance levels is 1/n —
+// which shrinks as the query lengthens. A tiebreaker merely squashed into
+// [0,1) would therefore still bridge a real relevance gap for any n > 1. So we
+// rank on the integer match COUNT (step size exactly 1) and keep the
+// tiebreaker strictly below 1. That makes domination hold for any keyword
+// count and any salience value.
+func rankScore(relevance, salience float64, numKeywords int) float64 {
+	if salience < 0 {
+		salience = 0
+	}
+	// Recover the integer match count; step size 1 regardless of query length.
+	matches := relevance * float64(numKeywords)
+	tiebreak := salience / (1.0 + salience) // in [0,1)
+	return matches + tiebreak
+}
+
 // foveatedRequest is the wire format for POST /v1/context/foveated.
 type foveatedRequest struct {
 	Prompt    string     `json:"prompt"`
@@ -38,14 +67,14 @@ type irisSignal struct {
 
 // foveatedResponse is the wire format returned to the hook.
 type foveatedResponse struct {
-	Context         string         `json:"context"`
-	Tokens          int            `json:"tokens"`
-	Anchor          string         `json:"anchor"`
-	Goal            string         `json:"goal"`
-	IrisPressure    float64        `json:"iris_pressure"`
-	CoherenceScore  float64        `json:"coherence_score"`
-	TierBreakdown   map[string]int `json:"tier_breakdown"`
-	EffectiveBudget int            `json:"effective_budget"`
+	Context         string          `json:"context"`
+	Tokens          int             `json:"tokens"`
+	Anchor          string          `json:"anchor"`
+	Goal            string          `json:"goal"`
+	IrisPressure    float64         `json:"iris_pressure"`
+	CoherenceScore  float64         `json:"coherence_score"`
+	TierBreakdown   map[string]int  `json:"tier_breakdown"`
+	EffectiveBudget int             `json:"effective_budget"`
 	Blocks          []foveatedBlock `json:"blocks"`
 }
 
@@ -174,7 +203,7 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 					URI:      doc.URI,
 					Path:     doc.Path,
 					Title:    doc.Title,
-					Salience: relevance*2.0 + salience,
+					Salience: rankScore(relevance, salience, len(keywords)),
 					Reason:   reason,
 				})
 			}
@@ -313,7 +342,6 @@ func (s *Server) handleFoveatedContext(w http.ResponseWriter, r *http.Request) {
 		Blocks:          blocks,
 	})
 }
-
 
 // renderKnowledgeContent builds the knowledge block content string from foveated docs.
 // This is the content-only portion; the block envelope is handled by ContextFrame.Render.
