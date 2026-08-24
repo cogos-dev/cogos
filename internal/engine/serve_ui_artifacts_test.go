@@ -225,3 +225,92 @@ func TestUIArtifacts_HiddenDirsExcluded(t *testing.T) {
 		t.Fatalf("artifacts = %+v, want only 'real'", got.Artifacts)
 	}
 }
+
+// A non-ASCII codepoint before <title> must not shift the byte offsets used to
+// slice the ORIGINAL buffer. strings.ToLower is not length-preserving (U+0130
+// folds 2 bytes to 1, U+212A folds 3 to 1), so folding with it and then slicing
+// the unfolded bytes yields a garbled title — or an out-of-range slice near the
+// end of the buffer. Regression probe for cog-review's note on #581.
+func TestUIArtifacts_TitleWithNonASCIIBeforeTag(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+	for name, head := range map[string]string{
+		// U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE: 2 bytes -> 1 when folded.
+		"dotted-i": "<meta content=\"\u0130\u0130\u0130\"><title>REAL TITLE</title>",
+		// U+212A KELVIN SIGN: 3 bytes -> 1 when folded.
+		"kelvin": "<meta content=\"\u212a\u212a\"><title>REAL TITLE</title>",
+		// Mixed, plus a codepoint that folds to the same length.
+		"mixed": "<meta content=\"\u0130\u00c9\u212a caf\u00e9\"><title>REAL TITLE</title>",
+	} {
+		writeArtifact(t, ws, name, "index.html",
+			"<!doctype html><html><head>"+head+"</head><body>x</body></html>")
+	}
+
+	rec := get(t, s.handleUIArtifactIndex, "/v1/ui/artifacts")
+	var got struct {
+		Artifacts []UIArtifact `json:"artifacts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Artifacts) != 3 {
+		t.Fatalf("got %d artifacts, want 3", len(got.Artifacts))
+	}
+	for _, a := range got.Artifacts {
+		if a.Title != "REAL TITLE" {
+			t.Errorf("%s: Title = %q, want %q (offset shift from non-ASCII folding)",
+				a.Name, a.Title, "REAL TITLE")
+		}
+	}
+}
+
+// A <title> preceded by codepoints whose lowercase form is LONGER in bytes
+// must not panic. Exactly two runes in Unicode grow when lowercased —
+// U+023A (Ⱥ, 2 bytes -> 3) and U+023E (Ⱦ, 2 bytes -> 3) — and enough of them
+// before the tag pushes the offsets found in the folded copy past the end of
+// the original buffer: "slice bounds out of range [:129] with capacity 97".
+// The shrinking runes (U+0130, U+212A) only garble; these crash.
+func TestUIArtifacts_TitleNonASCIIDoesNotPanic(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+	writeArtifact(t, ws, "pathological", "index.html",
+		strings.Repeat("\u023a", 40)+"<title>OK</title>")
+	writeArtifact(t, ws, "pathological2", "index.html",
+		strings.Repeat("\u023e", 40)+"<title>OK</title>")
+
+	// Under the buggy implementation this panics inside listUIArtifacts,
+	// taking the handler — and this test process — down.
+	rec := get(t, s.handleUIArtifactIndex, "/v1/ui/artifacts")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got struct {
+		Artifacts []UIArtifact `json:"artifacts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range got.Artifacts {
+		if a.Title != "OK" {
+			t.Errorf("%s: Title = %q, want %q", a.Name, a.Title, "OK")
+		}
+	}
+}
+
+// A file whose name legitimately begins with ".." is not traversal. os.Root
+// resolves it inside the artifact; a naive HasPrefix(clean, "..") guard would
+// 404 it. Note the name must be at the TOP level of the URL path for the naive
+// guard to bite — path.Clean("odd/..foo.txt") does not start with "..", so a
+// nested file would pass even against the buggy guard and prove nothing.
+func TestUIArtifacts_DotDotPrefixedFilenameIsServed(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+	// The artifact DIRECTORY itself is named "..odd", so the request path is
+	// "/ui/..odd/index.html" and path.Clean leaves a leading "..".
+	writeArtifact(t, ws, "..odd", "index.html", "<title>odd</title>legitimate content")
+
+	rec := get(t, s.handleUIArtifacts, "/ui/..odd/index.html")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (name starts with '..' but is not traversal)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "legitimate content") {
+		t.Error("file body not served")
+	}
+}

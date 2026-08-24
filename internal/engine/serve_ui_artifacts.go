@@ -122,6 +122,15 @@ func (s *Server) listUIArtifacts() ([]UIArtifact, error) {
 // uiArtifactTitle reads the <title> out of an HTML file, cheaply and without
 // parsing: only the first 8KB is scanned. An artifact with no title is listed
 // under its directory name.
+//
+// Case folding is done with asciiLowerInPlace rather than strings.ToLower
+// because the offsets found in the folded copy are used to slice the ORIGINAL
+// bytes. strings.ToLower is not length-preserving — U+0130 folds 2 bytes to 1
+// and U+212A folds 3 to 1 — so a non-ASCII codepoint anywhere before the
+// <title> tag shifts every subsequent offset and slices out the wrong range
+// (observed: a title reading "le>REAL TI" instead of "REAL TITLE"), or panics
+// near the end of the buffer. HTML tag names are ASCII, so folding only ASCII
+// is both sufficient and byte-for-byte length-preserving.
 func uiArtifactTitle(p string) string {
 	f, err := os.Open(p)
 	if err != nil {
@@ -130,7 +139,8 @@ func uiArtifactTitle(p string) string {
 	defer f.Close()
 	buf := make([]byte, 8192)
 	n, _ := io.ReadFull(f, buf)
-	head := strings.ToLower(string(buf[:n]))
+	buf = buf[:n]
+	head := string(asciiLowerInPlace(append([]byte(nil), buf...)))
 	i := strings.Index(head, "<title>")
 	if i < 0 {
 		return ""
@@ -140,6 +150,18 @@ func uiArtifactTitle(p string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(buf[i+len("<title>") : i+j]))
+}
+
+// asciiLowerInPlace lowercases A-Z in b and returns it. Every other byte —
+// including all UTF-8 continuation bytes — is left untouched, so the result
+// has exactly the same length and byte offsets as the input.
+func asciiLowerInPlace(b []byte) []byte {
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return b
 }
 
 // handleUIArtifactIndex serves GET /v1/ui/artifacts as JSON.
@@ -183,7 +205,10 @@ func (s *Server) handleUIArtifacts(w http.ResponseWriter, r *http.Request) {
 	defer root.Close()
 
 	clean := path.Clean(rel)
-	if clean == "." || strings.HasPrefix(clean, "..") {
+	// Reject only genuine traversal: "." or a leading ".." SEGMENT. A plain
+	// HasPrefix(clean, "..") would also reject a legitimately named file such
+	// as "..foo.txt", which os.Root resolves safely anyway.
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
