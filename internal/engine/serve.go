@@ -206,6 +206,11 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	mux := http.NewServeMux()
 	s.routeH(mux, "GET /", dashboard.Handler())
 	s.routeH(mux, "GET /canvas", canvas.Handler())
+	// Workspace-hosted UI artifacts (see serve_ui_artifacts.go). Unlike the
+	// two embedded UIs above, these live in $WORKSPACE/artifacts and are
+	// versioned with the workspace rather than the binary.
+	s.route(mux, "GET /ui/", s.handleUIArtifacts)
+	s.route(mux, "GET /v1/ui/artifacts", s.handleUIArtifactIndex)
 	s.route(mux, "GET /health", s.handleHealth)
 	s.route(mux, "GET /v1/context", s.handleContext)
 	s.route(mux, "GET /v1/resolve", s.handleResolve)
