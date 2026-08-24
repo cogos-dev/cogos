@@ -217,8 +217,15 @@ func (s *Server) handleUIArtifacts(w http.ResponseWriter, r *http.Request) {
 	if err == nil && st.IsDir() {
 		// Directory: redirect to a trailing slash so relative asset URLs in the
 		// artifact resolve against the directory, then serve its index file.
+		// The query string must survive the redirect — an artifact that reads
+		// window.location.search would otherwise lose its state on exactly the
+		// shareable URL this route exists to provide.
 		if !strings.HasSuffix(r.URL.Path, "/") {
-			http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
+			target := r.URL.Path + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
 			return
 		}
 		found := false

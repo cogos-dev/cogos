@@ -314,3 +314,63 @@ func TestUIArtifacts_DotDotPrefixedFilenameIsServed(t *testing.T) {
 		t.Error("file body not served")
 	}
 }
+
+// A directory redirect must carry the query string through. Artifacts that
+// read window.location.search would otherwise lose their state on exactly the
+// shareable URL this route exists to provide. Regression probe for
+// cog-review's confirmed finding on #581.
+func TestUIArtifacts_RedirectPreservesQueryString(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+	writeArtifact(t, ws, "desk", "index.html", "<title>d</title>")
+
+	for _, tc := range []struct{ target, wantLoc string }{
+		{"/ui/desk?theme=dark", "/ui/desk/?theme=dark"},
+		{"/ui/desk?a=1&b=2", "/ui/desk/?a=1&b=2"},
+		{"/ui/desk", "/ui/desk/"}, // no query: no stray "?"
+	} {
+		rec := get(t, s.handleUIArtifacts, tc.target)
+		if rec.Code != http.StatusMovedPermanently {
+			t.Fatalf("%s: status = %d, want 301", tc.target, rec.Code)
+		}
+		if loc := rec.Header().Get("Location"); loc != tc.wantLoc {
+			t.Errorf("%s: Location = %q, want %q", tc.target, loc, tc.wantLoc)
+		}
+	}
+}
+
+// listUIArtifacts walks artifact directories on the OS filesystem rather than
+// through os.Root. A symlink inside an artifact must not contribute its
+// TARGET's size to the reported byte count: fs.DirEntry.Info() lstats, so the
+// link's own path length is counted instead. This pins that behaviour so a
+// future switch to a following-stat would fail loudly rather than silently
+// reporting sizes of files outside the artifacts root.
+func TestUIArtifacts_SymlinkSizeNotFollowedInIndex(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+	writeArtifact(t, ws, "art", "index.html", "<title>a</title>")
+
+	big := filepath.Join(ws, "BIG.bin")
+	if err := os.WriteFile(big, make([]byte, 100000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(big, filepath.Join(ws, uiArtifactsDirName, "art", "link.bin")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	rec := get(t, s.handleUIArtifactIndex, "/v1/ui/artifacts")
+	var got struct {
+		Artifacts []UIArtifact `json:"artifacts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Artifacts) != 1 {
+		t.Fatalf("got %d artifacts, want 1", len(got.Artifacts))
+	}
+	if b := got.Artifacts[0].Bytes; b >= 100000 {
+		t.Errorf("Bytes = %d — symlink target size leaked into the index", b)
+	}
+	// And the symlink is still not servable through os.Root.
+	if rec := get(t, s.handleUIArtifacts, "/ui/art/link.bin"); rec.Code == http.StatusOK {
+		t.Errorf("symlink served with status %d; want refusal", rec.Code)
+	}
+}
