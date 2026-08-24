@@ -153,6 +153,8 @@ func classifyHTTPFamily(path string) string {
 		{"/v1/manifest", "kernel"},
 		{"/health", "kernel"},
 		{"/canvas", "kernel"},
+		{"/ui", "kernel"},
+		{"/v1/ui", "kernel"},
 	}
 	for _, p := range prefixes {
 		if strings.HasPrefix(path, p.prefix) {
