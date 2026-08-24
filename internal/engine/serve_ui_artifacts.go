@@ -1,7 +1,7 @@
 // serve_ui_artifacts.go — workspace-hosted UI artifacts.
 //
 //	GET /ui/                      → index page listing every artifact
-//	GET /ui/{name}/...            → static files from $WORKSPACE/artifacts/{name}/
+//	GET /ui/{name}/...            → static files from $WORKSPACE/ui/{name}/
 //	GET /v1/ui/artifacts          → JSON index of discovered artifacts
 //
 // Motivation: the kernel already serves two embedded UIs (GET / dashboard,
@@ -11,7 +11,7 @@
 // same-origin access to the kernel API, and no discoverability.
 //
 // This route hosts *workspace* artifacts instead of embedded ones: anything
-// under $WORKSPACE/artifacts/ is served read-only over the same origin as the
+// under $WORKSPACE/ui/ is served read-only over the same origin as the
 // kernel API, so an artifact can `fetch('/v1/...')` without CORS, and the set
 // of artifacts is versioned with the workspace rather than with the binary.
 //
@@ -23,7 +23,7 @@
 //     the kernel rather than in string-munging).
 //   - Only files under an artifact directory are reachable; the artifacts root
 //     itself is enumerated, never walked as a file tree.
-//   - Absent directory is not an error: a workspace with no artifacts/ serves
+//   - Absent directory is not an error: a workspace with no ui/ serves
 //     an empty index. The route exists unconditionally so /v1/manifest
 //     advertises a surface that is always really there.
 package engine
@@ -46,7 +46,7 @@ import (
 )
 
 // uiArtifactsDirName is the workspace-relative directory hosting artifacts.
-const uiArtifactsDirName = "artifacts"
+const uiArtifactsDirName = "ui"
 
 // uiArtifactIndexNames are tried, in order, when a directory is requested.
 var uiArtifactIndexNames = []string{"index.html", "index.htm"}
