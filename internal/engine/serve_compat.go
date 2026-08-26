@@ -646,6 +646,17 @@ func (s *Server) handleTAA(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMemorySearch searches CogDocs by query string.
+//
+// Delegates to SearchMemory (constellation FTS5 + bm25, grep fallback) — the
+// same path the MCP memory_search tool uses. It must NOT re-implement ranking:
+// a previous version scored docs with queryRelevance()*2.0 + salience, where
+// relevance is capped at 1.0 and salience is unbounded (observed 4.2–4.3). The
+// salience term dominated the sort, so the query string was inert — three
+// unrelated queries returned byte-identical results. See myrgic/cogos#578.
+//
+// Salience is deliberately NOT blended in here. If attentional weighting is
+// wanted it must be a tiebreaker *within* relevance-ranked results, never an
+// additive term that can outrank the query.
 func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 	s.logCompatDeprecated(r)
 	query := r.URL.Query().Get("query")
@@ -654,53 +665,23 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type searchResult struct {
-		Path    string  `json:"path"`
-		Title   string  `json:"title"`
-		Type    string  `json:"type"`
-		Score   float64 `json:"score"`
-		Snippet string  `json:"snippet,omitempty"`
-	}
+	// Request surface is deliberately unchanged: `query` only, limit fixed at
+	// the 20 this endpoint always returned. SearchMemory supports limit and
+	// sector, but exposing them here would widen a deprecated endpoint's
+	// contract inside a bugfix — a separate change if anyone wants it.
+	const limit = 20
 
-	var results []searchResult
-
-	cogIdx := s.process.Index()
-	if cogIdx != nil {
-		keywords := strings.Fields(strings.ToLower(query))
-		for _, doc := range cogIdx.ByURI {
-			score := queryRelevance(doc, keywords)
-			salience := s.process.Field().Score(doc.Path)
-			combined := score*2.0 + salience
-			if combined <= 0 {
-				continue
-			}
-			results = append(results, searchResult{
-				Path:  doc.Path,
-				Title: doc.Title,
-				Type:  doc.Type,
-				Score: combined,
-			})
-		}
-	}
-
-	// Sort by score descending, limit to 20.
-	for i := 0; i < len(results); i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].Score > results[i].Score {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
-	if len(results) > 20 {
-		results = results[:20]
+	// A retrieval error must surface as an error, not as an empty result set:
+	// the caller has to be able to tell "no matches" from "I am broken".
+	out, err := SearchMemory(s.cfg.WorkspaceRoot, query, limit, "")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("memory search failed: %v", err),
+			http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"query":   query,
-		"results": results,
-		"count":   len(results),
-	})
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // handleMemoryRead reads a CogDoc by path.
