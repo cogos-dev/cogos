@@ -80,19 +80,49 @@ func TestHealthHealthyWhenAppendsRecent(t *testing.T) {
 	}
 }
 
-// TestHealthNoFalsePositiveAtBoot: immediately after process start there has
-// been no append yet and that is correct, not a fault. Reporting Degraded here
-// would make every daemon boot look broken for the first 15 minutes.
+// TestHealthNoFalsePositiveAtBoot: immediately after start there has been no
+// append yet and that is correct, not a fault. Reporting Degraded here would
+// make every daemon boot look broken for the first 15 minutes.
 func TestHealthNoFalsePositiveAtBoot(t *testing.T) {
 	r := newTestRecorder(t)
-
-	prev := processStart
-	processStart = time.Now() // pretend we just booted
-	t.Cleanup(func() { processStart = prev })
+	r.startedAt = time.Now() // this recorder just booted
 
 	if st := r.Health(); st.Health != reconcile.HealthHealthy {
-		t.Fatalf("Health() = %v (%q); want Healthy — a fresh process that has "+
+		t.Fatalf("Health() = %v (%q); want Healthy — a fresh recorder that has "+
 			"not yet seen a tick is not stale", st.Health, st.Message)
+	}
+}
+
+// TestBootGraceIsPerInstance pins the fix for the cog-review note on PR #585:
+// the grace period must key off each Recorder's own start time, not a shared
+// package-level stamp. With a global, a recorder constructed after the
+// package had been loaded a while would be born already "stale" — wrong, and
+// confusing to debug.
+func TestBootGraceIsPerInstance(t *testing.T) {
+	SetWorkspaceRoot(t.TempDir())
+	t.Cleanup(func() { SetWorkspaceRoot("") })
+
+	// An old recorder that never appended: genuinely stale.
+	old := &Recorder{startedAt: time.Now().Add(-4 * time.Hour)}
+	// A brand-new one, created in the same process at the same moment.
+	fresh := &Recorder{startedAt: time.Now()}
+
+	if got := old.Health().Health; got != reconcile.HealthDegraded {
+		t.Errorf("old recorder Health() = %v; want Degraded", got)
+	}
+	if got := fresh.Health().Health; got != reconcile.HealthHealthy {
+		t.Errorf("fresh recorder Health() = %v; want Healthy — its grace period "+
+			"must not be inherited from an older sibling or from package init", got)
+	}
+}
+
+// TestBootStampFallsBackToPackageStart: a zero-value Recorder (every existing
+// construction site) must keep working without setting startedAt.
+func TestBootStampFallsBackToPackageStart(t *testing.T) {
+	r := &Recorder{}
+	if !r.bootStamp().Equal(processStart) {
+		t.Errorf("bootStamp() = %v; want the package stamp %v for a zero-value "+
+			"Recorder, so existing callers need no change", r.bootStamp(), processStart)
 	}
 }
 

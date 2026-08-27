@@ -133,9 +133,9 @@ func resolveWorkspaceRoot() (string, error) {
 // uselessness by an unrelated config change.
 const staleThreshold = 15 * time.Minute
 
-// processStart is stamped once at package init so Health() can distinguish
-// "never appended because we just booted" (fine) from "never appended
-// although we have been up for ages" (the dispatch is not wired).
+// processStart is the fallback boot stamp for a Recorder that was created
+// without one (the zero value). See Recorder.startedAt for why the grace
+// period is per-instance rather than package-global.
 var processStart = time.Now()
 
 // Recorder is the live retention engine: it appends bus_kernel_proprio
@@ -168,6 +168,19 @@ type Recorder struct {
 	// "monitor proven only by silence" failure this workspace treats as a
 	// defect class: absence of an error is not evidence of liveness.
 	lastAppendOKAt time.Time
+
+	// startedAt is this recorder's own boot stamp, used for the "never
+	// appended yet" grace period in Health().
+	//
+	// Per-instance rather than package-global (cog-review note on PR #585):
+	// a single shared processStart is harmless while production runs one
+	// globalRecorder, but it silently couples every Recorder's grace period
+	// to package init time. A test — or a future multi-node/multi-recorder
+	// arrangement — that constructs a fresh Recorder after the package has
+	// been loaded for a while would see it born already "stale", which is
+	// wrong and confusing. Zero value falls back to processStart via
+	// bootStamp() so existing construction sites need no change.
+	startedAt time.Time
 
 	// compacting is the single-flight guard: true while a compaction
 	// goroutine is running for this recorder. Read and written only under
@@ -208,7 +221,7 @@ type Recorder struct {
 // to the same instance, wired from two different call sites
 // (SetWorkspaceRoot via engine.SetProvidersWorkspace; HandleBusEvent via
 // engine.WireProviderRuntime).
-var globalRecorder = &Recorder{}
+var globalRecorder = &Recorder{startedAt: time.Now()}
 
 // GlobalRecorder returns the process-wide Recorder instance.
 func GlobalRecorder() *Recorder { return globalRecorder }
@@ -290,16 +303,16 @@ func (r *Recorder) Health() reconcile.ResourceStatus {
 	// wired, it is simply no longer being fed. Missing would imply it failed
 	// to load.
 	if r.lastAppendOKAt.IsZero() {
-		// No successful append since process start. Only meaningful once the
-		// process has been up long enough for a tick to have plausibly fired;
-		// before that, "nothing yet" is the correct and expected state, not a
-		// fault. processStart is stamped at package init.
-		if time.Since(processStart) > staleThreshold {
+		// No successful append since this recorder started. Only meaningful
+		// once it has been alive long enough for a tick to have plausibly
+		// fired; before that, "nothing yet" is the correct and expected
+		// state, not a fault.
+		if time.Since(r.bootStamp()) > staleThreshold {
 			return reconcile.ResourceStatus{
 				Sync: reconcile.SyncStatusSynced, Health: reconcile.HealthDegraded,
 				Operation: reconcile.OperationIdle,
 				Message: "no successful append since process start " +
-					time.Since(processStart).Round(time.Second).String() +
+					time.Since(r.bootStamp()).Round(time.Second).String() +
 					" ago — bus_kernel_proprio dispatch may not be wired",
 			}
 		}
@@ -321,6 +334,16 @@ func (r *Recorder) Health() reconcile.ResourceStatus {
 		}
 	}
 	return reconcile.NewResourceStatus(reconcile.SyncStatusSynced, reconcile.HealthHealthy)
+}
+
+// bootStamp returns this recorder's boot time, falling back to the package
+// stamp when the field was never set (zero-value Recorder). Caller must hold
+// r.mu, or call it only on a recorder not yet shared across goroutines.
+func (r *Recorder) bootStamp() time.Time {
+	if r.startedAt.IsZero() {
+		return processStart
+	}
+	return r.startedAt
 }
 
 func (r *Recorder) recordAppendResult(err error) {
