@@ -161,6 +161,15 @@ func (f *AttentionalField) Update() error {
 // deltaUpdate rescores only files changed between oldHEAD and newHEAD.
 // Opens the repo exactly once and reuses the handle for both diffing and scoring.
 // Returns the number of files updated.
+//
+// #563: this used to call computeFileSalienceWithRepo once per changed file,
+// each call running its own independent commit-graph walk — O(changed_files
+// x commits) and, per-file, unbounded by daysWindow (see the note on
+// computeFileSalienceWithRepo). With consolidation running continuously,
+// that was ~21% of kernel CPU on a live node. It now collects stats for
+// every changed memory file in a single date-bounded walk (batchCollectStats,
+// the same walk RankFilesBySalience's full scan already uses), so a delta
+// touching N files costs one walk of the commits-in-window, not N.
 func (f *AttentionalField) deltaUpdate(oldHEAD, newHEAD string) (int, error) {
 	repo, err := git.PlainOpen(f.cfg.WorkspaceRoot)
 	if err != nil {
@@ -180,8 +189,12 @@ func (f *AttentionalField) deltaUpdate(oldHEAD, newHEAD string) (int, error) {
 	}
 
 	memPrefix := fmt.Sprintf("%s/.cog/mem/", f.cfg.WorkspaceRoot)
-	updated := 0
 
+	// Partition changed paths: files that no longer exist are deleted from
+	// the field immediately; files that still exist go into the scope set
+	// for the shared batch walk below.
+	relToAbs := make(map[string]string, len(changed))
+	updated := 0
 	for _, relPath := range changed {
 		absPath := filepath.Join(f.cfg.WorkspaceRoot, filepath.FromSlash(relPath))
 		if !strings.HasPrefix(absPath, memPrefix) {
@@ -195,25 +208,45 @@ func (f *AttentionalField) deltaUpdate(oldHEAD, newHEAD string) (int, error) {
 			updated++
 			continue
 		}
-		score, err := computeFileSalienceWithRepo(repo, f.cfg.WorkspaceRoot, absPath, f.cfg.SalienceDaysWindow, f.salCfg)
-		if err != nil || score == nil {
-			continue
+		relToAbs[relPath] = absPath
+	}
+
+	if len(relToAbs) > 0 {
+		stats, err := batchCollectStats(repo, relToAbs, f.cfg.SalienceDaysWindow)
+		if err != nil {
+			return 0, fmt.Errorf("delta batch stats: %w", err)
 		}
-		baseVal := score.Total
-		observerVal := baseVal
-		if strings.Contains(absPath, inboxPathFragment) {
-			switch readInboxStatus(absPath) {
-			case "raw":
-				observerVal += inboxRawBoost
-			case "enriched":
-				observerVal += inboxEnrichedBoost
+		scores := batchComputeScores(stats, relToAbs, f.salCfg)
+
+		// Compute inbox-boosted observer values outside the lock (readInboxStatus
+		// does file I/O), then apply all of them under a single lock acquisition.
+		type scored struct {
+			path     string
+			base     float64
+			observer float64
+		}
+		results := make([]scored, 0, len(scores))
+		for _, fs := range scores {
+			baseVal := fs.Score
+			observerVal := baseVal
+			if strings.Contains(fs.Path, inboxPathFragment) {
+				switch readInboxStatus(fs.Path) {
+				case "raw":
+					observerVal += inboxRawBoost
+				case "enriched":
+					observerVal += inboxEnrichedBoost
+				}
 			}
+			results = append(results, scored{fs.Path, baseVal, observerVal})
 		}
+
 		f.mu.Lock()
-		f.base[absPath] = baseVal
-		f.observer[absPath] = observerVal
+		for _, r := range results {
+			f.base[r.path] = r.base
+			f.observer[r.path] = r.observer
+		}
 		f.mu.Unlock()
-		updated++
+		updated += len(results)
 	}
 
 	f.mu.Lock()
