@@ -117,6 +117,27 @@ func resolveWorkspaceRoot() (string, error) {
 
 // --- Recorder --------------------------------------------------------------
 
+// staleThreshold is how long the recorder may go without a successful append
+// before Health() reports Degraded.
+//
+// Sizing: the recorder is driven by the autonomic ticker's
+// bus_kernel_proprio dispatch (see recorder.go), which fires on the order of
+// once per minute. 15 minutes is therefore many missed ticks — comfortably
+// past transient scheduling jitter, a slow compaction pass, or a single
+// dropped event, while still catching a genuine stall the same hour it
+// starts rather than the next time a human happens to look.
+//
+// Deliberately NOT derived from the tick interval: this package is a leaf
+// (ADR-085) and does not import internal/engine, and a monitor whose
+// threshold silently follows the thing it monitors can be widened into
+// uselessness by an unrelated config change.
+const staleThreshold = 15 * time.Minute
+
+// processStart is stamped once at package init so Health() can distinguish
+// "never appended because we just booted" (fine) from "never appended
+// although we have been up for ages" (the dispatch is not wired).
+var processStart = time.Now()
+
 // Recorder is the live retention engine: it appends bus_kernel_proprio
 // snapshots to per-metric-day NDJSON files and runs compaction/budget
 // enforcement opportunistically on the same cadence (no new loop or daemon —
@@ -131,6 +152,22 @@ type Recorder struct {
 	lastAppendAt   time.Time
 	lastCompactErr error
 	lastCompactAt  time.Time
+
+	// lastAppendOKAt is the time of the most recent SUCCESSFUL append.
+	//
+	// Distinct from lastAppendAt, which is stamped on every append attempt
+	// including failures. Health() needs the success timestamp because the
+	// failure this field exists to catch is not "appends are erroring" but
+	// "appends have STOPPED HAPPENING AT ALL" — the handler no longer being
+	// invoked, or being invoked and silently recording nothing.
+	//
+	// Found live 2026-08-27: this recorder reported Healthy in the kernel
+	// snapshot while its newest on-disk row was 17 hours old. Health() only
+	// checked lastAppendErr, so a recorder that simply stopped writing was
+	// indistinguishable from one working perfectly. That is precisely the
+	// "monitor proven only by silence" failure this workspace treats as a
+	// defect class: absence of an error is not evidence of liveness.
+	lastAppendOKAt time.Time
 
 	// compacting is the single-flight guard: true while a compaction
 	// goroutine is running for this recorder. Read and written only under
@@ -233,6 +270,49 @@ func (r *Recorder) Health() reconcile.ResourceStatus {
 			Message:   "recent append failure: " + r.lastAppendErr.Error(),
 		}
 	}
+
+	// STALENESS — the liveness check, added 2026-08-27 after this recorder
+	// reported Healthy for 17 hours while writing nothing.
+	//
+	// The checks above can only fire when an append ATTEMPT recorded an
+	// error. They are structurally blind to the worse failure: the handler
+	// no longer being invoked at all. In that state lastAppendErr stays nil
+	// forever and every probe reads green, which is the "monitor proven only
+	// by silence" defect — a monitor whose passing signal is indistinguishable
+	// from its own death.
+	//
+	// This recorder is driven synchronously by the autonomic ticker's
+	// bus_kernel_proprio dispatch, so a successful append is expected roughly
+	// once per tick. Going staleThreshold without one means the drive path is
+	// broken upstream even though nothing here errored.
+	//
+	// Reported as Degraded rather than Missing: the provider is present and
+	// wired, it is simply no longer being fed. Missing would imply it failed
+	// to load.
+	if r.lastAppendOKAt.IsZero() {
+		// No successful append since process start. Only meaningful once the
+		// process has been up long enough for a tick to have plausibly fired;
+		// before that, "nothing yet" is the correct and expected state, not a
+		// fault. processStart is stamped at package init.
+		if time.Since(processStart) > staleThreshold {
+			return reconcile.ResourceStatus{
+				Sync: reconcile.SyncStatusSynced, Health: reconcile.HealthDegraded,
+				Operation: reconcile.OperationIdle,
+				Message: "no successful append since process start " +
+					time.Since(processStart).Round(time.Second).String() +
+					" ago — bus_kernel_proprio dispatch may not be wired",
+			}
+		}
+	} else if age := time.Since(r.lastAppendOKAt); age > staleThreshold {
+		return reconcile.ResourceStatus{
+			Sync: reconcile.SyncStatusSynced, Health: reconcile.HealthDegraded,
+			Operation: reconcile.OperationIdle,
+			Message: "stale: last successful append " +
+				age.Round(time.Second).String() +
+				" ago (expected ~1/tick) — the pulse has stopped",
+		}
+	}
+
 	if r.lastCompactErr != nil && time.Since(r.lastCompactAt) < 1*time.Hour {
 		return reconcile.ResourceStatus{
 			Sync: reconcile.SyncStatusSynced, Health: reconcile.HealthDegraded,
@@ -248,6 +328,9 @@ func (r *Recorder) recordAppendResult(err error) {
 	defer r.mu.Unlock()
 	r.lastAppendErr = err
 	r.lastAppendAt = time.Now()
+	if err == nil {
+		r.lastAppendOKAt = r.lastAppendAt
+	}
 }
 
 // recordCompactResult records the outcome of a finished compaction pass and
