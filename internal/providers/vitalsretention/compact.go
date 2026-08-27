@@ -11,7 +11,9 @@
 package vitalsretention
 
 import (
+	"fmt"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 )
 
@@ -50,6 +52,27 @@ func (r *Recorder) maybeCompact(base, nodeKey string) {
 	r.compactWG.Add(1)
 	go func() {
 		defer r.compactWG.Done()
+		// PANIC SAFETY (2026-08-27): recordCompactResult is the ONLY place
+		// that clears r.compacting, so a panic anywhere in the compaction
+		// pass would leave the single-flight slot claimed forever. Every
+		// subsequent maybeCompact would then return early at the
+		// `if r.compacting` guard — silently, with no error recorded and
+		// nothing in Health() to show for it. The recorder would look
+		// perfectly healthy while compaction never ran again for the life of
+		// the process.
+		//
+		// The package contract for this handler is already "never blocks,
+		// never panics" (see recorder.go), because it runs inside the
+		// autonomic ticker's dispatch. This makes that contract true for the
+		// goroutine too, and converts a permanent silent wedge into a
+		// recorded, Health()-visible failure.
+		defer func() {
+			if rec := recover(); rec != nil {
+				err := fmt.Errorf("compaction panicked: %v", rec)
+				r.recordCompactResult(err)
+				warnf("vitals-retention: %v\n%s", err, debug.Stack())
+			}
+		}()
 		err := compactHook(r, base, nodeKey, cfg)
 		r.recordCompactResult(err)
 		if err != nil {
