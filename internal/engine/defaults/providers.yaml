@@ -2,10 +2,6 @@
 # The router loads enabled providers at startup and routes requests
 # based on capability, availability, and the sovereignty gradient.
 #
-# Default local backend: LM Studio (lmstudio-darkstar) at 127.0.0.1:1234.
-# This is the resident gemma-4-26b instance on the Darkstar node.
-# Operators on other nodes should override in providers.local.yaml.
-#
 # ── claude-oauth: discovery, not declaration ─────────────────────────────────
 # You will NOT find a "claude-oauth" entry below. Every node that already has
 # Claude Code credentials (macOS keychain, CLAUDE_CODE_OAUTH_TOKEN env var, or
@@ -21,13 +17,25 @@
 # always overrides auto-registration — declaration wins over discovery.
 #
 # Additional provider types are first-class but disabled by default:
+#   - lmstudio       : OpenAI-compatible local server (LM Studio). Point
+#                      `endpoint` at your LM Studio REST address (the app
+#                      defaults to http://127.0.0.1:1234) and `model` at
+#                      whatever you have loaded there.
 #   - vllm           : OpenAI-compatible local server (Linux/CUDA). See
 #                      docs/inference/vllm.md for setup. The kernel
 #                      assumes the operator runs `vllm serve` themselves;
 #                      a future "vllm-supervised" type will add launchd /
 #                      systemd lifecycle management.
 #   - mlx-supervised : kernel-managed mlx_lm.server (Apple Silicon).
-# Add them to providers.local.yaml to opt in. Example for vLLM:
+# Add them to providers.local.yaml to opt in. Examples:
+#   lmstudio-local:
+#     type: lmstudio
+#     enabled: true
+#     endpoint: "http://127.0.0.1:1234"
+#     model: "your-loaded-model-id"
+#     timeout: 300
+#     context_window: 8192
+#
 #   vllm-local:
 #     type: vllm
 #     enabled: true
@@ -44,38 +52,32 @@
 # backend declares `options.model_state.manage: true`. See
 # docs/inference/lms-model-state.md.
 #
-# The block below is COMMENTED OUT deliberately. Enabling it will cause the
-# autonomic ticker to load/unload models on that backend. Uncomment ONLY after
-# `cd scripts/lms-actuator && npm install` and operator live-verification of the
-# actuator against the target backend. Note: context_length: 262144 is VERIFIED
-# for the Eclipse 24 GB card (do NOT use the refuted 65536 ceiling).
+# The block below is COMMENTED OUT deliberately, and its values are
+# placeholders for an example remote LM Studio backend on another machine on
+# your network -- fill in your own host, model, and context length. Verify
+# the context length live against that backend before trusting it (LM Studio
+# will silently accept a context_length larger than a model actually
+# supports). Uncomment ONLY after `cd scripts/lms-actuator && npm install`
+# and operator live-verification of the actuator against the target backend.
 #
-#   eclipse:
+#   remote-node:
 #     type: openai              # OpenAI-compatible dispatch (LM Studio REST)
 #     enabled: true
-#     endpoint: "http://192.168.10.191:1234"
-#     api_key_env: ECLIPSE_API_KEY   # Bearer token; also used by the reconciler
-#     model: "ornith-1.0-35b"
+#     endpoint: "http://REMOTE_HOST:1234"
+#     api_key_env: REMOTE_NODE_API_KEY   # Bearer token; also used by the reconciler
+#     model: "your-model-id"
 #     timeout: 300
-#     context_window: 262144
+#     context_window: 8192
 #     options:
 #       model_state:
 #         manage: true          # <-- the opt-in switch; false/absent ⇒ Suspended
-#         model: "ornith-1.0-35b"
-#         context_length: 262144  # VERIFIED loaded + serving on the 24GB card
+#         model: "your-model-id"
+#         context_length: 8192  # verify against what your backend actually serves
 #         parallel: 1
 #         keep_warm: true
 #         jit_evict: false       # true ⇒ unload a non-target model that crowds the card
 
 providers:
-  lmstudio-darkstar:
-    type: lmstudio
-    enabled: true
-    endpoint: "http://127.0.0.1:1234"
-    model: "google/gemma-4-26b-a4b"
-    timeout: 300
-    context_window: 128000
-
   anthropic:
     type: anthropic
     enabled: false   # Set ANTHROPIC_API_KEY and enable to use
@@ -87,5 +89,4 @@ providers:
 routing:
   prefer_local: true
   fallback_chain:
-    - lmstudio-darkstar
     - anthropic
