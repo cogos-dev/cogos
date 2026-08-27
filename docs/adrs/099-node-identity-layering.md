@@ -157,6 +157,60 @@ Scoping authority for the change itself is RFC-036's 2026-07-29 operator ruling
 
 ---
 
+## Addendum (2026-08-07): Open Question #1's stated blocker no longer holds
+
+Open Question #1 asked when the cogos kernel could import
+`github.com/myrgic/constellation`, and named "constellation's public API
+surface being stable enough for a go.mod dependency" as the blocker. That
+framing was accurate on 2026-05-18 and was never re-checked afterward.
+Re-measured on 2026-08-07:
+
+- `github.com/myrgic/constellation` is tagged `v0.1.0` (2026-04-14) and
+  `v0.2.0` (2026-05-08) — ten days before this ADR's own creation date.
+- `identity.go` is byte-identical between `v0.2.0` and the current `main`
+  tip (same git blob SHA, `8b6d86f`).
+- Three commits have landed on constellation's `main` since `v0.2.0`:
+  `acc3456` (2026-05-27, `docs/PAPER.md`), `2d08506` (2026-08-03,
+  `CHANGELOG.md` and `README.md`), and `c47074f` (2026-08-03,
+  `CONTRIBUTING.md`). All three are docs-only; none touches a `.go` file.
+- `go get github.com/myrgic/constellation@v0.2.0` resolves cleanly through
+  the standard module proxy, and a scratch module built and compiled
+  cleanly against its exported identity surface (`NodeIdentity`,
+  `GenerateIdentity`, `LoadIdentity`, `SaveIdentity`).
+
+The public API surface has been frozen since `v0.2.0`, predating this ADR
+by ten days. The *obstacle* Open Question #1 named — API instability — was
+therefore already gone on the day this ADR was created; the "blocked on
+API stability" label persisted only because nothing re-checked it until
+now.
+
+This does **not** clear precondition #1 itself. Precondition #1, verbatim
+above, is an act performed by cogos ("the cogos kernel imports
+`github.com/myrgic/constellation`"), not a fact about constellation's API.
+Checked on `main` on 2026-08-07: `grep constellation go.mod` finds nothing,
+and no `.go` file in the kernel imports `myrgic/constellation`. The import
+does not exist on `main` — a prototype exists only on the closed, unmerged
+branch `feat/adr099-l2-identity-migration` (see below), which is not part
+of this change. So the honest count is **zero of ADR-099's three gating
+preconditions cleared** on `main` today: precondition #1 (the import)
+remains as unmet as preconditions #2 (`IdentityProvider` L2→L1 projection)
+and #3 (`cogos node migrate-identity` CLI command). What has changed is
+that the API-stability obstacle to doing #1 is gone, so #1 is now
+unblocked rather than blocked — a necessary step before it can be done, not
+evidence that it has been done. No existing `.cog/identity.json` should be
+touched until all three preconditions are met and an operator decides to
+run the migration.
+
+A prototype implementation of the six-step procedure from "Migration
+guidance for Layer 2 (future wave)" above (`internal/l2migration`, plus
+the corresponding `go.mod` dependency addition) exists on the closed
+branch `feat/adr099-l2-identity-migration` (PR #538, closed without
+merging on 2026-08-07). It is unmerged and is not part of this change; a
+future attempt at the second and third preconditions does not need to
+start from zero.
+
+---
+
 ## References
 
 - Three-layer identity model (L1/L2/L3) — (internal reference omitted)
