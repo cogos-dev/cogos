@@ -839,26 +839,43 @@ func TestSaveRegistryAtomic(t *testing.T) {
 }
 
 // TestArchiveRetentionFor verifies the per-bus retention lookup: exact names,
-// family prefixes, and the keep-everything default for undeclared buses.
+// family prefixes, the explicit keep-everything opt-out for chat/mcp, and
+// the bounded (not unlimited) default for undeclared buses (myrgic/cogos#562).
 func TestArchiveRetentionFor(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		busID string
 		want  int
 	}{
-		{"bus_traces", 8},         // exact match, prefixed
-		{"traces", 8},             // exact match, unprefixed
-		{"bus_kernel_proprio", 8}, // exact match wins over the "kernel" segment
-		{"bus_peer_awareness", 8}, // exact match wins over the "peer" segment
-		{"bus_chat_abc-123", -1},  // conversation content: never auto-pruned
-		{"bus_mcp_deadbeef", -1},  // conversation content: never auto-pruned
-		{"bus_sessions", -1},      // undeclared: keep everything
-		{"", -1},                  // degenerate input must not panic or prune
+		{"bus_traces", 8},                        // exact match, prefixed
+		{"traces", 8},                             // exact match, unprefixed
+		{"bus_kernel_proprio", 8},                 // exact match wins over the "kernel" segment
+		{"bus_peer_awareness", 8},                 // exact match wins over the "peer" segment
+		{"bus_chat_abc-123", busArchiveKeepAll},   // conversation content: explicit never-prune
+		{"bus_mcp_deadbeef", busArchiveKeepAll},   // conversation content: explicit never-prune
+		{"bus_sessions", defaultArchiveRetention}, // undeclared: bounded default, not unlimited
+		{"", defaultArchiveRetention},             // degenerate input must not panic or prune, but must still be bounded
 	}
 	for _, tc := range cases {
 		if got := archiveRetentionFor(tc.busID); got != tc.want {
 			t.Errorf("archiveRetentionFor(%q) = %d, want %d", tc.busID, got, tc.want)
 		}
+	}
+}
+
+// TestArchiveRetentionFor_UndeclaredBusIsBoundedNotUnlimited is the
+// regression guard for myrgic/cogos#562 itself: before the fix, an
+// undeclared bus's retention was busArchiveKeepAll (unlimited) — this is a
+// direct behavioral check that it is now a finite, positive number, not a
+// check of the specific value (that's TestArchiveRetentionFor above).
+func TestArchiveRetentionFor_UndeclaredBusIsBoundedNotUnlimited(t *testing.T) {
+	t.Parallel()
+	got := archiveRetentionFor("bus_some_family_nobody_declared")
+	if got == busArchiveKeepAll {
+		t.Fatalf("archiveRetentionFor of an undeclared bus = busArchiveKeepAll (unlimited); want a bounded default (#562)")
+	}
+	if got <= 0 {
+		t.Fatalf("archiveRetentionFor of an undeclared bus = %d, want a positive keep count", got)
 	}
 }
 
@@ -905,7 +922,12 @@ func TestPruneBusArchives_KeepsNewest(t *testing.T) {
 }
 
 // TestPruneBusArchives_KeepAllIsNoop is the regression guard that matters most:
-// a bus with no declared retention must never lose an archive.
+// a bus that has explicitly declared busArchiveKeepAll (chat/mcp conversation
+// content — see busArchiveRetention) must never lose an archive. Before
+// #562 this bus's -1 came from the undeclared-bus fallback instead of an
+// explicit map entry; the outcome tested here is unchanged, but the fallback
+// path that used to produce it no longer exists (see
+// TestArchiveRetentionFor_UndeclaredBusIsBoundedNotUnlimited).
 func TestPruneBusArchives_KeepAllIsNoop(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -935,6 +957,127 @@ func TestPruneBusArchives_KeepAllIsNoop(t *testing.T) {
 	}
 	if archives != 2 {
 		t.Errorf("undeclared bus must keep all archives, got %d want 2", archives)
+	}
+}
+
+// countArchives is a small test helper: how many rotated events.<ts>.jsonl
+// files currently sit in busDir (excludes the live events.jsonl).
+func countArchives(t *testing.T, busDir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(busDir)
+	if err != nil {
+		t.Fatalf("read bus dir %s: %v", busDir, err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "events.") && e.Name() != "events.jsonl" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestSweepBusArchives_DryRunNeverDeletes verifies the safety property that
+// matters most for SweepBusArchives (myrgic/cogos#562): dryRun=true must
+// report exactly what a live run would prune, but must not remove a single
+// byte from disk.
+func TestSweepBusArchives_DryRunNeverDeletes(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+	busID := "bus_sweeptest_dryrun" // undeclared family -> defaultArchiveRetention
+	if _, err := mgr.AppendEvent(busID, "test", "seed", map[string]any{"n": 1}); err != nil {
+		t.Fatalf("seed append: %v", err)
+	}
+	busDir := filepath.Join(mgr.BusesDir(), busID)
+	stamps := []string{
+		"2026-01-01T000000Z", "2026-02-01T000000Z", "2026-03-01T000000Z",
+		"2026-04-01T000000Z", "2026-05-01T000000Z", "2026-06-01T000000Z",
+		"2026-07-01T000000Z", "2026-08-01T000000Z", "2026-09-01T000000Z",
+		"2026-10-01T000000Z",
+	} // 10 archives, one more than defaultArchiveRetention (8)
+	for _, ts := range stamps {
+		if err := os.WriteFile(filepath.Join(busDir, "events."+ts+".jsonl"), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("write archive %s: %v", ts, err)
+		}
+	}
+
+	report, err := mgr.SweepBusArchives(true)
+	if err != nil {
+		t.Fatalf("SweepBusArchives(dryRun=true): %v", err)
+	}
+
+	if got := countArchives(t, busDir); got != len(stamps) {
+		t.Fatalf("dry run deleted archives: got %d on disk, want all %d untouched", got, len(stamps))
+	}
+
+	var entry *ArchiveSweepEntry
+	for i := range report {
+		if report[i].BusID == busID {
+			entry = &report[i]
+		}
+	}
+	if entry == nil {
+		t.Fatalf("SweepBusArchives report missing entry for %q; report=%+v", busID, report)
+	}
+	if entry.Archives != len(stamps) {
+		t.Errorf("report.Archives = %d, want %d", entry.Archives, len(stamps))
+	}
+	wantPruned := len(stamps) - defaultArchiveRetention
+	if entry.Pruned != wantPruned {
+		t.Errorf("report.Pruned = %d, want %d (dry-run count of what a live run would remove)", entry.Pruned, wantPruned)
+	}
+}
+
+// TestSweepBusArchives_LiveRunPrunesAndRespectsKeepAll verifies that
+// dryRun=false actually reclaims an undeclared bus's excess archives down to
+// defaultArchiveRetention, while a bus that has explicitly declared
+// busArchiveKeepAll (chat/mcp — ground truth) is left completely untouched
+// in the same pass, and the live events.jsonl is never a candidate for
+// either bus.
+func TestSweepBusArchives_LiveRunPrunesAndRespectsKeepAll(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mgr := NewBusSessionManager(root)
+
+	undeclaredID := "bus_sweeptest_live"
+	keepAllID := "bus_chat_sweeptest-keepall"
+	for _, id := range []string{undeclaredID, keepAllID} {
+		if _, err := mgr.AppendEvent(id, "test", "seed", map[string]any{"n": 1}); err != nil {
+			t.Fatalf("seed append %s: %v", id, err)
+		}
+	}
+	undeclaredDir := filepath.Join(mgr.BusesDir(), undeclaredID)
+	keepAllDir := filepath.Join(mgr.BusesDir(), keepAllID)
+
+	stamps := []string{
+		"2026-01-01T000000Z", "2026-02-01T000000Z", "2026-03-01T000000Z",
+		"2026-04-01T000000Z", "2026-05-01T000000Z", "2026-06-01T000000Z",
+		"2026-07-01T000000Z", "2026-08-01T000000Z", "2026-09-01T000000Z",
+		"2026-10-01T000000Z",
+	}
+	for _, dir := range []string{undeclaredDir, keepAllDir} {
+		for _, ts := range stamps {
+			if err := os.WriteFile(filepath.Join(dir, "events."+ts+".jsonl"), []byte("{}\n"), 0o644); err != nil {
+				t.Fatalf("write archive %s in %s: %v", ts, dir, err)
+			}
+		}
+	}
+
+	if _, err := mgr.SweepBusArchives(false); err != nil {
+		t.Fatalf("SweepBusArchives(dryRun=false): %v", err)
+	}
+
+	if got := countArchives(t, undeclaredDir); got != defaultArchiveRetention {
+		t.Errorf("undeclared bus after live sweep: got %d archives, want %d (defaultArchiveRetention)", got, defaultArchiveRetention)
+	}
+	if got := countArchives(t, keepAllDir); got != len(stamps) {
+		t.Errorf("busArchiveKeepAll bus after live sweep: got %d archives, want all %d kept", got, len(stamps))
+	}
+	for _, dir := range []string{undeclaredDir, keepAllDir} {
+		if _, err := os.Stat(filepath.Join(dir, "events.jsonl")); err != nil {
+			t.Errorf("live events.jsonl must survive a sweep in %s: %v", dir, err)
+		}
 	}
 }
 
