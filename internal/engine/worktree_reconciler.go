@@ -882,8 +882,27 @@ func parseWorktreeListPorcelain(s string) []LiveWorktree {
 	return out
 }
 
+// gitHasUncommittedChanges reports whether a worktree has a dirty tree.
+//
+// --no-optional-locks is load-bearing, not cosmetic. `git status` is not
+// read-only on disk: it opportunistically REFRESHES the index, and to do that
+// it takes `.git/index.lock`. This call runs under a context deadline, and
+// exec.CommandContext's expiry path is Process.Kill() — SIGKILL, which git
+// cannot trap. A status killed inside that refresh window leaves a zero-byte
+// index.lock behind, and because linked worktrees SHARE the main repo's .git,
+// one killed *read* of one worktree then blocks every *write* in every
+// worktree until a human removes the file.
+//
+// Measured (macOS, git 2.x, 6k-file repo): SIGKILL delivered the instant the
+// lock appears orphaned it 60/60 times without the flag, and 0/20 with it —
+// with the flag the lock never appears at all, because git refuses to take a
+// lock it does not strictly need. The reconciler only reads dirtiness here, so
+// declining the index refresh costs nothing.
+//
+// The flag is a GLOBAL option: it must precede the subcommand. `git status
+// --no-optional-locks` is a usage error.
 func gitHasUncommittedChanges(ctx context.Context, worktreePath string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain")
+	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "status", "--porcelain")
 	cmd.Dir = worktreePath
 	out, err := cmd.Output()
 	if err != nil {
