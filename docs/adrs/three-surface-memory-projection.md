@@ -92,7 +92,7 @@ The alarm-not-merge discipline (ADR memory-projection-reconciler §5, inherited 
 
 ### Why this is an amendment, not a revision of ADR memory-projection-reconciler in place
 
-ADR memory-projection-reconciler is Accepted and implemented against; §1–§8 describe a shipped two-surface contract that remains correct for the surfaces it covers. Rewriting it to silently become a three-surface ADR would orphan any implementation or review history anchored to the two-surface acceptance criteria. The amendment pattern (ADR foveation-placement-under-prefix-cache-runtimes, `103-foveation-placement-under-prefix-cache-runtimes.md`, amending ADR-066/071, is the precedent in this corpus) keeps the original decision's acceptance intact and scopes the new decision to exactly the delta: one new `FetchLive` source, one new discovery mechanism, one new classification reusing an existing action.
+ADR memory-projection-reconciler is Accepted; its §1–§8 two-surface contract is ratified but not yet implemented — no reconciler code exists in the kernel as of this amendment (verified: zero Go files reference it). The contract remains correct for the surfaces it covers, and this amendment lands before implementation begins, so the reconciler can be built three-surface from the start. Rewriting it to silently become a three-surface ADR would orphan any implementation or review history anchored to the two-surface acceptance criteria. The amendment pattern (ADR foveation-placement-under-prefix-cache-runtimes, `103-foveation-placement-under-prefix-cache-runtimes.md`, amending ADR-066/071, is the precedent in this corpus) keeps the original decision's acceptance intact and scopes the new decision to exactly the delta: one new `FetchLive` source, one new discovery mechanism, one new classification reusing an existing action.
 
 ## Consequences
 
@@ -114,7 +114,7 @@ ADR memory-projection-reconciler is Accepted and implemented against; §1–§8 
 
 ## Implementation
 
-Files to add or modify (in addition to ADR memory-projection-reconciler's list, which stands):
+Files to add or modify (in addition to ADR memory-projection-reconciler's list, which stands as the base implementation plan — none of it built yet):
 
 - `internal/engine/memory_projection_reconciler.go` — third `FetchLive` scan (`hermes-memory-index.cog.md` table parse); index-membership check in `ComputePlan` (no cogdoc frontmatter read or write for origin); `hermes-native-parked` classification
 - `internal/engine/memory_projection_watcher.go` — third fsnotify watch, same debounce path
