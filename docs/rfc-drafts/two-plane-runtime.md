@@ -20,7 +20,7 @@ relates:
   - "RFC-033"
   - "RFC-036"
 scope: "Design only — no implementation in this document"
-revision: "third draft, post-council + post-adversarial-re-review"
+revision: "fourth draft — third repair pass, measured against the design-draft standard stated in the revision note"
 sections:
   - "1. Summary"
   - "2. Motivation"
@@ -36,21 +36,86 @@ sections:
 
 # RFC Draft: Two-plane runtime
 
-> **Revision note.** This is the third draft. The second incorporated a
-> five-lens adversarial review (Windows mechanics, security, substrate
-> coherence, cross-platform parity, operations) and an operator ruling on the
-> state question the review could not settle; three first-draft claims were
+> **Revision note — the standard this draft is measured against.** This is the
+> **fourth draft**, produced by the **third repair pass** against adversarial
+> re-review. The three passes were judged under progressively sharper standards;
+> this one was measured under the **design-draft standard**, stated here so a
+> reader can apply it rather than infer it:
+>
+> > This document's declared scope is **design only**. It passes iff **(a)** it
+> > makes no claim that is false against the kernel code or the substrate
+> > corpus; **(b)** every surface, mechanism, and write path the design touches
+> > is **named** — no undeclared doors, writers, or execution paths; and
+> > **(c)** every unresolved design point is **explicitly declared** as an open
+> > question or as a named conflict with a stated resolution path. An
+> > unresolved-but-declared question is a pass. A false claim, an undeclared
+> > surface, or a question silently assumed answered is a fail.
+>
+> That standard is why several items below are *declared open* rather than
+> decided, and why the enumerations in §5.1a / §5.1b / §5.1c / §6.4 are written
+> as closed lists a lint can be run against rather than as prose.
+>
+> **What the third pass changed.** Two fresh adversarial lenses (security;
+> corpus coherence) re-measured the third draft and did not clear the gate. The
+> corrections in this pass, all verified against code before being written:
+>
+> 1. **The config HTTP write path had no disposition.** `serve_config.go`
+>    registers `PATCH /v1/config` and `POST /v1/config/rollback`; the third
+>    draft split the config *file* by plane and said nothing about the route
+>    that rewrites it. §4.1 item 5 scopes those routes to the seat/workspace
+>    `kernel.yaml` **only**; §6.4 lints it; §3.3 records the route-scoping as
+>    net-new.
+> 2. **Skill execution was a machine-plane code-execution path from a
+>    seat-writable directory.** `POST /v1/skills/{name}/exec` executes a binary
+>    resolved from `~/.claude/skills` or `<workspaceRoot>/.claude/skills`. §4.1
+>    item 6 moves it off the machine plane entirely, under a new invariant in
+>    §5.8.
+> 3. **The minting gate's "weakens" was a closed enumeration** and §5.7's own
+>    opening sentence filed two weakenings in the routine bucket. §5.7 now
+>    defines weakening **non-enumeratively**.
+> 4. **§5.1b's enumeration of machine-plane writes inside `.cog/` was itself
+>    incomplete** — it missed the BEP agent-definitions sync directory (whose
+>    content is authored by *remote peers*) and the BEP sync-state directory.
+>    Both are added; the peer-sourced one is escalated to an open question (Q8).
+> 5. **§5.2's replication claim was an overstatement and contradicted §5.8.**
+>    "`.cog/` is BEP-replicated" is retracted: as shipped, BEP replicates
+>    exactly one subtree. The ledger strands are declared **never** in the
+>    replicated set, with the forgery reason stated and the inclusion list named
+>    as the lintable object.
+> 6. **Shipped kernel writers append inside `.cog/ledger/`.** The third draft
+>    asserted the opposite as an invariant and lints it. New §5.1c enumerates
+>    the three writers and dispositions them as **relocation work**, and §6.4's
+>    lint is marked as a post-rung-3 invariant rather than a present-tense fact.
+> 7. **ADR-097 / ADR-098 write projections into the same directories as the
+>    authored corpus**, so §5.1's two rows collide over one path and the ACL has
+>    no separable subtree to attach to. This RFC **cannot settle it** and does
+>    not pretend to: it is declared as **Q7** with two resolution paths, and
+>    §6.4's lint is scoped to the separable rows only.
+> 8. **The credential-distribution loop's mechanism was implicit.** §4.1 item 3
+>    now states that the agent distributes over **existing seat-owned
+>    mechanisms** and opens **no new listener**, with the residual mechanism
+>    choice declared as part of the rung-3e work item.
+> 9. **ADR-094 is status `Draft`** and was cited as accepted authority. Marked,
+>    and the lineage row now leans on ADR-095's accepted loop.
+>
+> ---
+>
+> **Prior passes, retained.** The **second** draft incorporated a five-lens
+> adversarial review (Windows mechanics, security, substrate coherence,
+> cross-platform parity, operations) and an operator ruling on the state
+> question the review could not settle; three first-draft claims were
 > **retracted**, not softened: the "exactly one door" invariant (§4.1), the
 > inheritance-from-#101 supervisor-seam claim (§3.3), and the single-ledger
 > reading of the state partition (§5).
 >
-> This third draft answers a second, adversarial re-review by two fresh lenses
-> (security; corpus coherence) that did **not** clear the blocker gate. Four
-> further claims are **retracted or corrected against code**:
+> The **third** draft answered a second adversarial re-review by two fresh
+> lenses (security; corpus coherence) that did **not** clear the blocker gate.
+> Four further claims were **retracted or corrected against code**:
 >
 > 1. **`kernel.yaml` was on the wrong side of the partition.** It is loaded from
 >    `CogDir/config/kernel.yaml` (`internal/engine/config.go`), i.e. inside
->    `.cog/` — seat(local)-written, git-settled, BEP-replicated — and it is where
+>    `.cog/` — seat(local)-written, git-settled, and inside the directory BEP
+>    syncs a subtree of (§5.2) — and it is where
 >    `EnableServiceControl`, `EnableSkillExec`, `EnableConfigMutation`,
 >    `BindAddr` and `WriteRouteGrantAuthDisabled` are set. The machine plane's
 >    entire security posture was therefore seat(local)-editable with a text
@@ -78,6 +143,16 @@ sections:
 > `.cog/` at all), then ADR-065's daemon state file and the ADR-097 / ADR-098
 > projection reconcilers are in scope for relocation and this RFC understates
 > the work. Called out rather than decided.
+>
+> **Second operator flag, new in this pass.** §5.1c records that shipped kernel
+> code appends to `.cog/ledger/` from the machine plane today (the worktree
+> reconciler, the kernel process's own session bucket, and an `mcp-client`
+> bucket). Under the weak reading of the ruling those are relocation work at
+> rung 3; under the strong reading they were never admissible at all. Either
+> way they are **named** here rather than covered by an invariant that reads as
+> already true. The disposition this draft proposes — relocate the three
+> kernel-emitted buckets to the machine strand — is stated in §5.1c and listed
+> as net-new in §3.3.
 
 ---
 
@@ -340,8 +415,10 @@ own design surface, sketched in §6.
 
 Machine-plane registration is **net-new work on all three platforms.**
 
-Two further items belong on the net-new list, both surfaced by the second
-adversarial re-review and both previously described as existing seams:
+Seven further items belong on the net-new list. The first two were surfaced by
+the second adversarial re-review and were previously described as existing
+seams; the remaining five were surfaced by the third and are new work the
+earlier drafts did not price at all:
 
 - **A cert-dir seam for node-id anchoring.** `internal/engine/process.go`
   hardcodes `nodeIDCertDir` to `bep.ExpandCertDir("")` — the default
@@ -360,6 +437,52 @@ adversarial re-review and both previously described as existing seams:
   `LoadConfig` (tests, `testkernel`, programmatic boot) must keep getting the
   safe defaults, which is the same trap #551's inverted-polarity flag was
   written to avoid. Net-new.
+- **Route-scoping the config-mutation surface.** `internal/engine/serve_config.go`
+  registers `GET /v1/config`, `PATCH /v1/config` (RFC 7396 merge-patch, atomic,
+  backed up) and `POST /v1/config/rollback`, all three gated only by
+  `EnableConfigMutation`. Splitting the config *file* (§5.1a) accomplishes
+  nothing if the merge-patch handler — running **inside the machine-plane
+  process**, above the new DACL — can rewrite the machine file on request.
+  §4.1 item 5 binds those routes to the seat/workspace `kernel.yaml` only.
+  Making that true is code: a write-target parameter on
+  `ReadConfigSnapshot`/the patch path, and a refusal for any key the machine
+  file owns. Net-new.
+- **Moving skill execution to the agent.** `POST /v1/skills/{name}/exec`
+  (`internal/engine/serve_skills.go`) resolves a skill through `skillDirs()` —
+  `os.UserHomeDir()/.claude/skills` and `<WorkspaceRoot>/.claude/skills` — and
+  `pkg/skills`' `Exec` runs `exec.CommandContext` on the resolved binary with
+  `os.Environ()` inherited. Under two-plane that route sits on the machine
+  plane and executes a **seat-writable, workspace-portable** binary as the
+  service account. §4.1 item 6 removes it from the machine plane and re-lands
+  it as a door-mediated request kind executed by the agent. Net-new: a request
+  kind, an agent-side executor, and the removal of the route from the listener.
+- **Relocating the kernel-emitted ledger buckets** enumerated in §5.1c
+  (`worktree-reconciler`, the kernel process's own session bucket, and
+  `mcp-client`) off the seat(local) strand and onto the machine strand. This is
+  the concrete work behind §5.2's isolation invariant; without it the invariant
+  is aspirational and §6.4's `.cog/ledger/` lint fails on a clean checkout.
+  Net-new, and a prerequisite for rung 3c.
+- **A BEP replication-scope declaration the doctor can read.** §5.2 requires
+  that the ledger strands are never in the replicated set. As shipped that is
+  **vacuously satisfied**: `pkg/substrate/bep/` has no ignore/exclusion
+  mechanism at all (no `stignore` equivalent; verified) and
+  `internal/engine/bep_provider.go` syncs exactly one folder,
+  `<root>/.cog/bin/agents/definitions/` (folder id `cogos-agent-defs`,
+  `internal/engine/bep_model.go`). So the lintable object today is the
+  **inclusion list**, not an ignore file. Net-new is only the declaration —
+  making the inclusion list an observable the doctor reads. **Ignore support
+  becomes net-new work only if the inclusion list is ever widened beyond a
+  subtree that provably excludes both strands**, and this RFC does not propose
+  widening it.
+- **Repointing the node-root credential's local consumers at the agent**
+  (§4.1 item 3, sequenced at rung 3e in §7.1). `internal/engine/boot_node_root_grant.go`'s
+  own header names them: the dashboard, canvas, Claude Code hook sessions, and
+  THESEUS. Each acquires the credential today either from the gate-exempt
+  `GET /v1/identity/grants/current?surface=node-root` or from the 0600 vault
+  file under the operator's home; both disappear under the split. Net-new per
+  consumer: a client change to read the credential from the agent's existing
+  seat-owned delivery instead. **No new listener is introduced** — see §4.1
+  item 3 for the mechanism constraint and what remains open inside it.
 
 What #101 does compose with, honestly: once both planes are registered, they
 become *observable* through the services manifest and the doctor, using the
@@ -386,7 +509,19 @@ Stated honestly, the machine plane has **two** inbound surfaces:
 | Surface | Transport | Access control | Callers |
 |---|---|---|---|
 | The door | named pipe (Windows) / unix socket | OS ACL on the object | the session agent only |
-| The HTTP listener | loopback TCP | bearer-token verification in-process | CLI, MCP clients, harnesses, any local process |
+| The HTTP listener | loopback TCP | **writes:** bearer-token verification in-process. **reads: none by default** — `internal/engine/serve_grant_auth.go` exempts `GET` on **every path except `/mcp`**, unconditionally | CLI, MCP clients, harnesses, any local process in any account |
+
+**The read half of that cell is stated plainly because it is the driver for
+item 3 below.** The gate is a *write*-route gate by construction and says so in
+its own header. Consequences a reader must not have to infer: the whole read
+surface of the machine plane — including `GET /v1/config?include_raw_yaml=1`,
+which returns raw `kernel.yaml` bytes, and the grant listing that exposes
+`grant_id`s — is reachable **with no credential at all** from any local
+account. The node-root credential GET (item 3) is not an isolated exception to
+an otherwise-authenticated read surface; it is the most valuable instance of
+the surface-wide default. That is why item 3 deletes the route rather than
+authenticating it: authenticating one exempt GET while the exemption rule
+stands would move a value and leave the rule.
 
 Both are in scope for §4. The relevant escalation shape is not hypothetical:
 service-lifecycle mutations are gated behind `Config.EnableServiceControl`
@@ -436,16 +571,89 @@ the *service account* would then execute.
      distribution point for user-plane consumers, because it is the only party
      that has authenticated to the machine plane at the OS level.
    - Existing local consumers that read the gate-exempt GET or the vault file
-     directly — the dashboard, a running harness hook session, THESEUS, all
-     named in `boot_node_root_grant.go`'s own header — acquire the credential
-     from the agent instead. **This is a breaking change for those consumers
-     and is called out as such**, sequenced at rung 3e (§7.1), where the agent
-     is already being demoted to session duties.
+     directly — the dashboard, canvas, a running harness hook session, THESEUS,
+     all named in `boot_node_root_grant.go`'s own header — acquire the
+     credential from the agent instead. **This is a breaking change for those
+     consumers and is called out as such**, sequenced at rung 3e (§7.1), where
+     the agent is already being demoted to session duties. The per-consumer
+     repointing is enumerated as net-new work in §3.3.
+   - **The distribution mechanism, constrained rather than left implicit.** The
+     third draft named the agent as "the distribution point" and stopped, which
+     read as a third inbound surface with no transport, no access control, and
+     no version. Constraint, decided: **the agent distributes over mechanisms
+     it already owns as the seat(local) principal — the filesystem, in
+     seat-owned paths, or the agent's existing local surface — and opens no new
+     listener.** This is what keeps §6.4's auxiliary-IPC lint satisfiable while
+     both planes are one binary (ADR-121): the credential moves *inside* the
+     identity that is entitled to it, rather than across a new boundary that
+     would then need its own gate. Note the interaction the reviewer caught:
+     §6.4's "not readable from any seat(local)-readable path" lint is about the
+     **machine plane's** copy under the machine root, not about the agent's
+     delivery to a consumer running as the same operator — a distinction the
+     lint text now makes explicitly. **Which of the seat-owned mechanisms is
+     chosen is declared as part of the rung-3e work item (§7.1), not left
+     implicit here**; what is decided here is the bound it must satisfy.
 4. **The auxiliary-endpoint lint survives the retraction**, narrowed to what is
    actually checkable: no IPC endpoint in the kernel's namespace other than the
    declared door (§6.4).
+5. **Config-mutation routes bind to the seat/workspace `kernel.yaml` only; the
+   machine config file is not reachable over HTTP at all.** §5.1a splits the
+   config file by plane, and the third draft stopped there — but the same keys
+   are mutable over HTTP. `internal/engine/serve_config.go` registers
+   `PATCH /v1/config` (RFC 7396 merge-patch, atomic, backed up) and
+   `POST /v1/config/rollback`, both gated only by `EnableConfigMutation` —
+   which §5.1a itself promotes to a machine key. Those handlers run **inside
+   the machine-plane process**, so the machine root's DACL does not constrain
+   them: the service would be rewriting its own posture on request from any
+   local caller holding any live grant. Left undecided, the split would protect
+   against a text editor and nothing else. **Decided:**
+   - `PATCH /v1/config` and `POST /v1/config/rollback` have exactly one write
+     target: the **seat/workspace `kernel.yaml`**. A patch naming any key the
+     machine config file owns (§5.1a's list) is **refused**, not merged and not
+     silently dropped.
+   - `GET /v1/config` likewise reports the workspace file; the machine file's
+     contents are not served on this listener in any form, `include_raw_yaml`
+     included.
+   - **Mutating the machine config is a machine-local operator-tier act**, not
+     an HTTP call. It is delivered the way every other operator-tier change on
+     this boundary is: as a **declared door kind** (§5.3) carrying operator-tier
+     attestation (§5.6), or by an operator editing the machine file directly
+     with the elevation the machine root's DACL requires. There is deliberately
+     no remote path to it, because a remotely reachable write to the machine
+     config is a remotely reachable write to every gate the machine config
+     turns on.
+   - §6.4 lints it as a route property: **no HTTP route on either listener
+     writes the machine config file.** §3.3 records the write-target change as
+     net-new.
+6. **Skill execution leaves the machine plane entirely.** Under two-plane the
+   HTTP listener is machine-plane, and `POST /v1/skills/{name}/exec`
+   (`internal/engine/serve_skills.go`) is a code-execution route on it:
+   `skillDirs()` resolves `os.UserHomeDir()/.claude/skills` and
+   `<WorkspaceRoot>/.claude/skills`, and `pkg/skills`' `Exec` runs
+   `exec.CommandContext` on the resolved binary with `os.Environ()` inherited.
+   That is a direct seat(local) → service-account code-execution path from a
+   **seat-writable, workspace-portable** directory — the identical escalation
+   §5.8 already names for `ServiceDef.Command`, one level less indirect.
+   §5.1a's promotion of `EnableSkillExec` to a machine key settles who may turn
+   it **on** and says nothing about who **executes** or from where.
+   **Decided, and as a general rule rather than a route-by-route patch:**
+   - Skill execution is **user-plane work**: user binaries, from seat-writable
+     directories, needing the operator's environment. It belongs to the agent
+     by §4.4's RPC inversion, not to the service.
+   - `POST /v1/skills/{name}/exec` is **removed from the machine plane's route
+     set** and re-lands as a **declared door request kind** (§5.3) that the
+     service raises and the **agent executes in its own session**. `GET
+     /v1/skills` (discovery, no execution) may stay.
+   - The general rule is stated as an invariant in §5.8: **the machine plane
+     executes nothing resolved from a seat(local)-writable or
+     workspace-portable directory.** `POST /v1/reconcile/{type}/resume`
+     (`EnableReconcileControl`) is in the same unscoped bucket and is covered by
+     the same rule — it controls machine-plane reconcilers, so it stays on the
+     machine plane, but it is named here so it is not read as an oversight.
+   - §6.4 lints it; §3.3 records the door kind and the agent-side executor as
+     net-new.
 
-All four items above are lintable and all four appear in §6.4. The second
+All six items above are lintable and all six appear in §6.4. The second
 draft carried a lint for item 4 only, which was the weakest of them.
 
 Both surfaces are *declared*: each appears in the node's doctor surface by
@@ -643,6 +851,29 @@ right, not a compliant executor:
     (user plane, workspace-portable), the principal it constrains would be the
     principal that edits it, and it would not be an envelope — it would be a
     preference. §6.4 lints this directly.
+  - **Bootstrap: the first logon of a new seat(local) principal has no
+    envelope, and default-deny is the correct behavior.** Stated because it is
+    a first-run property an implementer would otherwise discover rather than
+    read, and because it sits in visible tension with §6.1's "default tier — no
+    prompts at all." Since absence is the refusing state (§5.3, §5.4 polarity)
+    and envelope mutation is operator tier, a principal with no envelope can
+    raise **nothing** across the door until an operator acts. The flow:
+    1. The agent starts in the new logon session and authenticates to the door
+       (§4.2). The connection succeeds; the principal is recorded.
+    2. Every request kind the agent raises is refused for want of an envelope,
+       and each refusal is recorded with the reason `no-envelope` rather than
+       a generic denial, so the doctor can distinguish "not enrolled" from
+       "denied by policy."
+    3. **Enrolment — minting the principal's first envelope — is an
+       operator-tier act**, carrying the same attestation as any other
+       operator-tier change (§5.6). It is named in the ladder as part of rung
+       3e (§7.1): a node reaching 3e with N logon principals needs N
+       enrolments, and an un-enrolled principal is a **declared, observable
+       state**, not a broken one.
+    Note the scope this does *not* touch: §6.1's default tier is
+    **agent-plane-only** supervision with no service and therefore no door, so
+    a default-tier install has no envelope question to answer. The bootstrap
+    gap exists only on nodes that took node mode.
 - **Seat-addressed requests only.** Each queued request carries the seat(local)
   principal it was raised for, a nonce, and an expiry; the agent refuses any
   request not addressed to its own principal. Without this, a request enqueued
@@ -672,13 +903,14 @@ whether the file travels with the workspace.
 
 | | **node-local** (does not travel) | **workspace-portable** (travels with `.cog/`) |
 |---|---|---|
-| **machine plane** (service-written) | node identity + **BEP cert dir**; peer table; BEP membership; machine ledger strand (§5.2); **machine config** (§5.1a); **per-seat(local) capability envelopes** (§4.6); kernel binary + self-update staging; machine-root service definitions | **not empty — enumerated, not incidental** (§5.1b): daemon lifecycle state; projection-reconciler outputs |
+| **machine plane** (service-written) | node identity + **BEP cert dir**; peer table; BEP membership; machine ledger strand (§5.2); **machine config** (§5.1a); **per-seat(local) capability envelopes** (§4.6); kernel binary + self-update staging; machine-root service definitions | **not empty — enumerated, not incidental** (§5.1b): daemon lifecycle state; projection-reconciler outputs; the BEP agent-definitions sync dir (peer-sourced); BEP sync state. Plus, **today and not by design**, three ledger buckets (§5.1c) |
 | **user plane** (seat(local)-written) | per-user OAuth / token stores; DPAPI / keychain material; mapped drives; notification state | seat(local) ledger strand (§5.2); cogdoc corpus / memory; seat(local) config; harness homes |
 
 **The second draft declared the machine × portable cell "empty by
 construction." That is retracted: it is false against shipped code and against
-accepted decisions the draft never cited — ADR-065, ADR-094/ADR-095, and
-ADR-097/ADR-098** (§5.1b). What the ruling's structural content actually
+accepted decisions the draft never cited — ADR-065, ADR-095, and ADR-097 /
+ADR-098, all accepted; ADR-094 is status `Draft` and is cited for purpose, not
+authority** (§5.1b). What the ruling's structural content actually
 is, restated so it survives contact with the codebase: **the two planes do not
 share a *strand*.** They do share the workspace directory, in a small, named,
 lintable set of places.
@@ -701,9 +933,12 @@ Per-artifact, with the ACL story each one carries:
 | Kernel binary + self-update staging | machine | node-local | machine root | machine identity only | n/a (§5.8, Sigstore-gated) |
 | Machine-root service definitions | machine | node-local | machine root | machine identity only | **operator** |
 | Daemon lifecycle state (§5.1b) | machine | portable | `.cog/run/daemon/` | machine identity write, seat(local) read | cross-plane |
-| Projection-reconciler outputs (§5.1b) | machine | portable | `.cog/mem/semantic/lineage/projections/` and the ADR-097 / ADR-098 projection targets | machine identity write, seat(local) read | cross-plane |
-| seat(local) ledger strand | user | portable (often gitignored — see §5.2) | `.cog/ledger/` | seat(local) identity only | n/a (append-only) |
-| Cogdoc corpus / memory (authored) | user | portable | `.cog/mem/` | seat(local) identity write, machine **read grant** | cross-plane |
+| Lineage projections (§5.1b) | machine | portable | `.cog/mem/semantic/lineage/projections/` — **separable subtree** | machine identity write, seat(local) read | cross-plane |
+| ADR-097 / ADR-098 projection targets (§5.1b) | machine | portable | `.cog/mem/**`, `.cog/skills/**` — **not separable from the authored corpus; see §9 Q7** | **undecided — collides with the authored-corpus row below** | cross-plane |
+| BEP agent-definitions sync dir (§5.1b) | machine | portable | `.cog/bin/agents/definitions/` | machine identity write, seat(local) read — **content authored by remote peers; see §9 Q8** | cross-plane |
+| BEP sync state (§5.1b) | machine | portable | `.cog/.state/bep/` | machine identity write, seat(local) read | cross-plane |
+| seat(local) ledger strand | user | portable (often gitignored — see §5.2) | `.cog/ledger/` | seat(local) identity only — **target state; three machine-plane writers exist today, §5.1c** | n/a (append-only) |
+| Cogdoc corpus / memory (authored) | user | portable | `.cog/mem/` | seat(local) identity write, machine **read grant** — **but see the ADR-097/098 row above: the paths overlap and this cell is what Q7 has to reconcile** | cross-plane |
 | seat(local) config | user | portable | `.cog/config/` (§5.1a: seat(local) keys only) | seat(local) identity | cross-plane |
 
 ### 5.1a The kernel config file is split
@@ -712,68 +947,146 @@ The second draft placed `kernel.yaml` nowhere and thereby left it where it is,
 which the re-review correctly called placing it on the wrong side of the
 partition. Verified against code: `internal/engine/config.go` sets
 `CogDir = WorkspaceRoot/.cog` and loads the kernel config from
-`CogDir/config/kernel.yaml`. That file is seat(local)-written, git-settled, and
-BEP-replicated — and it is where `EnableServiceControl`, `EnableSkillExec`,
-`EnableConfigMutation`, `EnableReconcileControl`, `BindAddr` and
-`WriteRouteGrantAuthDisabled` are set.
+`CogDir/config/kernel.yaml`. That file is seat(local)-written and git-settled,
+and it sits inside the directory BEP syncs a subtree of — and it is where
+`EnableServiceControl`, `EnableSkillExec`, `EnableConfigMutation`,
+`EnableReconcileControl`, `BindAddr` and `WriteRouteGrantAuthDisabled` are set.
 
 The consequence is not subtle. Under two-plane as the second draft wrote it,
 **the seat(local) principal configures the machine plane's entire
 security posture with a text editor** — no HTTP call, no grant, no door,
-defeating every gate §4.1 negotiates. And because `.cog/` is BEP-replicated,
-**a peer node can push that posture onto this one.** §5.8 caught precisely
-this shape for two lesser inputs (#101's plugin manifest overlays,
-`runtime-services.yaml`) and missed the file that turns the gates off.
+defeating every gate §4.1 negotiates. §5.8 caught precisely this shape for two
+lesser inputs (#101's plugin manifest overlays, `runtime-services.yaml`) and
+missed the file that turns the gates off.
+
+**The replication half of that argument is corrected, and the correction
+matters in both directions.** The third draft wrote "because `.cog/` is
+BEP-replicated, a peer node can push that posture onto this one." That
+overstates the shipped code: BEP as shipped replicates **exactly one subtree**,
+`<root>/.cog/bin/agents/definitions/` (`internal/engine/bep_provider.go`, folder
+id `cogos-agent-defs` in `internal/engine/bep_model.go`), so **today a peer
+cannot push `kernel.yaml`**. Retracted as a present-tense claim. It does not
+weaken the split — the seat-with-a-text-editor path is real regardless, and it
+is the whole of the argument this section needs. It is restated as the reason
+the *lint* is written the way it is: a machine key must not be resolvable from
+a path that is seat(local)-writable **or in the BEP inclusion list**, so that
+widening the inclusion list later cannot quietly re-open the door. §5.2 states
+the inclusion-list invariant; §6.4 lints against the list rather than against a
+mental model of whole-workspace replication.
 
 **Decided: the file splits by plane, not by convenience.**
 
 - **Machine config** — a new file under the machine root, owned by the service
   identity, carrying every key that configures the machine plane: the `Enable*`
   gates (`EnableServiceControl`, `EnableSkillExec`, `EnableConfigMutation`,
-  `EnableReconcileControl`), `BindAddr`, `WriteRouteGrantAuthDisabled`, the
-  door's ACL principal set, the protocol/library floor, and the SCM
+  `EnableReconcileControl`), `BindAddr`, **`port`**, `WriteRouteGrantAuthDisabled`,
+  the door's ACL principal set, the protocol/library floor, and the SCM
   failure-action policy (§3.1). Rule of thumb for future keys: **if turning it
   the wrong way weakens a boundary the machine plane enforces, it is a machine
   key.**
+  - **On `port` specifically, and the asymmetry with `BindAddr`.** `port`
+    (`internal/engine/config.go`, default 6931) parameterizes the *same*
+    machine-plane listener as `BindAddr` and sits adjacent to it in the same
+    YAML section, so leaving it on the seat side would be a visible
+    inconsistency against the rule of thumb above. It is nonetheless a
+    **lower-severity** key and the asymmetry is worth naming rather than
+    flattening: moving `BindAddr` off loopback exposes the listener to the
+    network — a boundary weakening — whereas changing `port` is an
+    **availability** change, and a seat(local) principal who moves the port
+    breaks its own clients rather than widening the machine plane's exposure.
+    It travels with `BindAddr` for coherence, not because the two carry the
+    same risk. §6.4's machine-key lint covers both, and an implementer reading
+    a `port`-only failure should read it as a hygiene finding, not a breach.
 - **`kernel.yaml`** keeps only seat(local)- and workspace-scoped keys — model and
   provider selection, foveation and salience parameters, digest paths,
   intervals, workspace-local service *declarations* (as opposed to the
   machine-root service *definitions* the supervisor executes).
 - **Precedence is not "machine wins ties."** A machine-plane security key
   appearing in `kernel.yaml` is **not** an override to be shadowed; it is a
-  **lint failure and a boot warning**, because the interesting case is a key
-  that arrived by BEP replication from a peer. Ignoring it silently is how it
-  stays there.
+  **lint failure and a boot warning**. Two cases motivate refusing rather than
+  shadowing: a key an operator edited into the wrong file and believes is in
+  effect, and — if the BEP inclusion list is ever widened past the one subtree
+  it holds today (§5.2) — a key that arrived from a peer. Ignoring either
+  silently is how it stays there.
 - `WriteRouteGrantAuthDisabled` keeps its inverted polarity from #551 across
   the move: the zero value means **auth enforced**, so a caller that builds a
   config without the machine file gets the safe behavior, not the exposed one.
 
-§6.4 lints the invariant directly: **no machine-plane security key is readable
-from a seat(local)-writable or BEP-replicated path.** §3.3 records the code seam as
-net-new migration work.
+§6.4 lints two invariants here, not one:
+
+1. **No machine-plane security key is readable from a seat(local)-writable path
+   or from any path in the BEP inclusion list.** (The file half.)
+2. **No HTTP route on either listener writes the machine config file.** (The
+   route half — §4.1 item 5. Without it the first lint passes while the posture
+   is rewritten by merge-patch from inside the process the DACL cannot
+   constrain.)
+
+§3.3 records both code seams as net-new migration work.
 
 ### 5.1b Declared machine-plane writes inside the workspace
 
-Three accepted decisions and shipped code put machine-plane writes inside
-`.cog/`. The second draft's "empty by construction" contradicted all of them
-and cited none of them. Enumerated, so the exception is declared rather than
-discovered:
+Accepted decisions and shipped code put machine-plane writes inside `.cog/`. The
+second draft's "empty by construction" contradicted all of them and cited none
+of them; the third draft enumerated three and **missed two**, both of them BEP's
+— including the one whose content is written by remote peers. The enumeration
+below is the corrected one. It is written as a closed list precisely so the next
+sweep can be run against it rather than against a recollection of it:
 
 | Path | Writer | Authority | Disposition |
 |---|---|---|---|
-| `<workspaceRoot>/.cog/run/daemon/state.yaml` | daemon lifecycle (`internal/engine/daemon_lifecycle.go`) | **ADR-065** §7, accepted — the runtime state file is specified there verbatim | **stays.** It is node-local content in a portable directory: mode, endpoint, container name, workspace path, PID. Machine identity holds write; seat(local) holds read. Not git-settled — `.cog/run/` is runtime scratch, and this RFC requires it be excluded from BEP replication and from git, which is the property that makes a portable *location* safe for node-local *content*. |
-| `<workspaceRoot>/.cog/mem/semantic/lineage/projections/**` | projection reconcilers (`internal/engine/projection_reconciler.go`, `internal/engine/decision_lineage_reconciler.go`) | **ADR-094** (lineage observatory), driven by **ADR-095**'s reconcile loop | **stays.** Machine identity holds write on the `projections/` subtree only; the authored corpus around it stays seat(local)-write. Projections are derived, content-addressed outputs — regenerable, so a conflict is resolved by regeneration rather than by merge. |
-| `<workspaceRoot>/.cog/mem/**` and `<workspaceRoot>/.cog/skills/**` projection targets | memory / skill projection reconcilers | **ADR-097**, **ADR-098**, both accepted — both specify a kernel-run reconciler writing into these trees | **stays, and §5.1's "declared read grant as an indexer, not ownership" is corrected.** For the *authored* corpus the read-grant framing holds. For the **projection targets** it does not: ADR-097 and ADR-098 specify a writer, and this RFC does not get to demote them by assertion. The machine plane writes projections; it reads the authored corpus. |
+| `<workspaceRoot>/.cog/run/daemon/state.yaml` | daemon lifecycle (`internal/engine/daemon_lifecycle.go`) | **ADR-065** §7, accepted — the runtime state file is specified there verbatim | **stays.** Node-local content in a portable directory: mode, endpoint, container name, workspace path, PID. Machine identity holds write; seat(local) holds read. Not git-settled — `.cog/run/` is runtime scratch, gitignored in observed workspace practice. **BEP disposition, corrected:** the third draft required this path be "excluded from BEP replication," which implied an exclusion mechanism that does not exist. As shipped the requirement is **vacuously satisfied** — BEP's inclusion list contains one subtree and `.cog/run/` is not in it (§5.2). The lintable object is therefore the **inclusion list**, not an ignore file, and §6.4 reads it that way. |
+| `<workspaceRoot>/.cog/mem/semantic/lineage/projections/**` | projection reconcilers (`internal/engine/projection_reconciler.go`, `internal/engine/decision_lineage_reconciler.go`) | **ADR-095** (daemon reconcile-loop driver), accepted — the loop that runs the reconciler — plus shipped code. **ADR-094** (lineage observatory) is status **`Draft`** and is cited for the projection's *purpose*, not as settling authority | **stays.** The path **is separable**: `projection_reconciler.go` writes under `.cog/mem/semantic/lineage/projections/`, a subtree distinct from the authored corpus around it, so a directory ACL can be hung on it. Machine identity holds write on the `projections/` subtree only. Projections are derived, content-addressed outputs — regenerable, so a conflict is resolved by regeneration rather than by merge. |
+| `<workspaceRoot>/.cog/mem/**` and `<workspaceRoot>/.cog/skills/**` projection targets | memory / skill projection reconcilers | **ADR-097**, **ADR-098**, both accepted — both specify a kernel-run reconciler writing into these trees | **PENDING Q7 — the only row in this table whose ACL story does not close.** The authority is not in doubt; the *path boundary* is. ADR-097 §3's placement table writes projections to `.cog/mem/semantic/insights/{slug}.cog.md`, `semantic/projects/`, `semantic/references/`, `episodic/profile/` — **the same directories the authored corpus lives in**. There is no `projections/` subtree here to hang an ACL on, unlike the lineage row above. So §5.1's two rows (authored corpus: seat(local) write; projection targets: machine write) are contradictory over one path, and §6.4's declared-set lint over this row would be a *provenance* predicate, not a *path* predicate — unenforceable by the ACL mechanism §5.2 insists on. **This RFC does not settle it**; see §9 Q7 for the two resolution paths. |
+| `<workspaceRoot>/.cog/bin/agents/definitions/**` | the **BEP sync engine**, machine plane (`internal/engine/bep_provider.go` — watch dir bound to this path; folder id `cogos-agent-defs` in `internal/engine/bep_model.go`) | shipped code; the machine plane owns BEP membership per §3. **No ADR or RFC in the corpus declares this directory's trust properties** — that absence is the finding | **stays, and is flagged.** The content is **peer-sourced**: agent CRD files authored on *other nodes* and replicated here by the machine-plane engine. This is the only cell in the partition whose author is another machine, and the third draft's enumeration missed it entirely. It stays because cross-node agent distribution is the feature, but the trust question it raises is **escalated to §9 Q8** rather than dispositioned here: *what reads or executes these definitions, under which identity, and what admits a definition a remote peer wrote?* Cross-reference §5.8's execution invariant — whatever consumes these files, the **machine plane must not execute from this directory**, for the same reason it must not execute from `.claude/skills` (§4.1 item 6). |
+| `<workspaceRoot>/.cog/.state/bep/**` | the BEP sync engine, machine plane (`internal/engine/bep_engine.go` — state dir) | shipped code | **stays.** BEP index/sync bookkeeping: node-local, derived, machine-written, regenerable. Same shape as the daemon lifecycle row — node-local content in a portable directory — and it carries the same requirement: it is not in the BEP inclusion list, and it must not enter it. Seat(local) holds read. |
 
-The general rule these three share: **a machine-plane write inside `.cog/` is
-admissible only where it is (a) named in this table, (b) derived or runtime
-rather than authored, and (c) outside both ledger strands.** Anything else is a
-lint failure (§6.4). This is a narrower claim than "the cell is empty" and it
-is the one the code and the corpus actually support.
+The general rule these five share: **a machine-plane write inside `.cog/` is
+admissible only where it is (a) named in this table, (b) derived, runtime, or
+peer-sourced rather than locally authored, and (c) outside both ledger
+strands.** Anything else is a lint failure (§6.4). This is a narrower claim than
+"the cell is empty" and it is the one the code and the corpus actually support —
+with two honest residuals: row 3 is **pending Q7** because its paths are not
+separable, and row 4 is **flagged to Q8** because its content is authored
+off-node. Rule (c) is where §5.1c comes in: shipped code violates it today.
 
 Note that this is the same conflict-log entry (ADR-065 §7 versus RFC-033's path
 layering) that sits immediately above the machine-tier bullet §5.9 claims to
 close. The second draft decided it silently. It is decided out loud here.
+
+### 5.1c Machine-plane writers currently inside the seat(local) strand
+
+Rule (c) above — *outside both ledger strands* — is the one §5.2's two-party
+attestation actually rests on, and **shipped kernel code violates it today.**
+The third draft asserted the opposite as a present-tense invariant and lints it
+in §6.4, so the lint would fail on a clean checkout and the invariant reads as a
+fact when it is a target. Corrected: the writers are enumerated, and the
+invariant is restated as a **post-rung-3 property with named migration work**,
+not as a description of the current build.
+
+All three writers reach `.cog/ledger/<bucket>/events.jsonl` through
+`AppendEvent` (`internal/engine/ledger.go`), and all three run under §3's
+assignment of the reconcile loop and the HTTP listener to the machine plane:
+
+| Bucket | Writer | Disposition |
+|---|---|---|
+| `.cog/ledger/worktree-reconciler/` | `FilesystemLedgerWriter` (`internal/engine/worktree_spawn.go`) emitting `worktree.*` events; registered at boot by `internal/providers/all/all.go` | **relocate to the machine strand.** It is a reconciler's own record of machine-plane work; it is on the seat strand only because `AppendEvent` is the only ledger writer that exists. |
+| `.cog/ledger/<kernel session id>/` | `(*Process).EmitEvent` (`internal/engine/process.go`), called by the margin bridge's kernel event sink and by the MCP server | **split by origin.** Kernel-originated events relocate to the machine strand; events that record *user-plane* work the agent performed stay on the seat strand and are written **by the agent**, which is the identity that performed them (§4.4). This is the one row where the fix is not a path change but an authorship change. |
+| `.cog/ledger/mcp-client/` | config-only callers via `internal/engine/mcp_stubs.go` | **relocate to the machine strand**, or be re-attributed to the calling seat where a seat is identifiable. Whichever, it does not stay a machine-plane write on the seat strand. |
+
+Three consequences stated so nothing here is inferred:
+
+- **§5.2's invariant is a target, and §6.4's `.cog/ledger/` lint is a
+  post-rung-3 gate.** Both are marked as such. A lint that fails on today's
+  build is only honest if it is declared as measuring the destination rather
+  than the origin; that declaration is made here and repeated in §6.4.
+- **The relocation is net-new work** and is listed in §3.3. It is a
+  **prerequisite for rung 3c** (machine state migrated): migrating machine
+  state while the machine plane is still appending to the seat strand would
+  settle the ladder on a strand pair that is not yet isolated.
+- **Until it lands, §5.4's "count of two" is not yet real on this node.** Said
+  plainly rather than left as an implication of the table above. The pairing
+  mechanism is sound; the ACL that makes a pair two-party is what rung 3
+  installs.
 
 **The cogdoc corpus (Q1 in the first draft) is answered here**: the *authored*
 corpus is workspace-portable seat(local) state, and over it the machine plane
@@ -794,12 +1107,53 @@ reconciler generated.
   workspace-portable. Session events, lane dispatch, corpus writes. *Portable
   is not the same as git-settled, and the second draft used the terms
   interchangeably:* observed workspace practice gitignores `.cog/ledger/*`
-  (keeping only a `.gitkeep`), so the strand travels with the directory and by
-  BEP replication, not necessarily through git history. The invariants in this
-  RFC rest on **who holds the write handle**, which is unaffected either way;
-  but "git-settled" is a claim about durability that this RFC should not make
-  on the ledger's behalf. Whether the seat(local) strand *ought* to be
-  git-settled is a separate question and is not decided here.
+  (keeping only a `.gitkeep`), so the strand travels with the directory, not
+  necessarily through git history. The invariants in this RFC rest on **who
+  holds the write handle**, which is unaffected either way; but "git-settled"
+  is a claim about durability that this RFC should not make on the ledger's
+  behalf. Whether the seat(local) strand *ought* to be git-settled is a
+  separate question and is not decided here.
+
+  **"…and by BEP replication" is retracted.** The third draft said the strand
+  travels with the directory *and by BEP replication*, and §5.8 simultaneously
+  asserted that no machine-plane identity writes inside `.cog/ledger/`. Both
+  cannot hold: the BEP engine is machine-plane by §3's own assignment, so
+  anything BEP replicates into the workspace is written by the machine-plane
+  identity. The contradiction is resolved by **invariant, not by wording**, and
+  in the safe direction:
+
+  > **The ledger strands are never in the BEP-replicated set.** Neither
+  > `.cog/ledger/**` nor the machine strand is replicated by BEP, in any
+  > configuration.
+
+  The reason is sharper than "the machine plane would be writing the seat
+  strand," which is bad enough. If the seat strand were replicated, **a remote
+  peer could author a complement on this node's seat strand** — the second
+  observation in §5.4's two-party pair, written by a party that is neither of
+  the two. That is off-node complement forgery, and **no local privilege lint
+  detects it**, because no local principal is involved: §3.1's privilege ceiling
+  and §5.8's DACLs both govern principals on this box. Pairing would report
+  settlement that no local identity attested.
+
+  **What the invariant is enforced against, concretely.** BEP as shipped has
+  **no ignore or exclusion mechanism** — `pkg/substrate/bep/` contains nothing
+  of the kind — and replicates exactly one subtree,
+  `<root>/.cog/bin/agents/definitions/` (`internal/engine/bep_provider.go`;
+  folder id `cogos-agent-defs`, `internal/engine/bep_model.go`). So exclusion
+  today is **by inclusion list**, and the invariant is **vacuously satisfied**.
+  That is a fact about the present, not a guarantee about the future, so the
+  **lintable object is the inclusion list itself**: §6.4 reads the declared BEP
+  folder set and fails if it contains, or is a prefix of, `.cog/ledger/**` or
+  the machine strand. Ignore-support becomes net-new work (§3.3) **only if the
+  inclusion list is ever widened** to a scope that cannot exclude the strands by
+  construction; this RFC does not propose widening it.
+
+  **How the seat strand travels, then.** By **git** where the operator settles
+  it, or by an **explicit move** of the workspace directory — the transplant
+  case §9 Q6 is about. Not by BEP. Q6's question is unchanged by this; what
+  changes is that the transplant is an operator act with an observable moment,
+  which is what makes Q6's "seal at transplant" candidate answer coherent at
+  all.
 
   The existing session-ledger layout
   (`<workspaceRoot>/.cog/ledger/<sessionID>/events.jsonl`,
@@ -822,17 +1176,24 @@ RFC asserts, and the only one it needs:
 > **The isolation invariant protects the two ledger strands.** No
 > seat(local) principal holds write, create, or delete on the machine strand.
 > No machine-plane identity holds write, create, or delete on the seat(local)
-> strand — `.cog/ledger/**`. This says nothing about the rest of `.cog/`, which
-> is governed by the per-artifact table in §5.1 and the named exceptions in
-> §5.1b.
+> strand — `.cog/ledger/**`. Neither strand is in the BEP-replicated set. This
+> says nothing about the rest of `.cog/`, which is governed by the per-artifact
+> table in §5.1 and the named exceptions in §5.1b.
 
-Two properties make that invariant real rather than declared:
+**This invariant states the destination, not the present build.** Said here
+rather than left for a reader to discover: three shipped kernel writers append
+to `.cog/ledger/` from the machine plane today (§5.1c). The invariant is what
+rung 3 installs; the migration that installs it is named in §3.3 and gated at
+rung 3c. Everything below is written accordingly.
+
+Three properties make that invariant real rather than declared:
 
 1. **It is enforced by ACL, not convention**, and it is enforced **in both
    directions**. §5.8 states one direction (no seat(local)-writable path under
    the machine root). The direction §5.4's attestation actually depends on is
    the other one — **no machine-plane-writable path inside `.cog/ledger/`** —
-   and the second draft lints neither it nor its ceiling. §6.4 now carries both.
+   and the second draft lints neither it nor its ceiling. §6.4 now carries both,
+   the second marked as a post-rung-3 gate.
 2. **The privilege ceiling from §3.1 applies here or the ACL is decorative.** An
    ACL that says "the service cannot write the seat(local) strand" means
    nothing if the service runs as root, as SYSTEM, or with `SeBackupPrivilege`
@@ -841,6 +1202,13 @@ Two properties make that invariant real rather than declared:
    seat(local) strand's ACL**. That is why §3.1 strikes root on macOS, and it
    is the reason the Windows virtual account was chosen for being *strictly
    weaker than SYSTEM* rather than for being convenient.
+3. **The ACL has to be paired with the replication invariant, because ACLs are
+   local and replication is not.** A DACL denying the machine identity write on
+   `.cog/ledger/` is exactly as strong as the set of writers it can see. A file
+   arriving over BEP is written by the machine-plane engine and authored
+   somewhere else entirely; the local ACL is the wrong instrument for it. That
+   is why the strands' exclusion from the replicated set is stated as an
+   invariant above rather than left to configuration.
 
 That is what makes the next section mean anything.
 
@@ -979,11 +1347,17 @@ and sealed in the library.
 
 ### 5.7 Minting a kind is a governance act
 
-Adding a paired kind, changing a complement, changing a direction, changing a
-window, or lowering an otherness tier is a **version bump that raises the
-library floor**. It is not a code change that ships quietly with a refactor.
-The library is the boundary's vocabulary, and minting vocabulary is a security
-act: everything the door will ever admit is enumerated there.
+Every change to the library is a **version bump that raises the library floor**,
+and none of them is a code change that ships quietly with a refactor. The
+library is the boundary's vocabulary, and minting vocabulary is a security act:
+everything the door will ever admit is enumerated there.
+
+**The third draft's opening sentence here filed "changing a complement, changing
+a direction" in the routine bucket. That is retracted** — it is the same
+misfiling the gate below exists to prevent, sitting in the sentence that
+introduces the gate. Changing a complement or a direction is not a neutral edit
+of an existing kind; it is where the kind's *pairing* lives, and pairing is the
+whole primitive.
 
 **But the library governs the tiers, so the library must govern itself.** The
 second draft named minting "a security act" and then attached no authority to
@@ -993,12 +1367,45 @@ from **operator** to **cross-plane**, and §5.6's protection of a NodeID change
 would evaporate by version bump. Named gate, decided:
 
 > **Any library change that WEAKENS a constraint requires operator-tier
-> attestation, recorded as a paired entry on the machine strand.** Weakening
-> means: lowering an otherness tier; widening a window; removing a kind's
-> requirement (a complement, a direction, a declared field); or removing a kind
-> whose absence would silently re-admit an interaction under a looser rule.
-> Floor-raising changes — adding a kind, raising a tier, narrowing a window,
-> adding a required field — remain ordinary version bumps.
+> attestation, recorded as a paired entry on the machine strand.**
+>
+> "Weakens" is defined **non-enumeratively**, because the third draft's closed
+> list was incomplete on its second reading and a closed list here will be
+> incomplete on its third:
+>
+> > **Any non-additive change to an existing kind requires the operator-tier
+> > gate.** Non-additive means touching what the kind already declares — its
+> > tier, its window, its complement, its direction, or its field requirements
+> > — whether by **changing** the declared value or by **removing** it, and
+> > whether or not the change looks like a tightening. Removing a kind is a
+> > non-additive change to that kind.
+> >
+> > **Purely additive changes remain ordinary version bumps**: adding a new
+> > kind, adding a new *optional* field to an existing kind.
+>
+> The rule is deliberately over-inclusive. A tightening that trips the gate
+> costs one operator attestation; a weakening that slips it costs the
+> primitive.
+
+**Why "changing" had to join "removing," concretely.** The worked case is not
+hypothetical and it is why the enumeration failed: re-point an operator-tier
+kind's **complement** from a seat(local)-strand kind to a machine-strand kind,
+and both halves of the pair now land on **one strand** — which voids §5.4's
+"one identity cannot manufacture both halves" for that kind. Under a closed list
+that only caught *removals*, that edit reads as a floor-raising bump requiring
+no operator tier. Flipping `direction` does the same thing by the other route.
+The pairing fields are where the two-party property is encoded, so any edit to
+them is an edit to the two-party property.
+
+**The preventive half of this gate is the signature gate.** Worth composing
+explicitly rather than leaving in two sections: the gate above is **detective**
+— a weakening that shipped is observable after the fact on a strand the
+beneficiary cannot write. Since §5.3 ships the library **in the binary**, a
+library revision arrives by self-update, so the only *preventive* control on the
+path is the Sigstore gate §5.8 declares as an invariant
+(`internal/engine/cli_selfupdate.go`; `AllowUnsigned` bounded by pre-signing
+tags and never set by the reconcile provider). Detection on the strand,
+prevention at the update — one mechanism, two halves.
 
 Three properties this buys, none of which the intent-statement alone did:
 
@@ -1035,6 +1442,29 @@ Invariants:
 - **The machine-plane identity holds no privilege that overrides either ACL**
   (§3.1's privilege ceiling). An ACL is only as strong as the weakest privilege
   that bypasses it.
+- **The machine plane executes nothing resolved from a seat(local)-writable or
+  workspace-portable directory.** Stated as a general invariant rather than as a
+  route-by-route patch, because the third draft caught one instance of the shape
+  (`ServiceDef.Command`, below) and missed a more direct one. Binaries,
+  scripts, skill entry points, plugin executables, service commands: if the
+  machine plane runs it, it resolves from **under the machine root**, whose DACL
+  §5.8 specifies. Anything the operator can edit is executed by the **agent**,
+  in the operator's identity, per §4.4's inversion — which is where such work
+  belonged anyway, since it is user-plane work.
+  - The instance the third draft missed: `POST /v1/skills/{name}/exec`
+    (`internal/engine/serve_skills.go`) resolves through `skillDirs()` —
+    `os.UserHomeDir()/.claude/skills` and `<WorkspaceRoot>/.claude/skills` —
+    and `pkg/skills`' `Exec` runs `exec.CommandContext` on the resolved binary
+    with `os.Environ()` inherited. Under two-plane that is a seat(local) →
+    service-account code-execution path through a **workspace-portable**
+    directory, which means a peer node or a transplanted workspace supplies the
+    binary. §4.1 item 6 moves it to the agent.
+  - The instance the third draft caught, restated as the same rule:
+    `ServiceDef.Command` is a free-form command string, and the plugin-manifest
+    and `runtime-services.yaml` inputs below feed it.
+  - The instance §5.1b flags: the BEP agent-definitions sync directory holds
+    **peer-authored** content inside the workspace. Whatever consumes it, the
+    machine plane does not execute from it. See §9 Q8.
 - **Inheritance is broken at the root** and a fresh DACL is applied at
   registration, not inherited.
 - The service binary, the self-update staging directory, **the machine config
@@ -1102,10 +1532,23 @@ escalation as a seat(local)-writable binary, one level of indirection away.
 - **It decides, out loud, the conflict-log entry adjacent to that one.**
   ADR-065 §7 specifies `.cog/run/daemon/state.yaml` and RFC-033 layers the
   paths differently; §5.1b keeps the ADR-065 path and declares it as a named
-  machine-plane write inside the workspace, together with the ADR-094 lineage
+  machine-plane write inside the workspace, together with the lineage
   projections and the ADR-097 / ADR-098 projection targets driven by ADR-095's
-  reconcile loop. The second draft asserted a partition that contradicted all
-  five and cited none of them.
+  reconcile loop. The second draft asserted a partition that contradicted all of
+  them and cited none of them. **Standing note, applying §5.9's own rule to
+  itself:** the lineage row leans on **ADR-095** (accepted) plus shipped code
+  for its authority, not on **ADR-094**, which is status `Draft`. A draft does
+  not settle another draft's question — the correction this section makes for
+  ADR-099 applies one bullet away, and the third draft cited ADR-094 as though
+  it were accepted.
+- **It does not settle the projection-target path collision, and says so.**
+  ADR-097 and ADR-098 write into the same directories as the authored corpus,
+  which makes §5.1's two rows contradictory over one path and §6.4's declared-set
+  lint unenforceable by ACL over that row. That is a genuine conflict between
+  accepted decisions and this RFC's partition, and resolving it requires
+  amending an accepted ADR or changing the write mechanism — neither of which
+  this draft has standing to do unilaterally. Declared as **§9 Q7** with two
+  resolution paths.
 - **§4.4's request/receipt shape is the OwnerActuator posture at the process
   boundary — and §4.4 now implements the ladder rather than naming it.** The
   external-credential-federation RFC (status `draft`) specifies re-resolve →
@@ -1188,26 +1631,38 @@ not, including one §4.1 explicitly promised was lintable.
 | door present, ACL correct, **created first-instance by the service account** | §4.2 |
 | **door namespace reserved at registration** — the pipe's object-namespace directory / the socket's parent directory grants create rights to the machine identity only | §4.2 |
 | **door-name refusal is distinguishable from down** — "refused: name held by a foreign principal" is its own observable, naming the holder where the OS exposes it | §4.2 |
-| **no auxiliary IPC endpoint** in the kernel's namespace besides the declared door | §4.1 |
+| **no auxiliary IPC endpoint** in the kernel's namespace besides the declared door. Scope note: this constrains the **kernel's** namespace — the machine plane and the agent's service-facing side. It does not forbid the agent from using mechanisms it already owns as the seat(local) principal to serve consumers running as that same principal (§4.1 item 3) | §4.1 |
 | **service-lifecycle and register routes are not served on the loopback listener** — `/v1/services/*` and `POST /v1/services/register` reachable on the door only, and only against a machine-plane-scoped grant | §4.1 item 2 |
-| **no gate-exempt grant read** — no route returns a node-root credential without passing the grant gate; the node-root credential is not readable from any seat(local)-readable path | §4.1 item 3 |
+| **no gate-exempt grant read** — no route returns a node-root credential without passing the grant gate; **the machine plane's copy** of the node-root credential is not readable from any seat(local)-readable path. Scope note: this is about the machine root's copy, not about the agent's delivery of the credential to a consumer running as the same operator (§4.1 item 3) | §4.1 item 3 |
+| **no HTTP route writes the machine config file** — `PATCH /v1/config` and `POST /v1/config/rollback` resolve to the seat/workspace `kernel.yaml` only; a patch naming a machine key is refused, and no route serves the machine file's contents in any form | §4.1 item 5, §5.1a |
+| **the machine plane executes nothing from a seat(local)-writable or workspace-portable directory** — no machine-plane route or supervisor resolves an executable from `~/.claude/skills`, `<ws>/.claude/skills`, `.cog/bin/agents/definitions/`, `~/.cogos/plugins/`, or `~/.cogos/runtime-services.yaml`; `POST /v1/skills/{name}/exec` is not registered on the machine plane's listener | §4.1 item 6, §5.8 |
 | **protocol floor satisfied** (named check, distinct from skew) | §4.3 |
-| **no machine-plane security key readable from a seat(local)-writable or BEP-replicated path** — no `Enable*` gate, `BindAddr`, or `WriteRouteGrantAuthDisabled` resolvable from `.cog/`; a machine key found in `kernel.yaml` fails the lint rather than being shadowed | §5.1a |
+| **no machine-plane security key readable from a seat(local)-writable path or from any path in the BEP inclusion list** — no `Enable*` gate, `BindAddr`, `port`, or `WriteRouteGrantAuthDisabled` resolvable from `.cog/`; a machine key found in `kernel.yaml` fails the lint rather than being shadowed. A `port`-only failure is a hygiene finding, not a breach (§5.1a) | §5.1a |
 | **no seat(local)-writable path under the machine root** | §5.8 |
-| **no machine-plane-writable path inside `.cog/ledger/`** — the direction two-party attestation rests on | §5.2, §5.8 |
+| **no machine-plane-writable path inside `.cog/ledger/`** — the direction two-party attestation rests on. **Post-rung-3 gate:** this measures the destination, not today's build — three shipped kernel writers append there now (§5.1c), and the lint passes only once their relocation lands | §5.2, §5.1c, §5.8 |
+| **BEP inclusion list excludes both strands** — the declared BEP folder set contains no path that is, contains, or is a prefix of `.cog/ledger/**` or the machine strand. Read the **inclusion list**, not an ignore file: BEP ships no exclusion mechanism, so the list is the object | §5.2 |
 | **privilege ceiling** — machine-plane identity is not root / SYSTEM / Administrators and holds no `SeBackupPrivilege`, `SeRestorePrivilege`, `SeTakeOwnershipPrivilege`, or `CAP_DAC_OVERRIDE` | §3.1, §5.2 |
-| **machine-plane writes inside `.cog/` are exactly the declared set** — daemon lifecycle state and the declared projection targets, nothing else; and `.cog/run/` is excluded from git and from BEP replication | §5.1b |
+| **machine-plane writes inside `.cog/` are exactly the declared set** — enumerated in full: `.cog/run/daemon/state.yaml`; `.cog/mem/semantic/lineage/projections/**`; `.cog/bin/agents/definitions/**`; `.cog/.state/bep/**`. Nothing else. **Scope:** the lint runs over the **separable** rows only — the ADR-097 / ADR-098 targets under `.cog/mem/**` and `.cog/skills/**` are **excluded pending Q7**, because those paths are not separable from the authored corpus and the predicate over them would be provenance, not path. `.cog/run/` and `.cog/.state/` are gitignored and absent from the BEP inclusion list | §5.1b, §9 Q7 |
 | **capability envelopes are machine-plane-stored and not seat(local)-writable** — no envelope resolvable from `.cog/`, no seat(local) principal holding write on its own envelope | §4.6 |
 | **service image path integrity** — write-ACL on the image, unquoted-path check | §5.8 |
 | **self-update signature gate intact** — no unsigned-application path reachable from the reconcile provider | §5.8 |
 | **NodeID byte-identical** across the rung-2 → rung-3 transition, **and BEP DeviceID / cert bytes identical** — the derived value alone goes green while the anchor forks | §7.2 |
 | unpaired-past-window entries, **classified overdue vs. unexpressed vs. stalled**, with the vacancy call **paired to the occupancy signal** — never inferred from the counterpart strand's own silence | §5.4 |
 | declared otherness tier satisfied per paired kind | §5.6 |
-| **library weakenings carry operator-tier attestation** — every tier lowering, window widening, or requirement removal has its paired attestation entry on the machine strand | §5.7 |
+| **library weakenings carry operator-tier attestation** — every **non-additive** change to an existing kind (tier, window, complement, direction, or field requirements — changed *or* removed) has its paired attestation entry on the machine strand. Pure additions do not | §5.7 |
+| **capability-envelope enrolment state is observable** — every connected seat(local) principal either holds an envelope or is reported as **un-enrolled**, and refusals for want of an envelope are distinguishable from policy denials | §4.6 |
 | per-platform invariant checks: no UI surface, no user-profile read, no user credentials held — one enforceable check per platform, mirroring the S4U rule's specificity | §3.1 |
 
-Two honesty notes attached to the surface:
+Three honesty notes attached to the surface:
 
+- **Some lints measure the destination, not today's build, and each one says so
+  in its own row.** Two are marked: the `.cog/ledger/` write lint (fails until
+  §5.1c's relocation lands) and the declared-set lint (scoped to the separable
+  rows pending Q7). A lint that is known to fail on a clean checkout is honest
+  only if it is declared as a gate rather than presented as a check; a lint
+  scoped narrower than its section's claim is honest only if the exclusion is
+  named. Both are named here rather than discovered by whoever first runs the
+  doctor.
 - **A pipe or socket ACL grants a SID, not a binary.** "Only the agent holds
   the door" is not expressible and therefore not lintable. The threat model
   must not assume that unobservable.
@@ -1229,21 +1684,22 @@ its own gate predicate.
    logon-failure signature and prompts re-entry.
 3. **Two-plane** — split into sub-rungs below.
 
-### 7.1 Rung 3 is four operations, not one
+### 7.1 Rung 3 is a sequence, not one operation
 
 The first draft conjoined *service registered*, *machine state migrated*, *boot
 task deleted*, and *agent demoted* into a single rung with no intermediate
 checkpoint and no way back. An operator who lands mid-rung at 2am with a dead
 service, a deleted boot task, and half-migrated state has no doctor-declared
-route home. Sequenced:
+route home. Sequenced into five sub-rungs, each a settled observable state with
+its own gate predicate and its own way back:
 
 | Sub-rung | Gate predicate | Rollback |
 |---|---|---|
 | **3a. Service registered, boot task retained** | service registered and running under the expected identity; boot task still present and healthy | unregister the service; rung 2 is untouched |
 | **3b. Cert relocated, NodeID verified** | NodeID byte-identical to its rung-2 value **and BEP DeviceID / cert bytes identical** (§7.2) — the NodeID check alone measures the derived value, not the anchor | restore cert dir from the retained copy; both checks re-verified |
-| **3c. Machine state migrated, old copies retained read-only** | machine state present and ACL-correct at the new root; old copies still readable; **dual-valid window open** | repoint at the old root; both copies are still valid |
+| **3c. Machine state migrated, old copies retained read-only** | machine state present and ACL-correct at the new root; old copies still readable; **dual-valid window open**; **and the §5.1c ledger-writer relocation has landed** — the machine plane no longer appends inside `.cog/ledger/`, so §6.4's write-isolation lint passes | repoint at the old root; both copies are still valid |
 | **3d. Boot task deleted** | N consecutive healthy service checks passed while 3c's dual-valid window held | `--fix` re-creates the rung-2 boot task and repoints state at the old root |
-| **3e. Agent demoted to session duties, credential distribution moved to the door** | agent connected to the door, executing user-plane requests; the node-root credential is served from the machine root over the door and the gate-exempt GET is gone (§4.1 item 3); named local consumers repointed at the agent | agent reverts to standalone kernel supervision and to the rung-2 credential path |
+| **3e. Agent demoted to session duties, credential distribution moved to the door, skill exec inverted, principals enrolled** | agent connected to the door, executing user-plane requests; the node-root credential is served from the machine root over the door and the gate-exempt GET is gone (§4.1 item 3); the **seat-owned delivery mechanism is chosen and declared** and each named consumer (dashboard, canvas, harness hook sessions, THESEUS) is repointed at it — **no new listener** (§3.3); `POST /v1/skills/{name}/exec` removed from the machine plane and re-landed as an agent-executed door kind (§4.1 item 6); **every logon principal on this node either holds a capability envelope or is reported un-enrolled** — enrolment is an operator-tier act (§4.6) and a node with N principals needs N of them | agent reverts to standalone kernel supervision, to the rung-2 credential path, and to in-process skill exec |
 
 **Migration procedure per state category**: copy → verify → atomic rename, with
 a doctor gate on "machine state present and ACL-correct at the new root"
@@ -1359,9 +1815,20 @@ second draft wrote "BEP's envelope/receipt exchange between constellation nodes
 indicative. That is not true of the shipped code and the correction is worth
 making sharply, because §8's whole argument is a count of instances. BEP here
 is Syncthing's Block Exchange Protocol (`pkg/substrate/bep/`): a file-sync
-protocol whose message set is ClusterConfig / Index / Request / Response. It
-carries **no envelope, no receipt, and no durable two-party settlement by
-complement** — the words do not appear in the package.
+protocol whose full message set (`pkg/substrate/bep/proto.go`) is ClusterConfig,
+Index, IndexUpdate, Request, Response, Ping, Pong, Close, **Dispatch**, and
+**DispatchResult**. It carries **no envelope, no receipt, and no durable
+two-party settlement by complement** — the words do not appear in the package.
+
+**The Dispatch / DispatchResult pair is named rather than trimmed, because it is
+the nearest thing in BEP to a complement and leaving it out of this list would
+be favorable editing.** It is a remote-harness dispatch request and its result —
+a live **RPC pair**, and it does not count as an instance of §5.3's operation for
+one specific reason: it has **no durable strand and no settlement by
+complement**. A `DispatchResult` is a transport reply, correlated in flight and
+gone; nothing records that a `Dispatch` went unanswered, and no observable
+exists for the ones that never came back. That is precisely the step §8 says the
+host boundary codebooks stop short of, and BEP stops short of it too.
 
 Restated honestly: an inter-node strand pair — two write-isolated node records,
 a shared vocabulary, settlement by complement at a **cross-node** otherness tier
@@ -1406,7 +1873,7 @@ derive from `session` scope under selective scope inheritance — the
 **capability-envelope RFC**, not in ADR-074? (ADR-074 establishes selective
 scope inheritance; the tighten/loosen phrasing belongs to the RFC and the
 second draft credited it to the ADR.) Per-seat envelope scoping and §4.6's
-per-request seat binding are **one question, not two** — and per §4.6 the
+per-request **seat(local)** binding are **one question, not two** — and per §4.6 the
 envelope's *plane and write authority* are no longer part of this question:
 they are decided (machine-plane storage, operator-tier mutation, enforced at
 the door). What remains open is the schema.
@@ -1475,7 +1942,85 @@ defect with an obvious patch. The candidate answers, none chosen here:
 
 This interacts with §8: the inter-node instance proposed there is one framing of
 the same problem, which is a reason to answer this question *before* that RFC,
-not after.
+not after. Note one thing the third pass settles about its *mechanism*: the
+seat(local) strand travels by **git or an explicit move of the directory, never
+by BEP** (§5.2), so a transplant has an operator-visible moment. That makes the
+"seal at transplant" candidate below implementable; it does not choose it.
+
+**Q7 — Projection targets have no path boundary. OPEN, and it is a genuine
+corpus conflict this RFC cannot settle.**
+
+§5.1b row 3 admits the ADR-097 / ADR-098 projection targets as declared
+machine-plane writes, and §5.1's per-artifact table gives them "machine identity
+write, seat(local) read." The row directly above gives the **authored** corpus
+at `.cog/mem/` "seat(local) identity write, machine read grant." **Those are the
+same paths.** ADR-097 §3's placement table writes projections to
+`.cog/mem/semantic/insights/{slug}.cog.md`, `semantic/projects/`,
+`semantic/references/`, and `episodic/profile/` — exactly where authored cogdocs
+live. ADR-098's `.cog/skills/` is the same shape, milder.
+
+Three consequences, stated so the conflict is not softened:
+
+- Applied literally, the two rows **contradict each other** over one directory.
+- Applied as written, the operator **loses write on their own corpus**.
+- §6.4's "machine-plane writes inside `.cog/` are exactly the declared set" is
+  therefore a **provenance** predicate over these paths, not a **path**
+  predicate — and provenance is not enforceable by the ACL mechanism §5.2
+  insists on ("enforced by ACL, not convention"). The ADR-094 lineage row does
+  not have this problem: `projection_reconciler.go` writes under
+  `.cog/mem/semantic/lineage/projections/`, **a separable subtree** an ACL can
+  be hung on.
+
+**Why this RFC does not decide it.** ADR-097 and ADR-098 are **accepted**. The
+partition this RFC proposes is incompatible with their file layout, not with
+their authority. Resolving that means changing one of the two, and this draft
+has standing to propose but not to amend an accepted decision. The candidate
+resolution paths, neither chosen here:
+
+- **A separable projections subtree**, via an ADR-097 amendment (and ADR-098 in
+  parallel): projections land under a dedicated path — the shape the lineage
+  reconciler already uses — so the ACL has something to attach to and the lint
+  becomes a path predicate. Cleanest for this RFC; costs an amendment to an
+  accepted ADR and a migration of existing projections.
+- **Door-mediated writes instead of a direct ACL**: the reconciler does not hold
+  a filesystem write ACL on the corpus at all. It raises a declared request kind
+  (§5.3) and the **agent** performs the write in the operator's identity. The
+  paths need not be separable, because the machine plane never writes them.
+  Costs a round trip per projection and makes projection availability depend on
+  the agent being up — which §5.4's vacancy classification already models, so
+  the cost is bounded and observable.
+
+Until it resolves, §5.1b marks the row **pending Q7** and §6.4's declared-set
+lint is **scoped to the separable rows only**, with the exclusion named in the
+lint text. This is the honest state: an unenforceable predicate declared as
+unenforceable beats an enforceable-sounding one that no ACL can back.
+
+**Q8 — Peer-authored agent definitions. OPEN, flagged rather than dispositioned.**
+
+`internal/engine/bep_provider.go` binds the BEP sync watch directory to
+`<workspaceRoot>/.cog/bin/agents/definitions/` (folder id `cogos-agent-defs`,
+`internal/engine/bep_model.go`), and it is the **only** subtree BEP replicates
+as shipped. §5.1b now carries it as a declared machine-plane write. What it
+does not carry is a trust story, because none exists in the corpus to import:
+**the content of that directory is authored on other nodes.**
+
+The question, stated as a trust question rather than a placement one: *a remote
+peer authors an agent definition; the machine-plane engine on this node writes
+it into this workspace; what then reads or executes it, under which identity,
+and what admits it?* Every other cell in §5.1's partition has a local author.
+This one does not, and off-node authorship is the one case neither the ACL model
+(§5.8, local principals) nor the privilege ceiling (§3.1, local privileges)
+reaches — the same structural gap §5.2 names for the ledger strands, where the
+answer was to keep them out of the replicated set entirely. That answer is not
+available here, because cross-node agent distribution is the feature.
+
+Bound already decided, so this is a narrowed question rather than an open field:
+per §5.8, **the machine plane executes nothing resolved from this directory**,
+for the same reason it executes nothing from `.claude/skills` (§4.1 item 6).
+What remains open is admission — signing, peer attestation, an operator
+enrolment step, or a declared refusal to consume peer definitions without one.
+Recorded here as future-hardening work with a named owner-shaped question rather
+than folded into a disposition column that would imply it was answered.
 
 ---
 
@@ -1501,10 +2046,16 @@ citation below names the title, not only the number.
   inheritance.** The "inner can tighten, cannot loosen" phrasing cited in §9 Q2
   belongs to the capability-envelope RFC draft, not to this ADR
 - ADR-093 — managed-session durability: adopt-if-alive, else rebuild from ledger
-- ADR-094 — lineage observatory — the projections the reconciler writes (§5.1b)
+- ADR-094 (**status `Draft`**) — lineage observatory — the projections the
+  reconciler writes (§5.1b). Cited for the projections' *purpose*; the §5.1b
+  row's authority is **ADR-095** (accepted) plus shipped code, per §5.9's own
+  rule that a draft does not settle another draft's question
 - ADR-095 — daemon reconcile-loop driver — the loop that runs those reconcilers
-- ADR-097 — memory projection reconciler — kernel-run writer into `.cog/mem/`
-- ADR-098 — skill projection reconciler — kernel-run writer into `.cog/skills/`
+- ADR-097 — memory projection reconciler — kernel-run writer into `.cog/mem/`;
+  its §3 placement table writes into the **same directories as the authored
+  corpus**, which is the conflict §9 Q7 declares
+- ADR-098 — skill projection reconciler — kernel-run writer into `.cog/skills/`;
+  same shape as ADR-097, milder
 - ADR-099 — machine-tier path conflict log; **this RFC provides the argument to
   close its recorded "unsettled" entry (§5.9); the amendment lands on
   acceptance, and the change is larger than the one line the ADR anticipated**
@@ -1523,15 +2074,19 @@ citation below names the title, not only the number.
   into §4.4
 - Code touchpoints named in this draft: `internal/engine/serve.go`,
   `internal/engine/serve_services.go`, `internal/engine/serve_grant_auth.go`,
-  `internal/engine/serve_cors.go`,
+  `internal/engine/serve_cors.go`, `internal/engine/serve_config.go`,
+  `internal/engine/serve_skills.go`,
   `internal/engine/boot_node_root_grant.go`,
   `internal/engine/serve_identity_grants.go`,
   `internal/engine/config.go`, `internal/engine/process.go`,
-  `internal/engine/bep_engine.go`, `internal/engine/cli_selfupdate.go`,
+  `internal/engine/bep_engine.go`, `internal/engine/bep_provider.go`,
+  `internal/engine/bep_model.go`, `internal/engine/cli_selfupdate.go`,
   `internal/engine/daemon_lifecycle.go`,
   `internal/engine/projection_reconciler.go`,
   `internal/engine/decision_lineage_reconciler.go`,
   `internal/engine/service_supervisor.go`,
   `internal/engine/service_supervisor_stub.go`,
   `internal/engine/node_identity.go`, `internal/engine/ledger.go`,
-  `pkg/substrate/bep/tls.go`, `pkg/substrate/bep/config.go`
+  `internal/engine/worktree_spawn.go`, `internal/engine/mcp_stubs.go`,
+  `internal/providers/all/all.go`,
+  `pkg/skills`, `pkg/substrate/bep/tls.go`, `pkg/substrate/bep/config.go`
