@@ -31,6 +31,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -235,7 +237,35 @@ func NewWorktreeReconciler(repoRoot string, reader LedgerReader, writer LedgerWr
 // repo root; the type string includes a hash-free path token so multi-repo
 // deployments register distinct types.
 func (r *WorktreeReconciler) Type() string {
-	return "worktree-reconciler:" + r.RepoRoot
+	return "worktree-reconciler/" + instanceSlugForRoot(r.RepoRoot)
+}
+
+// instanceSlugForRoot derives a filesystem-safe, stable instance discriminator
+// from a repo root path.
+//
+// The type string is a registry key, and reconcile.StatePath joins registry
+// keys into `<root>/.cog/config/<key>/.state.json`. Interpolating the raw
+// absolute repo root produced a nested `worktree-reconciler:/Users/.../cog/`
+// tree inside the config directory of a live workspace. The basename keeps the
+// key legible to an operator reading `ls .cog/config`; the short digest keeps
+// two repos with the same basename from colliding onto one state file.
+func instanceSlugForRoot(repoRoot string) string {
+	sum := sha256.Sum256([]byte(repoRoot))
+	base := filepath.Base(filepath.Clean(repoRoot))
+	base = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		default:
+			return '-'
+		}
+	}, base)
+	if base == "" || base == "-" || base == "." || base == ".." {
+		base = "repo"
+	}
+	return base + "-" + hex.EncodeToString(sum[:4])
 }
 
 // worktreeConfig is what LoadConfig returns: the declared worktree set
