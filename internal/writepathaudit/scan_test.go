@@ -1,0 +1,743 @@
+package writepathaudit
+
+// scan_test.go — golden-diff CI gate over the live inventory.
+//
+// TestInventory_MatchesGolden regenerates the inventory by scanning the
+// repository fresh on every run and diffs it against the committed golden
+// files. A new write path (or a removed one) changes the diff and fails the
+// test with a message telling the developer to either undo the write or
+// re-declare the golden with -update. This is the two-plane RFC's section
+// 6.4 lint made real: the declared set is generated, not hand-authored — a
+// human only ever approves a diff.
+//
+// To regenerate after a deliberate change:
+//
+//	go test ./internal/writepathaudit/ -run TestInventory_MatchesGolden -update
+//
+// -update writes both testdata/inventory.golden.json and
+// testdata/inventory.golden.md and then passes; it is the ONLY code path in
+// this package that writes anything, and it only ever writes inside
+// testdata/.
+
+import (
+	"encoding/json"
+	"flag"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+var update = flag.Bool("update", false, "regenerate the golden write-path inventory")
+
+// repoRoot locates the repository root from this test file's own location,
+// the same technique internal/engine/namespace_sync_test.go uses: walk up
+// until a go.work file is found. go.work (not go.mod) is the marker here
+// because Scan needs to walk every module in the workspace, not just the
+// root module.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	dir := filepath.Dir(file)
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.work")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("cannot locate repo root (go.work) walking up from %s", file)
+	return ""
+}
+
+func goldenPaths(t *testing.T) (jsonPath, mdPath string) {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	dir := filepath.Join(filepath.Dir(file), "testdata")
+	return filepath.Join(dir, "inventory.golden.json"), filepath.Join(dir, "inventory.golden.md")
+}
+
+func marshalReport(t *testing.T, r *Report) []byte {
+	t.Helper()
+	out, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	return append(out, '\n')
+}
+
+func TestInventory_MatchesGolden(t *testing.T) {
+	root := repoRoot(t)
+	report, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(%s): %v", root, err)
+	}
+	if report.Summary.Total == 0 {
+		t.Fatalf("scan found zero write sites — this almost certainly means the scan is broken, not that the repo stopped writing to disk")
+	}
+
+	gotJSON := marshalReport(t, report)
+	gotMD := RenderMarkdown(report)
+
+	jsonPath, mdPath := goldenPaths(t)
+
+	if *update {
+		if err := os.WriteFile(jsonPath, gotJSON, 0o644); err != nil {
+			t.Fatalf("write golden json: %v", err)
+		}
+		if err := os.WriteFile(mdPath, []byte(gotMD), 0o644); err != nil {
+			t.Fatalf("write golden md: %v", err)
+		}
+		t.Logf("golden inventory regenerated: %d sites (cog=%d home=%d elsewhere=%d unanchored=%d dynamic=%d)",
+			report.Summary.Total, report.Summary.Cog, report.Summary.Home, report.Summary.Elsewhere, report.Summary.Unanchored, report.Summary.Dynamic)
+		return
+	}
+
+	wantJSON, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read golden json (run with -update to create it): %v", err)
+	}
+	wantMD, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read golden md (run with -update to create it): %v", err)
+	}
+
+	if string(gotJSON) != string(wantJSON) {
+		t.Errorf("write-path inventory (JSON) has drifted from testdata/inventory.golden.json.\n" +
+			"A write path was added, removed, or changed. Either:\n" +
+			"  1. undo the write-path change, or\n" +
+			"  2. re-declare the golden: go test ./internal/writepathaudit/ -run TestInventory_MatchesGolden -update\n" +
+			"then review the diff to testdata/inventory.golden.json before committing it.")
+	}
+	if gotMD != string(wantMD) {
+		t.Errorf("write-path inventory (markdown) has drifted from testdata/inventory.golden.md — regenerate with -update (see JSON error above for the procedure)")
+	}
+}
+
+// ─── Round-3 adversarial gate: named regression fixtures ───────────────────
+//
+// TestRound3GateFindings_Fixed pins, by name, every writer the round-3
+// adversarial gate found either ABSENT ENTIRELY or AFFIRMATIVELY
+// MISCLASSIFIED (stamped "elsewhere" for a genuinely unknown destination).
+// Each case quotes the gate's own finding and asserts the ACTUAL outcome
+// after the honest-binning + field/param-origin-chase fix:
+//
+//   - fully resolved to "cog" — the callable-origin index closed the hop
+//     (a struct field or parameter traced back to a literal), or
+//   - "unanchored" with its real file:line — the chase hit a genuine,
+//     declared dead end (a cross-package call this tool intentionally does
+//     not follow, or call sites that disagree and are correctly not
+//     merged). This is the honesty margin working as designed, NOT a
+//     remaining defect: the gate's own acceptance predicate accepts either
+//     outcome ("appears... under a .cog/ path... or, where genuinely
+//     dynamic, in the honesty margin with its file:line").
+//
+// A site never being "elsewhere" for a destination this tool could not
+// positively confirm is the one invariant every case here checks first.
+func TestRound3GateFindings_Fixed(t *testing.T) {
+	root := repoRoot(t)
+	report, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(%s): %v", root, err)
+	}
+
+	find := func(file string, line int) (Site, bool) {
+		for _, s := range report.Sites {
+			if s.File == file && s.Line == line {
+				return s, true
+			}
+		}
+		return Site{}, false
+	}
+	// findAny reports the first site matching file + a pattern substring,
+	// for cases where chasing a wrapper resolves to a DIFFERENT call's
+	// line than the one the hand-written verdict named (e.g. a Primitive
+	// added by this fix, or a passthrough resolved at its real primitive
+	// rather than the wrapper's own call expression).
+	findAny := func(file, patternContains string) (Site, bool) {
+		for _, s := range report.Sites {
+			if s.File == file && strings.Contains(s.Pattern, patternContains) {
+				return s, true
+			}
+		}
+		return Site{}, false
+	}
+
+	cases := []struct {
+		name  string
+		gate  string // the gate's own words, for traceability
+		check func(t *testing.T)
+	}{
+		{
+			name: "blobstore.go bs.root — chased through NewBlobStore's constructor to <WorkspaceRoot>/.cog/blobs",
+			gate: `internal/engine/blobstore.go:66,72,273,290 — ".cog/blobs/**" binned 'elsewhere' as {bs.root}`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/engine/blobstore.go", 66)
+				if !ok {
+					t.Fatal("blobstore.go:66 (os.MkdirAll ensureDirs) not found in inventory")
+				}
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/blobs") {
+					t.Errorf("blobstore.go:66 = category %q pattern %q, want cog / .cog/blobs", s.Category, s.Pattern)
+				}
+				if got, _ := find("internal/engine/blobstore.go", 290); got.Category != "cog" {
+					t.Errorf("blobstore.go:290 (manifest.jsonl) = category %q, want cog", got.Category)
+				}
+			},
+		},
+		{
+			name: "bep_provider.go p.watchDir — chased through NewBEPProvider's constructor AND its boot.go call site to <WorkspaceRoot>/.cog/bin/agents/definitions",
+			gate: `internal/engine/bep_provider.go:111,456 — ".cog/bin/agents/definitions/" (BEP-replicated, peer-writable) binned 'elsewhere' as {p.watchDir}`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/engine/bep_provider.go", 111)
+				if !ok {
+					t.Fatal("bep_provider.go:111 not found in inventory")
+				}
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/bin/agents/definitions") {
+					t.Errorf("bep_provider.go:111 = category %q pattern %q, want cog / .cog/bin/agents/definitions", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "serve_attention.go l.path — resolved directly (workspaceRoot is anchor-named in the SAME constructor, no chase needed) to <WorkspaceRoot>/.cog/run/attention.jsonl",
+			gate: `internal/engine/serve_attention.go:53 — the ".cog/run/attention.jsonl" append itself binned 'elsewhere' as {l.path}`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/engine/serve_attention.go", 53)
+				if !ok {
+					t.Fatal("serve_attention.go:53 not found in inventory")
+				}
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/run/attention.jsonl") {
+					t.Errorf("serve_attention.go:53 = category %q pattern %q, want cog / .cog/run/attention.jsonl", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "rotating_writer.go w.path — pure passthrough field, chased entirely through log_capture.go's call site to <WorkspaceRoot>/.cog/run/kernel.log.jsonl",
+			gate: `internal/engine/log_capture.go:48 — ".cog/run/kernel.log.jsonl"; real writes at internal/engine/rotating_writer.go:47/50/89/137/141 binned 'elsewhere' as {path}/{w.path}`,
+			check: func(t *testing.T) {
+				for _, line := range []int{50, 89, 141} {
+					s, ok := find("internal/engine/rotating_writer.go", line)
+					if !ok {
+						t.Fatalf("rotating_writer.go:%d not found in inventory", line)
+					}
+					if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/run/kernel.log.jsonl") {
+						t.Errorf("rotating_writer.go:%d = category %q pattern %q, want cog / .cog/run/kernel.log.jsonl", line, s.Category, s.Pattern)
+					}
+				}
+				// log_capture.go itself has no os/io primitive of its own
+				// (it only computes the path and hands it to
+				// newRotatingWriter) — that is correctly zero rows, not a
+				// gap, now that the REAL writer resolves fully.
+			},
+		},
+		{
+			name: "proprioceptive.go logPath — chased through NewProprioceptiveLogger's call sites to <WorkspaceRoot>/.cog/run/proprioceptive.jsonl",
+			gate: `internal/engine/proprioceptive.go:54,72 — ".cog/run/proprioceptive.jsonl" binned 'elsewhere'; '.cog' never appears in any row`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/engine/proprioceptive.go", 72)
+				if !ok {
+					t.Fatal("proprioceptive.go:72 not found in inventory")
+				}
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/run/proprioceptive.jsonl") {
+					t.Errorf("proprioceptive.go:72 = category %q pattern %q, want cog / .cog/run/proprioceptive.jsonl", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "mcp_stubs.go / sdk/constellation/db.go — sql.Open(sqlite3) now a recognized primitive; the two direct-anchor call sites resolve fully to .cog/.state/constellation.db",
+			gate: `.cog/.state/constellation.db — mcp_stubs.go opens it via sql.Open("sqlite3", ...); sdk/constellation/store_guard.go:201 likewise. sqlite writes through CGO, invisible to an os-primitive scanner`,
+			check: func(t *testing.T) {
+				s, ok := find("sdk/constellation/db.go", 42)
+				if !ok {
+					t.Fatal("sdk/constellation/db.go:42 (the real read-write sql.Open) not found in inventory")
+				}
+				if s.Primitive != "sql.Open(sqlite3)" || s.Category != "cog" || !strings.Contains(s.Pattern, "constellation.db") {
+					t.Errorf("db.go:42 = primitive %q category %q pattern %q, want sql.Open(sqlite3) / cog / constellation.db", s.Primitive, s.Category, s.Pattern)
+				}
+				if s, ok := find("internal/engine/mcp_stubs.go", 103); !ok || s.Category != "cog" {
+					t.Errorf("mcp_stubs.go:103 (workspaceRoot-anchored sql.Open) = %+v, want category cog", s)
+				}
+				// store_guard.go:201 and mcp_stubs.go:210 pass an
+				// already-computed dbPath THROUGH one or more further
+				// hops this tool cannot positively confirm agree with
+				// each other (one chain runs through a cross-package
+				// call it intentionally does not follow) — correctly
+				// UNANCHORED, never "elsewhere", never merged with the
+				// resolved sites above by guessing.
+				if s, ok := find("sdk/constellation/store_guard.go", 201); !ok || s.Category == "elsewhere" {
+					t.Errorf("store_guard.go:201 = %+v, must never be 'elsewhere' for an unconfirmed sqlite DSN", s)
+				}
+			},
+		},
+		{
+			name: "serve_blocks.go os.CreateTemp — the PUT /v1/blocks/{hash} ingress is no longer absent from the inventory",
+			gate: `internal/engine/serve_blocks.go — the PUT /v1/blocks/{hash} machine-plane ingress. Its only write primitive is os.CreateTemp at :184, which is not in the tool's recognized set. File is wholly absent`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/engine/serve_blocks.go", 184)
+				if !ok {
+					t.Fatal("serve_blocks.go:184 (os.CreateTemp) still absent from the inventory")
+				}
+				if s.Primitive != "os.CreateTemp" {
+					t.Errorf("serve_blocks.go:184 primitive = %q, want os.CreateTemp", s.Primitive)
+				}
+				// It streams into os.TempDir() (dir arg is ""), NOT under
+				// .cog/ — "elsewhere" is the honest, positively-resolved
+				// answer here (root "" is a concrete, known-non-opaque
+				// root), not an over-claim.
+				if s.Category != "elsewhere" {
+					t.Errorf("serve_blocks.go:184 category = %q, want elsewhere (root is the literal \"\" = os.TempDir)", s.Category)
+				}
+				if s, ok := find("internal/engine/serve_blocks.go", 195); !ok || s.Primitive != "io.Copy" {
+					t.Errorf("serve_blocks.go:195 (io.Copy into the CreateTemp'd file) = %+v, want io.Copy present", s)
+				}
+			},
+		},
+		{
+			name: "internal/conversations — .cog/state/conversations is no longer absent",
+			gate: `internal/conversations/provider.go — ".cog/state/conversations/"; no os primitive, file absent`,
+			check: func(t *testing.T) {
+				// The real primitive lives in index.go, not provider.go
+				// (provider.go itself has none, same "wrapper vs
+				// primitive" shape as everywhere else in this tool) — but
+				// the bucket itself is no longer invisible.
+				s, ok := findAny("internal/conversations/index.go", ".cog/state/conversations")
+				if !ok {
+					t.Fatal(".cog/state/conversations not found anywhere in internal/conversations/index.go")
+				}
+				if s.Category != "cog" {
+					t.Errorf("conversations index.go %s:%d = category %q, want cog", s.File, s.Line, s.Category)
+				}
+			},
+		},
+		{
+			name: "boot_node_root_grant.go vault path — fully resolved to cog now that callChase excludes nodeRootVaultPath's own error-guard branch, to <Home>/.cog/vault/node-root-grant",
+			gate: `internal/engine/boot_node_root_grant.go:275,279,282 — "~/.cog/vault/node-root-grant" (0600 raw token) binned 'elsewhere' as {path}`,
+			check: func(t *testing.T) {
+				// Round-3 found this dead-ending to UNANCHORED, because
+				// nodeRootVaultPath's own `return "", err` guard branch was
+				// (wrongly) treated as a second, disagreeing candidate
+				// against its real `return filepath.Join(home, ".cog",
+				// "vault", ...), nil` branch. With that guard branch
+				// correctly excluded (callChase's isErrorGuardReturn), the
+				// function has exactly ONE real candidate and resolves in
+				// full — to <Home>/.cog/vault/node-root-grant, a genuine
+				// .cog/ path (home-rooted rather than workspace-rooted,
+				// but .cog/ all the same per hasCogSegment's definition).
+				s, ok := find("internal/engine/boot_node_root_grant.go", 279)
+				if !ok {
+					t.Fatal("boot_node_root_grant.go:279 not found in inventory")
+				}
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/vault/node-root-grant") {
+					t.Errorf("boot_node_root_grant.go:279 = category %q pattern %q, want cog / .cog/vault/node-root-grant", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "pkg/substrate/bep/tls.go CertDir — dead-ends to UNANCHORED (GenerateBEPCert is only ever called through a cross-package qualified selector, a declared blind spot), never 'elsewhere'",
+			gate: `pkg/substrate/bep/tls.go:61,124,143 ... "~/.cog/etc" CertDir / node identity, binned 'elsewhere'`,
+			check: func(t *testing.T) {
+				s, ok := find("pkg/substrate/bep/tls.go", 61)
+				if !ok {
+					t.Fatal("pkg/substrate/bep/tls.go:61 not found in inventory")
+				}
+				if s.Category == "elsewhere" {
+					t.Errorf("tls.go:61 = elsewhere, must never over-claim a non-.cog destination for the BEP cert dir")
+				}
+				if s.Category != "unanchored" {
+					t.Errorf("tls.go:61 = category %q, want unanchored (cross-package call site, not chased by design)", s.Category)
+				}
+			},
+		},
+		{
+			name: "node_identity.go persistNodeID — dead-ends to UNANCHORED (call-site chase does not reach a positively-known root), never 'elsewhere'",
+			gate: `internal/engine/node_identity.go:321,326,335 — node identity, binned 'elsewhere'`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/engine/node_identity.go", 321)
+				if !ok {
+					t.Fatal("node_identity.go:321 not found in inventory")
+				}
+				if s.Category == "elsewhere" {
+					t.Errorf("node_identity.go:321 = elsewhere, must never over-claim a non-.cog destination for the machine node-id dir")
+				}
+			},
+		},
+		{
+			name: "pkg/substrate/bep/index.go PersistIndex — dead-ends to UNANCHORED (PersistIndex is only ever called cross-package as bep.PersistIndex(...), a declared blind spot), never 'elsewhere'",
+			gate: `internal/engine/bep_engine.go:200 — ".cog/.state/bep"; real write at pkg/substrate/bep/index.go:335/352/355 binned 'elsewhere' as {stateDir}`,
+			check: func(t *testing.T) {
+				s, ok := find("pkg/substrate/bep/index.go", 335)
+				if !ok {
+					t.Fatal("pkg/substrate/bep/index.go:335 not found in inventory")
+				}
+				if s.Category == "elsewhere" {
+					t.Errorf("index.go:335 = elsewhere, must never over-claim a non-.cog destination for the BEP sync-state dir")
+				}
+				if s.Category != "unanchored" {
+					t.Errorf("index.go:335 = category %q, want unanchored (PersistIndex is called only via the cross-package selector bep.PersistIndex(...))", s.Category)
+				}
+			},
+		},
+		{
+			name: "projection_compiler.go writeCompilerState — dead-ends to UNANCHORED (cfg.StatePath is a config value with no traced origin), never 'elsewhere'",
+			gate: `internal/engine/projection_compiler.go — ".cog/state/projection-compiler.json" binned 'elsewhere'`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/engine/projection_compiler.go", 181)
+				if !ok {
+					t.Fatal("projection_compiler.go:181 not found in inventory")
+				}
+				if s.Category == "elsewhere" {
+					t.Errorf("projection_compiler.go:181 = elsewhere, must never over-claim a non-.cog destination for the projection-compiler state file")
+				}
+			},
+		},
+		{
+			name: "identity-grants / worktree-reconciler / mcp-client ledger buckets — now individually emitted as bucket-specific rows, in addition to the shared AppendEvent primitive site",
+			gate: `serve_identity_grants.go has no os primitive; the string "identity-grants" appears nowhere in the inventory ... .cog/ledger/worktree-reconciler/ (worktree_spawn.go, FilesystemLedgerWriter) and .cog/ledger/mcp-client/ (mcp_stubs.go:641). Neither bucket name is in the inventory`,
+			check: func(t *testing.T) {
+				// This fixture's premise changed (see appendEventBucketSites
+				// in audit.go, added for the round-2 gate's predicate about
+				// the ledger-bucket literal names): the tool now chases the
+				// bucket argument at every AppendEvent-reaching call site —
+				// a bare call, or (serve_identity_grants.go's case) a call
+				// through the "appendEvent: AppendEvent" struct-field seam
+				// — and emits one Primitive="engine.AppendEvent(bucket)"
+				// row per call site whose bucket resolves to a positive
+				// literal. Each of the three named buckets must now appear
+				// as its own row.
+				wantBucket := func(file string, line int, bucket string) {
+					t.Helper()
+					s, ok := find(file, line)
+					if !ok {
+						t.Errorf("%s:%d not found in inventory (want the %q ledger bucket row)", file, line, bucket)
+						return
+					}
+					if s.Primitive != "engine.AppendEvent(bucket)" || s.Category != "cog" {
+						t.Errorf("%s:%d = primitive %q category %q, want engine.AppendEvent(bucket) / cog", file, line, s.Primitive, s.Category)
+					}
+					want := ".cog/ledger/" + bucket + "/events.jsonl"
+					if !strings.Contains(s.Pattern, want) {
+						t.Errorf("%s:%d pattern %q does not contain %q", file, line, s.Pattern, want)
+					}
+				}
+				wantBucket("internal/engine/serve_identity_grants.go", 723, "identity-grants")
+				wantBucket("internal/engine/serve_identity_grants.go", 780, "identity-grants")
+				wantBucket("internal/engine/serve_identity_grants.go", 823, "identity-grants")
+				wantBucket("internal/engine/worktree_spawn.go", 273, "worktree-reconciler")
+				wantBucket("internal/engine/mcp_stubs.go", 641, "mcp-client")
+
+				// The shared AppendEvent primitive site itself (ledger.go's
+				// one real os.OpenFile call) is unaffected by this — it
+				// still reports its own generic, sanitize-hole row.
+				ledger, ok := find("internal/engine/ledger.go", 192)
+				if !ok || ledger.Category != "cog" || !strings.Contains(ledger.Pattern, ".cog/ledger/") {
+					t.Fatalf("internal/engine/ledger.go:192 (the shared AppendEvent primitive all buckets funnel through) = %+v, want a cog-classified .cog/ledger/ site", ledger)
+				}
+			},
+		},
+		{
+			name: "internal/coherence/coherence.go:190 is a READ, not a write — correction to the hand-discovered validation set, not a tool defect",
+			gate: `the verdicts cite internal/coherence/coherence.go:190 as writing ".cog/run/coherence/canonical-hash". Source shows :190 is inside gitCanonicalHash and is an os.ReadFile. No non-test writer of that file exists in this tree`,
+			check: func(t *testing.T) {
+				if _, ok := find("internal/coherence/coherence.go", 190); ok {
+					t.Errorf("coherence.go:190 appears as a write site — the gate itself confirmed this line is os.ReadFile, a read; it must NEVER be listed as a writer fixture (this is the one correction TO the validation set, not a finding about the tool)")
+				}
+				// The file's one real write primitive (an unrelated,
+				// immediately-removed git-index scratch file used to
+				// compute a tree hash without touching the real index —
+				// nothing to do with canonical-hash) is still correctly
+				// present, proving the file itself IS scanned.
+				if _, ok := find("internal/coherence/coherence.go", 156); !ok {
+					t.Errorf("coherence.go:156 (the unrelated os.CreateTemp git-index scratch file) missing — coherence.go may not be getting scanned at all")
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, tc.check)
+	}
+}
+
+// ─── Round-4 adversarial gate: the nine false-elsewhere rows ───────────────
+//
+// TestRound4GateFindings_NeverElsewhere pins, by name, every one of the
+// round-4 gate's nine AFFIRMATIVELY FALSE "elsewhere" rows — real .cog/
+// writers that a prior repair had stamped resolved:true, category:
+// "elsewhere" — plus the separate manifest.go mis-bin (a genuine non-.cog
+// writer that landed in the wrong HONEST bin). Each case quotes the gate's
+// own finding and asserts the row now lands in "cog" or "unanchored" (per
+// the gate's own acceptance bar: "each must land cog or unanchored"),
+// NEVER "elsewhere" again. The three root causes these rows exercise:
+//
+//   - callChase dropping/collapsing a callee's return branches instead of
+//     excluding only its own error-guard branch (containedJoin,
+//     resolveMemoryDocPath, RunDir, and — one hop further —
+//     memoryProjector.setMemory via p.kernel.MemoryDir());
+//   - isOpaqueRoot treating a WorkspaceRoot-rooted pattern with an opaque
+//     TAIL segment as positively resolved (init.go's two rows);
+//   - collectLocalDefs folding a compound assignment as a rebind, and two
+//     sibling for-loops' same-named loop-local variable flattening into
+//     one shared definition (sdk/cogos.go, init.go).
+func TestRound4GateFindings_NeverElsewhere(t *testing.T) {
+	root := repoRoot(t)
+	report, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(%s): %v", root, err)
+	}
+	find := func(file string, line int) (Site, bool) {
+		for _, s := range report.Sites {
+			if s.File == file && s.Line == line {
+				return s, true
+			}
+		}
+		return Site{}, false
+	}
+
+	// wantNeverElsewhere is the single invariant every case here checks:
+	// under-claiming (cog or unanchored) is always acceptable, but
+	// "elsewhere" for a destination this tool has not positively confirmed
+	// is outside .cog/ is the one failure mode round 2 through round 4 all
+	// converged on as the worst.
+	wantNeverElsewhere := func(t *testing.T, file string, line int) Site {
+		t.Helper()
+		s, ok := find(file, line)
+		if !ok {
+			t.Fatalf("%s:%d not found in inventory", file, line)
+		}
+		if s.Category == "elsewhere" {
+			t.Errorf("%s:%d = elsewhere (pattern %q) — must never over-claim a non-.cog destination", file, line, s.Pattern)
+		}
+		if s.Category != "cog" && s.Category != "unanchored" {
+			t.Errorf("%s:%d = category %q, want cog or unanchored", file, line, s.Category)
+		}
+		return s
+	}
+
+	cases := []struct {
+		name  string
+		gate  string
+		check func(t *testing.T)
+	}{
+		{
+			name: "daemon_detach_unix.go:43 (detachProcess's os.OpenFile) — REGRESSION GUARD: logPath has a TempDir outer def AND a workspace/.cog rebind inside a range over args; a use site outside the loop cannot know which fired, so any resolved category is over-claiming (round-3 gate's sole predicate-2 failure; fixed by poisonLoopRebinds)",
+			gate: `internal/engine/daemon_detach_unix.go:43 (os.OpenFile) ... stamped resolved:true, category:"elsewhere", pattern "<TempDir>/cogos-daemon.log" ... the :35 reassignment sits inside a for i, a := range args body ... "elsewhere" with resolved:true is the one answer that is affirmatively wrong.`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "internal/engine/daemon_detach_unix.go", 43)
+				if s.Category != "unanchored" && s.Category != "cog" {
+					t.Errorf("daemon_detach_unix.go:43 = category %q, want unanchored (branch disagreement) or cog (workspace branch)", s.Category)
+				}
+			},
+		},
+		{
+			name: "mcp_server.go:1600 (WriteCogDoc's os.MkdirAll) — REGRESSION GUARD: this exact site was the round-4 gate's headline finding (stamped elsewhere under a MORE specific, MORE false heading) and must never relapse",
+			gate: `internal/engine/mcp_server.go:1600 (os.MkdirAll, pattern "dirname()") ... Both stamped resolved:true, category:"elsewhere". REGRESSION: the prior gate had these in the DYNAMIC honesty margin.`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "internal/engine/mcp_server.go", 1600)
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
+					t.Errorf("mcp_server.go:1600 = category %q pattern %q, want cog / .cog/mem (containedJoin's filepath.Clean(full) branch, not its own \"\", err guard)", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "mcp_server.go:1652 (WriteCogDoc's os.WriteFile) — REGRESSION GUARD, same call chain as :1600",
+			gate: `internal/engine/mcp_server.go:1652 (os.WriteFile, pattern "") ... Both stamped resolved:true, category:"elsewhere".`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "internal/engine/mcp_server.go", 1652)
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
+					t.Errorf("mcp_server.go:1652 = category %q pattern %q, want cog / .cog/mem", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "memory_sections.go:353 (atomicWriteMemoryFile's os.CreateTemp) — resolveMemoryDocPath's filepath.Clean(candidate) branch, not its own escape/absolute-path guards",
+			gate: `internal/engine/memory_sections.go:353 (os.CreateTemp, "dirname()") ... Stamped "elsewhere".`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "internal/engine/memory_sections.go", 353)
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
+					t.Errorf("memory_sections.go:353 = category %q pattern %q, want cog / .cog/mem", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "memory_sections.go:375 (atomicWriteMemoryFile's os.Rename)",
+			gate: `internal/engine/memory_sections.go:375 (os.Rename, "") ... Stamped "elsewhere".`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "internal/engine/memory_sections.go", 375)
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
+					t.Errorf("memory_sections.go:375 = category %q pattern %q, want cog / .cog/mem", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "sdk/cogos.go:414 (setMemory's os.MkdirAll) — memPath's compound assignment (+=) no longer destroys the MemoryDir() join, and p.kernel.MemoryDir() now chases through methodChase",
+			gate: `sdk/cogos.go:414 (os.MkdirAll, "dirname(.md)"), :469 ..., :478 ... — memoryProjector.setMemory / writeAtomicFile write under p.kernel.MemoryDir() = <root>/.cog/mem. The memPath += ".md" compound assignment destroyed the join. All three stamped "elsewhere".`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "sdk/cogos.go", 414)
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
+					t.Errorf("sdk/cogos.go:414 = category %q pattern %q, want cog / .cog/mem", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "sdk/cogos.go:469 (deleteMemory's os.Stat path — actually a read; the write is :478's os.Rename, checked separately, but :469 must still never be elsewhere if present)",
+			gate: `sdk/cogos.go:469 (os.MkdirAll, "dirname(.md)")`,
+			check: func(t *testing.T) {
+				wantNeverElsewhere(t, "sdk/cogos.go", 469)
+			},
+		},
+		{
+			name: "sdk/cogos.go:478 (writeAtomicFile's os.Rename)",
+			gate: `sdk/cogos.go:478 (os.Rename, ".md") ... All three stamped "elsewhere".`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "sdk/cogos.go", 478)
+				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
+					t.Errorf("sdk/cogos.go:478 = category %q pattern %q, want cog / .cog/mem", s.Category, s.Pattern)
+				}
+			},
+		},
+		{
+			name: "init.go:68 (cogos init's directory-scaffolding os.MkdirAll) — the dir-over-initDirs loop's OWN loop variable, not the SECOND loop's f.target (round-4's mis-attribution finding), and a WorkspaceRoot-rooted opaque tail is no longer treated as positively resolved",
+			gate: `internal/engine/init.go:68 (os.MkdirAll) ... pattern "<WorkspaceRoot>/{f.target}" ... Also mis-attributed: :68's loop var is dir over initDirs, but the flat local-def map gave it the later target := filepath.Join(workspaceRoot, f.target) assignment.`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "internal/engine/init.go", 68)
+				if s.Category != "unanchored" {
+					t.Errorf("init.go:68 = category %q, want unanchored (the tail segment is a range-loop variable this tool has no data-flow into, not a positively-known non-.cog destination)", s.Category)
+				}
+				if strings.Contains(s.Pattern, "f.target") {
+					t.Errorf("init.go:68 pattern %q still shows the SECOND loop's f.target — the loop-scoping fix did not take", s.Pattern)
+				}
+			},
+		},
+		{
+			name: "init.go:91 (cogos init's config-file os.WriteFile) — same WorkspaceRoot+opaque-tail rule as :68, from the SECOND loop's own f.target this time",
+			gate: `internal/engine/init.go:91 (os.WriteFile), pattern "<WorkspaceRoot>/{f.target}" ... Every element of initFiles ... is under .cog/. Stamped "elsewhere".`,
+			check: func(t *testing.T) {
+				s := wantNeverElsewhere(t, "internal/engine/init.go", 91)
+				if s.Category != "unanchored" {
+					t.Errorf("init.go:91 = category %q, want unanchored", s.Category)
+				}
+			},
+		},
+		{
+			name: "manifest.go:103 (experiment.RunDir's os.OpenFile) — not a .cog writer, but the elsewhere verdict rested on RunDir's own \"\", err guard branch; the honest bin is home",
+			gate: `internal/testkernel/experiment/manifest.go:103 (os.OpenFile, "/observations.jsonl") — not a .cog writer, but the "elsewhere" verdict rests on bogus evidence (RunDir's return "", err guard). Its real root is $COGOS_WORKSPACE_ROOT or <Home>/workspaces/first-instruments-runs, so the honest bin is "home", not "elsewhere".`,
+			check: func(t *testing.T) {
+				s, ok := find("internal/testkernel/experiment/manifest.go", 103)
+				if !ok {
+					t.Fatal("manifest.go:103 not found in inventory")
+				}
+				if s.Category == "elsewhere" {
+					t.Errorf("manifest.go:103 = elsewhere — must never over-claim; RunDir's error-guard branch is not a real, disagreeing candidate")
+				}
+				if s.Category != "home" && s.Category != "unanchored" {
+					t.Errorf("manifest.go:103 = category %q, want home (or, failing full resolution, unanchored) — never elsewhere", s.Category)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, tc.check)
+	}
+}
+
+// TestAppendEventBucketRows_NeverDoubleCount checks that a call site whose
+// bucket argument is genuinely dynamic (not a positive literal) does NOT
+// get a synthetic bucket row — the ledger.go primitive site already covers
+// it, and adding a second row would double-count the same underlying
+// write. Spot-checked against turn_storage.go, whose sessionID is a
+// per-turn struct field with no traced literal origin.
+func TestAppendEventBucketRows_NeverDoubleCount(t *testing.T) {
+	root := repoRoot(t)
+	report, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(%s): %v", root, err)
+	}
+	for _, s := range report.Sites {
+		if s.Primitive == "engine.AppendEvent(bucket)" && s.File == "internal/engine/turn_storage.go" {
+			t.Errorf("turn_storage.go unexpectedly got a bucket row (%d): %+v — its sessionID is turn.SessionID, a genuinely dynamic per-turn value with no literal origin", s.Line, s)
+		}
+	}
+}
+
+// TestSubprocessAppendix_Declared checks that the subprocess-writer
+// appendix (item 5: declared out of scope, never silently dropped) is
+// populated with the named exec.Command/exec.CommandContext sites, with
+// cmd.Dir resolved where the source sets it.
+func TestSubprocessAppendix_Declared(t *testing.T) {
+	root := repoRoot(t)
+	report, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(%s): %v", root, err)
+	}
+	if len(report.Subprocess) == 0 {
+		t.Fatal("Report.Subprocess is empty — the subprocess appendix must enumerate exec.Command/exec.CommandContext sites, never silently drop them")
+	}
+
+	find := func(file string, line int) (SubprocessSite, bool) {
+		for _, s := range report.Subprocess {
+			if s.File == file && s.Line == line {
+				return s, true
+			}
+		}
+		return SubprocessSite{}, false
+	}
+
+	wantDir := func(t *testing.T, file string, line int, dirContains string) {
+		t.Helper()
+		s, ok := find(file, line)
+		if !ok {
+			t.Fatalf("%s:%d not found in subprocess appendix", file, line)
+		}
+		if !s.DirKnown {
+			t.Errorf("%s:%d DirKnown=false, want a resolved cmd.Dir", file, line)
+			return
+		}
+		if !strings.Contains(s.Dir, dirContains) {
+			t.Errorf("%s:%d Dir = %q, want it to contain %q", file, line, s.Dir, dirContains)
+		}
+	}
+
+	// transition_hooks.go's `sh -c <h.Shell>` runs with cmd.Dir set to the
+	// hook's own workspace parameter — an operator-configured shell
+	// hook getting the workspace root as its cwd, exactly the §5.1a
+	// config-overwrite shape the appendix exists to surface.
+	if _, ok := find("internal/engine/transition_hooks.go", 225); !ok {
+		t.Error("transition_hooks.go:225 (the sh -c transition-hook subprocess) missing from the subprocess appendix")
+	}
+	// worktree_spawn.go / worktree_reconciler.go: `git worktree add|remove`
+	// with cmd.Dir = repoRoot — a real filesystem mutation (a whole
+	// worktree directory tree, or its recursive removal) this tool's
+	// primitive scanner cannot see because it crosses a process boundary.
+	wantDir(t, "internal/engine/worktree_spawn.go", 134, "repoRoot")
+	wantDir(t, "internal/engine/worktree_reconciler.go", 832, "repoRoot")
+	// mcp_architecture.go / projection_compiler.go: python3 script
+	// subprocesses with no cmd.Dir set at all (inherits the process's own
+	// cwd) — DirKnown must be false, not a guessed value.
+	if s, ok := find("internal/engine/mcp_architecture.go", 156); !ok {
+		t.Error("mcp_architecture.go:156 (the python3 architecture-tool subprocess) missing from the subprocess appendix")
+	} else if s.DirKnown {
+		t.Errorf("mcp_architecture.go:156 DirKnown=true (Dir=%q), want false — no cmd.Dir is set in source", s.Dir)
+	}
+	if _, ok := find("internal/engine/projection_compiler.go", 388); !ok {
+		t.Error("projection_compiler.go:388 (the python3 cogblock-parse subprocess) missing from the subprocess appendix")
+	}
+	// site.go: `bash build.sh` with cmd.Dir = appDir.
+	wantDir(t, "internal/providers/site/site.go", 601, "appDir")
+
+	// The rendered markdown must carry the appendix and its scope-boundary
+	// statement — declared, not silent.
+	md := RenderMarkdown(report)
+	if !strings.Contains(md, "Subprocess writers (declared out of scope for v1 — uncounted)") {
+		t.Error("rendered markdown is missing the 'Subprocess writers' appendix heading")
+	}
+}
