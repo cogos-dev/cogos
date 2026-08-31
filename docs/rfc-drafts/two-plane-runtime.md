@@ -2,10 +2,11 @@
 type: rfc-draft
 title: "Two-plane runtime: machine-plane service + user-plane session agent"
 status: draft
-closes: "myrgic/cogos#586"
 relates:
+  - "myrgic/cogos#586"   # anchor issue — REFERENCED, NOT CLOSED: the issue tracks the feature through implementation; this RFC is design only
   - "myrgic/cogos#101"
   - "myrgic/cogos#551"
+  - "myrgic/cogos#591"   # write-path inventory + golden-diff gate — the generated enumeration §5.1b/§5.1c/§6.4 now defer to
   - "ADR-001"   # workspace membrane (substrate corpus)
   - "ADR-065"   # container-native daemon lifecycle (substrate corpus)
   - "ADR-074"   # nested sovereignty / scope inheritance (substrate corpus)
@@ -20,7 +21,7 @@ relates:
   - "RFC-033"
   - "RFC-036"
 scope: "Design only — no implementation in this document"
-revision: "fourth draft — third repair pass, measured against the design-draft standard stated in the revision note"
+revision: "fifth draft — fourth repair pass; hand-authored write-path enumerations retired in favour of the generated inventory landed by #591"
 sections:
   - "1. Summary"
   - "2. Motivation"
@@ -52,8 +53,59 @@ sections:
 > > surface, or a question silently assumed answered is a fail.
 >
 > That standard is why several items below are *declared open* rather than
-> decided, and why the enumerations in §5.1a / §5.1b / §5.1c / §6.4 are written
-> as closed lists a lint can be run against rather than as prose.
+> decided. It is also why, as of this pass, the write-path enumerations in
+> §5.1b / §5.1c / §6.4 are **no longer hand-authored closed lists**.
+>
+> ---
+>
+> **What the fourth pass changed: the enumeration asymptote, closed by a
+> generated inventory.** The council's standing objection to the third draft was
+> that a hand-authored table of write paths is an **enumeration asymptote** — it
+> converges on completeness without ever reaching it, and each pass had in fact
+> found writers the previous pass missed (the third pass alone added two). A
+> closed list a human maintains is not an instrument; it is a recollection with
+> a table around it.
+>
+> That objection is now answered by code rather than by another sweep.
+> **myrgic/cogos#591 merged to `main`** (squash `6c2f634`), landing
+> `internal/writepathaudit` — a **code-derived** inventory of every filesystem
+> write site in the repository, with a **golden-diff gate**
+> (`internal/writepathaudit/testdata/inventory.golden.{json,md}`) that fails CI
+> when a write path appears or disappears without the golden being
+> re-declared. Its own `scan_test.go` names this RFC as the reason it exists:
+> *"the two-plane RFC's section 6.4 lint made real: the declared set is
+> generated, not hand-authored — a human only ever approves a diff."*
+>
+> Accordingly, in this pass:
+>
+> 1. **§5.1b and §5.1c now DEFER to the generated inventory** as the
+>    authoritative enumeration, and their tables are demoted to **illustrative
+>    excerpts, marked as such**. §6.4's declared-set lint is re-pointed at the
+>    golden instead of at prose.
+> 2. **The inventory immediately falsified two hand-authored claims**, which is
+>    the argument for the deferral rather than an embarrassment to it. §5.1c
+>    said "all three writers reach `.cog/ledger/` through `AppendEvent`
+>    (`internal/engine/ledger.go`)". The inventory shows a **fourth bucket**
+>    (`identity-grants`, written by the machine-plane HTTP listener at
+>    `internal/engine/serve_identity_grants.go`) and a **second,
+>    independently-drifted `AppendEvent`** at `pkg/cogblock/ledger.go` reaching
+>    the same directory. Both are now carried.
+> 3. **§5.1b row 5's citation was imprecise** and is corrected: the BEP state
+>    dir is *configured* at `internal/engine/bep_engine.go:200` but the write
+>    primitive is `PersistIndex` in `pkg/substrate/bep/index.go`, which the
+>    inventory bins `elsewhere` as `{stateDir}` because the anchor does not
+>    resolve statically. The inventory's own test records this as a named gate.
+> 4. **The inventory's honesty margin is adopted as the RFC's.** 237 sites, of
+>    which **84 unanchored** and **41 dynamic** — i.e. the tool reports what it
+>    cannot resolve rather than dropping it, and 73 subprocess writers are
+>    declared out of scope for v1. §6.4 inherits those margins explicitly rather
+>    than inheriting a table that looks complete.
+>
+> Two items are **deliberately left as they stand**, flagged for the operator
+> and not resolved by this pass: the strand-scoping reading (below) and §5.1c's
+> "count of two". Both are his calls, not the pilot's.
+>
+> ---
 >
 > **What the third pass changed.** Two fresh adversarial lenses (security;
 > corpus coherence) re-measured the third draft and did not clear the gate. The
@@ -457,11 +509,22 @@ earlier drafts did not price at all:
   it as a door-mediated request kind executed by the agent. Net-new: a request
   kind, an agent-side executor, and the removal of the route from the listener.
 - **Relocating the kernel-emitted ledger buckets** enumerated in §5.1c
-  (`worktree-reconciler`, the kernel process's own session bucket, and
-  `mcp-client`) off the seat(local) strand and onto the machine strand. This is
-  the concrete work behind §5.2's isolation invariant; without it the invariant
-  is aspirational and §6.4's `.cog/ledger/` lint fails on a clean checkout.
-  Net-new, and a prerequisite for rung 3c.
+  (`worktree-reconciler`, the kernel process's own session bucket, `mcp-client`,
+  and — added in this pass, from the generated inventory — `identity-grants`)
+  off the seat(local) strand and onto the machine strand. This is the concrete
+  work behind §5.2's isolation invariant; without it the invariant is
+  aspirational and §6.4's `.cog/ledger/` lint fails on a clean checkout.
+  Net-new, and a prerequisite for rung 3c. **Scope grew by a quarter between
+  drafts** on the strength of one generated inventory, which is the honest
+  argument for §5.1b's deferral: this estimate was wrong in the direction of
+  optimism three drafts running, and the correction came from a scanner rather
+  than from a fourth read-through. Note also that the relocation must handle
+  **two** append implementations, not one (`internal/engine/ledger.go` and
+  `pkg/cogblock/ledger.go`), which is a second under-estimate the inventory's
+  package doc surfaced.
+- **Dispositioning the remaining `.cog/` write sites** the inventory anchors but
+  §5.1b does not assign a plane to (**Q9**). Bounded sweep, prerequisite for
+  rung 3c, and not a design question — but not done, and therefore not assumed.
 - **A BEP replication-scope declaration the doctor can read.** §5.2 requires
   that the ledger strands are never in the replicated set. As shipped that is
   **vacuously satisfied**: `pkg/substrate/bep/` has no ignore/exclusion
@@ -1028,9 +1091,45 @@ mental model of whole-workspace replication.
 Accepted decisions and shipped code put machine-plane writes inside `.cog/`. The
 second draft's "empty by construction" contradicted all of them and cited none
 of them; the third draft enumerated three and **missed two**, both of them BEP's
-— including the one whose content is written by remote peers. The enumeration
-below is the corrected one. It is written as a closed list precisely so the next
-sweep can be run against it rather than against a recollection of it:
+— including the one whose content is written by remote peers.
+
+**The authoritative enumeration is generated, not written here.** Three drafts
+in a row, each hand-authored table was found incomplete by the next review. That
+is not a sequence of careless passes; it is the signature of an **enumeration
+asymptote** — a hand-maintained list of write paths converges on completeness
+without reaching it, because the thing it describes changes under it and nothing
+forces the two back into agreement. This section therefore **defers**:
+
+> **Authority.** The enumeration of filesystem write sites is
+> `internal/writepathaudit`, landed by **myrgic/cogos#591**. It derives the
+> inventory from the source tree on every run and diffs it against
+> `internal/writepathaudit/testdata/inventory.golden.{json,md}`; the diff is a
+> **CI gate** — `TestInventory_MatchesGolden` runs under this repository's
+> standard `go test -race -count=1 ./...` job — so a new or removed write path
+> fails the build until a human re-declares the golden with
+> `go test ./internal/writepathaudit/ -run TestInventory_MatchesGolden -update`.
+> Where this RFC and the golden disagree, **the golden is right and this RFC is
+> stale.**
+
+At the merge of #591 the inventory reports **237 write sites** — 97 under
+`.cog/`, 2 under the user home, 13 elsewhere (positively resolved to a
+non-`.cog/` anchor), **84 unanchored** and **41 dynamic**, plus **73 subprocess
+writers declared out of scope for v1**. Those last three numbers are the point:
+the tool reports every site it *cannot* fully resolve in its own bucket rather
+than dropping it, so the margin of the enumeration is itself observable. This
+RFC adopts that margin as its own (§6.4) instead of presenting a table that
+looks complete.
+
+The table below is retained as an **illustrative excerpt, not a closed list** —
+it carries the *dispositions*, which are this RFC's contribution and are not
+derivable from a scanner. The excerpt covers the rows whose plane assignment is
+contested or whose disposition is load-bearing elsewhere in this document. It is
+**not** the set of machine-plane-adjacent writes inside `.cog/`; the golden
+names others this excerpt does not disposition — among them
+`.cog/blobs/manifest.jsonl`, `.cog/run/bus/*.cursors.jsonl`,
+`.cog/state/conversations`, `.cog/observatory/quarantine/`,
+`.cog/mem/episodic/experiments/`, and `.cog/docs/generated/` — each of which
+needs a plane assignment before rung 3c and none of which this draft assigns:
 
 | Path | Writer | Authority | Disposition |
 |---|---|---|---|
@@ -1038,16 +1137,26 @@ sweep can be run against it rather than against a recollection of it:
 | `<workspaceRoot>/.cog/mem/semantic/lineage/projections/**` | projection reconcilers (`internal/engine/projection_reconciler.go`, `internal/engine/decision_lineage_reconciler.go`) | **ADR-095** (daemon reconcile-loop driver), accepted — the loop that runs the reconciler — plus shipped code. **ADR-094** (lineage observatory) is status **`Draft`** and is cited for the projection's *purpose*, not as settling authority | **stays.** The path **is separable**: `projection_reconciler.go` writes under `.cog/mem/semantic/lineage/projections/`, a subtree distinct from the authored corpus around it, so a directory ACL can be hung on it. Machine identity holds write on the `projections/` subtree only. Projections are derived, content-addressed outputs — regenerable, so a conflict is resolved by regeneration rather than by merge. |
 | `<workspaceRoot>/.cog/mem/**` and `<workspaceRoot>/.cog/skills/**` projection targets | memory / skill projection reconcilers | **ADR-097**, **ADR-098**, both accepted — both specify a kernel-run reconciler writing into these trees | **PENDING Q7 — the only row in this table whose ACL story does not close.** The authority is not in doubt; the *path boundary* is. ADR-097 §3's placement table writes projections to `.cog/mem/semantic/insights/{slug}.cog.md`, `semantic/projects/`, `semantic/references/`, `episodic/profile/` — **the same directories the authored corpus lives in**. There is no `projections/` subtree here to hang an ACL on, unlike the lineage row above. So §5.1's two rows (authored corpus: seat(local) write; projection targets: machine write) are contradictory over one path, and §6.4's declared-set lint over this row would be a *provenance* predicate, not a *path* predicate — unenforceable by the ACL mechanism §5.2 insists on. **This RFC does not settle it**; see §9 Q7 for the two resolution paths. |
 | `<workspaceRoot>/.cog/bin/agents/definitions/**` | the **BEP sync engine**, machine plane (`internal/engine/bep_provider.go` — watch dir bound to this path; folder id `cogos-agent-defs` in `internal/engine/bep_model.go`) | shipped code; the machine plane owns BEP membership per §3. **No ADR or RFC in the corpus declares this directory's trust properties** — that absence is the finding | **stays, and is flagged.** The content is **peer-sourced**: agent CRD files authored on *other nodes* and replicated here by the machine-plane engine. This is the only cell in the partition whose author is another machine, and the third draft's enumeration missed it entirely. It stays because cross-node agent distribution is the feature, but the trust question it raises is **escalated to §9 Q8** rather than dispositioned here: *what reads or executes these definitions, under which identity, and what admits a definition a remote peer wrote?* Cross-reference §5.8's execution invariant — whatever consumes these files, the **machine plane must not execute from this directory**, for the same reason it must not execute from `.claude/skills` (§4.1 item 6). |
-| `<workspaceRoot>/.cog/.state/bep/**` | the BEP sync engine, machine plane (`internal/engine/bep_engine.go` — state dir) | shipped code | **stays.** BEP index/sync bookkeeping: node-local, derived, machine-written, regenerable. Same shape as the daemon lifecycle row — node-local content in a portable directory — and it carries the same requirement: it is not in the BEP inclusion list, and it must not enter it. Seat(local) holds read. |
+| `<workspaceRoot>/.cog/.state/bep/**` | the BEP sync engine, machine plane. **Citation corrected against the generated inventory:** the state dir is *configured* at `internal/engine/bep_engine.go:200` (`filepath.Join(root, ".cog", ".state", "bep")`), but the **write primitive** is `PersistIndex` in `pkg/substrate/bep/index.go`, writing `index.json` via temp-file + rename. The inventory bins that site **`elsewhere`, as `{stateDir}`**, because the anchor is a parameter and does not resolve statically; `internal/writepathaudit/scan_test.go` records the pairing as a named gate | shipped code | **stays.** BEP index/sync bookkeeping: node-local, derived, machine-written, regenerable. Same shape as the daemon lifecycle row — node-local content in a portable directory — and it carries the same requirement: it is not in the BEP inclusion list, and it must not enter it. Seat(local) holds read. **Note the shape of this correction:** a hand-authored table named the *configuring* file and called it the writer; the generated inventory names the *primitive*. That is the difference the deferral above buys. |
 
-The general rule these five share: **a machine-plane write inside `.cog/` is
-admissible only where it is (a) named in this table, (b) derived, runtime, or
-peer-sourced rather than locally authored, and (c) outside both ledger
-strands.** Anything else is a lint failure (§6.4). This is a narrower claim than
-"the cell is empty" and it is the one the code and the corpus actually support —
-with two honest residuals: row 3 is **pending Q7** because its paths are not
-separable, and row 4 is **flagged to Q8** because its content is authored
-off-node. Rule (c) is where §5.1c comes in: shipped code violates it today.
+The general rule these five share, **restated so that it no longer depends on
+the completeness of a table in this document**: a machine-plane write inside
+`.cog/` is admissible only where it is (a) **present in the generated
+inventory's golden** — i.e. a human has approved its diff — and carries a
+recorded disposition, (b) derived, runtime, or peer-sourced rather than locally
+authored, and (c) outside both ledger strands. Anything else is a lint failure
+(§6.4).
+
+Clause (a) is the substantive change in this pass. Previously it read "named in
+this table", which made the invariant only as good as the last hand sweep; it
+now names a **generated** object with a CI gate behind it, so a write path that
+nobody wrote down still fails the build. This is a narrower claim than "the cell
+is empty" and it is the one the code and the corpus actually support — with
+three honest residuals: row 3 is **pending Q7** because its paths are not
+separable, row 4 is **flagged to Q8** because its content is authored off-node,
+and the `.cog/` writers named above the table but not dispositioned in it are
+**declared as Q9**. Rule (c) is where §5.1c comes in: shipped code violates it
+today.
 
 Note that this is the same conflict-log entry (ADR-065 §7 versus RFC-033's path
 layering) that sits immediately above the machine-tier bullet §5.9 claims to
@@ -1063,15 +1172,37 @@ fact when it is a target. Corrected: the writers are enumerated, and the
 invariant is restated as a **post-rung-3 property with named migration work**,
 not as a description of the current build.
 
-All three writers reach `.cog/ledger/<bucket>/events.jsonl` through
-`AppendEvent` (`internal/engine/ledger.go`), and all three run under §3's
-assignment of the reconcile loop and the HTTP listener to the machine plane:
+**Corrected against the generated inventory (#591).** The third draft asserted
+that "all three writers reach `.cog/ledger/<bucket>/events.jsonl` through
+`AppendEvent` (`internal/engine/ledger.go`)". Both halves of that sentence were
+wrong, and the generated inventory is what showed it:
+
+- **There is a fourth bucket.** `.cog/ledger/identity-grants/events.jsonl` is
+  appended by the identity-grant registry —
+  `internal/engine/serve_identity_grants.go` at `appendGrantEventLocked`,
+  `appendExtendEventLocked`, and `appendSupersessionEventLocked` — which runs
+  **inside the machine-plane HTTP listener** under §3's assignment. It is
+  arguably the most consequential of the set, since it records grant issuance.
+- **There is a second, independently-drifted `AppendEvent`.** `pkg/cogblock/ledger.go`
+  declares its own package-level `AppendEvent` writing
+  `<workspaceRoot>/.cog/ledger/<sessionID>/events.jsonl` — same directory, same
+  file, different function, its own doc comment calling itself "the canonical
+  write path for all events". The inventory's package doc names this
+  duplication explicitly as the reason it scans **write primitives rather than
+  function names**: a name-based sweep for `AppendEvent` cannot tell these
+  apart, and a hand-authored table did not.
+
+So the enumeration below is **four buckets reached through at least two distinct
+append implementations**, and it is offered as the current reading of the
+golden rather than as a closed set. All of them run under §3's assignment of the
+reconcile loop and the HTTP listener to the machine plane:
 
 | Bucket | Writer | Disposition |
 |---|---|---|
 | `.cog/ledger/worktree-reconciler/` | `FilesystemLedgerWriter` (`internal/engine/worktree_spawn.go`) emitting `worktree.*` events; registered at boot by `internal/providers/all/all.go` | **relocate to the machine strand.** It is a reconciler's own record of machine-plane work; it is on the seat strand only because `AppendEvent` is the only ledger writer that exists. |
 | `.cog/ledger/<kernel session id>/` | `(*Process).EmitEvent` (`internal/engine/process.go`), called by the margin bridge's kernel event sink and by the MCP server | **split by origin.** Kernel-originated events relocate to the machine strand; events that record *user-plane* work the agent performed stay on the seat strand and are written **by the agent**, which is the identity that performed them (§4.4). This is the one row where the fix is not a path change but an authorship change. |
-| `.cog/ledger/mcp-client/` | config-only callers via `internal/engine/mcp_stubs.go` | **relocate to the machine strand**, or be re-attributed to the calling seat where a seat is identifiable. Whichever, it does not stay a machine-plane write on the seat strand. |
+| `.cog/ledger/mcp-client/` | `EmitLedgerEvent` (`internal/engine/mcp_stubs.go:641`) | **relocate to the machine strand**, or be re-attributed to the calling seat where a seat is identifiable. Whichever, it does not stay a machine-plane write on the seat strand. |
+| `.cog/ledger/identity-grants/` | the identity-grant registry (`internal/engine/serve_identity_grants.go:723/780/823`), running inside the machine-plane HTTP listener | **relocate to the machine strand.** Grant issuance, extension, and supersession are machine-plane acts recorded by the machine plane; this is the clearest case in the table, and it was missed by three hand sweeps. **Sequencing note:** it is also the row most likely to be load-bearing for §4.1 item 3, whose credential-distribution rework reads this same registry — the relocation and that rework should land together rather than in either order. |
 
 Three consequences stated so nothing here is inferred:
 
@@ -1181,10 +1312,17 @@ RFC asserts, and the only one it needs:
 > table in §5.1 and the named exceptions in §5.1b.
 
 **This invariant states the destination, not the present build.** Said here
-rather than left for a reader to discover: three shipped kernel writers append
-to `.cog/ledger/` from the machine plane today (§5.1c). The invariant is what
-rung 3 installs; the migration that installs it is named in §3.3 and gated at
-rung 3c. Everything below is written accordingly.
+rather than left for a reader to discover: **four** shipped kernel ledger
+buckets are appended from the machine plane today, through at least two distinct
+append implementations (§5.1c, corrected against the generated inventory —
+the count was three until #591's inventory surfaced the `identity-grants`
+bucket). The invariant is what rung 3 installs; the migration that installs it
+is named in §3.3 and gated at rung 3c. Everything below is written accordingly.
+
+**And the count is not asserted as final.** It is the current reading of
+`internal/writepathaudit`'s golden, which is regenerated and diffed in CI. If a
+fifth bucket appears the gate fails and the golden's diff names it; that is the
+property this RFC is now relying on instead of on its own thoroughness.
 
 Three properties make that invariant real rather than declared:
 
@@ -1639,10 +1777,10 @@ not, including one §4.1 explicitly promised was lintable.
 | **protocol floor satisfied** (named check, distinct from skew) | §4.3 |
 | **no machine-plane security key readable from a seat(local)-writable path or from any path in the BEP inclusion list** — no `Enable*` gate, `BindAddr`, `port`, or `WriteRouteGrantAuthDisabled` resolvable from `.cog/`; a machine key found in `kernel.yaml` fails the lint rather than being shadowed. A `port`-only failure is a hygiene finding, not a breach (§5.1a) | §5.1a |
 | **no seat(local)-writable path under the machine root** | §5.8 |
-| **no machine-plane-writable path inside `.cog/ledger/`** — the direction two-party attestation rests on. **Post-rung-3 gate:** this measures the destination, not today's build — three shipped kernel writers append there now (§5.1c), and the lint passes only once their relocation lands | §5.2, §5.1c, §5.8 |
+| **no machine-plane-writable path inside `.cog/ledger/`** — the direction two-party attestation rests on. **Post-rung-3 gate:** this measures the destination, not today's build — **four** kernel ledger buckets are appended from the machine plane now, through at least two append implementations (§5.1c), and the lint passes only once their relocation lands. The doctor reads the bucket set from `internal/writepathaudit`'s golden rather than from a list in this document | §5.2, §5.1c, §5.8 |
 | **BEP inclusion list excludes both strands** — the declared BEP folder set contains no path that is, contains, or is a prefix of `.cog/ledger/**` or the machine strand. Read the **inclusion list**, not an ignore file: BEP ships no exclusion mechanism, so the list is the object | §5.2 |
 | **privilege ceiling** — machine-plane identity is not root / SYSTEM / Administrators and holds no `SeBackupPrivilege`, `SeRestorePrivilege`, `SeTakeOwnershipPrivilege`, or `CAP_DAC_OVERRIDE` | §3.1, §5.2 |
-| **machine-plane writes inside `.cog/` are exactly the declared set** — enumerated in full: `.cog/run/daemon/state.yaml`; `.cog/mem/semantic/lineage/projections/**`; `.cog/bin/agents/definitions/**`; `.cog/.state/bep/**`. Nothing else. **Scope:** the lint runs over the **separable** rows only — the ADR-097 / ADR-098 targets under `.cog/mem/**` and `.cog/skills/**` are **excluded pending Q7**, because those paths are not separable from the authored corpus and the predicate over them would be provenance, not path. `.cog/run/` and `.cog/.state/` are gitignored and absent from the BEP inclusion list | §5.1b, §9 Q7 |
+| **machine-plane writes inside `.cog/` are exactly the declared set** — **the declared set is generated, not written here.** The lint reads `internal/writepathaudit/testdata/inventory.golden.json` (#591) and asserts that every `.cog/`-anchored site carries a recorded plane disposition; an undispositioned site fails. The golden itself is CI-gated by `TestInventory_MatchesGolden`, so a *new* write path fails the build before this lint ever runs — the two compose as generate-then-disposition. **Scope:** the disposition check runs over the **separable** rows only — the ADR-097 / ADR-098 targets under `.cog/mem/**` and `.cog/skills/**` are **excluded pending Q7**, because those paths are not separable from the authored corpus and the predicate over them would be provenance, not path; the sites named in §5.1b but not yet dispositioned are **open as Q9**. `.cog/run/` and `.cog/.state/` are gitignored and absent from the BEP inclusion list | §5.1b, §9 Q7, §9 Q9 |
 | **capability envelopes are machine-plane-stored and not seat(local)-writable** — no envelope resolvable from `.cog/`, no seat(local) principal holding write on its own envelope | §4.6 |
 | **service image path integrity** — write-ACL on the image, unquoted-path check | §5.8 |
 | **self-update signature gate intact** — no unsigned-application path reachable from the reconcile provider | §5.8 |
@@ -1653,7 +1791,21 @@ not, including one §4.1 explicitly promised was lintable.
 | **capability-envelope enrolment state is observable** — every connected seat(local) principal either holds an envelope or is reported as **un-enrolled**, and refusals for want of an envelope are distinguishable from policy denials | §4.6 |
 | per-platform invariant checks: no UI surface, no user-profile read, no user credentials held — one enforceable check per platform, mirroring the S4U rule's specificity | §3.1 |
 
-Three honesty notes attached to the surface:
+Four honesty notes attached to the surface:
+
+- **The write-path lints inherit the generated inventory's margins, and those
+  margins are wide.** At #591's merge the inventory resolves 237 sites but bins
+  **84 as unanchored** (root not positively resolved) and **41 as dynamic**
+  (unresolved entirely), and declares **73 subprocess writers out of scope for
+  v1** — writes performed by processes the kernel spawns, plus non-Go writers
+  (shell and Python scripts this repo runs). A `.cog/`-anchored lint built on
+  this inventory therefore proves something about the sites the scanner *could*
+  place, and proves nothing about the rest. That is a far better position than
+  a hand-authored list, which has the same blind spots without reporting them —
+  but it is not coverage, and the doctor must not present it as coverage. The
+  honest claim is: **no unreported blind spot**, not **no blind spot**.
+  Narrowing the unanchored and dynamic buckets, and bringing subprocess writers
+  in scope, is follow-on work on #591's package, not on this RFC.
 
 - **Some lints measure the destination, not today's build, and each one says so
   in its own row.** Two are marked: the `.cog/ledger/` write lint (fails until
@@ -2022,11 +2174,50 @@ enrolment step, or a declared refusal to consume peer definitions without one.
 Recorded here as future-hardening work with a named owner-shaped question rather
 than folded into a disposition column that would imply it was answered.
 
+**Q9 — Undispositioned `.cog/` write sites surfaced by the generated inventory.
+OPEN, and newly visible rather than newly created.**
+
+§5.1b's excerpt dispositions five paths. The generated inventory (#591) anchors
+**97 write sites under `.cog/`**, and several that are plainly not authored by
+the operator carry no plane assignment in this RFC — among them
+`.cog/blobs/manifest.jsonl` (`internal/engine/blobstore.go`),
+`.cog/run/bus/*.cursors.jsonl` (`internal/engine/bus_consumers.go`),
+`.cog/state/conversations` (`internal/conversations/index.go`),
+`.cog/observatory/quarantine/` (`internal/conversations/quarantine.go`),
+`.cog/mem/episodic/experiments/` (`internal/engine/benchmark.go`), and
+`.cog/docs/generated/` (`internal/engine/docs_generate.go`).
+
+Most of these look like the daemon-state row: derived, runtime, node-local, and
+therefore probably admissible under §5.1b's rule (b) with the machine plane
+holding write. **"Probably" is the finding.** Under this document's own standard
+a surface is either named with a disposition or declared open, and guessing a
+disposition per path from its name is exactly the hand-sweep method this pass
+retired. Two of them warrant more than a rubber stamp:
+`.cog/observatory/quarantine/` holds content that was quarantined *because it
+was untrusted*, which makes its plane assignment a security question rather than
+a bookkeeping one; and `.cog/docs/generated/` is a generated tree living beside
+authored docs, which is the shape of Q7's separability problem in miniature.
+
+**Disposition of the question itself:** this is a bounded sweep, not a design
+problem — walk the golden's `.cog/` section, assign each site a plane, and land
+the assignments in §5.1b. It is a **prerequisite for rung 3c** for the same
+reason §5.1c's relocation is: an ACL cannot be hung on a partition with
+unassigned cells. It is listed separately from Q7 because Q7 is a genuine corpus
+conflict requiring an ADR amendment, whereas this is work that merely has not
+been done yet. Naming the difference matters — an open question that is really
+just unfinished labour should not borrow the authority of one that is genuinely
+unresolved.
+
 ---
 
 ## 10. References
 
 - myrgic/cogos#586 — anchor issue (feature request, incident record)
+- myrgic/cogos#591 — **merged** (squash `6c2f634`): `internal/writepathaudit`,
+  the code-derived write-path inventory with a golden-diff CI gate. The
+  authoritative enumeration §5.1b / §5.1c / §6.4 defer to. Golden:
+  `internal/writepathaudit/testdata/inventory.golden.{json,md}`; regenerate with
+  `go test ./internal/writepathaudit/ -run TestInventory_MatchesGolden -update`
 - myrgic/cogos#101 — services extensibility; Linux user-bus scope, Windows
   explicitly deferred (see §3.3 for what this RFC does *not* inherit)
 - myrgic/cogos#551 — kernel write-route hardening; precedent for §4.5 and for
