@@ -1218,24 +1218,25 @@ func (idx *globalIndex) methodChase(dir, recvType, methodName string, callee *as
 // rule callChase always applied).
 //
 // The argument's own degenerateRoot flag (see resolveExpr's return shape)
-// is deliberately dropped at this substitution boundary: the callee sees
-// only a plain string literal, never a degeneracy-tagged value, so a
-// degenerate argument threaded across a function-call boundary and used as
-// the callee's own path root is not currently caught here. This is the
-// same species of open, documented gap as fieldOrigin/paramOrigin's
-// positive-memoization depth-dependence above, not a claim that
-// cross-call-boundary composition is closed — only the WITHIN-one-scope
-// composition (filepath.Join/Dir/Base, or a further string concatenation
-// — including through a compound assign's synthetic BinaryExpr — wrapping
-// or extending a concat in the same function) is.
+// cannot ride along on a substitution: merged holds plain ast.Expr values,
+// so a degeneracy-tagged resolution would enter the callee disguised as an
+// ordinary string literal and be re-resolved there as positive
+// information. Rather than thread a side channel through the defs map, a
+// degenerate argument is never substituted at all — the callee's parameter
+// falls through to its own opaque "{name}" placeholder, which classifies
+// as unanchored. That trades pattern detail for the guarantee that a
+// degenerate root cannot cross a call boundary and come back "elsewhere".
+// Degeneracy that arises INSIDE the callee (from a substituted,
+// non-degenerate argument) is unaffected: chaseReturns carries the
+// callee's own flag out.
 func substituteAndMergeDefs(params []string, args []ast.Expr, calleeBody *ast.BlockStmt, caller *resolver, callerDefs map[string]ast.Expr, depth int) map[string]ast.Expr {
 	merged := map[string]ast.Expr{}
 	for i, p := range params {
 		if i >= len(args) {
 			continue
 		}
-		pattern, ok, _ := caller.resolveExpr(args[i], callerDefs, depth+1)
-		if ok {
+		pattern, ok, degenerate := caller.resolveExpr(args[i], callerDefs, depth+1)
+		if ok && !degenerate {
 			merged[p] = &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(pattern)}
 		}
 	}
@@ -1346,9 +1347,9 @@ func resolverContextFor(idx *globalIndex, dir string, sc funcScope) *resolver {
 // ("/observations.jsonl" either way), which is exactly why this can't be
 // recovered later from pattern's text alone the way every other opacity
 // signal in this package is (see isOpaqueRoot): it has to be threaded
-// through as its own value from the exact point it's known, and it stays
-// true once set: composing a degenerate sub-expression into a larger
-// pattern — via filepath.Join, joining resolved parts with "/";
+// through as its own value from the exact point it's known. Within the
+// scope that established it, composing a degenerate sub-expression into a
+// larger pattern — via filepath.Join, joining resolved parts with "/";
 // filepath.Dir/Base wrapping "dirname(...)"/"basename(...)" around an
 // inner resolution; or a further string concatenation gluing another
 // operand onto an already-degenerate one (including the SYNTHETIC
@@ -1364,14 +1365,20 @@ func resolverContextFor(idx *globalIndex, dir string, sc funcScope) *resolver {
 // together with its own left=="" test (see the BinaryExpr case), since
 // EITHER operand can already be carrying a degenerate root from a nested
 // sub-expression, not only this level's own left-hand side. Every other
-// case in the switch below either produces a positively-known root (an
-// anchor, a literal, a package-level const) and is never degenerate, or
-// produces an opaque placeholder ("{name}", "<call:...>") that pattern's
-// text already flags as opaque on its own, so degeneracy is moot for it —
-// see the table in resolveExpr's own switch and resolveCall for the
-// per-case disposition; every branch that composes or transforms a
-// sub-expression's resolution is required to fall into one of these two
-// buckets, and there is no third bucket that silently drops the flag.
+// case in the switch below and in resolveCall falls into one of THREE
+// buckets: it produces a positively-known root (an anchor, a literal, a
+// package-level const) and is never degenerate; or it produces an opaque
+// placeholder ("{name}", "<call:...>") whose text already flags itself,
+// so degeneracy is moot; or it is a transparent propagator — ParenExpr,
+// an Ident or SelectorExpr chased through local defs / paramOrigin /
+// fieldOrigin, filepath.Clean, and callChase/methodChase via chaseReturns
+// — that inherits the flag of whatever it delegates to. The one place a
+// degenerate resolution could otherwise enter a fresh scope as a plain
+// literal — argument substitution in substituteAndMergeDefs — refuses to
+// substitute a degenerate argument at all (see that function's comment),
+// so the flag never has to survive a call boundary: a degenerate value
+// either stays in the scope that knows it is degenerate, or is replaced
+// by an opaque placeholder on the far side.
 func (r *resolver) resolveExpr(e ast.Expr, defs map[string]ast.Expr, depth int) (pattern string, ok bool, degenerateRoot bool) {
 	if depth > maxChaseDepth {
 		return "<max-depth>", false, false

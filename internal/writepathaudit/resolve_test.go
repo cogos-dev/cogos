@@ -819,3 +819,108 @@ func TestSubsystemOf(t *testing.T) {
 		}
 	}
 }
+
+// TestCallBoundaryDegenerateArgNeverElsewhere pins the substitution
+// boundary in substituteAndMergeDefs: a degenerate argument must never
+// cross into a callee as a positively-resolved literal and come back
+// classified "elsewhere". Adversarial verification of the within-scope
+// threading found four laundering shapes here; the fix declines the
+// substitution, so each falls to the callee parameter's opaque
+// placeholder ("unanchored"). The controls pin the two properties the
+// fix must not break: a genuine absolute literal through the same callee
+// still classifies "elsewhere", and degeneracy built INSIDE the callee
+// from a non-degenerate argument still propagates out via chaseReturns.
+// resolve_test.go's parseCallArg harness builds an empty global index and
+// cannot reach this path, so these go through buildGlobalIndex +
+// scanParsedFile like a real scan.
+func TestCallBoundaryDegenerateArgNeverElsewhere(t *testing.T) {
+	tests := []struct {
+		name         string
+		src          string
+		wantCategory string
+	}{
+		{
+			name: "concat-wrapping callee",
+			src: `package p
+func wrap(q string) string { return q + ".tmp" }
+func f() {
+	base := ""
+	os.WriteFile(wrap(base+"/observations.jsonl"), nil, 0644)
+}`,
+			wantCategory: "unanchored",
+		},
+		{
+			name: "verbatim-return callee",
+			src: `package p
+func ident(q string) string { return q }
+func f() {
+	base := ""
+	os.WriteFile(ident(base+"/observations.jsonl"), nil, 0644)
+}`,
+			wantCategory: "unanchored",
+		},
+		{
+			name: "join-wrapping callee",
+			src: `package p
+func under(q string) string { return filepath.Join(q, "y") }
+func f() {
+	base := ""
+	os.WriteFile(under(base+"/observations.jsonl"), nil, 0644)
+}`,
+			wantCategory: "unanchored",
+		},
+		{
+			name: "method callee via methodChase",
+			src: `package p
+type K struct{}
+func (k K) Wrap(q string) string { return q + ".tmp" }
+type P struct{ k K }
+func (p P) f() {
+	base := ""
+	os.WriteFile(p.k.Wrap(base+"/observations.jsonl"), nil, 0644)
+}`,
+			wantCategory: "unanchored",
+		},
+		{
+			name: "control: absolute literal through the same callee stays elsewhere",
+			src: `package p
+func wrap(q string) string { return q + ".tmp" }
+func f() {
+	os.WriteFile(wrap("/etc/cogos/config.yaml"), nil, 0644)
+}`,
+			wantCategory: "elsewhere",
+		},
+		{
+			name: "control: degeneracy built inside the callee still propagates out",
+			src: `package p
+func mk(b string) string { return b + "/observations.jsonl" }
+func f() {
+	base := ""
+	os.WriteFile(mk(base), nil, 0644)
+}`,
+			wantCategory: "unanchored",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "snippet.go", tt.src, 0)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			pf := parsedFile{relPath: "snippet.go", dir: "pkg", fset: fset, file: f, scopes: collectFuncScopes(f, fset)}
+			idx := buildGlobalIndex([]parsedFile{pf})
+			sites := scanParsedFile(pf, idx)
+			if len(sites) == 0 {
+				t.Fatalf("no write site found in snippet")
+			}
+			got := sites[len(sites)-1]
+			if got.Category != tt.wantCategory {
+				t.Errorf("category = %q (pattern %q), want %q", got.Category, got.Pattern, tt.wantCategory)
+			}
+			if strings.ContainsRune(got.Pattern, '\x00') {
+				t.Errorf("pattern %q contains a NUL byte", got.Pattern)
+			}
+		})
+	}
+}
