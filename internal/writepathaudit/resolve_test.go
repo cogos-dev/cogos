@@ -1702,3 +1702,254 @@ func f(root string, mode int) {
 		t.Errorf("second site's p = %q, want the second.json join", secondText)
 	}
 }
+
+// ─── Round-7 gate: category agreement for rebinds staticPathText can't read ──
+//
+// The round-4/5/6 poison rule decided, BEFORE any resolution, whether a
+// conditional plain `=` rebind disagreed with the outer binding — using
+// staticPathText, which deliberately never leaves the current function body.
+// Every rebind it could not read was therefore left in defs by
+// last-assignment-wins and then resolved by the FULL interprocedural
+// resolver, so the site classified from ONE branch's value with the outer
+// binding gone. Five shapes reproduced it through the production siteAtLine
+// path, each a one-substitution paraphrase of the round-4 finding's literal
+// rebind: a declared function's return value, a package-level const, a
+// filepath.Join over a declared-function call, a local bound to such a call,
+// and the same shape one call-frame down inside a chased callee.
+//
+// The fix is resolveCondRebindPair: an unreadable conditional rebind no
+// longer replaces the outer binding at all — the two are recorded as a pair
+// and resolved together, with the FULL resolver, accepted only when they
+// agree on classify() category. This is chaseReturns's idiom, applied to
+// branches within one function rather than to a callee's return statements.
+// These tests all go through siteAtLine (the production path); parseCallArg
+// cannot see the difference, since the defect was never in the resolver's
+// reach but in what the def map handed it.
+
+// TestUnreadableConditionalRebindFallsToUnanchored is the five reproductions,
+// pinned. Each has the SAME outer binding — a plainly .cog-rooted join — and
+// a rebind that staticPathText cannot read but the interprocedural resolver
+// can read as non-.cog. Before the fix every one of them stamped the site
+// "elsewhere" with the sibling branch's path: the single failure this package
+// declares never acceptable.
+func TestUnreadableConditionalRebindFallsToUnanchored(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		line int
+	}{
+		{
+			// h1: the round-4 finding's own shape with ONE substitution —
+			// string literal replaced by a call to a declared function. This
+			// is the shape internal/engine/log_capture.go:121-123 uses.
+			name: "rebind to a declared function's return value",
+			src: `package p
+func Save(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		path = globalSettingsPath()
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func globalSettingsPath() string { return "/etc/cogos/global-settings.json" }`,
+			line: 7,
+		},
+		{
+			// h2: a package-level const — resolveExpr's constDecl lookup
+			// reads it, staticPathText (by design) does not.
+			name: "rebind to a package-level const",
+			src: `package p
+const globalSettings = "/etc/cogos/global-settings.json"
+func Save(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		path = globalSettings
+	}
+	return os.WriteFile(path, nil, 0644)
+}`,
+			line: 8,
+		},
+		{
+			// h5: the unreadable call wrapped in a filepath.Join, so the
+			// round-5 widening (which DID teach staticPathText Join) still
+			// cannot read it — one of its arguments is out of reach.
+			name: "rebind to filepath.Join over a declared-function call",
+			src: `package p
+func Save(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		path = filepath.Join(globalRoot(), "g.json")
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func globalRoot() string { return "/etc/cogos" }`,
+			line: 7,
+		},
+		{
+			// h13: one more hop — the rebind names a local that is itself
+			// bound to the unreadable call.
+			name: "rebind to a local bound to a declared-function call",
+			src: `package p
+func Save(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		alt := globalSettingsPath()
+		path = alt
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func globalSettingsPath() string { return "/etc/cogos/global-settings.json" }`,
+			line: 8,
+		},
+		{
+			// h15: the same shape inside a CALLEE whose return value is
+			// chased. collectLocalDefs (the whole-function fold callChase
+			// substitutes into) has to build the same pair, or the defect
+			// simply moves one frame down.
+			name: "the same shape inside a chased callee",
+			src: `package p
+func Save(useCog bool, workspaceRoot string) error {
+	return os.WriteFile(pick(useCog, workspaceRoot), nil, 0644)
+}
+func pick(useCog bool, workspaceRoot string) string {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		path = globalSettingsPath()
+	}
+	return path
+}
+func globalSettingsPath() string { return "/etc/cogos/global-settings.json" }`,
+			line: 3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := siteAtLine(t, tc.src, tc.line)
+			if s.Category == "elsewhere" || s.Category == "home" {
+				t.Fatalf("category = %q pattern = %q — a genuine .cog/ write stamped with a sibling branch's non-.cog value is the one failure this package treats as never acceptable", s.Category, s.Pattern)
+			}
+			if s.Category != "unanchored" {
+				t.Errorf("category = %q pattern = %q, want unanchored — the outer binding is .cog-rooted and the rebind is not, so neither may decide the site", s.Category, s.Pattern)
+			}
+		})
+	}
+}
+
+// TestAgreeingConditionalRebindKeepsItsCategory is the required control on
+// the other side of the same rule: when the outer binding and an unreadable
+// conditional rebind resolve to DIFFERENT paths that land in the SAME
+// category, the binding stands and the site keeps that category. Without
+// this, "poison every unreadable conditional rebind" would look identical to
+// the real fix on the five shapes above while silently discarding every
+// two-branch .cog/ writer in the repo.
+func TestAgreeingConditionalRebindKeepsItsCategory(t *testing.T) {
+	src := `package p
+func Save(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		path = altCogPath(workspaceRoot)
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func altCogPath(workspaceRoot string) string { return filepath.Join(workspaceRoot, ".cog", "alt.json") }`
+	s := siteAtLine(t, src, 7)
+	if s.Category != "cog" {
+		t.Errorf("category = %q pattern = %q, want cog — both branches write under .cog/, so which one runs cannot change the site's category and the binding must stand", s.Category, s.Pattern)
+	}
+}
+
+// TestDisagreeingConditionalRebindFallsToUnanchored is the disagreement
+// control stated in the categories that make the rule's shape clearest — one
+// branch <Home>-rooted, the other a plain absolute literal — so the test does
+// not read as a special case about ".cog" text.
+func TestDisagreeingConditionalRebindFallsToUnanchored(t *testing.T) {
+	src := `package p
+func Save(useHome bool) error {
+	path := homeConfigPath()
+	if !useHome {
+		path = etcConfigPath()
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func homeConfigPath() string { home, _ := os.UserHomeDir(); return filepath.Join(home, "cogos.json") }
+func etcConfigPath() string  { return "/etc/cogos/cogos.json" }`
+	s := siteAtLine(t, src, 7)
+	if s.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored — a home-rooted branch and an /etc-rooted branch are a real disagreement, not something to resolve by picking the later assignment", s.Category, s.Pattern)
+	}
+}
+
+// TestUnreadableConditionalRebindWithNoOuterBindingIsUnchanged pins the
+// boundary of the new rule: it only ever engages where last-assignment-wins
+// actually DESTROYED something. A conditional rebind with no displaced outer
+// binding (the name's first and only binding at this level) has no sibling
+// value to disagree with, so it resolves exactly as it did before.
+func TestUnreadableConditionalRebindWithNoOuterBindingIsUnchanged(t *testing.T) {
+	src := `package p
+func Save(useCog bool, workspaceRoot string) error {
+	var path string
+	if useCog {
+		path = cogSettingsPath(workspaceRoot)
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func cogSettingsPath(workspaceRoot string) string { return filepath.Join(workspaceRoot, ".cog", "settings.json") }`
+	s := siteAtLine(t, src, 7)
+	if s.Category != "cog" {
+		t.Errorf("category = %q pattern = %q, want cog — with nothing displaced there is no pair to disagree, and the pre-existing single-binding behavior must be untouched", s.Category, s.Pattern)
+	}
+}
+
+// TestEveryBranchMustAgree pins the left-fold: THREE branches, two agreeing
+// and one not. A pair built only from the outer binding and the LAST rebind
+// would miss the middle branch entirely.
+func TestEveryBranchMustAgree(t *testing.T) {
+	src := `package p
+func Save(mode int, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "a.json")
+	switch mode {
+	case 1:
+		path = globalSettingsPath()
+	case 2:
+		path = cogSettingsPath(workspaceRoot)
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func cogSettingsPath(workspaceRoot string) string { return filepath.Join(workspaceRoot, ".cog", "settings.json") }
+func globalSettingsPath() string                  { return "/etc/cogos/global-settings.json" }`
+	s := siteAtLine(t, src, 10)
+	if s.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored — the case-1 branch disagrees with the other two, and a fold that only compared the outer binding against the LAST rebind would never see it", s.Category, s.Pattern)
+	}
+}
+
+// TestConditionalRebindInsideItsOwnBranchStillSeesItsOwnValue is the
+// scope-chain control the new rule must not disturb: a write INSIDE the
+// branch that performs the rebind is on that branch's own execution path, so
+// it resolves from the rebind alone — no pair, no disagreement. This is the
+// shape internal/providers/selfupdate/spawn_unix.go:39 has (the MkdirAll sits
+// inside the `if root != ""` branch, while the OpenFile at :43 sits after it
+// and is genuinely two-destination).
+func TestConditionalRebindInsideItsOwnBranchStillSeesItsOwnValue(t *testing.T) {
+	src := `package p
+func Save(root string) error {
+	logPath := filepath.Join(os.TempDir(), "x.log")
+	if root != "" {
+		logPath = cogRunPath(root)
+		if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(logPath, nil, 0644)
+}
+func cogRunPath(root string) string { return filepath.Join(root, ".cog", "run", "x.log") }`
+	inside := siteAtLine(t, src, 6)
+	if inside.Category != "cog" {
+		t.Errorf("inside the branch (line 6) = category %q pattern %q, want cog — a site on the rebind's own path sees the rebind, and pairing must not reach it", inside.Category, inside.Pattern)
+	}
+	after := siteAtLine(t, src, 10)
+	if after.Category != "unanchored" {
+		t.Errorf("after the branch (line 10) = category %q pattern %q, want unanchored — a TempDir default and a .cog/run rebind are a real disagreement for a site outside the branch", after.Category, after.Pattern)
+	}
+}

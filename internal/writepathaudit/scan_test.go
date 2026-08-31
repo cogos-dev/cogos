@@ -319,16 +319,32 @@ func TestRound3GateFindings_Fixed(t *testing.T) {
 			},
 		},
 		{
-			name: "rotating_writer.go w.path — pure passthrough field, chased entirely through log_capture.go's call site to <WorkspaceRoot>/.cog/run/kernel.log.jsonl",
+			name: "rotating_writer.go w.path — pure passthrough field, chased through log_capture.go's call site to a genuinely branch-dependent path (round-7 re-pin: unanchored, never elsewhere)",
 			gate: `internal/engine/log_capture.go:48 — ".cog/run/kernel.log.jsonl"; real writes at internal/engine/rotating_writer.go:47/50/89/137/141 binned 'elsewhere' as {path}/{w.path}`,
 			check: func(t *testing.T) {
+				// ROUND 7 re-pin. The chase still reaches log_capture.go's
+				// `path := cfg.KernelLogPath; if path == "" { path =
+				// DefaultKernelLogPath(cfg.WorkspaceRoot) }` — but it no
+				// longer takes the `if` branch's value as the site's answer.
+				// The two branches disagree in category (an operator-supplied
+				// cfg.KernelLogPath has no chaseable origin and can name any
+				// file on disk → unanchored; the fallback is
+				// <WorkspaceRoot>/.cog/run/kernel.log.jsonl → cog), and a
+				// disagreement is exactly what the category-agreement rule
+				// refuses to resolve by picking one side (see
+				// resolveCondRebindPair). The gate's own finding — these rows
+				// stamped "elsewhere" — stays closed: unanchored is the
+				// honesty margin, not a claim about being outside .cog/.
 				for _, line := range []int{50, 89, 141} {
 					s, ok := find("internal/engine/rotating_writer.go", line)
 					if !ok {
 						t.Fatalf("rotating_writer.go:%d not found in inventory", line)
 					}
-					if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/run/kernel.log.jsonl") {
-						t.Errorf("rotating_writer.go:%d = category %q pattern %q, want cog / .cog/run/kernel.log.jsonl", line, s.Category, s.Pattern)
+					if s.Category == "elsewhere" || s.Category == "home" {
+						t.Errorf("rotating_writer.go:%d = category %q pattern %q — the gate's own finding: a confident non-.cog category taken from one branch is never acceptable here", line, s.Category, s.Pattern)
+					}
+					if s.Category != "unanchored" || !strings.Contains(s.Pattern, "branch-disagreement") {
+						t.Errorf("rotating_writer.go:%d = category %q pattern %q, want unanchored / branch-disagreement (cfg.KernelLogPath vs the DefaultKernelLogPath fallback disagree in category)", line, s.Category, s.Pattern)
 					}
 				}
 				// log_capture.go itself has no os/io primitive of its own
@@ -659,9 +675,24 @@ func TestRound4GateFindings_NeverElsewhere(t *testing.T) {
 			name: "memory_sections.go:353 (atomicWriteMemoryFile's os.CreateTemp) — resolveMemoryDocPath's filepath.Clean(candidate) branch, not its own escape/absolute-path guards",
 			gate: `internal/engine/memory_sections.go:353 (os.CreateTemp, "dirname()") ... Stamped "elsewhere".`,
 			check: func(t *testing.T) {
+				// ROUND 7 re-pin. This row read "cog" from round 4 until the
+				// category-agreement rule landed (see
+				// poisonConditionalAndLoopRebinds/resolveCondRebindPair): it
+				// was reading resolveMemoryDocPath's LAST `candidate = ...`
+				// branch alone, under last-assignment-wins. That function
+				// assigns `candidate` in four mutually exclusive branches, and
+				// they do NOT all land under .cog/mem — the default case's
+				// first branch is `wsPath := filepath.Join(cogRoot, path)`,
+				// workspace-relative on purpose (its own comment names
+				// `.cog/ontology/crystal.cog.md` as the case it exists for),
+				// which classifies unanchored while the other three are
+				// .cog/mem-rooted. A genuine branch disagreement, so the
+				// honest bin is the unanchored margin. The gate's own
+				// complaint — a false "elsewhere" — stays closed either way,
+				// which is what wantNeverElsewhere asserts.
 				s := wantNeverElsewhere(t, "internal/engine/memory_sections.go", 353)
-				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
-					t.Errorf("memory_sections.go:353 = category %q pattern %q, want cog / .cog/mem", s.Category, s.Pattern)
+				if s.Category != "unanchored" || !strings.Contains(s.Pattern, "branch-disagreement") {
+					t.Errorf("memory_sections.go:353 = category %q pattern %q, want unanchored / branch-disagreement (resolveMemoryDocPath's workspace-relative branch disagrees in category with its .cog/mem branches)", s.Category, s.Pattern)
 				}
 			},
 		},
@@ -669,9 +700,10 @@ func TestRound4GateFindings_NeverElsewhere(t *testing.T) {
 			name: "memory_sections.go:375 (atomicWriteMemoryFile's os.Rename)",
 			gate: `internal/engine/memory_sections.go:375 (os.Rename, "") ... Stamped "elsewhere".`,
 			check: func(t *testing.T) {
+				// Same re-pin as :353 above, same call chain.
 				s := wantNeverElsewhere(t, "internal/engine/memory_sections.go", 375)
-				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/mem") {
-					t.Errorf("memory_sections.go:375 = category %q pattern %q, want cog / .cog/mem", s.Category, s.Pattern)
+				if s.Category != "unanchored" || !strings.Contains(s.Pattern, "branch-disagreement") {
+					t.Errorf("memory_sections.go:375 = category %q pattern %q, want unanchored / branch-disagreement", s.Category, s.Pattern)
 				}
 			},
 		},

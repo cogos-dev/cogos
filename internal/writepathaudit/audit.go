@@ -129,12 +129,16 @@
 //   - package-level constants and vars are not folded (a path built from a
 //     `const cogDirName = ".cog"` will not be recognized as the <CogDir>
 //     anchor unless the literal ".cog" appears directly in the call)
-//   - the local-variable resolver is flat per function body: it does not
-//     model branches, shadowing, or loop iterations, and if a name is
-//     assigned more than once it heuristically takes the last textual
-//     assignment. Sites resolved this way still carry their real
-//     file:line, so this affects the recorded *pattern*, never the
-//     recorded *location*.
+//   - the local-variable resolver models a position's LEXICAL scope chain
+//     and the statements preceding it (see the resolution-semantics section
+//     below), but not runtime control flow: within one straight-line level
+//     it still takes the last textual assignment, and where a
+//     conditionally-executed rebind makes that unsafe the name is either
+//     dropped or held as a two-branch pair that must agree on category
+//     before it classifies anything. It does not evaluate conditions, count
+//     loop iterations, or track which branch a caller takes. Sites resolved
+//     this way still carry their real file:line, so this affects the
+//     recorded *pattern* and *category*, never the recorded *location*.
 //
 // # Primitive coverage
 //
@@ -520,10 +524,26 @@ func paramNames(fl *ast.FieldList) []string {
 //
 // THE INVARIANT (stated once here, enforced by foldScopeLevel below): a
 // write site must never classify from a binding that is not guaranteed on
-// its own execution path. When the auditor cannot establish that, the name
-// is dropped and the site falls to "unanchored"; a genuine .cog/ write
-// stamped "elsewhere" from a sibling branch's value is the one failure this
-// package treats as never acceptable.
+// its own execution path, and must never be assigned a CONFIDENT category —
+// cog, home, elsewhere — that only one of several possible branch values
+// would justify. Where the auditor cannot establish which value reaches the
+// site, the name is dropped, or its competing values are carried as a pair
+// that resolves only if they agree (resolveCondRebindPair), and the site
+// falls to "unanchored". A genuine .cog/ write stamped "elsewhere" from a
+// sibling branch's value is the failure this package treats as never
+// acceptable.
+//
+// This is a statement of what the code enforces, not an aspiration, and it
+// costs recall to keep it true: a write whose path is genuinely
+// branch-dependent — internal/engine/log_capture.go's `path :=
+// cfg.KernelLogPath; if path == "" { path = DefaultKernelLogPath(...) }`,
+// internal/engine/memory_sections.go's four-branch resolveMemoryDocPath —
+// classifies "unanchored" here even though one of its branches is plainly
+// under .cog/. That is the invariant working, not a gap in it. The gaps that
+// remain are named where they live: see poisonConditionalAndLoopRebinds's
+// doc comment for the two open ones (a .cog-bearing readable rebind is
+// trusted rather than paired; a `:=` in a sibling branch is not modeled as
+// a competing value).
 //
 // THE RULE, per site at position P: build P's defs by walking the chain of
 // block scopes that lexically enclose P — the enclosing function body
@@ -532,8 +552,8 @@ func paramNames(fl *ast.FieldList) []string {
 // bare `{ }` blocks, any of them reachable through a labeled statement) —
 // and at EVERY level apply the SAME two steps in the SAME order over that
 // level's statements UP TO P: fold that level's directly-visible bindings,
-// then poison the names that level's nested, off-path subtrees rebind in a
-// way P cannot trust (see foldScopeLevel and
+// then poison-or-pair the names that level's nested, off-path subtrees
+// rebind in a way P cannot trust (see foldScopeLevel and
 // poisonConditionalAndLoopRebinds). Every level is treated identically;
 // there is no "flat map plus a differently-behaved overlay" anymore, which
 // is exactly where the round-6 gate's two false "elsewhere" findings lived —
@@ -628,8 +648,8 @@ func localDefsFor(cache map[token.Pos]map[string]ast.Expr, fnBody *ast.BlockStmt
 // token.NoPos, which turns both position rules off and folds the whole body
 // — the whole-function form collectLocalDefs needs.
 func foldScopeLevel(defs map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable bool) {
-	applyDirectLocalDefs(defs, body, true, limit)
-	poisonConditionalAndLoopRebinds(defs, body, limit, revisitable)
+	displaced := applyDirectLocalDefs(defs, body, true, limit)
+	poisonConditionalAndLoopRebinds(defs, displaced, body, limit, revisitable)
 }
 
 // containsGoto reports whether body contains any `goto` statement, including
@@ -675,22 +695,30 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 	return defs
 }
 
-// poisonConditionalAndLoopRebinds deletes from defs every name that a
-// FOR/RANGE loop, a conditionally-executed subtree (IfStmt — body and else
-// chain, SwitchStmt/TypeSwitchStmt case bodies, SelectStmt comm clauses),
-// or a function literal NESTED INSIDE body rebinds in a way a use site
-// outside that subtree cannot safely trust.
+// poisonConditionalAndLoopRebinds un-trusts every name that a FOR/RANGE
+// loop, a conditionally-executed subtree (IfStmt — body and else chain,
+// SwitchStmt/TypeSwitchStmt case bodies, SelectStmt comm clauses), or a
+// function literal NESTED INSIDE body rebinds in a way a use site outside
+// that subtree cannot safely trust. It does so in one of two ways: it
+// DELETES the name outright (the loop case, and a conditional rebind
+// staticPathText can read as a non-.cog root), or — when the rebind is one
+// staticPathText cannot read at all — it replaces the name's binding with a
+// PAIR of the displaced outer binding and that rebind, which resolves only
+// if the two agree on category (condRebindPair/resolveCondRebindPair). Both
+// outcomes are conservative; the difference is that a pair can still earn a
+// confident category when every branch would produce the same one, and a
+// deletion never can.
 //
 // body here is ONE scope level, not necessarily a whole function: this runs
 // on the enclosing function body and, identically, on every nested scope
 // level on a use site's chain (see foldScopeLevel and localDefsFor). At any
-// level, the subtrees this function poisons are exactly the ones NOT on the
+// level, the subtrees this function acts on are exactly the ones NOT on the
 // use site's chain in that level — a nested scope that IS on the chain gets
 // its own foldScopeLevel pass afterward, which re-establishes its own
-// bindings on top of whatever was poisoned here. That is what lets one
-// position-blind poison rule serve every level: removing a name is always
-// safe (the site falls to unanchored), and only an on-path level is allowed
-// to put a value back.
+// bindings on top of whatever was removed or paired here. That is what lets
+// one position-blind rule serve every level: removing a name (or demanding
+// agreement from it) is always safe, and only an on-path level is allowed to
+// put a plain value back.
 //
 // Neither `:=` nor a `var x = expr` ValueSpec ever poisons — when
 // either shadows an existing outer name, it never touches that outer
@@ -765,30 +793,39 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // os.TempDir(); the same anchor names identifierAnchors knows; and a plain
 // Ident chased through defs (recursively, bounded — see
 // maxPoisonChaseDepth) when this SAME function already has a resolvable
-// binding for it. Two real, currently-shipping .cog/ writers pin down why
-// the check has to stay this narrow rather than "any plain `=` inside a
-// conditional poisons, full stop":
+// binding for it. Two real, currently-shipping writers show what this
+// narrowness buys and what it costs — both are shapes staticPathText cannot
+// read, so both are now PAIRED rather than either trusted or deleted:
 //
 //   - internal/engine/log_capture.go's `path := cfg.KernelLogPath; if
 //     path == "" { path = DefaultKernelLogPath(cfg.WorkspaceRoot) }` — the
-//     OUTER value is an opaque, unchased struct field; the CONDITIONAL
-//     rebind is the one call that actually resolves to
-//     <WorkspaceRoot>/.cog/run/kernel.log.jsonl. Poisoning this (as an
-//     earlier, unconditional version of this fix did) throws away the
-//     ONLY known-good classification for a genuine .cog/run/ writer,
-//     purely because the rebind sits inside an `if`. staticPathText still
-//     cannot evaluate DefaultKernelLogPath(...) — it is a call to another
-//     declared function, outside the narrow filepath/os allowlist above —
-//     so this case is completely unaffected by the round-5 widening.
-//   - internal/engine/memory_sections.go's resolveMemoryDocPath: every
-//     branch of its switch (and the if/else nested in its default case)
-//     assigns `candidate` via a filepath.Join call whose own arguments
-//     (cogRoot, path — both function PARAMETERS, which staticPathText
-//     deliberately never chases; see its own doc comment) are themselves
-//     unresolvable this way, so every branch still reads as "cannot prove"
-//     and none of them get poisoned — same outcome as round 4, for a
-//     structurally different reason (an unresolvable argument, not an
-//     unrecognized call shape).
+//     OUTER value is an opaque, unchased struct field (unanchored); the
+//     CONDITIONAL rebind resolves to
+//     <WorkspaceRoot>/.cog/run/kernel.log.jsonl (cog). Deleting the name
+//     outright (as an earlier, unconditional version of this fix did) threw
+//     away every classification for a genuine .cog/run/ writer purely
+//     because the rebind sat inside an `if`; trusting the rebind (as round
+//     4 through 6 did) claimed .cog/ for a path an operator-set
+//     cfg.KernelLogPath can point anywhere. The pair does neither: the two
+//     branches disagree in category, so internal/engine/rotating_writer.go's
+//     five rows read "unanchored" — the honest answer for a genuinely
+//     branch-dependent destination, and the reason the round-3 gate's
+//     rotating_writer case is re-pinned to it in scan_test.go.
+//   - internal/engine/memory_sections.go's resolveMemoryDocPath: four
+//     mutually exclusive `candidate = ...` branches (its switch cases plus
+//     the if/else nested in its default case), each a filepath.Join whose
+//     own arguments (cogRoot, path — both function PARAMETERS, which
+//     staticPathText deliberately never chases) it cannot read. Three of
+//     them are .cog/mem-rooted; the fourth, `wsPath := filepath.Join(cogRoot,
+//     path)`, is workspace-relative on purpose — its own comment names
+//     `.cog/ontology/crystal.cog.md` as the case it exists for — and
+//     classifies unanchored. A real disagreement, so the two
+//     atomicWriteMemoryFile rows read "unanchored" too.
+//
+// Both of those were "cog" before round 7 and are named here, rather than
+// only in the golden diff, because they are the recall this invariant costs:
+// see the invariant paragraph at the top of this file's resolution-semantics
+// section.
 //
 // The round-4 gate's own reproduction —
 // `path := filepath.Join(workspaceRoot, ".cog", "settings.json"); if
@@ -812,37 +849,84 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // needing the real resolver's interprocedural machinery to do it — see
 // TestManifestGoRunsRootEnvBranch_NoLongerOverclaimsHome in scan_test.go
 // for the pinned-down regression. This is the resolver's own invariant,
-// applied as far as pre-resolution syntax alone can prove it: a write site
-// must never classify from a binding not guaranteed on its execution path —
-// when a branch's own fold GUARANTEES the anchor (compound assign) or this
-// function cannot yet tell whether a rebind disagrees (an unresolved call,
-// field, or parameter), the existing binding stands; only a rebind this
-// function can already read — now via staticPathText's wider, still
-// self-contained reach — as a DIFFERENT, non-.cog root forces the site to
-// the unanchored margin.
+// applied as far as pre-resolution syntax alone can prove it: when a
+// branch's own fold GUARANTEES the anchor (compound assign) the existing
+// binding stands, and a rebind this function can already read — now via
+// staticPathText's wider, still self-contained reach — as a DIFFERENT,
+// non-.cog root forces the site to the unanchored margin outright.
 //
-// staticPathText's reach is still bounded on purpose, and a further,
-// currently-open gap follows the identical shape: a rebind this function
-// CAN read as .cog-ROOTED is never poisoned either way (see hasCogSegment
-// below) — favoring a false "cog" over a false "elsewhere", the same
+// THE THIRD CASE — a rebind this function CANNOT read (an unresolved call,
+// a package-level const, a field, a parameter) — is the round-7 gate's
+// finding, and it is where an earlier version of this comment claimed
+// something false. It said "the existing binding stands". It does not: this
+// function runs AFTER applyDirectLocalDefs has already folded the rebind in
+// under last-assignment-wins, so declining to act here left the UNREADABLE
+// REBIND in defs, with the outer binding gone, to be resolved by the full
+// interprocedural resolver — which reads plenty this evaluator cannot. Five
+// one-substitution paraphrases of the round-4 shape (rebind to a declared
+// function's return value, to a package-level const, to a filepath.Join over
+// either, to a local bound to either, and the same one call-frame down)
+// therefore stamped a genuine .cog/ write "elsewhere" with the sibling
+// branch's path. An unreadable rebind is now neither trusted nor discarded:
+// applyDirectLocalDefs hands this function the binding the rebind DISPLACED,
+// and the two are recorded together as a category-agreement pair
+// (condRebindPair) that the full resolver settles later —
+// resolveCondRebindPair accepts the binding only when both sides classify
+// the same, and otherwise reports the branch disagreement as opacity, which
+// classify routes to "unanchored". Loops keep their unconditional poison
+// (see the LOOPS section above); nothing about the compound-assign or
+// readable-rebind cases changed.
+//
+// TWO GAPS REMAIN OPEN HERE, and the second is strictly the worse of the two.
+//
+// First, the cog-favoring asymmetry: a rebind this function CAN read as
+// .cog-ROOTED is neither poisoned NOR paired (see hasCogSegment below) —
+// favoring a false "cog" over a false "elsewhere", the same
 // over-claim-toward-.cog-is-the-safe-direction posture classify()'s own doc
-// comment states for every other ambiguous case in this package. This is a
-// deliberate asymmetry, not an oversight left beside this one: a branch
-// rebind to a .cog-bearing value, resolvable or not, is trusted; a branch
-// rebind this function can positively read as non-.cog is poisoned. Making
-// the two directions symmetric (poisoning a .cog-bearing rebind too, the
-// instant it sits beside an unguaranteed sibling) would trade real .cog/
-// writers currently caught by exactly this one-resolvable-branch heuristic
-// (log_capture.go above is one) for a more theoretically consistent, but
-// practically worse, failure mode — so it is left as is here, named
-// explicitly rather than silently implied, with the asymmetry pinned down
-// by a dedicated regression test (TestConditionalCogBearingRebindStaysTrusted
-// in resolve_test.go) so a future change to this balance is a conscious
-// decision, not an accidental one.
-func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable bool) {
+// comment states for every other ambiguous case in this package. Making it
+// symmetric (pairing a .cog-bearing rebind against its outer binding too)
+// would move real, currently-caught .cog/ writers into the unanchored margin
+// for a consistency gain; it is left as is, pinned by
+// TestConditionalCogBearingRebindStaysTrusted so a future change to the
+// balance is a conscious decision.
+//
+// Second, agreement is checked at CATEGORY granularity, not pattern
+// granularity: when the two branches agree, the DISPLACED branch's pattern
+// text is what the pair reports, even though the other branch would have
+// written a different file. Two consequences, the second of which is a real
+// (if narrow) hole:
+//
+//   - the Pattern column, for such a site, names one real branch out of
+//     several rather than all of them —
+//     internal/engine/provider_mlx_supervised.go's plist name is the
+//     shipping example (both branches are unanchored; the reported text is
+//     the outer one);
+//   - because the TEXT of one branch is what composes upward, a pair whose
+//     branches agree at this level can still hand a LARGER expression a
+//     text that classifies differently from what the other branch's text
+//     would have. Two unanchored branches, one an opaque "{x}" and one a
+//     bare relative literal, agree here and then diverge (unanchored vs
+//     elsewhere) once joined under <WorkspaceRoot>.
+//
+// This is exactly chaseReturns's own long-standing exposure — it returns
+// cands[0].pattern once its candidates agree on category, with the same
+// text-composes-upward consequence — and the pair follows that idiom
+// deliberately rather than inventing a second, differently-behaved
+// tie-break. No shipping row in the golden currently sits on it (the
+// agreeing pairs there report opaque text, which is the conservative side),
+// so it is named as a known hole rather than fixed blind; closing it means
+// giving chaseReturns and the pair ONE shared rule for which of several
+// agreeing texts to report, not patching this call site alone.
+func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, displaced map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable bool) {
 	if body == nil {
 		return
 	}
+	// Names this level's conditional plain `=` rebinds touch with an RHS
+	// staticPathText cannot read, in source order. Applied after the walk
+	// (see condRebindPair) rather than during it, so a name a LATER
+	// readable-and-non-cog rebind poisons outright stays poisoned.
+	unreadable := map[string][]ast.Expr{}
+	var unreadableOrder []string
 	// poisonLoop deletes defs[name] for EVERY name a loop-body rebind
 	// touches, plain `=` or compound alike — see this function's doc
 	// comment's LOOPS section for why loops get no plain-vs-compound
@@ -893,7 +977,20 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockSt
 					continue
 				}
 				text, litOK := staticPathText(assign.Rhs[i], defs, 0)
-				if !litOK || hasCogSegment(text) {
+				if !litOK {
+					// Unreadable here, but NOT therefore harmless: the full
+					// interprocedural resolver reaches shapes this evaluator
+					// cannot (a declared function's return value, a
+					// package-level const, a local bound to either), and
+					// last-assignment-wins would hand the site this branch's
+					// value alone. Defer to a category-agreement pair instead.
+					if _, seen := unreadable[ident.Name]; !seen {
+						unreadableOrder = append(unreadableOrder, ident.Name)
+					}
+					unreadable[ident.Name] = append(unreadable[ident.Name], assign.Rhs[i])
+					continue
+				}
+				if hasCogSegment(text) {
 					continue
 				}
 				delete(defs, ident.Name)
@@ -957,6 +1054,44 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockSt
 		}
 		return true
 	})
+	// Every unreadable conditional rebind that displaced a binding at this
+	// level becomes a category-agreement pair over the displaced value and
+	// each such rebind's RHS, left-folded so ALL of them have to agree.
+	for _, name := range unreadableOrder {
+		outer, hadOuter := displaced[name]
+		if !hadOuter {
+			// Nothing was displaced: this rebind is the name's only binding
+			// at this level, so there is no sibling value it could disagree
+			// with and nothing for last-assignment-wins to have destroyed.
+			continue
+		}
+		if _, still := defs[name]; !still {
+			continue // already poisoned outright by a readable non-.cog rebind
+		}
+		cand := outer
+		for _, rhs := range unreadable[name] {
+			cand = condRebindPair(cand, rhs)
+		}
+		defs[name] = cand
+	}
+}
+
+// condRebindPair builds the synthetic node that records "this name is bound
+// to EITHER outer OR rebind, and the auditor cannot tell which" — resolved
+// by resolveExpr's token.LOR case, which accepts the binding only when both
+// sides resolve AND agree on classify() category, and reports an outright
+// resolution failure otherwise (so classify falls to unanchored).
+//
+// The carrier is a real *ast.BinaryExpr because ast.Expr cannot be
+// implemented outside go/ast (its exprNode() method is unexported), and
+// token.LOR because `||` is boolean-only in Go: no genuine path expression
+// in this corpus is spelled with it, and the resolver's own BinaryExpr case
+// already refused every non-ADD operator outright before this existed.
+// Nothing walks a defs value with ast.Walk, and staticPathText's BinaryExpr
+// case still rejects every non-ADD operator, so a pair is opaque to the
+// pre-resolution evaluator — the conservative side.
+func condRebindPair(outer, rebind ast.Expr) ast.Expr {
+	return &ast.BinaryExpr{X: outer, Op: token.LOR, Y: rebind}
 }
 
 // maxPoisonChaseDepth bounds staticPathText's own recursion — a separate,
@@ -1162,9 +1297,22 @@ func staticPathText(expr ast.Expr, defs map[string]ast.Expr, depth int) (string,
 // the ValueSpec case's own comment) — since a `var` declaration is exactly
 // as much a fresh, block-scoped local as a `:=` is; nothing about the two
 // declaration forms warrants different treatment here.
-func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoopBodies bool, limit token.Pos) {
+//
+// The returned DISPLACED map records, per name, the binding that this
+// level's FIRST conditionally-executed plain `=` rebind of that name pushed
+// out of defs. That value is the only thing last-assignment-wins destroys
+// irrecoverably, and poisonConditionalAndLoopRebinds — which runs
+// immediately after this walk, over the same level — needs it to build a
+// branch pair for a rebind it cannot read (see condRebindPair). Recording
+// only the FIRST displacement is deliberate: subsequent rebinds at the same
+// level displace a value that was itself branch-conditional, so the first
+// one is the level's pre-conditional binding (or, when there was none, the
+// first branch's own value, which the pair then compares against the
+// later branches' — exactly the right comparison either way).
+func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoopBodies bool, limit token.Pos) map[string]ast.Expr {
+	displaced := map[string]ast.Expr{}
 	if body == nil {
-		return
+		return displaced
 	}
 	condDepth := 0
 	var isCondStack []bool
@@ -1216,7 +1364,7 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 		}
 		switch stmt := n.(type) {
 		case *ast.AssignStmt:
-			applyAssign(defs, stmt, condDepth > 0)
+			applyAssign(defs, displaced, stmt, condDepth > 0)
 		case *ast.ValueSpec:
 			// A `var x = expr` declaration is the DECLARE case's exact
 			// counterpart to `:=` — see applyAssign's own doc comment for
@@ -1248,6 +1396,7 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 		}
 		return true
 	})
+	return displaced
 }
 
 // applyAssign records one AssignStmt's bindings into defs, honoring
@@ -1282,13 +1431,24 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 // it); a compound assign still folds exactly as it does anywhere else,
 // conditional or not — folding never discards the prior binding, so there
 // is nothing here that needs gating on conditional depth.
-func applyAssign(defs map[string]ast.Expr, stmt *ast.AssignStmt, insideConditional bool) {
+func applyAssign(defs map[string]ast.Expr, displaced map[string]ast.Expr, stmt *ast.AssignStmt, insideConditional bool) {
 	for i, lhs := range stmt.Lhs {
 		ident, ok := lhs.(*ast.Ident)
 		if !ok || ident.Name == "_" || i >= len(stmt.Rhs) {
 			continue
 		}
 		rhs := stmt.Rhs[i]
+		if stmt.Tok == token.ASSIGN && insideConditional {
+			// Record what this conditional rebind is about to push out, so
+			// the poison pass can pair the two instead of letting
+			// last-assignment-wins silently pick the branch (see
+			// applyDirectLocalDefs's own doc comment and condRebindPair).
+			if prev, had := defs[ident.Name]; had {
+				if _, already := displaced[ident.Name]; !already {
+					displaced[ident.Name] = prev
+				}
+			}
+		}
 		if stmt.Tok != token.ASSIGN && stmt.Tok != token.DEFINE {
 			if prev, had := defs[ident.Name]; had {
 				rhs = &ast.BinaryExpr{X: prev, Op: token.ADD, Y: rhs}
@@ -2053,6 +2213,9 @@ func (r *resolver) resolveExpr(e ast.Expr, defs map[string]ast.Expr, depth int) 
 		return r.resolveExpr(v.X, defs, depth+1)
 
 	case *ast.BinaryExpr:
+		if v.Op == token.LOR {
+			return r.resolveCondRebindPair(v, defs, depth)
+		}
 		if v.Op != token.ADD {
 			return "<expr>", false, false
 		}
@@ -2150,6 +2313,55 @@ func (r *resolver) resolveExpr(e ast.Expr, defs map[string]ast.Expr, depth int) 
 	}
 
 	return "<expr>", false, false
+}
+
+// resolveCondRebindPair resolves a condRebindPair marker: a name bound to
+// EITHER the value a conditional plain `=` displaced OR that rebind's own
+// RHS, with no way to tell which executes. It follows chaseReturns's idiom
+// exactly — resolve every candidate with the FULL resolver, accept only when
+// they all agree on classify() category — for the same reason chaseReturns
+// does: two destinations that land in the same bin classify identically no
+// matter which one runs, and two that do not are a real dead end rather than
+// something to guess at.
+//
+// A disagreement (or either side failing to resolve) returns ok=false, which
+// classify turns into "dynamic" at the top level and, once composed into a
+// larger pattern, keeps that pattern out of "elsewhere" entirely — the
+// unanchored/dynamic margin, never a confident category taken from one
+// branch. This is where the round-7 gate's five shapes (a rebind to a
+// declared function's return value, to a package-level const, to a
+// filepath.Join over either, to a local bound to either, and the same
+// through a chased callee) stop producing a false "elsewhere": staticPathText
+// cannot read any of them before resolution, but this runs after it.
+func (r *resolver) resolveCondRebindPair(pair *ast.BinaryExpr, defs map[string]ast.Expr, depth int) (string, bool, bool) {
+	outerPat, outerOK, outerDeg := r.resolveExpr(pair.X, defs, depth+1)
+	rebindPat, rebindOK, rebindDeg := r.resolveExpr(pair.Y, defs, depth+1)
+	// The comparison runs through classify() itself rather than through a
+	// separate ok/not-ok test first, because classify already encodes what
+	// "unresolvable" MEANS for this question: a side that failed to
+	// decompose lands in "dynamic" and therefore disagrees with any
+	// confident category (poisoning the name, as intended), while a side
+	// whose text carries a ".cog" segment is "cog" whether or not the rest
+	// of it resolved — the deliberate, documented cog-first ordering in
+	// classify's own body. Re-deciding either of those here would be a
+	// second, drifting copy of that rule.
+	if classify(outerPat, outerOK, outerDeg) != classify(rebindPat, rebindOK, rebindDeg) {
+		// Both branch SHAPES are known; which one executes is not. That is
+		// exactly what this package's opaque-placeholder vocabulary already
+		// means, so the marker is spelled in the same "{...}" form
+		// isOpaqueRoot and hasOpaqueSegment already recognize — the site
+		// lands in "unanchored", and a pattern that composes this marker
+		// into a larger join is held out of "elsewhere" by the same existing
+		// rules that hold "{name}" out of it.
+		return "{branch-disagreement}", true, false
+	}
+	// Same category either way: either pattern classifies the site
+	// identically, so the binding stands. The displaced (outer) text is the
+	// one reported, along with its own ok — degeneracy from EITHER side is
+	// carried, since a degenerate root anywhere in the pair is still a
+	// resolution artifact (the same any-operand posture filepath.Join and
+	// concatenation take).
+	return outerPat, outerOK, outerDeg || rebindDeg
 }
 
 // resolveCall handles: the narrow filepath/os allowlist (Join/Dir/Base,
