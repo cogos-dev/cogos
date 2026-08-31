@@ -2181,3 +2181,173 @@ func Save(a bool, root string) error {
 		t.Errorf("category = %q pattern = %q, want cog — the header `:=` declares a name scoped to the if statement and must resolve exactly as if the shadow never existed", s.Category, s.Pattern)
 	}
 }
+
+// ─── Round-9 gate: closure bodies and forward `goto` ──────────────────────
+//
+// Two false-"elsewhere" mechanisms that sat OUTSIDE the four gaps the
+// resolution-semantics invariant paragraph enumerated, both predating the
+// branch-pair mechanism (they reproduce identically at 82e8cb3 and d941abe)
+// and both latent — no shipping site had either shape.
+//
+// First: a FUNC-LITERAL body was absent from applyDirectLocalDefs's
+// condRegion, so a closure's plain `=` rebind ran at condDepth 0. applyAssign
+// therefore never recorded what it displaced, and the pairing loop's
+// `if !hadOuter { continue }` left the closure's own RHS alone in defs for
+// the full interprocedural resolver — which reads shapes staticPathText
+// cannot. The closure was neither poisoned NOR paired: exactly the hole the
+// round-7 pair was built to close for conditionals, still open one subtree
+// kind over. TestFuncLitRebindPoisonsEnclosingSite could not see it because
+// its rebind is a bare string literal, which staticPathText reads and
+// poisons outright on the readable-and-non-.cog path.
+//
+// Second: containsGoto modeled only the BACKWARD jump (statements after the
+// site can precede it on a second pass). A FORWARD `goto` jumping OVER a
+// rebind leaves that rebind folded as if it always executes.
+
+// TestFuncLitUnreadableRebindPairsAgainstDisplacedBinding is the first
+// mechanism, in all four shapes a closure reaches an enclosing local through:
+// called via a parameter, deferred, spawned with `go`, and bound to a local.
+// The RHS is a declared function's return value — resolvable by the full
+// resolver, invisible to staticPathText — so the rebind lands in the
+// unreadable bucket, and the site must fall to unanchored rather than take
+// either branch's value.
+func TestFuncLitUnreadableRebindPairsAgainstDisplacedBinding(t *testing.T) {
+	const prelude = `package p
+func globalSettingsPath() string { return "/etc/cogos/global-settings.json" }
+`
+	cases := []struct {
+		name string
+		body string
+		line int
+	}{
+		{"called-through-parameter", `func f(root string, run func(func())) {
+	path := filepath.Join(root, ".cog", "settings.json")
+	run(func() {
+		path = globalSettingsPath()
+	})
+	os.WriteFile(path, nil, 0644)
+}`, 8},
+		{"defer", `func f(root string) {
+	path := filepath.Join(root, ".cog", "settings.json")
+	defer func() {
+		path = globalSettingsPath()
+	}()
+	os.WriteFile(path, nil, 0644)
+}`, 8},
+		{"go", `func f(root string) {
+	path := filepath.Join(root, ".cog", "settings.json")
+	go func() {
+		path = globalSettingsPath()
+	}()
+	os.WriteFile(path, nil, 0644)
+}`, 8},
+		{"bound-to-local", `func f(root string) {
+	path := filepath.Join(root, ".cog", "settings.json")
+	fn := func() {
+		path = globalSettingsPath()
+	}
+	_ = fn
+	os.WriteFile(path, nil, 0644)
+}`, 9},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := siteAtLine(t, prelude+tc.body, tc.line)
+			if s.Category == "elsewhere" || s.Category == "home" {
+				t.Fatalf("category = %q pattern = %q — real Go sends this write to {root}/.cog/settings.json whenever the closure has not run; a confident NON-cog category here is the failure this package treats as never acceptable", s.Category, s.Pattern)
+			}
+			if s.Category != "unanchored" {
+				t.Errorf("category = %q pattern = %q, want unanchored — whether the closure ran before this write is not something this package models, so the two candidate values must be paired and disagree", s.Category, s.Pattern)
+			}
+		})
+	}
+}
+
+// TestFuncLitCogBearingRebindStaysTrusted is the control for the deliberate
+// cog-favoring asymmetry, at a closure instead of a conditional: a rebind
+// staticPathText CAN read as .cog-rooted is still neither poisoned nor
+// paired, exactly as TestConditionalCogBearingRebindStaysTrusted pins for an
+// `if` body. Closing the unreadable case above must not have made this
+// symmetric by accident.
+func TestFuncLitCogBearingRebindStaysTrusted(t *testing.T) {
+	src := `package p
+func f(elsewhereRoot string, run func(func())) {
+	path := filepath.Join(elsewhereRoot, "settings.json")
+	run(func() {
+		path = "/var/lib/x/.cog/settings.json"
+	})
+	os.WriteFile(path, nil, 0644)
+}`
+	s := siteAtLine(t, src, 7)
+	if s.Category != "cog" {
+		t.Errorf("category = %q pattern = %q, want cog — a closure rebind THIS tool can read as .cog-rooted is deliberately never poisoned, the same documented asymmetry conditionals get", s.Category, s.Pattern)
+	}
+}
+
+// TestFuncLitShadowDeclarationLeavesOuterBindingIntact is the closure twin of
+// the `:=`-shadow control: a `:=` inside a closure declares a variable scoped
+// to the closure and must not clobber the enclosing function's binding of the
+// same name. Before the condRegion/isScope fix this was a THIRD false
+// "elsewhere" of the same family — the closure's dead local resolved the
+// enclosing function's genuine .cog write.
+func TestFuncLitShadowDeclarationLeavesOuterBindingIntact(t *testing.T) {
+	src := `package p
+func f(root string) {
+	path := filepath.Join(root, ".cog", "settings.json")
+	defer func() {
+		path := "/etc/cogos/g.json"
+		_ = path
+	}()
+	os.WriteFile(path, nil, 0644)
+}`
+	s := siteAtLine(t, src, 8)
+	if s.Category != "cog" {
+		t.Errorf("category = %q pattern = %q, want cog — the closure's `:=` is its own local and must resolve exactly as if it never existed", s.Category, s.Pattern)
+	}
+}
+
+// TestForwardGotoOverRebindPoisonsSite is the second mechanism. `goto done`
+// jumps over the `path = "/etc/a.json"` rebind, so when a is true real Go
+// writes {root}/.cog/settings.json — but the fold sees only a straight-line
+// rebind preceding the site and, before this fix, stamped it "elsewhere"
+// with the skipped branch's literal.
+func TestForwardGotoOverRebindPoisonsSite(t *testing.T) {
+	src := `package p
+func f(root string, a bool) {
+	path := filepath.Join(root, ".cog", "settings.json")
+	if a {
+		goto done
+	}
+	path = "/etc/a.json"
+done:
+	os.WriteFile(path, nil, 0644)
+}`
+	s := siteAtLine(t, src, 9)
+	if s.Category == "elsewhere" || s.Category == "home" {
+		t.Fatalf("category = %q pattern = %q — the `goto` skips the rebind when a is true, so real Go sends this write into .cog/", s.Category, s.Pattern)
+	}
+	if s.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored", s.Category, s.Pattern)
+	}
+}
+
+// TestBackwardGotoStillPoisonsAfterSiteRebinds is the control for the
+// direction containsGoto already modeled: a backward jump brings the site
+// around again after the rebind that follows it. Behavior here is unchanged —
+// the site was, and stays, unanchored.
+func TestBackwardGotoStillPoisonsAfterSiteRebinds(t *testing.T) {
+	src := `package p
+func f(root string, a bool) {
+	path := filepath.Join(root, ".cog", "settings.json")
+again:
+	os.WriteFile(path, nil, 0644)
+	path = "/etc/a.json"
+	if a {
+		goto again
+	}
+}`
+	s := siteAtLine(t, src, 5)
+	if s.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored — the back edge re-runs this write after the rebind", s.Category, s.Pattern)
+	}
+}

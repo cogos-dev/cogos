@@ -555,38 +555,67 @@ func paramNames(fl *ast.FieldList) []string {
 // under .cog/. That is the invariant working, not a gap in it.
 //
 // IT IS A GOAL, NOT A THEOREM. FOUR GAPS ARE OPEN, and a write site can still
-// come out "elsewhere" through the last two. This list is meant to be
+// come out "elsewhere" through the last three. This list is meant to be
 // exhaustive — a gap found outside it is a defect in this paragraph as much as
-// in the code — and each is named again where it lives:
+// in the code — and each is named again where it lives. Each entry's stated
+// behavior was re-verified against the code at round 9, not carried forward
+// on trust; the "last three" above is one such correction, since the second
+// entry's own composed-upward reproduction does reach "elsewhere" (a
+// displaced bare literal and an opaque rebind agree at "unanchored" here,
+// and the reported literal then composes to <WorkspaceRoot>/b.json —
+// "elsewhere" — under a join the opaque branch would have left unanchored).
 //
-//   - a conditional rebind staticPathText can read as .cog-ROOTED is trusted
-//     rather than paired (poisonConditionalAndLoopRebinds's doc comment).
-//     Over-claims toward .cog, so it cannot produce a false "elsewhere".
+//   - a rebind staticPathText can read as .cog-ROOTED, in a conditional or a
+//     closure alike, is trusted rather than paired
+//     (poisonConditionalAndLoopRebinds's doc comment). Over-claims toward
+//     .cog, so it cannot produce a false "elsewhere".
 //   - agreement is checked at CATEGORY granularity, so an agreeing pair
 //     reports ONE branch's pattern text, which can compose upward differently
 //     from the other's — chaseReturns's own long-standing exposure, shared on
-//     purpose (same doc comment).
+//     purpose (same doc comment). Which way that lands depends on which
+//     branch was displaced, so unlike the first entry it is NOT
+//     direction-safe.
 //   - an opaque tail segment under a positively-known LITERAL absolute root
 //     still classifies "elsewhere", because hasOpaqueSegment is scoped to
 //     <WorkspaceRoot>-rooted patterns (classify's doc comment). Not about
 //     branches at all — it reproduces with no conditional in the snippet — but
 //     a conditional rebind deleted outright by the readable-and-non-.cog
 //     poison degrades into exactly its shape.
-//   - a branch-local `:=` whose name collides with a PARAMETER of the
-//     enclosing function shadows that parameter for a site AFTER the branch.
-//     applyAssign's shadow guard is an existence test over defs, and
-//     parameters are not in defs, so the branch-local reads as a fresh local
-//     and survives its own scope:
+//   - a branch-local (or closure-local) `:=` whose name collides with a
+//     PARAMETER of the enclosing function shadows that parameter for a site
+//     AFTER the branch. applyAssign's shadow guard is an existence test over
+//     defs, and parameters are not in defs, so the branch-local reads as a
+//     fresh local and survives its own scope:
 //
 //	func Save(a bool, path string) error {
 //	    if a { path := "/etc/elsewhere.json"; _ = path }
 //	    return os.WriteFile(path, nil, 0644)  // "elsewhere", from a dead value
 //	}
 //
-//     even when every caller passes a .cog/ path. Both this and the previous
-//     gap predate the branch-pair mechanism and are unchanged by it
+//     even when every caller passes a .cog/ path. The closure spelling
+//     (`defer func() { path := "/etc/elsewhere.json"; _ = path }()`) is the
+//     same gap through the same guard, and is NOT closed by round 9's
+//     FuncLit-as-conditional-region change — that change protects an outer
+//     BINDING, and a parameter has none to protect. Both this and the
+//     previous gap predate the branch-pair mechanism and are unchanged by it
 //     (reproduced identically at 82e8cb3 and d941abe); closing either is a
 //     recall decision to make with a golden diff in hand.
+//
+// TWO MECHANISMS THAT WERE OUTSIDE THIS LIST are now closed, which is the
+// only honest way to record that the "exhaustive" claim above had already
+// been false once. Both were latent — no shipping site had either shape, and
+// both reproduce identically at 82e8cb3 and d941abe, so neither was
+// introduced by the branch-pair mechanism:
+//
+//   - a FUNC-LITERAL body was absent from applyDirectLocalDefs's condRegion,
+//     so a closure's plain `=` with an RHS staticPathText cannot read was
+//     neither poisoned nor paired and reached the full resolver alone. A
+//     closure body is now a conditional region for all of that bookkeeping
+//     (poisonConditionalAndLoopRebinds's FUNCTION LITERALS section).
+//   - containsGoto modeled only the BACKWARD jump. A FORWARD `goto` over a
+//     function-level rebind left that rebind folded as always-executing. A
+//     function containing any `goto` now has its plain `=` rebinds poisoned
+//     at every level, in both directions (foldScopeLevel's gotoPresent).
 //
 // A degenerate/disagreeing pattern is exposed to none of the four: classify
 // routes it through isOpaqueRoot, which short-circuits on degenerateRoot
@@ -628,9 +657,16 @@ func paramNames(fl *ast.FieldList) []string {
 // body's rebinds are poisoned for a use site outside the loop) rather than
 // ignored. A backward `goto` is the same hazard without the loop syntax, so
 // a function containing any `goto` at all is treated as re-entrant at every
-// level. Last-assignment-wins itself is unchanged for the straight-line case
-// it was always about: a rebind BEFORE P still wins over everything before
-// it (TestStraightLineRebindStillLastAssignmentWins).
+// level. A FORWARD `goto` is the mirror hazard — it can jump OVER a rebind
+// that PRECEDES P, so a statement this walk folds as always-executing may
+// never run — and it is answered the same blunt way, since neither direction
+// is worth modeling label targets for: in a function containing any `goto`,
+// every plain `=` rebind at every level is poisoned outright, before and
+// after P alike (foldScopeLevel's gotoPresent,
+// TestForwardGotoOverRebindPoisonsSite). Last-assignment-wins itself is
+// unchanged for the straight-line, goto-free case it was always about: a
+// rebind BEFORE P still wins over everything before it
+// (TestStraightLineRebindStillLastAssignmentWins).
 
 // localDefsFor resolves the local defs visible at pos, folding pos's scope
 // chain level by level (see the semantics block above). It is memoized per
@@ -667,12 +703,21 @@ func localDefsFor(cache map[token.Pos]map[string]ast.Expr, fnBody *ast.BlockStmt
 	// by. Rather than model label targets, treat a function containing any
 	// `goto` as re-entrant at every level — the conservative side (after-pos
 	// rebinds poison instead of being ignored).
-	revisitable := containsGoto(fnBody)
+	//
+	// A FORWARD `goto` is the same hazard in the other direction: it can
+	// jump OVER a rebind that precedes pos textually, so a rebind this walk
+	// folds as always-executing may never run at all. Neither direction is
+	// modeled by label targets; gotoPresent carries the fact that the
+	// function has one to every level's poison pass, which then un-trusts
+	// every plain `=` rebind at that level (see
+	// poisonConditionalAndLoopRebinds).
+	gotoPresent := containsGoto(fnBody)
+	revisitable := gotoPresent
 	defs := map[string]ast.Expr{}
-	foldScopeLevel(defs, fnBody, pos, revisitable)
+	foldScopeLevel(defs, fnBody, pos, revisitable, gotoPresent)
 	for _, level := range scopeChain(fnBody, pos) {
 		revisitable = revisitable || level.isLoop
-		foldScopeLevel(defs, level.body, pos, revisitable)
+		foldScopeLevel(defs, level.body, pos, revisitable, gotoPresent)
 	}
 	cache[pos] = defs
 	return defs
@@ -694,14 +739,26 @@ func localDefsFor(cache map[token.Pos]map[string]ast.Expr, fnBody *ast.BlockStmt
 // again after them, in which case they are poisoned instead. limit may be
 // token.NoPos, which turns both position rules off and folds the whole body
 // — the whole-function form collectLocalDefs needs.
-func foldScopeLevel(defs map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable bool) {
+//
+// gotoPresent says the enclosing function contains a `goto` at all, which
+// makes every plain `=` rebind at every level untrustworthy in BOTH
+// directions (a backward jump can re-run the site after a later rebind; a
+// forward jump can skip an earlier one). It is deliberately a SEPARATE flag
+// from revisitable, which a loop body also sets: a loop body's statements
+// before the site do execute before it on every iteration, so they stay
+// trustworthy, and only the after-limit ones need the back-edge treatment.
+func foldScopeLevel(defs map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable, gotoPresent bool) {
 	displaced := applyDirectLocalDefs(defs, body, true, limit)
-	poisonConditionalAndLoopRebinds(defs, displaced, body, limit, revisitable)
+	poisonConditionalAndLoopRebinds(defs, displaced, body, limit, revisitable, gotoPresent)
 }
 
 // containsGoto reports whether body contains any `goto` statement, including
 // inside nested function literals (over-approximating on purpose — see
-// localDefsFor).
+// localDefsFor). It says nothing about the jump's DIRECTION, and callers do
+// not ask: a backward jump re-runs a site after later statements, a forward
+// jump skips earlier ones, and localDefsFor answers both by treating the
+// whole function as untrustworthy for plain `=` rebinds rather than by
+// resolving label targets.
 func containsGoto(body *ast.BlockStmt) bool {
 	found := false
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -738,7 +795,10 @@ func containsGoto(body *ast.BlockStmt) bool {
 // resolved using the SECOND loop's `f.target`, not its own loop's `dir`).
 func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 	defs := map[string]ast.Expr{}
-	foldScopeLevel(defs, body, token.NoPos, false)
+	// No position to scope by, so revisitable is meaningless here — but a
+	// `goto` still makes this body's plain `=` rebinds untrustworthy for
+	// EVERY reader of the map, which is exactly what gotoPresent says.
+	foldScopeLevel(defs, body, token.NoPos, false, containsGoto(body))
 	return defs
 }
 
@@ -796,16 +856,42 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // walk: a plain `=` inside a closure rebinds the captured outer variable,
 // and over-poisoning fails toward unanchored, the honest side.
 //
-// FUNCTION LITERALS get the conditional (narrow) poison in their own right,
-// wherever they sit. applyDirectLocalDefs walks INTO a func literal's body
-// and folds its assignments into the enclosing function's map, but a
-// closure's body is never on an enclosing-function use site's scope chain —
-// a position inside a func literal resolves against that literal's OWN
-// funcScope (see collectFuncScopes/enclosingFuncScope) — and whether the
-// closure ran at all before a given use site is exactly the kind of thing
-// this package does not model. So a closure's plain `=` to a provably
-// non-.cog root is a sibling-branch value by any other name, and is
-// poisoned on the same terms as a conditional's.
+// FUNCTION LITERALS are treated as a conditional region in FULL, wherever
+// they sit. applyDirectLocalDefs walks INTO a func literal's body and folds
+// its assignments into the enclosing function's map, but a closure's body is
+// never on an enclosing-function use site's scope chain — a position inside a
+// func literal resolves against that literal's OWN funcScope (see
+// collectFuncScopes/enclosingFuncScope) — and whether the closure ran at all
+// before a given use site is exactly the kind of thing this package does not
+// model. A closure body is therefore the DEFINITION of
+// not-guaranteed-to-execute-before-the-site, and every one of the three
+// pieces of conditional bookkeeping applies to it identically:
+//
+//   - a closure's plain `=` to a root staticPathText can read as non-.cog is
+//     deleted here, exactly as a conditional's is
+//     (TestFuncLitRebindPoisonsEnclosingSite);
+//   - a closure's plain `=` whose RHS staticPathText CANNOT read is PAIRED
+//     against the binding it displaced, exactly as a conditional's is —
+//     applyDirectLocalDefs's condRegion carries the closure's body, so
+//     condDepth is nonzero inside it and applyAssign records the
+//     displacement the pair needs (TestFuncLitUnreadableRebindPairs
+//     AgainstDisplacedBinding, over all four shapes a closure reaches an
+//     enclosing local through: called via a parameter, `defer`, `go`, and
+//     bound to a local);
+//   - a closure's `:=` is a shadow scoped to the closure and never touches
+//     the enclosing binding — applyDirectLocalDefs's isScope counts the
+//     FuncLit node for the same reason it counts an IfStmt
+//     (TestFuncLitShadowDeclarationLeavesOuterBindingIntact).
+//
+// Only the first of those three was true before round 9, and the second's
+// absence was a live false-"elsewhere" mechanism: an unreadable closure
+// rebind was neither poisoned (staticPathText cannot read it) NOR paired
+// (nothing was recorded as displaced, so the pairing loop's `!hadOuter`
+// guard skipped it), which left the closure's own RHS alone in defs for the
+// full interprocedural resolver — which reads plenty this evaluator cannot.
+// The cog-favoring asymmetry below applies here unchanged: a closure rebind
+// readable as .cog-ROOTED is still trusted outright
+// (TestFuncLitCogBearingRebindStaysTrusted).
 //
 // CONDITIONALS are a deliberately NARROWER poison than loops, for two
 // independent reasons layered on top of each other.
@@ -939,8 +1025,9 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // symmetric (pairing a .cog-bearing rebind against its outer binding too)
 // would move real, currently-caught .cog/ writers into the unanchored margin
 // for a consistency gain; it is left as is, pinned by
-// TestConditionalCogBearingRebindStaysTrusted so a future change to the
-// balance is a conscious decision.
+// TestConditionalCogBearingRebindStaysTrusted — and, since round 9 put
+// closures on these same terms, by TestFuncLitCogBearingRebindStaysTrusted —
+// so a future change to the balance is a conscious decision.
 //
 // Second, agreement is checked at CATEGORY granularity, not pattern
 // granularity: when the two branches agree, the DISPLACED branch's pattern
@@ -969,7 +1056,7 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // so it is named as a known hole rather than fixed blind; closing it means
 // giving chaseReturns and the pair ONE shared rule for which of several
 // agreeing texts to report, not patching this call site alone.
-func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, displaced map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable bool) {
+func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, displaced map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable, gotoPresent bool) {
 	if body == nil {
 		return
 	}
@@ -1046,6 +1133,34 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, displaced map[str
 					continue
 				}
 				delete(defs, ident.Name)
+			}
+			return true
+		})
+	}
+	// A `goto` anywhere in the function makes EVERY plain `=` rebind at this
+	// level untrustworthy, in both directions and regardless of limit: a
+	// backward jump re-runs the site after a later rebind (that is what
+	// revisitable's after-limit poison below already handles), and a FORWARD
+	// jump skips an earlier one, which nothing else here models —
+	// `path := <.cog path>; if a { goto done }; path = "/etc/a.json"; done:
+	// write(path)` folds the rebind as always-executing and stamps a genuine
+	// .cog write "elsewhere" when a is true. Rather than model label targets
+	// and reachability, poison outright: it fails to unanchored, which is
+	// always an acceptable landing, and no non-test function in this corpus
+	// contains a `goto` at all. Compound assigns are deliberately left alone
+	// — a skipped `+=` changes the suffix, never the root, so the category
+	// this package reports is the same either way (see the LOOPS section
+	// above for the same plain-vs-compound reasoning).
+	if gotoPresent {
+		ast.Inspect(body, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok || assign.Tok != token.ASSIGN {
+				return true
+			}
+			for _, lhs := range assign.Lhs {
+				if ident, ok := lhs.(*ast.Ident); ok && ident.Name != "_" {
+					delete(defs, ident.Name)
+				}
 			}
 			return true
 		})
@@ -1427,6 +1542,14 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 			condRegion[s.Body] = true
 		case *ast.SelectStmt:
 			condRegion[s.Body] = true
+		case *ast.FuncLit:
+			// A closure body is the DEFINITION of not-guaranteed-to-execute-
+			// before-the-site: whether it ran at all, and how many times, is
+			// exactly what this package does not model. It is therefore a
+			// conditional region for both bookkeeping questions — see the
+			// two-depths comment above and
+			// poisonConditionalAndLoopRebinds's FUNCTION LITERALS section.
+			condRegion[s.Body] = true
 		}
 		return true
 	})
@@ -1436,6 +1559,14 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 	isScope := func(n ast.Node) bool {
 		switch n.(type) {
 		case *ast.IfStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt:
+			return true
+		case *ast.FuncLit:
+			// A `:=` inside a closure declares a variable scoped to the
+			// closure, exactly as a conditional's does to its branch, and
+			// must not clobber the enclosing function's same-named binding
+			// in this block-scoping-free map. (A site INSIDE the closure
+			// resolves against the closure's own funcScope, so the shadow's
+			// own value stays visible where it is actually in scope.)
 			return true
 		}
 		return false
