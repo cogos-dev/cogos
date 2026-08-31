@@ -1225,8 +1225,9 @@ func (idx *globalIndex) methodChase(dir, recvType, methodName string, callee *as
 // same species of open, documented gap as fieldOrigin/paramOrigin's
 // positive-memoization depth-dependence above, not a claim that
 // cross-call-boundary composition is closed — only the WITHIN-one-scope
-// composition (filepath.Join/Dir/Base wrapping a concat in the same
-// function) is.
+// composition (filepath.Join/Dir/Base, or a further string concatenation
+// — including through a compound assign's synthetic BinaryExpr — wrapping
+// or extending a concat in the same function) is.
 func substituteAndMergeDefs(params []string, args []ast.Expr, calleeBody *ast.BlockStmt, caller *resolver, callerDefs map[string]ast.Expr, depth int) map[string]ast.Expr {
 	merged := map[string]ast.Expr{}
 	for i, p := range params {
@@ -1347,18 +1348,30 @@ func resolverContextFor(idx *globalIndex, dir string, sc funcScope) *resolver {
 // signal in this package is (see isOpaqueRoot): it has to be threaded
 // through as its own value from the exact point it's known, and it stays
 // true once set: composing a degenerate sub-expression into a larger
-// pattern (via filepath.Join, joining resolved parts with "/", or
-// filepath.Dir/Base, wrapping "dirname(...)"/"basename(...)" around an
-// inner resolution) never launders it back to positive information, even
-// when the degenerate fragment ends up buried in the composed pattern's
-// tail rather than sitting at its literal front. filepath.Join's own
-// degenerateRoot is true when ANY kept argument was flagged degenerate,
-// regardless of which position it lands in; filepath.Dir/Base inherit
-// their single inner expression's flag directly, since dirname(x)/
-// basename(x) never changes what x's own root was. Every other case
-// either produces a positively-known root (an anchor, a literal) and is
-// never degenerate, or produces an opaque placeholder ("{name}",
-// "<call:...>") that pattern's text already flags as opaque on its own.
+// pattern — via filepath.Join, joining resolved parts with "/";
+// filepath.Dir/Base wrapping "dirname(...)"/"basename(...)" around an
+// inner resolution; or a further string concatenation gluing another
+// operand onto an already-degenerate one (including the SYNTHETIC
+// BinaryExpr a compound assign like `p += ".tmp"` folds onto an existing
+// binding — see applyAssign) — never launders it back to positive
+// information, even when the degenerate fragment ends up buried in the
+// composed pattern's tail rather than sitting at its literal front.
+// filepath.Join's own degenerateRoot is true when ANY kept argument was
+// flagged degenerate, regardless of which position it lands in;
+// filepath.Dir/Base inherit their single inner expression's flag
+// directly, since dirname(x)/basename(x) never changes what x's own root
+// was; a further BinaryExpr concatenation ORs both operands' own flags
+// together with its own left=="" test (see the BinaryExpr case), since
+// EITHER operand can already be carrying a degenerate root from a nested
+// sub-expression, not only this level's own left-hand side. Every other
+// case in the switch below either produces a positively-known root (an
+// anchor, a literal, a package-level const) and is never degenerate, or
+// produces an opaque placeholder ("{name}", "<call:...>") that pattern's
+// text already flags as opaque on its own, so degeneracy is moot for it —
+// see the table in resolveExpr's own switch and resolveCall for the
+// per-case disposition; every branch that composes or transforms a
+// sub-expression's resolution is required to fall into one of these two
+// buckets, and there is no third bucket that silently drops the flag.
 func (r *resolver) resolveExpr(e ast.Expr, defs map[string]ast.Expr, depth int) (pattern string, ok bool, degenerateRoot bool) {
 	if depth > maxChaseDepth {
 		return "<max-depth>", false, false
@@ -1378,8 +1391,8 @@ func (r *resolver) resolveExpr(e ast.Expr, defs map[string]ast.Expr, depth int) 
 		if v.Op != token.ADD {
 			return "<expr>", false, false
 		}
-		left, leftOK, _ := r.resolveExpr(v.X, defs, depth+1)
-		right, rightOK, _ := r.resolveExpr(v.Y, defs, depth+1)
+		left, leftOK, leftDeg := r.resolveExpr(v.X, defs, depth+1)
+		right, rightOK, rightDeg := r.resolveExpr(v.Y, defs, depth+1)
 		combined := left + right
 		// Concatenation is the manual-join idiom's own primitive
 		// (`base + "/observations.jsonl"` instead of filepath.Join(base,
@@ -1397,7 +1410,27 @@ func (r *resolver) resolveExpr(e ast.Expr, defs map[string]ast.Expr, depth int) 
 		// classify reading its accidental leading slash as the same
 		// positive evidence a genuine literal like
 		// "/etc/cogos/config.yaml" carries.
-		degenerate := left == "" && strings.HasPrefix(right, "/")
+		//
+		// Either operand's OWN degenerateRoot must also be propagated, not
+		// just this level's own left=="" shape — the same any-operand-
+		// degenerate posture filepath.Join already takes (see resolveCall's
+		// Join case). Without this, a concat composing an ALREADY-degenerate
+		// sub-expression silently launders it back to positive information
+		// the moment this level's own left operand is no longer literally
+		// "" — which is exactly what happens one level up from the
+		// degenerate concat itself: `p := base + "/observations.jsonl"`
+		// (degenerate, left=="") followed by `p += ".tmp"` folds into a
+		// SYNTHETIC outer BinaryExpr(BinaryExpr(base, "/observations.jsonl"),
+		// ".tmp") — see applyAssign's compound-assignment fold — whose own
+		// left operand resolves to "/observations.jsonl", not "", so the
+		// left=="" test alone finds nothing degenerate at this level even
+		// though its left operand's OWN root was never positively
+		// established. The identical shape recurs for a second concat
+		// chained directly onto a degenerate one (`p + ".gz"`) and for a
+		// concat appending onto a degenerate filepath.Dir/Base wrapping
+		// (dirname(base+"/x") is itself degenerate per the Dir case below,
+		// and appending ".log" onto that must not clear it either).
+		degenerate := leftDeg || rightDeg || (left == "" && strings.HasPrefix(right, "/"))
 		return combined, leftOK && rightOK, degenerate
 
 	case *ast.Ident:

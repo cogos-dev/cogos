@@ -429,6 +429,108 @@ func f() {
 	}
 }
 
+// TestConcatOfDegenerateConcatNeverElsewhere reproduces the round-4 CI
+// review's confirmed leak: a SECOND string concatenation appending onto an
+// already-degenerate concat's RESULT, reached through an intermediate local
+// (`p := base + "/x"` then `p + ".tmp"`), rather than a compound assign.
+// Before the fix, the BinaryExpr case discarded both operands' own
+// degenerateRoot with `_` and recomputed the flag from scratch as
+// `left == "" && strings.HasPrefix(right, "/")` — which finds nothing here,
+// because by the time `p` is resolved its own text is already
+// "/x" (non-empty), even though that text's root was never positively
+// established. The fix threads `p`'s own degenerateRoot through as
+// leftDeg instead of discarding it.
+func TestConcatOfDegenerateConcatNeverElsewhere(t *testing.T) {
+	src := `package p
+func f() {
+	base := ""
+	p := base + "/x"
+	os.WriteFile(p+".tmp", nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+
+	if pattern != "/x.tmp" {
+		t.Errorf("pattern = %q, want %q", pattern, "/x.tmp")
+	}
+	if !resolved {
+		t.Errorf("resolved = false, want true")
+	}
+	if !degenerate {
+		t.Errorf("degenerate = false, want true — %q's own root was never positively established, and concatenating onto it must not launder that away", "p")
+	}
+	if got := classify(pattern, resolved, degenerate); got == "elsewhere" {
+		t.Errorf("classify(%q, %v, %v) = %q, want anything but \"elsewhere\"", pattern, resolved, degenerate, got)
+	}
+}
+
+// TestCompoundAssignOntoDegenerateConcatNeverElsewhere reproduces the
+// round-4 CI review's other confirmed leak, and the exact idiom isOpaqueRoot's
+// own doc comment already cites as real (`memPath += ".md"`): a compound
+// assign folds onto an EXISTING degenerate concat via applyAssign's
+// synthetic `BinaryExpr{X: prev, Op: ADD, Y: rhs}`, so the outer BinaryExpr's
+// own left operand is itself a BinaryExpr (not empty-string text) by the
+// time resolveExpr reaches it — the identical shape
+// TestConcatOfDegenerateConcatNeverElsewhere exercises via an intermediate
+// local instead of a compound assign, confirming the fix covers both
+// syntactic routes to the same synthetic-BinaryExpr shape.
+func TestCompoundAssignOntoDegenerateConcatNeverElsewhere(t *testing.T) {
+	src := `package p
+func f() {
+	base := ""
+	p := base + "/observations.jsonl"
+	p += ".md"
+	os.WriteFile(p, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+
+	if pattern != "/observations.jsonl.md" {
+		t.Errorf("pattern = %q, want %q", pattern, "/observations.jsonl.md")
+	}
+	if !resolved {
+		t.Errorf("resolved = false, want true")
+	}
+	if !degenerate {
+		t.Errorf("degenerate = false, want true — the compound assign's synthetic BinaryExpr must not lose the inner concat's own degeneracy")
+	}
+	if got := classify(pattern, resolved, degenerate); got == "elsewhere" {
+		t.Errorf("classify(%q, %v, %v) = %q, want anything but \"elsewhere\"", pattern, resolved, degenerate, got)
+	}
+}
+
+// TestConcatOntoDegenerateDirNeverElsewhere reproduces the round-4 CI
+// review's third confirmed laundering shape: a string concatenation
+// appending a further literal segment onto a filepath.Dir call that itself
+// wraps a degenerate concat — `filepath.Dir(base+"/observations.jsonl")` is
+// degenerate (the Dir case inherits its inner expression's flag), and
+// appending "/y.json" onto that result must not clear it, even though the
+// Dir call's own resolved text ("dirname(/observations.jsonl)") is
+// non-empty and carries no leading "/" for the BinaryExpr case's own
+// left=="" test to catch.
+func TestConcatOntoDegenerateDirNeverElsewhere(t *testing.T) {
+	src := `package p
+func f() {
+	base := ""
+	os.WriteFile(filepath.Dir(base+"/observations.jsonl")+"/y.json", nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+
+	if pattern != "dirname(/observations.jsonl)/y.json" {
+		t.Errorf("pattern = %q, want %q", pattern, "dirname(/observations.jsonl)/y.json")
+	}
+	if !resolved {
+		t.Errorf("resolved = false, want true")
+	}
+	if !degenerate {
+		t.Errorf("degenerate = false, want true — dirname(...)'s own inherited degeneracy must survive a further concat appended onto its result")
+	}
+	if got := classify(pattern, resolved, degenerate); got == "elsewhere" {
+		t.Errorf("classify(%q, %v, %v) = %q, want anything but \"elsewhere\"", pattern, resolved, degenerate, got)
+	}
+}
+
 // TestFieldAndParamOriginChase exercises the callable-origin index directly
 // — the mechanism that chases a struct field or a bare function parameter
 // back to where it was actually constructed, closing the exact defect class
