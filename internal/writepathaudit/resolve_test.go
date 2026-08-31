@@ -295,6 +295,44 @@ func f() {
 	}
 }
 
+// TestConcatEmptyBaseNeverElsewhere reproduces the CONCATENATION shape of
+// the same over-claim TestJoinEmptyBaseNeverElsewhere fixes for
+// filepath.Join: `base := ""` followed by `base + "/observations.jsonl"`
+// reached through string concatenation (token.ADD on a *ast.BinaryExpr)
+// rather than a filepath.Join call. The Join fix alone did not cover this
+// producer — the round-2 CI review's confirmed finding against it — because
+// the "/" here is already baked into the right-hand literal rather than
+// inserted as a separator between joined parts, so Join's empty-part-
+// skipping logic never runs. The fix instead tags the concatenation result
+// with degenerateRootMarker whenever the left operand resolves to the
+// literal empty string and the right operand starts with "/", and
+// isOpaqueRoot treats that marker as an opaque root — the same "we have not
+// positively established a destination outside .cog/" honesty margin the
+// Join case lands in, not a confirmed absolute-path literal like
+// "/etc/cogos/config.yaml".
+func TestConcatEmptyBaseNeverElsewhere(t *testing.T) {
+	src := `package p
+func f() {
+	base := ""
+	os.WriteFile(base+"/observations.jsonl", nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved := r.resolveExpr(argExpr, defs, 0)
+
+	if !resolved {
+		t.Errorf("resolved = false, want true — both the base and the literal resolved successfully")
+	}
+	if got := classify(pattern, resolved); got == "elsewhere" {
+		t.Errorf("classify(%q, %v) = %q, want anything but \"elsewhere\" — the leading slash came from concatenating a literal onto an empty-resolved base, not from a genuine absolute-path literal", pattern, resolved, got)
+	}
+
+	// stripDegenerateRootMarker is what a Site.Pattern actually carries —
+	// the marker itself must never reach the rendered inventory.
+	if displayed := stripDegenerateRootMarker(pattern); displayed != "/observations.jsonl" {
+		t.Errorf("stripDegenerateRootMarker(%q) = %q, want %q", pattern, displayed, "/observations.jsonl")
+	}
+}
+
 // TestFieldAndParamOriginChase exercises the callable-origin index directly
 // — the mechanism that chases a struct field or a bare function parameter
 // back to where it was actually constructed, closing the exact defect class

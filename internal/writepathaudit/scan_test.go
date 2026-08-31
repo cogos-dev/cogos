@@ -76,6 +76,37 @@ func marshalReport(t *testing.T, r *Report) []byte {
 	return append(out, '\n')
 }
 
+// diffAgainstGolden serializes report exactly the way the golden files are
+// serialized (marshalReport for JSON, RenderMarkdown for markdown) and
+// reports whether each differs from the committed golden. This is the ONE
+// comparison the golden-diff gate runs — TestInventory_MatchesGolden (the
+// drift check that runs on every CI build) and TestGoldenGate_
+// DetectsInjectedCogWrite (the mutation test proving the gate fails
+// closed) both call this same function rather than each maintaining its
+// own copy of the comparison. That sharing is the point: a mutation test
+// built against an independently-reimplemented comparison can prove
+// nothing about whether the REAL gate's comparison fails closed — it
+// would keep passing even if TestInventory_MatchesGolden's own comparison
+// were silently neutered, since the two never share code. Routing both
+// through diffAgainstGolden means a bug in the comparison logic breaks
+// both tests identically, which is what makes the mutation test's proof
+// actually apply to the gate it claims to guard.
+func diffAgainstGolden(t *testing.T, report *Report) (jsonDiffers, mdDiffers bool) {
+	t.Helper()
+	jsonPath, mdPath := goldenPaths(t)
+	wantJSON, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read golden json (run TestInventory_MatchesGolden -update first): %v", err)
+	}
+	wantMD, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read golden md (run TestInventory_MatchesGolden -update first): %v", err)
+	}
+	gotJSON := marshalReport(t, report)
+	gotMD := RenderMarkdown(report)
+	return string(gotJSON) != string(wantJSON), gotMD != string(wantMD)
+}
+
 func TestInventory_MatchesGolden(t *testing.T) {
 	root := repoRoot(t)
 	report, err := Scan(root)
@@ -86,12 +117,11 @@ func TestInventory_MatchesGolden(t *testing.T) {
 		t.Fatalf("scan found zero write sites — this almost certainly means the scan is broken, not that the repo stopped writing to disk")
 	}
 
-	gotJSON := marshalReport(t, report)
-	gotMD := RenderMarkdown(report)
-
 	jsonPath, mdPath := goldenPaths(t)
 
 	if *update {
+		gotJSON := marshalReport(t, report)
+		gotMD := RenderMarkdown(report)
 		if err := os.WriteFile(jsonPath, gotJSON, 0o644); err != nil {
 			t.Fatalf("write golden json: %v", err)
 		}
@@ -103,23 +133,15 @@ func TestInventory_MatchesGolden(t *testing.T) {
 		return
 	}
 
-	wantJSON, err := os.ReadFile(jsonPath)
-	if err != nil {
-		t.Fatalf("read golden json (run with -update to create it): %v", err)
-	}
-	wantMD, err := os.ReadFile(mdPath)
-	if err != nil {
-		t.Fatalf("read golden md (run with -update to create it): %v", err)
-	}
-
-	if string(gotJSON) != string(wantJSON) {
+	jsonDiffers, mdDiffers := diffAgainstGolden(t, report)
+	if jsonDiffers {
 		t.Errorf("write-path inventory (JSON) has drifted from testdata/inventory.golden.json.\n" +
 			"A write path was added, removed, or changed. Either:\n" +
 			"  1. undo the write-path change, or\n" +
 			"  2. re-declare the golden: go test ./internal/writepathaudit/ -run TestInventory_MatchesGolden -update\n" +
 			"then review the diff to testdata/inventory.golden.json before committing it.")
 	}
-	if gotMD != string(wantMD) {
+	if mdDiffers {
 		t.Errorf("write-path inventory (markdown) has drifted from testdata/inventory.golden.md — regenerate with -update (see JSON error above for the procedure)")
 	}
 }
@@ -148,28 +170,16 @@ func TestGoldenGate_DetectsInjectedCogWrite(t *testing.T) {
 		t.Fatalf("Scan(%s): %v", root, err)
 	}
 
-	jsonPath, mdPath := goldenPaths(t)
-	wantJSON, err := os.ReadFile(jsonPath)
-	if err != nil {
-		t.Fatalf("read golden json (run TestInventory_MatchesGolden -update first): %v", err)
-	}
-	wantMD, err := os.ReadFile(mdPath)
-	if err != nil {
-		t.Fatalf("read golden md (run TestInventory_MatchesGolden -update first): %v", err)
-	}
-
 	// Precondition: the UNMODIFIED live scan must already match the
 	// committed golden. Otherwise this test would "pass" for the wrong
 	// reason — ANY report at all would differ from an already-stale
 	// golden, telling us nothing about whether the gate detects a real,
 	// isolated mutation. TestInventory_MatchesGolden enforces this same
-	// invariant; asserting it again here keeps this test meaningful on
-	// its own even if run in isolation.
-	if got := marshalReport(t, report); string(got) != string(wantJSON) {
+	// invariant (through this same diffAgainstGolden call); asserting it
+	// again here keeps this test meaningful on its own even if run in
+	// isolation.
+	if jsonDiffers, mdDiffers := diffAgainstGolden(t, report); jsonDiffers || mdDiffers {
 		t.Fatalf("precondition failed: the live scan does not match the committed golden BEFORE injecting anything — golden is stale, run -update first")
-	}
-	if got := RenderMarkdown(report); got != string(wantMD) {
-		t.Fatalf("precondition failed: the live scan's markdown does not match the committed golden BEFORE injecting anything — golden is stale, run -update first")
 	}
 
 	// Inject a synthetic .cog/ write site the real repo does not have —
@@ -197,13 +207,11 @@ func TestGoldenGate_DetectsInjectedCogWrite(t *testing.T) {
 	byPrimitive["os.WriteFile"]++
 	mutated.Summary.ByPrimitive = byPrimitive
 
-	gotJSON := marshalReport(t, &mutated)
-	gotMD := RenderMarkdown(&mutated)
-
-	if string(gotJSON) == string(wantJSON) {
+	jsonDiffers, mdDiffers := diffAgainstGolden(t, &mutated)
+	if !jsonDiffers {
 		t.Error("golden gate did not notice an injected .cog/ write site — mutated JSON is byte-identical to the committed golden")
 	}
-	if gotMD == string(wantMD) {
+	if !mdDiffers {
 		t.Error("golden gate did not notice an injected .cog/ write site — mutated markdown is byte-identical to the committed golden")
 	}
 }
