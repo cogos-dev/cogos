@@ -555,9 +555,14 @@ func paramNames(fl *ast.FieldList) []string {
 // under .cog/. That is the invariant working, not a gap in it.
 //
 // IT IS A GOAL, NOT A THEOREM. FOUR GAPS ARE OPEN, and a write site can still
-// come out "elsewhere" through the last three. This list is meant to be
-// exhaustive — a gap found outside it is a defect in this paragraph as much as
-// in the code — and each is named again where it lives. Each entry's stated
+// come out "elsewhere" through the last three. This list is MAINTAINED, not
+// proven: three times now a mechanism outside it has been found by
+// adversarial review and either closed or added, so the honest claim is not
+// "these are all the gaps" but "these are the known ones, and the
+// golden-diff gate plus adversarial review is the instrument that extends
+// this list" — a gap found outside it is a finding to record here, not a
+// contradiction to explain away. Each entry is named again where it lives,
+// and each entry's stated
 // behavior was re-verified against the code at round 9, not carried forward
 // on trust; the "last three" above is one such correction, since the second
 // entry's own composed-upward reproduction does reach "elsewhere" (a
@@ -601,10 +606,12 @@ func paramNames(fl *ast.FieldList) []string {
 //     (reproduced identically at 82e8cb3 and d941abe); closing either is a
 //     recall decision to make with a golden diff in hand.
 //
-// TWO MECHANISMS THAT WERE OUTSIDE THIS LIST are now closed, which is the
-// only honest way to record that the "exhaustive" claim above had already
-// been false once. Both were latent — no shipping site had either shape, and
-// both reproduce identically at 82e8cb3 and d941abe, so neither was
+// THREE MECHANISMS THAT WERE OUTSIDE THIS LIST are now closed, which is the
+// only honest way to record that the old "exhaustive" claim had already
+// been false. All three were latent — no shipping WRITE site's
+// classification is affected (functions with these shapes exist in the repo,
+// but none of them also holds a write site, so the golden is unchanged), and
+// all three reproduce identically at 82e8cb3 and d941abe, so none was
 // introduced by the branch-pair mechanism:
 //
 //   - a FUNC-LITERAL body was absent from applyDirectLocalDefs's condRegion,
@@ -616,6 +623,14 @@ func paramNames(fl *ast.FieldList) []string {
 //     function-level rebind left that rebind folded as always-executing. A
 //     function containing any `goto` now has its plain `=` rebinds poisoned
 //     at every level, in both directions (foldScopeLevel's gotoPresent).
+//   - an assignment through an ALIAS (`pp := &base; *pp = ...`) was invisible
+//     to applyAssign's Ident-only LHS filter — with or without a conditional
+//     in the snippet — so the aliased rebind never displaced, poisoned, or
+//     paired anything and the site classified from a dead value. Any name
+//     whose address is taken with `&name` anywhere in the function is now
+//     deleted from defs after every level folds (addressTakenNames), falling
+//     to the unanchored margin; deliberately over-conservative, an address
+//     taken only for reading poisons too.
 //
 // A degenerate/disagreeing pattern is exposed to none of the four: classify
 // routes it through isOpaqueRoot, which short-circuits on degenerateRoot
@@ -719,6 +734,13 @@ func localDefsFor(cache map[token.Pos]map[string]ast.Expr, fnBody *ast.BlockStmt
 		revisitable = revisitable || level.isLoop
 		foldScopeLevel(defs, level.body, pos, revisitable, gotoPresent)
 	}
+	// Final pass, after every level has folded: a name whose address is
+	// taken anywhere in the function can be rebound through an alias no
+	// LHS filter above ever saw, so no level's binding of it survives
+	// (addressTakenNames).
+	for name := range addressTakenNames(fnBody) {
+		delete(defs, name)
+	}
 	cache[pos] = defs
 	return defs
 }
@@ -773,6 +795,27 @@ func containsGoto(body *ast.BlockStmt) bool {
 	return found
 }
 
+// addressTakenNames reports every local name whose address is taken with
+// `&name` anywhere in body, nested function literals included. A name on
+// this list can be rebound through an alias (`pp := &base; *pp = ...`) that
+// applyAssign's Ident-only LHS filter cannot see, so no binding of it is
+// trustworthy anywhere in the function — the caller deletes such names from
+// defs outright, and the site falls to the unanchored margin. This is
+// deliberately over-conservative: an address taken only for reading poisons
+// too. The alternative — modeling pointer flow — is a different tool.
+func addressTakenNames(body *ast.BlockStmt) map[string]bool {
+	taken := map[string]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if u, ok := n.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			if id, ok := u.X.(*ast.Ident); ok {
+				taken[id.Name] = true
+			}
+		}
+		return true
+	})
+	return taken
+}
+
 // collectLocalDefs builds a last-assignment-wins map of local variable name
 // -> defining expression for a single function body, WITHOUT any position
 // scoping: it is exactly foldScopeLevel applied to the function body alone,
@@ -799,6 +842,9 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 	// `goto` still makes this body's plain `=` rebinds untrustworthy for
 	// EVERY reader of the map, which is exactly what gotoPresent says.
 	foldScopeLevel(defs, body, token.NoPos, false, containsGoto(body))
+	for name := range addressTakenNames(body) {
+		delete(defs, name)
+	}
 	return defs
 }
 
@@ -874,10 +920,10 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 //     against the binding it displaced, exactly as a conditional's is —
 //     applyDirectLocalDefs's condRegion carries the closure's body, so
 //     condDepth is nonzero inside it and applyAssign records the
-//     displacement the pair needs (TestFuncLitUnreadableRebindPairs
-//     AgainstDisplacedBinding, over all four shapes a closure reaches an
-//     enclosing local through: called via a parameter, `defer`, `go`, and
-//     bound to a local);
+//     displacement the pair needs
+//     (TestFuncLitUnreadableRebindPairsAgainstDisplacedBinding, over all
+//     four shapes a closure reaches an enclosing local through: called via
+//     a parameter, `defer`, `go`, and bound to a local);
 //   - a closure's `:=` is a shadow scoped to the closure and never touches
 //     the enclosing binding — applyDirectLocalDefs's isScope counts the
 //     FuncLit node for the same reason it counts an IfStmt

@@ -2351,3 +2351,78 @@ again:
 		t.Errorf("category = %q pattern = %q, want unanchored — the back edge re-runs this write after the rebind", s.Category, s.Pattern)
 	}
 }
+
+// TestAliasedRebindNeverClassifiesFromDeadValue pins the address-taken
+// poison (addressTakenNames): an assignment through a pointer alias is
+// invisible to applyAssign's Ident-only LHS filter, so any name whose
+// address is taken anywhere in the function is deleted from defs after
+// every level folds and the site falls to the unanchored margin. Round-6
+// gate finding — the aliased rebind used to leave the site classifying
+// from a dead value ("elsewhere" on a write real Go sends into .cog/).
+// The rule is deliberately over-conservative: an address taken only for
+// reading poisons too (third subtest). The control pins that a function
+// with no address-taken name is untouched.
+func TestAliasedRebindNeverClassifiesFromDeadValue(t *testing.T) {
+	tests := []struct {
+		name         string
+		src          string
+		line         int
+		wantCategory string
+	}{
+		{
+			name: "straight-line deref rebind",
+			src: `package p
+func f(root string) {
+	base := "/etc/elsewhere.json"
+	pp := &base
+	*pp = filepath.Join(root, ".cog", "s.json")
+	os.WriteFile(base, nil, 0644)
+}`,
+			line:         6,
+			wantCategory: "unanchored",
+		},
+		{
+			name: "conditional deref rebind",
+			src: `package p
+func f(root string, a bool) {
+	base := "/etc/elsewhere.json"
+	pp := &base
+	if a {
+		*pp = filepath.Join(root, ".cog", "s.json")
+	}
+	os.WriteFile(base, nil, 0644)
+}`,
+			line:         8,
+			wantCategory: "unanchored",
+		},
+		{
+			name: "address taken only for reading still poisons",
+			src: `package p
+func f(root string) {
+	base := filepath.Join(root, ".cog", "s.json")
+	observe(&base)
+	os.WriteFile(base, nil, 0644)
+}`,
+			line:         5,
+			wantCategory: "unanchored",
+		},
+		{
+			name: "control: no address taken, resolution unchanged",
+			src: `package p
+func f(root string) {
+	base := filepath.Join(root, ".cog", "s.json")
+	os.WriteFile(base, nil, 0644)
+}`,
+			line:         4,
+			wantCategory: "cog",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := siteAtLine(t, tt.src, tt.line)
+			if got.Category != tt.wantCategory {
+				t.Errorf("category = %q (pattern %q), want %q", got.Category, got.Pattern, tt.wantCategory)
+			}
+		})
+	}
+}
