@@ -1042,22 +1042,22 @@ func f() {
 //
 // The round-4 fix's `:=`-shadow guard in applyAssign is a bare EXISTENCE
 // test (`if _, hadOuter := defs[ident.Name]; hadOuter { continue }`) over a
-// single flat, whole-function map. That test cannot tell "this is a
-// genuine outer binding from before the conditional" apart from "this is a
-// SIBLING branch's own `:=` that merely happened to be folded first by the
-// AST walk" — both look identical to a bare existence check. The fix is
+// single whole-function map. That test cannot tell "this is a genuine outer
+// binding from before the conditional" apart from "this is a SIBLING
+// branch's own `:=` that merely happened to be folded first by the AST walk"
+// — both look identical to a bare existence check. The fix is
 // localDefsFor/scopeChain: a position strictly inside a given conditional
-// body resolves using THAT body's own direct defs, layered back on top of
-// the flat map, regardless of what a sibling branch or the outer scope
-// recorded for the same name. These tests use scanParsedFile directly (the
+// body resolves by folding THAT body's own level after its enclosing ones,
+// regardless of what a sibling branch or the outer scope recorded for the
+// same name. These tests use scanParsedFile directly (the
 // real per-call-site production path, backed by localDefsFor) rather than
 // parseCallArg's single-match flat collectLocalDefs, specifically because
 // each case has MORE THAN ONE matched write call and the whole point is
 // that each one must resolve independently.
 
 // siteAtLine runs the same scanning path scanParsedFile/Scan use in
-// production (localDefsFor's position-aware scopeChain overlay, NOT
-// parseCallArg's flat, non-position-aware collectLocalDefs) and returns the
+// production (localDefsFor's position-scoped scope-chain fold, NOT
+// parseCallArg's whole-function, non-position-aware collectLocalDefs) and returns the
 // matched write site at wantLine, so a snippet with more than one write
 // call — one per sibling branch — can be asserted on independently.
 func siteAtLine(t *testing.T, src string, wantLine int) Site {
@@ -1087,7 +1087,7 @@ func siteAtLine(t *testing.T, src string, wantLine int) Site {
 // two SIBLING `if`/`if` branches (not else-if — deliberately two separate
 // IfStmts, the exact reproduction shape) each declare the same name `p` via
 // `:=` with a DIFFERENT value and write it. Before this fix, the SECOND
-// branch's `:=` saw the FIRST branch's `p` already sitting in the flat map
+// branch's `:=` saw the FIRST branch's `p` already sitting in the shared map
 // (hadOuter=true, even though it is a SIBLING, not an enclosing scope) and
 // was treated as a shadow — recorded nowhere — so the second branch's own
 // write silently resolved against the FIRST branch's value.
@@ -1277,5 +1277,428 @@ func f(useCog bool, elsewhereRoot string) error {
 	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
 	if got := classify(pattern, resolved, degenerate); got != "cog" {
 		t.Errorf("classify(%q, %v, %v) = %q, want %q — a conditional rebind THIS tool can read as .cog-rooted is deliberately never poisoned, even though the branch might not execute at runtime (the accepted, documented asymmetry — see poisonConditionalAndLoopRebinds's doc comment)", pattern, resolved, degenerate, got, "cog")
+	}
+}
+
+// ─── Round-6 gate: one fold rule for every scope level ────────────────────
+//
+// The round-5 fix layered each conditional body's own defs back on top of
+// the whole-function map for positions inside it, but the poison pass that
+// decides which rebinds a site may trust ran ONLY over the whole-function
+// fold. Every overlay level was therefore free to re-introduce exactly the
+// rebinds the poison had just removed, and a labeled loop dropped out of the
+// chain entirely. The fix is structural: localDefsFor folds the function
+// body and each level of the site's scope chain through ONE function
+// (foldScopeLevel = fold-then-poison), scoped to the statements that precede
+// the site. These tests pin the shapes that fix is answerable for, all
+// through siteAtLine — the production path. parseCallArg cannot see any of
+// them: it calls collectLocalDefs directly and is structurally blind to the
+// scope chain where every one of these defects lived.
+
+// TestNestedConditionalRebindDoesNotReachOuterSite is round-6 finding #1: a
+// conditional nested INSIDE the branch that holds the write. The inner
+// branch's plain rebind to a provably non-.cog root was folded into the
+// outer branch's overlay and never poisoned there, so the write — which the
+// inner branch may never have touched — was stamped with the inner branch's
+// value. The same defect with a loop as the outer scope is the if-inside-loop
+// shape below; the sibling case/comm-clause spellings are the same shape
+// again, one construct over.
+func TestNestedConditionalRebindDoesNotReachOuterSite(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		line int
+	}{
+		{
+			name: "if inside if",
+			src: `package p
+func f(root string, cond, other bool) error {
+	if cond {
+		path := filepath.Join(root, ".cog", "x.json")
+		if other {
+			path = "/etc/cogos/g.json"
+		}
+		return os.WriteFile(path, nil, 0644)
+	}
+	return nil
+}`,
+			line: 8,
+		},
+		{
+			name: "if inside else-if",
+			src: `package p
+func f(root string, a, b bool) {
+	if a {
+		_ = a
+	} else if b {
+		path := filepath.Join(root, ".cog", "x.json")
+		if a {
+			path = "/etc/cogos/g.json"
+		}
+		os.WriteFile(path, nil, 0644)
+	}
+}`,
+			line: 10,
+		},
+		{
+			name: "if inside switch case",
+			src: `package p
+func f(root string, mode int, c bool) {
+	switch mode {
+	case 1:
+		path := filepath.Join(root, ".cog", "x.json")
+		if c {
+			path = "/etc/cogos/g.json"
+		}
+		os.WriteFile(path, nil, 0644)
+	}
+}`,
+			line: 9,
+		},
+		{
+			name: "if inside type-switch case",
+			src: `package p
+func f(root string, v interface{}, c bool) {
+	switch v.(type) {
+	case int:
+		path := filepath.Join(root, ".cog", "x.json")
+		if c {
+			path = "/etc/cogos/g.json"
+		}
+		os.WriteFile(path, nil, 0644)
+	}
+}`,
+			line: 9,
+		},
+		{
+			name: "if inside select comm clause",
+			src: `package p
+func f(root string, ch chan int, c bool) {
+	select {
+	case <-ch:
+		path := filepath.Join(root, ".cog", "x.json")
+		if c {
+			path = "/etc/cogos/g.json"
+		}
+		os.WriteFile(path, nil, 0644)
+	}
+}`,
+			line: 9,
+		},
+		{
+			name: "loop inside if",
+			src: `package p
+func f(root string, cond bool, args []string) {
+	if cond {
+		path := filepath.Join(root, ".cog", "x.json")
+		for _, a := range args {
+			_ = a
+			path = "/etc/cogos/g.json"
+		}
+		os.WriteFile(path, nil, 0644)
+	}
+}`,
+			line: 9,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			site := siteAtLine(t, tt.src, tt.line)
+			if site.Category != "unanchored" {
+				t.Errorf("category = %q pattern = %q, want unanchored — the nested branch's rebind is not guaranteed on this write's path and must poison, not classify, it", site.Category, site.Pattern)
+			}
+		})
+	}
+}
+
+// TestIfInsideLoopPoisonsAtLoopLevel is the pre-existing twin of the shape
+// above, wrong at every earlier commit in this arc: the write sits at a loop
+// body's own level with a conditional rebind nested in that loop body. Before
+// the round-6 fix the loop-body overlay folded the conditional's rebind in
+// unpoisoned; now the loop body is folded and poisoned like any other level.
+func TestIfInsideLoopPoisonsAtLoopLevel(t *testing.T) {
+	src := `package p
+func f(root string, args []string, cond bool) {
+	for _, a := range args {
+		_ = a
+		p := filepath.Join(root, ".cog", "inner.json")
+		if cond {
+			p = "/etc/cogos/g.json"
+		}
+		os.WriteFile(p, nil, 0644)
+	}
+}`
+	site := siteAtLine(t, src, 9)
+	if site.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored", site.Category, site.Pattern)
+	}
+}
+
+// TestLabeledLoopBodyStaysOnTheScopeChain is round-6 finding #2, and the
+// worst-shaped one: a LABELED loop was not a scope the chain walk knew about
+// (nestedScope had no *ast.LabeledStmt case), so a write inside it resolved
+// from the enclosing function's map alone and picked up the same-named outer
+// binding its loop-local `:=` shadows — a genuine .cog/ write stamped
+// "elsewhere", the one failure mode this tool declares it must never produce.
+// The unlabeled twin, which was always correct, is the control: a label must
+// not change a classification.
+func TestLabeledLoopBodyStaysOnTheScopeChain(t *testing.T) {
+	labeled := `package p
+func f(root string, args []string) {
+	p := "/etc/cogos/outer.json"
+Loop:
+	for _, a := range args {
+		_ = a
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+		break Loop
+	}
+	_ = p
+}`
+	unlabeled := `package p
+func f(root string, args []string) {
+	p := "/etc/cogos/outer.json"
+	for _, a := range args {
+		_ = a
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+		break
+	}
+	_ = p
+}`
+	withLabel := siteAtLine(t, labeled, 8)
+	if withLabel.Category != "cog" || !strings.Contains(withLabel.Pattern, ".cog/inner.json") {
+		t.Errorf("labeled loop = category %q pattern %q, want cog / .cog/inner.json — a real .cog write must never be stamped from an outer binding its own loop-local := shadows", withLabel.Category, withLabel.Pattern)
+	}
+	noLabel := siteAtLine(t, unlabeled, 7)
+	if noLabel.Category != withLabel.Category || noLabel.Pattern != withLabel.Pattern {
+		t.Errorf("labeled = %q/%q but unlabeled twin = %q/%q — a label must not change a classification", withLabel.Category, withLabel.Pattern, noLabel.Category, noLabel.Pattern)
+	}
+}
+
+// TestLabeledScopesOtherThanLoops covers the rest of what a label can wrap:
+// the same unwrapping has to work for a labeled block and a labeled switch,
+// not just the labeled `for` the gate happened to reproduce with. The
+// labeled switch was broken the same way the labeled loop was; the labeled
+// block happened to come out right at af01c3c for an unrelated reason (a
+// `:=` directly inside a bare block is at conditional depth zero, so it
+// overwrote the outer binding in the whole-function map by accident) and is
+// kept here as the control that says so.
+func TestLabeledScopesOtherThanLoops(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		line int
+	}{
+		{
+			name: "labeled block",
+			src: `package p
+func f(root string) {
+	p := "/etc/cogos/outer.json"
+Blk:
+	{
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+		break Blk
+	}
+	_ = p
+}`,
+			line: 7,
+		},
+		{
+			name: "labeled switch case",
+			src: `package p
+func f(root string, mode int) {
+	p := "/etc/cogos/outer.json"
+Sw:
+	switch mode {
+	case 1:
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+		break Sw
+	}
+	_ = p
+}`,
+			line: 8,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			site := siteAtLine(t, tt.src, tt.line)
+			if site.Category != "cog" || !strings.Contains(site.Pattern, ".cog/inner.json") {
+				t.Errorf("category = %q pattern = %q, want cog / .cog/inner.json", site.Category, site.Pattern)
+			}
+		})
+	}
+}
+
+// TestRebindAfterTheWriteDoesNotClassifyIt pins the within-level half of the
+// rule: last-assignment-wins is about assignments that PRECEDE the read.
+// Folding a whole level regardless of position let a rebind written strictly
+// AFTER the write site classify it — including a `:=` shadow declared after
+// the write, which is not even the same variable. Each of these is a genuine
+// .cog write that a following statement stamped "elsewhere".
+func TestRebindAfterTheWriteDoesNotClassifyIt(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		line int
+	}{
+		{
+			name: "plain rebind after the write",
+			src: `package p
+func f(root string) {
+	p := filepath.Join(root, ".cog", "inner.json")
+	os.WriteFile(p, nil, 0644)
+	p = "/etc/cogos/g.json"
+	_ = p
+}`,
+			line: 4,
+		},
+		{
+			name: "conditional rebind after the write",
+			src: `package p
+func f(root string, c bool) {
+	p := filepath.Join(root, ".cog", "inner.json")
+	os.WriteFile(p, nil, 0644)
+	if c {
+		p = "/etc/cogos/g.json"
+	}
+	_ = p
+}`,
+			line: 4,
+		},
+		{
+			name: "shadow declared after the write",
+			src: `package p
+func f(root string, c bool) {
+	p := filepath.Join(root, ".cog", "inner.json")
+	if c {
+		os.WriteFile(p, nil, 0644)
+		p := "/etc/cogos/g.json"
+		_ = p
+	}
+}`,
+			line: 5,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			site := siteAtLine(t, tt.src, tt.line)
+			if site.Category != "cog" || !strings.Contains(site.Pattern, ".cog/inner.json") {
+				t.Errorf("category = %q pattern = %q, want cog / .cog/inner.json — a statement that runs after this write cannot be what the write resolved", site.Category, site.Pattern)
+			}
+		})
+	}
+}
+
+// TestRebindAfterTheWriteInsideLoopPoisons is the required counterweight to
+// the test above: inside a loop body, a rebind that follows the write DOES
+// precede it on the next iteration, so ignoring it would be an over-claim in
+// the other direction. It poisons instead — the site falls to unanchored,
+// never to the following statement's value.
+func TestRebindAfterTheWriteInsideLoopPoisons(t *testing.T) {
+	src := `package p
+func f(root string, args []string) {
+	for _, a := range args {
+		_ = a
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+		p = "/etc/cogos/g.json"
+		_ = p
+	}
+}`
+	site := siteAtLine(t, src, 6)
+	if site.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored — a loop back edge brings this write around again after the rebind, so neither value is guaranteed", site.Category, site.Pattern)
+	}
+}
+
+// TestFuncLitRebindPoisonsEnclosingSite covers the last subtree kind that is
+// never on an enclosing site's scope chain: a closure's body. The fold walks
+// into it (a closure's plain `=` rebinds the captured outer variable), so
+// without a matching poison a closure that may never have run could classify
+// a write in the enclosing function.
+func TestFuncLitRebindPoisonsEnclosingSite(t *testing.T) {
+	src := `package p
+func f(root string, run func(func())) {
+	p := filepath.Join(root, ".cog", "inner.json")
+	run(func() {
+		p = "/etc/cogos/g.json"
+	})
+	os.WriteFile(p, nil, 0644)
+}`
+	site := siteAtLine(t, src, 7)
+	if site.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored — whether the closure ran before this write is not something this package models", site.Category, site.Pattern)
+	}
+}
+
+// TestLocalDefsForCacheIsKeyedByPosition pins the cache contract the round-6
+// gate found broken. The previous key was the innermost *ast.BlockStmt in the
+// chain, and a switch/type-switch/select case body has no *ast.BlockStmt of
+// its own — nestedScope synthesizes a fresh one per call — so every lookup
+// for a site inside a case body missed and left a dead entry behind. The key
+// is now the position itself, which is also the only correct key now that a
+// level folds only up to the site: two sites in one case body legitimately
+// get two different maps, and asking the cache for one position must never
+// return the other's.
+func TestLocalDefsForCacheIsKeyedByPosition(t *testing.T) {
+	src := `package p
+func f(root string, mode int) {
+	switch mode {
+	case 1:
+		p := filepath.Join(root, ".cog", "first.json")
+		os.WriteFile(p, nil, 0644)
+		p = filepath.Join(root, ".cog", "second.json")
+		os.WriteFile(p, nil, 0644)
+	}
+}`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "snippet.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	scopes := collectFuncScopes(file, fset)
+	if len(scopes) == 0 {
+		t.Fatal("no function scopes")
+	}
+	body := scopes[0].body
+
+	var writes []*ast.CallExpr
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if _, _, matched := matchWriterCall(call, map[string]ast.Expr{}); matched {
+			writes = append(writes, call)
+		}
+		return true
+	})
+	if len(writes) != 2 {
+		t.Fatalf("expected 2 matched writer calls, got %d", len(writes))
+	}
+
+	cache := map[token.Pos]map[string]ast.Expr{}
+	first := localDefsFor(cache, body, writes[0].Pos())
+	second := localDefsFor(cache, body, writes[1].Pos())
+	if len(cache) != 2 {
+		t.Errorf("cache holds %d entries for 2 distinct positions, want 2 — a key that never matches (or one that matches too eagerly) is how the previous version both missed every lookup and claimed sharing it did not have", len(cache))
+	}
+	if again := localDefsFor(cache, body, writes[0].Pos()); len(cache) != 2 {
+		t.Errorf("re-asking for the first position grew the cache to %d entries — the key does not match itself", len(cache))
+		_ = again
+	}
+	firstText := exprString(first["p"])
+	secondText := exprString(second["p"])
+	if firstText == secondText {
+		t.Errorf("both sites resolved p to %q — each write must see only the assignments that precede it", firstText)
+	}
+	if !strings.Contains(firstText, "first.json") {
+		t.Errorf("first site's p = %q, want the first.json join", firstText)
+	}
+	if !strings.Contains(secondText, "second.json") {
+		t.Errorf("second site's p = %q, want the second.json join", secondText)
 	}
 }

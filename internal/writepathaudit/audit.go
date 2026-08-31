@@ -516,64 +516,147 @@ func paramNames(fl *ast.FieldList) []string {
 	return names
 }
 
-// localDefsFor is computed lazily per (function scope, position) and cached
-// by the caller, since most files have far more scopes than matched call
-// sites. pos matters because every scope-introducing construct on the path
-// down to pos — FOR/RANGE loop bodies, but ALSO if/else bodies, switch/
-// type-switch case bodies, and select comm-clause bodies — gets its own
-// defs layered back on top of the whole-function flat map (see scopeChain
-// and collectLocalDefs) — the cache key is the innermost such body actually
-// reached from pos, or fnBody itself when pos is not inside any of them, so
-// two call sites inside the SAME loop iteration or the SAME conditional
-// branch correctly share one map while two call sites in DIFFERENT
-// (sibling, or unrelated) loops or branches never do.
+// ─── Resolution semantics for one write site ─────────────────────────────
 //
-// The conditional half of this (added alongside loops) is what closes two
-// round-5-gate defects the flat map's own hadOuter existence-test could not:
-// two SIBLING branches (an if/else-if pair, or two switch cases) declaring
-// the same name via `:=` were flattening onto whichever branch's `:=` the
-// AST walk happened to visit FIRST — see applyAssign's own doc comment —
-// which not only mis-resolved a read outside both branches but, worse,
-// mis-resolved the SECOND branch's own write, inside its own body, onto the
-// first branch's value; and a `:=` that genuinely shadows an OUTER name
-// protected the outer read correctly (see poisonConditionalAndLoopRebinds)
-// but, as a side effect of never being recorded at all, left the shadow's
-// OWN value invisible to a read of the SAME name INSIDE the very branch
-// that declared it. Layering each conditional body's own direct defs back
-// on top, scoped only to positions actually inside that body, fixes both:
-// a use site inside a given branch now always sees THAT branch's own
-// bindings (its own `:=`, `=`, and `var` declarations, applied with
-// conditional depth restarting at zero for that body's own top-level
-// statements — see applyDirectLocalDefs), regardless of what a sibling
-// branch or the outer scope recorded for the same name. A use site outside
-// every conditional is completely unaffected: scopeChain returns an empty
-// chain for it, so it resolves purely from the base flat map exactly as
-// before this fix (poisonConditionalAndLoopRebinds's existing rules still
-// govern what that map holds for such a read).
-func localDefsFor(cache map[*ast.BlockStmt]map[string]ast.Expr, fnBody *ast.BlockStmt, pos token.Pos) map[string]ast.Expr {
+// THE INVARIANT (stated once here, enforced by foldScopeLevel below): a
+// write site must never classify from a binding that is not guaranteed on
+// its own execution path. When the auditor cannot establish that, the name
+// is dropped and the site falls to "unanchored"; a genuine .cog/ write
+// stamped "elsewhere" from a sibling branch's value is the one failure this
+// package treats as never acceptable.
+//
+// THE RULE, per site at position P: build P's defs by walking the chain of
+// block scopes that lexically enclose P — the enclosing function body
+// first, then each nested scope on the path down to P (loop bodies, if/else
+// bodies, switch and type-switch case bodies, select comm-clause bodies,
+// bare `{ }` blocks, any of them reachable through a labeled statement) —
+// and at EVERY level apply the SAME two steps in the SAME order over that
+// level's statements UP TO P: fold that level's directly-visible bindings,
+// then poison the names that level's nested, off-path subtrees rebind in a
+// way P cannot trust (see foldScopeLevel and
+// poisonConditionalAndLoopRebinds). Every level is treated identically;
+// there is no "flat map plus a differently-behaved overlay" anymore, which
+// is exactly where the round-6 gate's two false "elsewhere" findings lived —
+// an overlay level folded a nested branch's rebind in without ever poisoning
+// it (nested-conditional-inside-conditional, and its if-inside-loop twin),
+// because the poison pass only ever ran over the function-level fold.
+//
+// Two things make this sound. First, ORDER ACROSS LEVELS: a subtree NOT on
+// P's chain only ever gets to REMOVE a name (poison), never to hand P a
+// value, while a subtree ON P's chain re-establishes its own bindings at its
+// own level, AFTER the enclosing level's poison has run — so a read inside a
+// branch still sees that branch's own `:=`, `=`, and `var` bindings, and a
+// read outside every branch sees none of them.
+//
+// Second, ORDER WITHIN A LEVEL: statements that follow P at a level are not
+// on P's execution path either, and folding them was the last, purely
+// positional source of the same false "elsewhere" — `p := <.cog path>;
+// write(p); p = "/etc/..."` and its `if`-wrapped and shadow-declaration
+// variants all stamped the write with a value assigned strictly after it,
+// under the flat map's last-assignment-wins rule. Each level therefore folds
+// only up to P. The one case where a later statement CAN precede P is a
+// loop back edge — if any level on the chain from the function body down is
+// a loop body, that loop re-runs P after the statements following it — so
+// then the after-P statements are poisoned (wholesale, exactly as a loop
+// body's rebinds are poisoned for a use site outside the loop) rather than
+// ignored. A backward `goto` is the same hazard without the loop syntax, so
+// a function containing any `goto` at all is treated as re-entrant at every
+// level. Last-assignment-wins itself is unchanged for the straight-line case
+// it was always about: a rebind BEFORE P still wins over everything before
+// it (TestStraightLineRebindStillLastAssignmentWins).
+
+// localDefsFor resolves the local defs visible at pos, folding pos's scope
+// chain level by level (see the semantics block above). It is memoized per
+// position by a caller-owned cache, since every scanning pass calls it more
+// than once for the same site; the key is pos itself, because the map is
+// genuinely position-specific — two sites in the SAME branch see the same
+// CHAIN but not the same statements, since each folds only up to its own
+// position. (The earlier cache keyed on the innermost *ast.BlockStmt in the
+// chain and claimed sites in one branch shared a map. That claim was false
+// twice over: a switch/type-switch/select case body has no *ast.BlockStmt of
+// its own in the AST, so the key was a freshly-synthesized block allocated
+// per call — every lookup missed and left a dead entry behind — and, with
+// position-scoped folding, sharing a map across positions would be wrong
+// even where the pointer did match.)
+//
+// What the chain walk closes, beyond the round-6 gate's false "elsewhere"
+// shapes (see the semantics block above): the flat map's own hadOuter
+// existence test could not tell a genuine outer binding apart from a SIBLING
+// branch's `:=` that the AST walk merely happened to fold first (see
+// applyAssign), and a `:=` that genuinely shadows an outer name protected
+// the outer read correctly but left the shadow's OWN value invisible to a
+// read inside the very branch that declared it. Both are consequences of
+// resolving from one scope-blind map; both are fixed by resolving from P's
+// own chain.
+func localDefsFor(cache map[token.Pos]map[string]ast.Expr, fnBody *ast.BlockStmt, pos token.Pos) map[string]ast.Expr {
 	if fnBody == nil {
 		return map[string]ast.Expr{}
 	}
-	chain := scopeChain(fnBody, pos)
-	key := fnBody
-	if len(chain) > 0 {
-		key = chain[len(chain)-1]
-	}
-	if defs, ok := cache[key]; ok {
+	if defs, ok := cache[pos]; ok {
 		return defs
 	}
-	defs := collectLocalDefs(fnBody)
-	for _, scopeBody := range chain {
-		applyDirectLocalDefs(defs, scopeBody, true)
+	// A backward `goto` can re-run pos after statements that follow it,
+	// exactly as a loop back edge does, without any loop syntax to detect it
+	// by. Rather than model label targets, treat a function containing any
+	// `goto` as re-entrant at every level — the conservative side (after-pos
+	// rebinds poison instead of being ignored).
+	revisitable := containsGoto(fnBody)
+	defs := map[string]ast.Expr{}
+	foldScopeLevel(defs, fnBody, pos, revisitable)
+	for _, level := range scopeChain(fnBody, pos) {
+		revisitable = revisitable || level.isLoop
+		foldScopeLevel(defs, level.body, pos, revisitable)
 	}
-	cache[key] = defs
+	cache[pos] = defs
 	return defs
 }
 
-// collectLocalDefs builds a flat, last-assignment-wins map of local variable
-// name -> defining expression for a single function body. See the package
-// doc comment for the deliberate limitations (no branch sensitivity beyond
-// the compound-assignment handling below, no shadowing).
+// foldScopeLevel applies ONE scope level to defs: first that level's own
+// directly-visible bindings (applyDirectLocalDefs — which descends through
+// conditionals but never into a loop body or a nested function's body), then
+// the poison pass over that level's nested, not-guaranteed-to-execute
+// subtrees (poisonConditionalAndLoopRebinds). Both the function-level fold
+// and every nested-scope level go through this one function, so the two
+// steps can never again drift apart the way they had (the poison used to run
+// only on the function-level fold, leaving every nested level free to
+// re-introduce exactly the un-poisoned rebinds it had just removed).
+//
+// limit is the use site's position: statements starting after it are not on
+// the site's execution path and are neither folded nor consulted, unless
+// revisitable says a loop back edge (or a `goto`) can bring the site around
+// again after them, in which case they are poisoned instead. limit may be
+// token.NoPos, which turns both position rules off and folds the whole body
+// — the whole-function form collectLocalDefs needs.
+func foldScopeLevel(defs map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable bool) {
+	applyDirectLocalDefs(defs, body, true, limit)
+	poisonConditionalAndLoopRebinds(defs, body, limit, revisitable)
+}
+
+// containsGoto reports whether body contains any `goto` statement, including
+// inside nested function literals (over-approximating on purpose — see
+// localDefsFor).
+func containsGoto(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if br, ok := n.(*ast.BranchStmt); ok && br.Tok == token.GOTO {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// collectLocalDefs builds a last-assignment-wins map of local variable name
+// -> defining expression for a single function body, WITHOUT any position
+// scoping: it is exactly foldScopeLevel applied to the function body alone,
+// i.e. localDefsFor's first level and nothing else. Production scanning
+// always goes through localDefsFor; this entry point exists for callers that
+// have no position to scope by (and for the flat-map unit tests). See the
+// package doc comment for the deliberate limitations (no branch sensitivity
+// beyond the compound-assignment handling, no shadowing).
 //
 // FOR- and RANGE-loop BODIES are deliberately excluded from this walk (see
 // applyDirectLocalDefs) — each loop body's own local defs are layered on
@@ -588,16 +671,28 @@ func localDefsFor(cache map[*ast.BlockStmt]map[string]ast.Expr, fnBody *ast.Bloc
 // resolved using the SECOND loop's `f.target`, not its own loop's `dir`).
 func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 	defs := map[string]ast.Expr{}
-	applyDirectLocalDefs(defs, body, true)
-	poisonConditionalAndLoopRebinds(defs, body)
+	foldScopeLevel(defs, body, token.NoPos, false)
 	return defs
 }
 
 // poisonConditionalAndLoopRebinds deletes from defs every name that a
-// FOR/RANGE loop OR a conditionally-executed subtree (IfStmt — body and
-// else chain, SwitchStmt/TypeSwitchStmt case bodies, SelectStmt comm
-// clauses) rebinds in a way a use site OUTSIDE that subtree cannot safely
-// trust. Neither `:=` nor a `var x = expr` ValueSpec ever poisons — when
+// FOR/RANGE loop, a conditionally-executed subtree (IfStmt — body and else
+// chain, SwitchStmt/TypeSwitchStmt case bodies, SelectStmt comm clauses),
+// or a function literal NESTED INSIDE body rebinds in a way a use site
+// outside that subtree cannot safely trust.
+//
+// body here is ONE scope level, not necessarily a whole function: this runs
+// on the enclosing function body and, identically, on every nested scope
+// level on a use site's chain (see foldScopeLevel and localDefsFor). At any
+// level, the subtrees this function poisons are exactly the ones NOT on the
+// use site's chain in that level — a nested scope that IS on the chain gets
+// its own foldScopeLevel pass afterward, which re-establishes its own
+// bindings on top of whatever was poisoned here. That is what lets one
+// position-blind poison rule serve every level: removing a name is always
+// safe (the site falls to unanchored), and only an on-path level is allowed
+// to put a value back.
+//
+// Neither `:=` nor a `var x = expr` ValueSpec ever poisons — when
 // either shadows an existing outer name, it never touches that outer
 // binding in the first place (see applyDirectLocalDefs/applyAssign's
 // condDepth handling, mirrored identically for ValueSpec), so there is
@@ -605,8 +700,8 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // outer counterpart, it is not a rebind of anything outer at all, so
 // poisoning has no name to act on either way. (A use site strictly INSIDE
 // the subtree that declared such a shadow sees the shadow's own value
-// regardless — see localDefsFor/scopeChain, a separate, position-scoped
-// overlay that runs after this poisoning pass and is unaffected by it.)
+// regardless — that subtree's own foldScopeLevel pass, which runs after
+// this one, records it again; see localDefsFor.)
 //
 // LOOPS: applyDirectLocalDefs never applies a loop body's assignments to
 // the outer map at all (skipLoopBodies=true skips the whole construct,
@@ -622,9 +717,20 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // workspace/.cog rebind inside a range over args) stamped "elsewhere" on
 // the outer branch alone. Use sites INSIDE the loop are unaffected:
 // localDefsFor layers the loop body's own assignments back on top.
-// FuncLit bodies are deliberately NOT excluded: a plain `=` inside a
-// closure rebinds the captured outer variable, and over-poisoning fails
-// toward unanchored, the honest side.
+// FuncLit bodies are deliberately NOT excluded from a loop's own poison
+// walk: a plain `=` inside a closure rebinds the captured outer variable,
+// and over-poisoning fails toward unanchored, the honest side.
+//
+// FUNCTION LITERALS get the conditional (narrow) poison in their own right,
+// wherever they sit. applyDirectLocalDefs walks INTO a func literal's body
+// and folds its assignments into the enclosing function's map, but a
+// closure's body is never on an enclosing-function use site's scope chain —
+// a position inside a func literal resolves against that literal's OWN
+// funcScope (see collectFuncScopes/enclosingFuncScope) — and whether the
+// closure ran at all before a given use site is exactly the kind of thing
+// this package does not model. So a closure's plain `=` to a provably
+// non-.cog root is a sibling-branch value by any other name, and is
+// poisoned on the same terms as a conditional's.
 //
 // CONDITIONALS are a deliberately NARROWER poison than loops, for two
 // independent reasons layered on top of each other.
@@ -733,7 +839,7 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // by a dedicated regression test (TestConditionalCogBearingRebindStaysTrusted
 // in resolve_test.go) so a future change to this balance is a conscious
 // decision, not an accidental one.
-func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt) {
+func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt, limit token.Pos, revisitable bool) {
 	if body == nil {
 		return
 	}
@@ -795,7 +901,25 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockSt
 			return true
 		})
 	}
+	// Statements after the use site are not on its path: skip them entirely
+	// when the site cannot come back around (see foldScopeLevel), and poison
+	// every non-`:=` rebind in them wholesale when it can — on a second
+	// iteration those rebinds precede the site, and which of the two values
+	// the site sees is exactly what this package does not model.
+	if limit.IsValid() && revisitable {
+		for _, stmt := range body.List {
+			if stmt.Pos() > limit {
+				poisonLoop(stmt)
+			}
+		}
+	}
 	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			return false
+		}
+		if limit.IsValid() && !revisitable && n.Pos() > limit {
+			return false
+		}
 		switch s := n.(type) {
 		case *ast.ForStmt:
 			poisonLoop(s.Init)
@@ -825,6 +949,10 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockSt
 		case *ast.TypeSwitchStmt:
 			poisonConditional(s.Body)
 		case *ast.SelectStmt:
+			poisonConditional(s.Body)
+		case *ast.FuncLit:
+			// Not guaranteed to have run on any enclosing use site's path —
+			// see this function's doc comment's FUNCTION LITERALS section.
 			poisonConditional(s.Body)
 		}
 		return true
@@ -995,6 +1123,13 @@ func staticPathText(expr ast.Expr, defs map[string]ast.Expr, depth int) (string,
 // Init/Cond/Post/Key/Value) is not descended into at all — see
 // collectLocalDefs's doc comment for why.
 //
+// When limit is valid, nothing starting after it is folded: the walk is
+// pruned at any node whose Pos() exceeds the use site's, so what lands in
+// defs is the prefix of body that actually precedes the read. Pass
+// token.NoPos to fold the whole body (the whole-function form). Note that
+// "at any point in the function where memPath is later read", above, means
+// later — a `+=` folds for reads that follow it, never for reads before it.
+//
 // A `:=` DECLARATION found while this walk is inside a conditionally-
 // executed subtree (IfStmt, SwitchStmt/TypeSwitchStmt, SelectStmt — a
 // depth counter, condDepth, tracks this using ast.Inspect's own paired
@@ -1015,9 +1150,10 @@ func staticPathText(expr ast.Expr, defs map[string]ast.Expr, depth int) (string,
 // suddenly-unresolvable opaque name. A plain `=` and a compound assign are
 // NOT gated on conditional depth at all here — both are still recorded
 // (and still fold, for compound) exactly as outside a conditional; it is
-// poisonConditionalAndLoopRebinds, run once collectLocalDefs's walk is
-// complete, that decides which of THOSE survive for a use site outside the
-// subtree. See that function's doc comment for the plain-vs-compound
+// poisonConditionalAndLoopRebinds, run over this same level immediately
+// after this walk (see foldScopeLevel), that decides which of THOSE survive
+// for a use site outside the subtree. See that function's doc comment for
+// the plain-vs-compound
 // split and why a `:=` needs no matching poison step at all.
 //
 // A `var x = expr` ValueSpec found inside a conditionally-executed subtree
@@ -1026,7 +1162,7 @@ func staticPathText(expr ast.Expr, defs map[string]ast.Expr, depth int) (string,
 // the ValueSpec case's own comment) — since a `var` declaration is exactly
 // as much a fresh, block-scoped local as a `:=` is; nothing about the two
 // declaration forms warrants different treatment here.
-func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoopBodies bool) {
+func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoopBodies bool, limit token.Pos) {
 	if body == nil {
 		return
 	}
@@ -1052,6 +1188,16 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 				}
 			}
 			return true
+		}
+		// Anything starting after the use site is not on its execution path
+		// and must not be folded — the last-assignment-wins rule is about
+		// assignments that PRECEDE the read. (Whether such a statement can
+		// still reach the site around a loop back edge is a separate
+		// question, answered by the poison pass; see foldScopeLevel.) Pruning
+		// here is safe for the condDepth bookkeeping below because nothing
+		// has been pushed onto isCondStack for n yet.
+		if limit.IsValid() && n.Pos() > limit {
+			return false
 		}
 		switch n.(type) {
 		case *ast.ForStmt:
@@ -1127,8 +1273,10 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 // insideConditional (true when applyDirectLocalDefs's condDepth is > 0 at
 // this statement) affects ONLY the `:=` case: a declaration found inside a
 // conditionally-executed subtree is a shadow local to it and must not
-// overwrite an outer binding of the same name in this flat, scope-blind
-// map — see applyDirectLocalDefs's own doc comment. A plain `=` still
+// overwrite an outer binding of the same name: one level's own walk carries
+// no block scoping of its own (the scoping lives one layer up, in the chain
+// localDefsFor folds) — see applyDirectLocalDefs's own doc comment. A plain
+// `=` still
 // records outright (poisonConditionalAndLoopRebinds decides afterward
 // whether a conditional's plain rebind survives for a use site outside
 // it); a compound assign still folds exactly as it does anywhere else,
@@ -1169,108 +1317,139 @@ func applyAssign(defs map[string]ast.Expr, stmt *ast.AssignStmt, insideCondition
 	}
 }
 
-// nestedScopeBody returns the nested block scope inside stmt that contains
-// pos, one level down, or nil when stmt introduces no such nested scope (or
-// pos falls outside all of its nested bodies — e.g. it's in an if/for/
-// switch HEADER, not its body). Handles the constructs that introduce a new
-// block scope in Go: a bare block, if/else (including else-if chains via
-// recursion), for, range, switch/case, type-switch/case, and select/
-// comm-clause. Consumed by scopeChain (via directChildBlockContaining)
-// below, which walks every level this function knows about — a loop nested
-// inside an if/switch/select, or vice versa, is found correctly either way,
-// and each level along the path gets its own defs overlay (see
-// localDefsFor).
-func nestedScopeBody(stmt ast.Stmt, pos token.Pos) *ast.BlockStmt {
-	switch s := stmt.(type) {
-	case *ast.BlockStmt:
-		if pos >= s.Pos() && pos < s.End() {
-			return s
-		}
-	case *ast.IfStmt:
-		if s.Body != nil && pos >= s.Body.Pos() && pos < s.Body.End() {
-			return s.Body
-		}
-		if s.Else != nil && pos >= s.Else.Pos() && pos < s.Else.End() {
-			return nestedScopeBody(s.Else, pos)
-		}
-	case *ast.ForStmt:
-		if s.Body != nil && pos >= s.Body.Pos() && pos < s.Body.End() {
-			return s.Body
-		}
-	case *ast.RangeStmt:
-		if s.Body != nil && pos >= s.Body.Pos() && pos < s.Body.End() {
-			return s.Body
-		}
-	case *ast.SwitchStmt:
-		for _, c := range s.Body.List {
-			if cc, ok := c.(*ast.CaseClause); ok && pos >= cc.Pos() && pos < cc.End() {
-				return &ast.BlockStmt{Lbrace: cc.Colon + 1, List: cc.Body, Rbrace: cc.End()}
-			}
-		}
-	case *ast.TypeSwitchStmt:
-		for _, c := range s.Body.List {
-			if cc, ok := c.(*ast.CaseClause); ok && pos >= cc.Pos() && pos < cc.End() {
-				return &ast.BlockStmt{Lbrace: cc.Colon + 1, List: cc.Body, Rbrace: cc.End()}
-			}
-		}
-	case *ast.SelectStmt:
-		for _, c := range s.Body.List {
-			if cc, ok := c.(*ast.CommClause); ok && pos >= cc.Pos() && pos < cc.End() {
-				return &ast.BlockStmt{Lbrace: cc.Colon + 1, List: cc.Body, Rbrace: cc.End()}
-			}
-		}
-	}
-	return nil
+// scopeLevel is one nested block scope on a position's scope chain: body is
+// the statement list to fold, key is a STABLE identity node for that scope.
+// The two differ only for a switch/type-switch case clause and a select comm
+// clause, whose bodies are bare statement lists in the AST with no
+// *ast.BlockStmt of their own — nestedScope has to synthesize one per call,
+// so the synthesized pointer is worthless as a cache key and the clause node
+// itself is used instead (see localDefsFor's cache).
+type scopeLevel struct {
+	key    ast.Node
+	body   *ast.BlockStmt
+	isLoop bool // a FOR/RANGE body: statements after a use site can precede it again
 }
 
-// directChildBlockContaining finds the ONE statement directly in block.List
-// that contains pos, and returns whatever nested scope body that statement
-// introduces (nil if none, or if pos is in that statement's header rather
-// than its body).
-func directChildBlockContaining(block *ast.BlockStmt, pos token.Pos) *ast.BlockStmt {
-	for _, stmt := range block.List {
-		if pos < stmt.Pos() || pos >= stmt.End() {
+// nestedScope returns the nested block scope inside stmt that contains pos,
+// one level down, or the zero scopeLevel when stmt introduces no such nested
+// scope (or pos falls outside all of its nested bodies — e.g. it's in an
+// if/for/switch HEADER, not its body). Handles every construct that
+// introduces a new block scope in Go: a bare block, if/else (including
+// else-if chains via recursion), for, range, switch/case, type-switch/case,
+// and select/comm-clause — each of which may be wrapped in an
+// *ast.LabeledStmt, which is unwrapped here rather than treated as an opaque
+// statement. That unwrapping is the round-6 gate's second finding: a LABELED
+// loop (`Loop: for ... { p := <.cog path>; write(p) }`) dropped out of the
+// chain entirely, so a write inside it resolved from the enclosing
+// function's map alone and could be stamped "elsewhere" off a same-named
+// outer binding the loop-local `:=` shadows — the tool's own declared worst
+// failure mode, and one its unlabeled twin never had.
+//
+// Consumed by scopeChain (via directChildScopeContaining) below.
+func nestedScope(stmt ast.Stmt, pos token.Pos) scopeLevel {
+	switch s := stmt.(type) {
+	case *ast.LabeledStmt:
+		// A label wraps the labeled statement; the scope, if any, is the
+		// wrapped statement's.
+		if s.Stmt != nil {
+			return nestedScope(s.Stmt, pos)
+		}
+	case *ast.BlockStmt:
+		if within(pos, s) {
+			return scopeLevel{key: s, body: s}
+		}
+	case *ast.IfStmt:
+		if s.Body != nil && within(pos, s.Body) {
+			return scopeLevel{key: s.Body, body: s.Body}
+		}
+		if s.Else != nil && within(pos, s.Else) {
+			return nestedScope(s.Else, pos)
+		}
+	case *ast.ForStmt:
+		if s.Body != nil && within(pos, s.Body) {
+			return scopeLevel{key: s.Body, body: s.Body, isLoop: true}
+		}
+	case *ast.RangeStmt:
+		if s.Body != nil && within(pos, s.Body) {
+			return scopeLevel{key: s.Body, body: s.Body, isLoop: true}
+		}
+	case *ast.SwitchStmt:
+		return caseClauseScope(s.Body, pos)
+	case *ast.TypeSwitchStmt:
+		return caseClauseScope(s.Body, pos)
+	case *ast.SelectStmt:
+		return caseClauseScope(s.Body, pos)
+	}
+	return scopeLevel{}
+}
+
+// within reports whether pos falls inside n's source extent.
+func within(pos token.Pos, n ast.Node) bool {
+	return n != nil && pos >= n.Pos() && pos < n.End()
+}
+
+// caseClauseScope finds the *ast.CaseClause (switch, type switch) or
+// *ast.CommClause (select) in body that contains pos and returns it as a
+// scopeLevel: the clause node as the stable key, and a synthesized
+// *ast.BlockStmt over the clause's statement list as the body to fold.
+func caseClauseScope(body *ast.BlockStmt, pos token.Pos) scopeLevel {
+	if body == nil {
+		return scopeLevel{}
+	}
+	for _, c := range body.List {
+		if !within(pos, c) {
 			continue
 		}
-		return nestedScopeBody(stmt, pos)
+		switch cc := c.(type) {
+		case *ast.CaseClause:
+			return scopeLevel{key: cc, body: &ast.BlockStmt{Lbrace: cc.Colon + 1, List: cc.Body, Rbrace: cc.End()}}
+		case *ast.CommClause:
+			return scopeLevel{key: cc, body: &ast.BlockStmt{Lbrace: cc.Colon + 1, List: cc.Body, Rbrace: cc.End()}}
+		}
 	}
-	return nil
+	return scopeLevel{}
+}
+
+// directChildScopeContaining finds the ONE statement directly in block.List
+// that contains pos, and returns whatever nested scope that statement
+// introduces (the zero scopeLevel if none, or if pos is in that statement's
+// header rather than its body).
+func directChildScopeContaining(block *ast.BlockStmt, pos token.Pos) scopeLevel {
+	for _, stmt := range block.List {
+		if !within(pos, stmt) {
+			continue
+		}
+		return nestedScope(stmt, pos)
+	}
+	return scopeLevel{}
 }
 
 // scopeChain returns, from outermost to innermost, every nested block scope
 // — a loop body, an if/else body, a switch/type-switch case body, a select
-// comm-clause body, or a bare `{ }` block — that lexically contains pos
-// within fnBody, by walking directChildBlockContaining one level at a time
-// from fnBody down. This replaces the earlier, loop-only loopBodyChain:
-// generalizing to every scope-introducing construct is what lets
-// localDefsFor layer a CONDITIONAL branch's own local defs back on top of
-// the flat map for a position inside that specific branch (see
-// localDefsFor's doc comment for the two round-5-gate defects this closes
-// — sibling branches colliding, and a shadow's own write being invisible to
-// reads inside its own branch), not just a loop iteration's.
+// comm-clause body, or a bare `{ }` block, each of them found through an
+// enclosing label if one is present — that lexically contains pos within
+// fnBody, by walking directChildScopeContaining one level at a time from
+// fnBody down. fnBody itself is NOT in the returned chain; localDefsFor
+// folds it first and then walks these levels in order.
 //
-// Loop bodies keep behaving exactly as loopBodyChain always had them:
-// nothing here changes what a position OUTSIDE every conditional resolves
-// to (collectLocalDefs's own flat fold, plus poisonConditionalAndLoopRebinds,
-// is unaffected — this only adds overlays for positions strictly INSIDE a
-// tracked body), and a plain nested `{ }` block with no conditional or loop
-// around it is a genuine, if previously untracked, Go lexical scope of its
-// own — layering it in only makes a same-named local declared solely inside
-// such a block resolve correctly for reads inside that block, never for
-// reads outside it.
-func scopeChain(fnBody *ast.BlockStmt, pos token.Pos) []*ast.BlockStmt {
-	var chain []*ast.BlockStmt
-	if fnBody == nil || pos < fnBody.Pos() || pos >= fnBody.End() {
+// A position OUTSIDE every nested scope gets an empty chain and therefore
+// resolves from the function-level fold alone. That fold is not a different
+// mechanism: it is foldScopeLevel applied to fnBody, the same fold-then-
+// poison pair every level in this chain gets (see localDefsFor's semantics
+// block for why uniformity across levels is the whole point).
+func scopeChain(fnBody *ast.BlockStmt, pos token.Pos) []scopeLevel {
+	var chain []scopeLevel
+	if fnBody == nil || !within(pos, fnBody) {
 		return chain
 	}
 	cur := fnBody
 	for {
-		next := directChildBlockContaining(cur, pos)
-		if next == nil {
+		next := directChildScopeContaining(cur, pos)
+		if next.body == nil {
 			return chain
 		}
 		chain = append(chain, next)
-		cur = next
+		cur = next.body
 	}
 }
 
@@ -1436,7 +1615,7 @@ func buildGlobalIndex(files []parsedFile) *globalIndex {
 	// Pass 2: call sites of those functions, and keyed composite-literal
 	// field assignments for any struct type.
 	for _, pf := range files {
-		localDefsCache := map[*ast.BlockStmt]map[string]ast.Expr{}
+		localDefsCache := map[token.Pos]map[string]ast.Expr{}
 		ast.Inspect(pf.file, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.CallExpr:
@@ -2210,7 +2389,7 @@ func hasWriteFlag(e ast.Expr) bool {
 
 // scanParsedFile finds every write-call site in an already-parsed file.
 func scanParsedFile(pf parsedFile, idx *globalIndex) []Site {
-	localDefsCache := map[*ast.BlockStmt]map[string]ast.Expr{}
+	localDefsCache := map[token.Pos]map[string]ast.Expr{}
 	var sites []Site
 
 	ast.Inspect(pf.file, func(n ast.Node) bool {
@@ -2321,7 +2500,7 @@ func appendEventBucketSites(files []parsedFile, idx *globalIndex) []Site {
 
 	var sites []Site
 	for _, pf := range files {
-		localDefsCache := map[*ast.BlockStmt]map[string]ast.Expr{}
+		localDefsCache := map[token.Pos]map[string]ast.Expr{}
 		ast.Inspect(pf.file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
@@ -2396,7 +2575,7 @@ func appendEventBucketSites(files []parsedFile, idx *globalIndex) []Site {
 func scanSubprocessSites(files []parsedFile, idx *globalIndex) []SubprocessSite {
 	var out []SubprocessSite
 	for _, pf := range files {
-		localDefsCache := map[*ast.BlockStmt]map[string]ast.Expr{}
+		localDefsCache := map[token.Pos]map[string]ast.Expr{}
 		ast.Inspect(pf.file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
