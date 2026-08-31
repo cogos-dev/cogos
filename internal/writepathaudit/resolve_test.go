@@ -1037,3 +1037,245 @@ func f() {
 		})
 	}
 }
+
+// ─── Round-5 gate: sibling-branch and shadow-visibility scoping ───────────
+//
+// The round-4 fix's `:=`-shadow guard in applyAssign is a bare EXISTENCE
+// test (`if _, hadOuter := defs[ident.Name]; hadOuter { continue }`) over a
+// single flat, whole-function map. That test cannot tell "this is a
+// genuine outer binding from before the conditional" apart from "this is a
+// SIBLING branch's own `:=` that merely happened to be folded first by the
+// AST walk" — both look identical to a bare existence check. The fix is
+// localDefsFor/scopeChain: a position strictly inside a given conditional
+// body resolves using THAT body's own direct defs, layered back on top of
+// the flat map, regardless of what a sibling branch or the outer scope
+// recorded for the same name. These tests use scanParsedFile directly (the
+// real per-call-site production path, backed by localDefsFor) rather than
+// parseCallArg's single-match flat collectLocalDefs, specifically because
+// each case has MORE THAN ONE matched write call and the whole point is
+// that each one must resolve independently.
+
+// siteAtLine runs the same scanning path scanParsedFile/Scan use in
+// production (localDefsFor's position-aware scopeChain overlay, NOT
+// parseCallArg's flat, non-position-aware collectLocalDefs) and returns the
+// matched write site at wantLine, so a snippet with more than one write
+// call — one per sibling branch — can be asserted on independently.
+func siteAtLine(t *testing.T, src string, wantLine int) Site {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "snippet.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	pf := parsedFile{relPath: "snippet.go", dir: "pkg", fset: fset, file: f, scopes: collectFuncScopes(f, fset)}
+	idx := buildGlobalIndex([]parsedFile{pf})
+	sites := scanParsedFile(pf, idx)
+	for _, s := range sites {
+		if s.Line == wantLine {
+			return s
+		}
+	}
+	var lines []int
+	for _, s := range sites {
+		lines = append(lines, s.Line)
+	}
+	t.Fatalf("no matched writer call at line %d (found lines: %v)", wantLine, lines)
+	return Site{}
+}
+
+// TestSiblingIfBranchesResolveOwnValuesIndependently is round-5 finding #1:
+// two SIBLING `if`/`if` branches (not else-if — deliberately two separate
+// IfStmts, the exact reproduction shape) each declare the same name `p` via
+// `:=` with a DIFFERENT value and write it. Before this fix, the SECOND
+// branch's `:=` saw the FIRST branch's `p` already sitting in the flat map
+// (hadOuter=true, even though it is a SIBLING, not an enclosing scope) and
+// was treated as a shadow — recorded nowhere — so the second branch's own
+// write silently resolved against the FIRST branch's value.
+func TestSiblingIfBranchesResolveOwnValuesIndependently(t *testing.T) {
+	src := `package p
+func f(a bool, root string) {
+	if a {
+		p := "/etc/cogos/outer.json"
+		os.WriteFile(p, nil, 0644)
+	}
+	if !a {
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+	}
+}`
+	branch1 := siteAtLine(t, src, 5)
+	if branch1.Category != "elsewhere" || !strings.Contains(branch1.Pattern, "outer.json") {
+		t.Errorf("branch 1 (line 5) = category %q pattern %q, want elsewhere / outer.json — its own := must resolve on ITS OWN value", branch1.Category, branch1.Pattern)
+	}
+	branch2 := siteAtLine(t, src, 9)
+	if branch2.Category != "cog" || !strings.Contains(branch2.Pattern, ".cog/inner.json") {
+		t.Errorf("branch 2 (line 9) = category %q pattern %q, want cog / .cog/inner.json — the SECOND sibling branch's own := must not silently vanish behind the FIRST branch's := the way a bare hadOuter existence test collapses it", branch2.Category, branch2.Pattern)
+	}
+}
+
+// TestSwitchCaseSiblingBranchesResolveOwnValuesIndependently is the same
+// shape as TestSiblingIfBranchesResolveOwnValuesIndependently, but for two
+// SwitchStmt case bodies — the verifier's other named sibling shape.
+func TestSwitchCaseSiblingBranchesResolveOwnValuesIndependently(t *testing.T) {
+	src := `package p
+func f(mode int, root string) {
+	switch mode {
+	case 1:
+		p := "/etc/cogos/outer.json"
+		os.WriteFile(p, nil, 0644)
+	case 2:
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+	}
+}`
+	case1 := siteAtLine(t, src, 6)
+	if case1.Category != "elsewhere" || !strings.Contains(case1.Pattern, "outer.json") {
+		t.Errorf("case 1 (line 6) = category %q pattern %q, want elsewhere / outer.json", case1.Category, case1.Pattern)
+	}
+	case2 := siteAtLine(t, src, 9)
+	if case2.Category != "cog" || !strings.Contains(case2.Pattern, ".cog/inner.json") {
+		t.Errorf("case 2 (line 9) = category %q pattern %q, want cog / .cog/inner.json — a switch case's own := must resolve independently of the PREVIOUS case's own :=", case2.Category, case2.Pattern)
+	}
+}
+
+// TestShadowDeclarationVisibleInsideItsOwnBranch is round-5 finding #2: the
+// `:=`-shadow guard correctly protects a read OUTSIDE the conditional (see
+// TestConditionalShadowDeclarationDoesNotPoisonOuter), but as a side effect
+// of never recording the shadow's own value anywhere, it ALSO broke a read
+// INSIDE the same branch that declared the shadow — that read saw the
+// OUTER value instead of the shadow's own, genuinely different, value.
+func TestShadowDeclarationVisibleInsideItsOwnBranch(t *testing.T) {
+	src := `package p
+func f(a bool, root string) {
+	p := "/etc/cogos/outer.json"
+	if a {
+		p := filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+	}
+	os.WriteFile(p, nil, 0644)
+}`
+	inside := siteAtLine(t, src, 6)
+	if inside.Category != "cog" || !strings.Contains(inside.Pattern, ".cog/inner.json") {
+		t.Errorf("inside the if-block (line 6) = category %q pattern %q, want cog / .cog/inner.json — a read of `p` INSIDE the very branch that shadows it must see the SHADOW's own value, not the outer one", inside.Category, inside.Pattern)
+	}
+	outside := siteAtLine(t, src, 8)
+	if outside.Category != "elsewhere" || !strings.Contains(outside.Pattern, "outer.json") {
+		t.Errorf("outside the if-block (line 8) = category %q pattern %q, want elsewhere / outer.json — the required control: the outer read must still be completely unaffected by the shadow", outside.Category, outside.Pattern)
+	}
+}
+
+// TestValueSpecShadowGatedLikeDefine is round-5 finding #3: applyAssign's
+// `:=` DEFINE case is gated on shadowing an outer name (record unless it
+// would clobber one), but the *ast.ValueSpec (`var x = expr`) arm was
+// gated on condDepth == 0 instead — unconditionally dropping EVERY `var`
+// declared inside any conditional, shadow or not. This mirrors both halves
+// of TestShadowDeclarationVisibleInsideItsOwnBranch and
+// TestConditionalShadowDeclarationDoesNotPoisonOuter for the `var` form:
+// the outer read must stay protected, AND a read inside the branch that
+// declares the `var` shadow must see the shadow's own value — neither of
+// which held before this fix (the outer read never SAW the shadow, since
+// nothing at condDepth>0 was ever recorded — the inside read hit the same
+// gap; only the OUTSIDE half happened to look correct by accident, because
+// there was never anything at condDepth>0 not being poisoned in the first
+// place, but that accident is exactly what made the total drop of the
+// inside value invisible to a golden-diff comparison).
+func TestValueSpecShadowGatedLikeDefine(t *testing.T) {
+	src := `package p
+func f(a bool, root string) {
+	var p = "/etc/cogos/outer.json"
+	if a {
+		var p = filepath.Join(root, ".cog", "inner.json")
+		os.WriteFile(p, nil, 0644)
+	}
+	os.WriteFile(p, nil, 0644)
+}`
+	inside := siteAtLine(t, src, 6)
+	if inside.Category != "cog" || !strings.Contains(inside.Pattern, ".cog/inner.json") {
+		t.Errorf("inside the if-block (line 6) = category %q pattern %q, want cog / .cog/inner.json — a `var` shadow must be visible to a read inside its own branch, exactly like a `:=` shadow", inside.Category, inside.Pattern)
+	}
+	outside := siteAtLine(t, src, 8)
+	if outside.Category != "elsewhere" || !strings.Contains(outside.Pattern, "outer.json") {
+		t.Errorf("outside the if-block (line 8) = category %q pattern %q, want elsewhere / outer.json — the outer `var` must stay protected from the branch's own `var` shadow", outside.Category, outside.Pattern)
+	}
+}
+
+// TestConditionalJoinWrappedRebindPoisonsToUnanchored is round-5 finding
+// #4's confirmed reproduction, restated one syntactic step from the
+// round-4 gate's own literal-only case: the rebind is wrapped in
+// filepath.Join over plain literals instead of spelled as one bare
+// literal. staticPathText (literalPathText's round-5 replacement) must
+// still catch this and poison it, exactly as the bare-literal case already
+// does.
+func TestConditionalJoinWrappedRebindPoisonsToUnanchored(t *testing.T) {
+	src := `package p
+func f(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		path = filepath.Join("/etc", "cogos", "g.json")
+	}
+	return os.WriteFile(path, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	if got := classify(pattern, resolved, degenerate); got != "unanchored" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q — a filepath.Join-wrapped conditional rebind to a non-.cog root must poison exactly like a bare-literal one", pattern, resolved, degenerate, got, "unanchored")
+	}
+}
+
+// TestConditionalRebindThroughLocalChasePoisons extends the same coverage
+// to a rebind whose root is reached through ONE already-known local in the
+// SAME function (the manifest.go RunsRoot shape: `home := os.UserHomeDir();
+// ...; root = filepath.Join(home, "workspaces")`) rather than an inline
+// literal — staticPathText's Ident-through-defs chase is what closes this,
+// distinct from (and in addition to) the plain filepath.Join-of-literals
+// case above.
+func TestConditionalRebindThroughLocalChasePoisons(t *testing.T) {
+	src := `package p
+func f(useEnv bool, envRoot string) (string, error) {
+	root := envRoot
+	if !useEnv {
+		home, _ := os.UserHomeDir()
+		root = filepath.Join(home, "workspaces")
+	}
+	return root, nil
+}
+func g(useEnv bool, envRoot string) error {
+	root, _ := f(useEnv, envRoot)
+	return os.MkdirAll(filepath.Join(root, "first-instruments-runs"), 0755)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	got := classify(pattern, resolved, degenerate)
+	if got == "home" {
+		t.Errorf("classify(%q, %v, %v) = %q — a conditional rebind chased through one local (home := os.UserHomeDir()) must not let the env-unset branch alone stamp a confident \"home\"", pattern, resolved, degenerate, got)
+	}
+}
+
+// TestConditionalCogBearingRebindStaysTrusted pins down the DELIBERATE
+// asymmetry round-5 finding #5 flagged: a branch rebind this tool can read
+// as .cog-ROOTED is trusted (never poisoned) even though the branch might
+// not execute, while a branch rebind to a provably non-.cog root IS
+// poisoned (see TestConditionalPlainRebindPoisonsToUnanchored and its
+// siblings above). This is the SAME over-claim-toward-.cog-is-the-safe-
+// direction posture classify()'s own doc comment states for every other
+// ambiguous case in this package, applied here too — see
+// poisonConditionalAndLoopRebinds's doc comment for the full reasoning and
+// for why making this symmetric would cost real .cog/ writers (log_capture.
+// go's shape) more than it would gain. This test exists so a future change
+// to this balance is a conscious, gate-visible decision, never an
+// accidental one.
+func TestConditionalCogBearingRebindStaysTrusted(t *testing.T) {
+	src := `package p
+func f(useCog bool, elsewhereRoot string) error {
+	path := filepath.Join(elsewhereRoot, "settings.json")
+	if useCog {
+		path = "/var/lib/x/.cog/settings.json"
+	}
+	return os.WriteFile(path, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	if got := classify(pattern, resolved, degenerate); got != "cog" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q — a conditional rebind THIS tool can read as .cog-rooted is deliberately never poisoned, even though the branch might not execute at runtime (the accepted, documented asymmetry — see poisonConditionalAndLoopRebinds's doc comment)", pattern, resolved, degenerate, got, "cog")
+	}
+}

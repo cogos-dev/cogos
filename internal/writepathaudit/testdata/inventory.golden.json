@@ -2203,8 +2203,8 @@
       "column": 12,
       "primitive": "os.MkdirAll",
       "func": "RunDir",
-      "pattern": "\u003cHome\u003e/workspaces/first-instruments-runs/{runID}",
-      "category": "home",
+      "pattern": "{root}/first-instruments-runs/{runID}",
+      "category": "unanchored",
       "resolved": true,
       "subsystem": "internal:testkernel",
       "raw": "dir"
@@ -2215,8 +2215,8 @@
       "column": 12,
       "primitive": "os.OpenFile",
       "func": "NewObservationWriter",
-      "pattern": "\u003cHome\u003e/workspaces/first-instruments-runs/{runID}/observations.jsonl",
-      "category": "home",
+      "pattern": "{root}/first-instruments-runs/{runID}/observations.jsonl",
+      "category": "unanchored",
       "resolved": true,
       "subsystem": "internal:testkernel",
       "raw": "path"
@@ -2849,9 +2849,9 @@
   "summary": {
     "total": 237,
     "cog": 100,
-    "home": 4,
+    "home": 2,
     "elsewhere": 13,
-    "unanchored": 77,
+    "unanchored": 79,
     "dynamic": 43,
     "by_primitive": {
       "engine.AppendEvent(bucket)": 5,

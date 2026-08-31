@@ -518,17 +518,43 @@ func paramNames(fl *ast.FieldList) []string {
 
 // localDefsFor is computed lazily per (function scope, position) and cached
 // by the caller, since most files have far more scopes than matched call
-// sites. pos matters because FOR/RANGE loop bodies are scoped separately
-// (see collectLocalDefs) — the cache key is the innermost loop body
-// actually reached from pos, or fnBody itself when pos is not inside any
-// loop, so two call sites inside the SAME loop iteration correctly share
-// one map while two call sites in DIFFERENT (sibling, or unrelated) loops
-// never do.
+// sites. pos matters because every scope-introducing construct on the path
+// down to pos — FOR/RANGE loop bodies, but ALSO if/else bodies, switch/
+// type-switch case bodies, and select comm-clause bodies — gets its own
+// defs layered back on top of the whole-function flat map (see scopeChain
+// and collectLocalDefs) — the cache key is the innermost such body actually
+// reached from pos, or fnBody itself when pos is not inside any of them, so
+// two call sites inside the SAME loop iteration or the SAME conditional
+// branch correctly share one map while two call sites in DIFFERENT
+// (sibling, or unrelated) loops or branches never do.
+//
+// The conditional half of this (added alongside loops) is what closes two
+// round-5-gate defects the flat map's own hadOuter existence-test could not:
+// two SIBLING branches (an if/else-if pair, or two switch cases) declaring
+// the same name via `:=` were flattening onto whichever branch's `:=` the
+// AST walk happened to visit FIRST — see applyAssign's own doc comment —
+// which not only mis-resolved a read outside both branches but, worse,
+// mis-resolved the SECOND branch's own write, inside its own body, onto the
+// first branch's value; and a `:=` that genuinely shadows an OUTER name
+// protected the outer read correctly (see poisonConditionalAndLoopRebinds)
+// but, as a side effect of never being recorded at all, left the shadow's
+// OWN value invisible to a read of the SAME name INSIDE the very branch
+// that declared it. Layering each conditional body's own direct defs back
+// on top, scoped only to positions actually inside that body, fixes both:
+// a use site inside a given branch now always sees THAT branch's own
+// bindings (its own `:=`, `=`, and `var` declarations, applied with
+// conditional depth restarting at zero for that body's own top-level
+// statements — see applyDirectLocalDefs), regardless of what a sibling
+// branch or the outer scope recorded for the same name. A use site outside
+// every conditional is completely unaffected: scopeChain returns an empty
+// chain for it, so it resolves purely from the base flat map exactly as
+// before this fix (poisonConditionalAndLoopRebinds's existing rules still
+// govern what that map holds for such a read).
 func localDefsFor(cache map[*ast.BlockStmt]map[string]ast.Expr, fnBody *ast.BlockStmt, pos token.Pos) map[string]ast.Expr {
 	if fnBody == nil {
 		return map[string]ast.Expr{}
 	}
-	chain := loopBodyChain(fnBody, pos)
+	chain := scopeChain(fnBody, pos)
 	key := fnBody
 	if len(chain) > 0 {
 		key = chain[len(chain)-1]
@@ -537,8 +563,8 @@ func localDefsFor(cache map[*ast.BlockStmt]map[string]ast.Expr, fnBody *ast.Bloc
 		return defs
 	}
 	defs := collectLocalDefs(fnBody)
-	for _, loopBody := range chain {
-		applyDirectLocalDefs(defs, loopBody, true)
+	for _, scopeBody := range chain {
+		applyDirectLocalDefs(defs, scopeBody, true)
 	}
 	cache[key] = defs
 	return defs
@@ -571,12 +597,16 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // FOR/RANGE loop OR a conditionally-executed subtree (IfStmt — body and
 // else chain, SwitchStmt/TypeSwitchStmt case bodies, SelectStmt comm
 // clauses) rebinds in a way a use site OUTSIDE that subtree cannot safely
-// trust. `:=` never poisons — when it shadows an existing outer name, it
-// never touches that outer binding in the first place (see
-// applyDirectLocalDefs/applyAssign's condDepth handling), so there is
-// nothing here to poison; when it introduces a brand-new name with no
+// trust. Neither `:=` nor a `var x = expr` ValueSpec ever poisons — when
+// either shadows an existing outer name, it never touches that outer
+// binding in the first place (see applyDirectLocalDefs/applyAssign's
+// condDepth handling, mirrored identically for ValueSpec), so there is
+// nothing here to poison; when either introduces a brand-new name with no
 // outer counterpart, it is not a rebind of anything outer at all, so
-// poisoning has no name to act on either way.
+// poisoning has no name to act on either way. (A use site strictly INSIDE
+// the subtree that declared such a shadow sees the shadow's own value
+// regardless — see localDefsFor/scopeChain, a separate, position-scoped
+// overlay that runs after this poisoning pass and is unaffected by it.)
 //
 // LOOPS: applyDirectLocalDefs never applies a loop body's assignments to
 // the outer map at all (skipLoopBodies=true skips the whole construct,
@@ -617,15 +647,21 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 // established a prior fold to protect in the first place — see the loop
 // section of this comment).
 //
-// Second (the actual round-4 gate fix): a PLAIN `=` rebind is poisoned
-// only when this function can PROVE, using nothing but the rebind's own
-// syntax — no resolver, no call chase, no defs lookup beyond existence —
-// that the rebind assigns a root DIFFERENT from .cog/. literalPathText
-// recognizes exactly one shape for this: a self-contained string literal
-// (or a `+`-chain of them) whose text does not itself contain a ".cog"
-// segment (hasCogSegment). Two real, currently-shipping .cog/ writers
-// pin down why the check has to be this narrow rather than "any plain `=`
-// inside a conditional poisons, full stop":
+// Second (the round-4 gate fix, broadened at round 5 — see staticPathText):
+// a PLAIN `=` rebind is poisoned only when this function can PROVE, using
+// nothing but syntax already sitting in this one function's own defs map —
+// no *globalIndex, no interprocedural call chase, no paramOrigin/
+// fieldOrigin — that the rebind assigns a root DIFFERENT from .cog/.
+// staticPathText (round 4's literalPathText, widened) recognizes: a
+// self-contained string literal or `+`-chain of them (the original round-4
+// shape); a filepath.Join/Dir/Base/Clean call composed entirely of
+// arguments THIS function can itself resolve; os.UserHomeDir()/
+// os.TempDir(); the same anchor names identifierAnchors knows; and a plain
+// Ident chased through defs (recursively, bounded — see
+// maxPoisonChaseDepth) when this SAME function already has a resolvable
+// binding for it. Two real, currently-shipping .cog/ writers pin down why
+// the check has to stay this narrow rather than "any plain `=` inside a
+// conditional poisons, full stop":
 //
 //   - internal/engine/log_capture.go's `path := cfg.KernelLogPath; if
 //     path == "" { path = DefaultKernelLogPath(cfg.WorkspaceRoot) }` — the
@@ -634,35 +670,69 @@ func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 //     <WorkspaceRoot>/.cog/run/kernel.log.jsonl. Poisoning this (as an
 //     earlier, unconditional version of this fix did) throws away the
 //     ONLY known-good classification for a genuine .cog/run/ writer,
-//     purely because the rebind sits inside an `if`.
+//     purely because the rebind sits inside an `if`. staticPathText still
+//     cannot evaluate DefaultKernelLogPath(...) — it is a call to another
+//     declared function, outside the narrow filepath/os allowlist above —
+//     so this case is completely unaffected by the round-5 widening.
 //   - internal/engine/memory_sections.go's resolveMemoryDocPath: every
 //     branch of its switch (and the if/else nested in its default case)
-//     assigns `candidate` via a filepath.Join call, never a bare literal;
-//     the read at :252/:def happens after the switch closes. Same shape,
-//     same reasoning.
+//     assigns `candidate` via a filepath.Join call whose own arguments
+//     (cogRoot, path — both function PARAMETERS, which staticPathText
+//     deliberately never chases; see its own doc comment) are themselves
+//     unresolvable this way, so every branch still reads as "cannot prove"
+//     and none of them get poisoned — same outcome as round 4, for a
+//     structurally different reason (an unresolvable argument, not an
+//     unrecognized call shape).
 //
-// In both cases the rebind's RHS is a CallExpr (or a bare Ident naming a
-// further local), which literalPathText deliberately cannot evaluate —
-// there is no resolver available yet at this stage of building defs to
-// chase it, so this function has no basis to call it a conflict, and
-// leaves it alone. This is a conscious asymmetry, not an oversight: the
-// round-4 finding's OWN reproduction —
+// The round-4 gate's own reproduction —
 // `path := filepath.Join(workspaceRoot, ".cog", "settings.json"); if
-// !useCog { path = "/etc/cogos/global-settings.json" }` — is a
-// self-contained literal with no ".cog" segment, so it IS caught. A
-// hypothetical rebind that instead called some OTHER, non-.cog-rooted
-// helper function (`path = filepath.Join("/etc", "cogos")`) would not be
-// caught by this narrower check; that residual gap needs the resolver
-// itself to be branch-aware to close (see the package doc's open-issues
-// section) and is out of scope for this fix, which targets the literal
-// confirmed finding. This is the resolver's own invariant, applied as
-// far as pre-resolution syntax alone can prove it: a write site must
-// never classify from a binding not guaranteed on its execution path —
-// when a branch's own fold GUARANTEES the anchor (compound assign) or
-// this function cannot yet tell whether a rebind disagrees (an
-// unresolved call/field), the existing binding stands; only a rebind this
-// function can already read as a DIFFERENT, non-.cog literal forces the
-// site to the unanchored margin.
+// !useCog { path = "/etc/cogos/global-settings.json" }` — was already
+// caught by the literal-only check. The round-5 gate's finding is that a
+// ONE-STEP paraphrase of the identical shape — `path = filepath.Join("/etc",
+// "cogos", "g.json")`, or the same idiom threading through one already-known
+// local (`root = filepath.Join(home, "workspaces")` where `home` was itself
+// bound to `os.UserHomeDir()` earlier in the SAME function) — was NOT
+// caught, purely because the rebind happened to be wrapped in a
+// filepath.Join call instead of spelled as one bare literal. This was not a
+// hypothetical: internal/testkernel/experiment/manifest.go's RunsRoot is a
+// real, shipping instance of exactly the second shape (`root :=
+// os.Getenv("COGOS_WORKSPACE_ROOT"); if root == "" { home, _ :=
+// os.UserHomeDir(); root = filepath.Join(home, "workspaces") }`, read after
+// the `if` closes) — the env-var-unset branch's Join was the ONLY thing
+// keeping RunsRoot's two call sites classified "home" instead of the honest
+// "unanchored" a genuinely branch-dependent, partly-dynamic (os.Getenv)
+// root deserves. staticPathText closes exactly this gap by evaluating the
+// same narrow filepath/os shapes the real resolver already knows, without
+// needing the real resolver's interprocedural machinery to do it — see
+// TestManifestGoRunsRootEnvBranch_NoLongerOverclaimsHome in scan_test.go
+// for the pinned-down regression. This is the resolver's own invariant,
+// applied as far as pre-resolution syntax alone can prove it: a write site
+// must never classify from a binding not guaranteed on its execution path —
+// when a branch's own fold GUARANTEES the anchor (compound assign) or this
+// function cannot yet tell whether a rebind disagrees (an unresolved call,
+// field, or parameter), the existing binding stands; only a rebind this
+// function can already read — now via staticPathText's wider, still
+// self-contained reach — as a DIFFERENT, non-.cog root forces the site to
+// the unanchored margin.
+//
+// staticPathText's reach is still bounded on purpose, and a further,
+// currently-open gap follows the identical shape: a rebind this function
+// CAN read as .cog-ROOTED is never poisoned either way (see hasCogSegment
+// below) — favoring a false "cog" over a false "elsewhere", the same
+// over-claim-toward-.cog-is-the-safe-direction posture classify()'s own doc
+// comment states for every other ambiguous case in this package. This is a
+// deliberate asymmetry, not an oversight left beside this one: a branch
+// rebind to a .cog-bearing value, resolvable or not, is trusted; a branch
+// rebind this function can positively read as non-.cog is poisoned. Making
+// the two directions symmetric (poisoning a .cog-bearing rebind too, the
+// instant it sits beside an unguaranteed sibling) would trade real .cog/
+// writers currently caught by exactly this one-resolvable-branch heuristic
+// (log_capture.go above is one) for a more theoretically consistent, but
+// practically worse, failure mode — so it is left as is here, named
+// explicitly rather than silently implied, with the asymmetry pinned down
+// by a dedicated regression test (TestConditionalCogBearingRebindStaysTrusted
+// in resolve_test.go) so a future change to this balance is a conscious
+// decision, not an accidental one.
 func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt) {
 	if body == nil {
 		return
@@ -694,11 +764,14 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockSt
 	}
 	// poisonConditional deletes defs[name] for a plain `=` rebind found
 	// inside a conditionally-executed subtree, but ONLY when the rebind's
-	// own RHS is a literalPathText the auditor can read WITHOUT a
-	// resolver and that text does not carry a ".cog" segment — see this
-	// function's doc comment for the two real .cog/ writers (a struct
-	// field and a filepath.Join call, both left alone) that a broader,
-	// unconditional version of this check silently broke.
+	// own RHS is a staticPathText the auditor can read WITHOUT a resolver
+	// (using only THIS function's own already-folded defs, passed in below)
+	// and that text does not carry a ".cog" segment — see this function's
+	// doc comment for the real .cog/ writers (a struct field, and a
+	// filepath.Join over unchaseable parameters) that a broader,
+	// unconditional version of this check would silently break, and for
+	// the deliberate cog-favoring asymmetry in the hasCogSegment check
+	// itself.
 	poisonConditional := func(n ast.Node) {
 		if n == nil {
 			return
@@ -713,7 +786,7 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockSt
 				if !isIdent || ident.Name == "_" || i >= len(assign.Rhs) {
 					continue
 				}
-				text, litOK := literalPathText(assign.Rhs[i])
+				text, litOK := staticPathText(assign.Rhs[i], defs, 0)
 				if !litOK || hasCogSegment(text) {
 					continue
 				}
@@ -758,20 +831,45 @@ func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockSt
 	})
 }
 
-// literalPathText cheaply evaluates expr as a self-contained literal path
-// string — no resolver, no call chase, no anchor-token recognition —
-// returning ok only for a plain string literal or a `+`-chain of them.
-// This exists solely so poisonConditionalAndLoopRebinds can tell a
-// conditional rebind's root apart from an outer binding's using nothing
-// but syntax: a hardcoded literal is either .cog-rooted (its text says so
-// directly) or it manifestly is not, and either way no resolution
-// machinery is needed to know which. Anything this function can't read
-// at all — a filepath.Join call, a struct-field or parameter reference,
-// a call to another function — returns ok=false, which
-// poisonConditionalAndLoopRebinds treats as "cannot prove a conflict",
-// not as "no conflict": see that function's doc comment for why guessing
-// either way here would be wrong.
-func literalPathText(expr ast.Expr) (string, bool) {
+// maxPoisonChaseDepth bounds staticPathText's own recursion — a separate,
+// smaller ceiling than maxChaseDepth because this evaluator never leaves
+// the current function body (no *globalIndex, no paramOrigin/fieldOrigin,
+// no callChase), so a handful of levels covers every shape it needs to
+// reach: a `+`-chain, a filepath.Join/Dir/Base/Clean wrapping one, and an
+// Ident chased through this same function's own defs.
+const maxPoisonChaseDepth = 8
+
+// staticPathText evaluates expr as a self-contained path pattern using
+// nothing but syntax and the SAME FUNCTION's own already-folded defs — no
+// *globalIndex, no interprocedural call chase, no anchor beyond the same
+// four identifierAnchors names the real resolver knows. This exists so
+// poisonConditionalAndLoopRebinds can tell a conditional rebind's root
+// apart from an outer binding's for more than a bare string literal (round
+// 4's literalPathText, which this supersedes): a filepath.Join/Dir/Base/
+// Clean call composed entirely of arguments THIS function can itself
+// resolve — including a plain Ident naming an earlier local this same
+// function already defines — is exactly as provably a root as a bare
+// literal is, and treating it as unprovable (round 4's version did) is what
+// let internal/testkernel/experiment/manifest.go's RunsRoot ship a false
+// "home" classification for a root that is genuinely branch-dependent (see
+// poisonConditionalAndLoopRebinds's own doc comment for the full story).
+//
+// Anything this function can't read this way — a call to another declared
+// function, a struct field, an unchaseable parameter, os.Getenv and any
+// other stdlib call outside the narrow filepath/os allowlist below —
+// returns ok=false, which poisonConditionalAndLoopRebinds treats as
+// "cannot prove a conflict", not as "no conflict": see that function's doc
+// comment for why guessing either way here would be wrong. This is a
+// STRICT SUBSET of what the real resolver (resolveExpr/resolveCall) can
+// do — deliberately: it runs during collectLocalDefs, before any
+// *globalIndex exists to chase a parameter or field through, so it only
+// ever needs to prove a rebind's root using information already sitting in
+// this one function's own defs map, never information that lives outside
+// it.
+func staticPathText(expr ast.Expr, defs map[string]ast.Expr, depth int) (string, bool) {
+	if depth > maxPoisonChaseDepth {
+		return "", false
+	}
 	switch e := expr.(type) {
 	case *ast.BasicLit:
 		if e.Kind != token.STRING {
@@ -782,19 +880,105 @@ func literalPathText(expr ast.Expr) (string, bool) {
 			return "", false
 		}
 		return v, true
+
+	case *ast.ParenExpr:
+		return staticPathText(e.X, defs, depth+1)
+
 	case *ast.BinaryExpr:
 		if e.Op != token.ADD {
 			return "", false
 		}
-		left, ok := literalPathText(e.X)
+		left, ok := staticPathText(e.X, defs, depth+1)
 		if !ok {
 			return "", false
 		}
-		right, ok := literalPathText(e.Y)
+		right, ok := staticPathText(e.Y, defs, depth+1)
 		if !ok {
 			return "", false
 		}
 		return left + right, true
+
+	case *ast.Ident:
+		if anchor, isAnchor := identifierAnchors[strings.ToLower(e.Name)]; isAnchor {
+			return anchor, true
+		}
+		// Only a name THIS function already has a folded def for — never a
+		// parameter, a struct field, or anything requiring the real
+		// resolver's interprocedural reach (paramOrigin/fieldOrigin), which
+		// is not available at this stage. See this function's own doc
+		// comment: this is precisely the line between the manifest.go gap
+		// this closes (an Ident bound to os.UserHomeDir() earlier in the
+		// SAME function) and the memory_sections.go/log_capture.go cases
+		// that must stay unresolvable (an Ident that is itself a function
+		// parameter).
+		if def, isLocal := defs[e.Name]; isLocal {
+			return staticPathText(def, defs, depth+1)
+		}
+		return "", false
+
+	case *ast.CallExpr:
+		sel, isSel := e.Fun.(*ast.SelectorExpr)
+		if !isSel {
+			return "", false
+		}
+		pkgIdent, isPkg := sel.X.(*ast.Ident)
+		if !isPkg {
+			return "", false
+		}
+		switch {
+		case pkgIdent.Name == "filepath" && sel.Sel.Name == "Join":
+			// Same empty-component-skipping behavior as the real resolver's
+			// filepath.Join handling (resolveCall) — real filepath.Join
+			// does the same. Unlike resolveCall, ANY unresolvable argument
+			// fails the WHOLE call rather than degrading to a partial,
+			// opaque-segment pattern: this evaluator has no downstream
+			// classify() pass to hand an opaque segment to, so an
+			// unresolvable argument must mean "cannot prove", full stop.
+			parts := make([]string, 0, len(e.Args))
+			for _, arg := range e.Args {
+				p, ok := staticPathText(arg, defs, depth+1)
+				if !ok {
+					return "", false
+				}
+				if p != "" {
+					parts = append(parts, p)
+				}
+			}
+			return strings.Join(parts, "/"), true
+
+		case pkgIdent.Name == "filepath" && sel.Sel.Name == "Dir":
+			if len(e.Args) != 1 {
+				return "", false
+			}
+			inner, ok := staticPathText(e.Args[0], defs, depth+1)
+			if !ok {
+				return "", false
+			}
+			return "dirname(" + inner + ")", true
+
+		case pkgIdent.Name == "filepath" && sel.Sel.Name == "Base":
+			if len(e.Args) != 1 {
+				return "", false
+			}
+			inner, ok := staticPathText(e.Args[0], defs, depth+1)
+			if !ok {
+				return "", false
+			}
+			return "basename(" + inner + ")", true
+
+		case pkgIdent.Name == "filepath" && sel.Sel.Name == "Clean":
+			if len(e.Args) != 1 {
+				return "", false
+			}
+			return staticPathText(e.Args[0], defs, depth+1)
+
+		case pkgIdent.Name == "os" && sel.Sel.Name == "UserHomeDir":
+			return "<Home>", true
+
+		case pkgIdent.Name == "os" && sel.Sel.Name == "TempDir":
+			return "<TempDir>", true
+		}
+		return "", false
 	}
 	return "", false
 }
@@ -835,6 +1019,13 @@ func literalPathText(expr ast.Expr) (string, bool) {
 // complete, that decides which of THOSE survive for a use site outside the
 // subtree. See that function's doc comment for the plain-vs-compound
 // split and why a `:=` needs no matching poison step at all.
+//
+// A `var x = expr` ValueSpec found inside a conditionally-executed subtree
+// is gated identically to `:=` above — shadow-protected only when an outer
+// binding of the same name already exists, recorded plainly otherwise (see
+// the ValueSpec case's own comment) — since a `var` declaration is exactly
+// as much a fresh, block-scoped local as a `:=` is; nothing about the two
+// declaration forms warrants different treatment here.
 func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoopBodies bool) {
 	if body == nil {
 		return
@@ -881,13 +1072,32 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 		case *ast.AssignStmt:
 			applyAssign(defs, stmt, condDepth > 0)
 		case *ast.ValueSpec:
-			if condDepth == 0 {
-				for i, name := range stmt.Names {
-					if name.Name == "_" || i >= len(stmt.Values) {
+			// A `var x = expr` declaration is the DECLARE case's exact
+			// counterpart to `:=` — see applyAssign's own doc comment for
+			// the full reasoning, mirrored here rather than restated: a
+			// ValueSpec found inside a conditionally-executed subtree is
+			// only ever a SHADOW (and therefore left untouched, protecting
+			// the outer binding of the same name) when an outer binding
+			// already exists; a `var x = expr` with no outer counterpart is
+			// simply this subtree's own fresh local and must still be
+			// recorded, exactly as it would be outside a conditional. An
+			// earlier version of this function gated the whole case on
+			// condDepth == 0 — silently dropping EVERY `var x = expr`
+			// declared inside any conditional, shadow or not, which is both
+			// undocumented (this comment is the fix) and asymmetric with
+			// the `:=` case sitting right next to it for no principled
+			// reason: nothing distinguishes a `var`-form fresh conditional
+			// local from a `:=`-form one.
+			for i, name := range stmt.Names {
+				if name.Name == "_" || i >= len(stmt.Values) {
+					continue
+				}
+				if condDepth > 0 {
+					if _, hadOuter := defs[name.Name]; hadOuter {
 						continue
 					}
-					defs[name.Name] = stmt.Values[i]
 				}
+				defs[name.Name] = stmt.Values[i]
 			}
 		}
 		return true
@@ -965,9 +1175,11 @@ func applyAssign(defs map[string]ast.Expr, stmt *ast.AssignStmt, insideCondition
 // switch HEADER, not its body). Handles the constructs that introduce a new
 // block scope in Go: a bare block, if/else (including else-if chains via
 // recursion), for, range, switch/case, type-switch/case, and select/
-// comm-clause. Only FOR/RANGE bodies are actually consumed by
-// loopBodyChain today; the rest are here so a loop nested inside an
-// if/switch/select is still found correctly.
+// comm-clause. Consumed by scopeChain (via directChildBlockContaining)
+// below, which walks every level this function knows about — a loop nested
+// inside an if/switch/select, or vice versa, is found correctly either way,
+// and each level along the path gets its own defs overlay (see
+// localDefsFor).
 func nestedScopeBody(stmt ast.Stmt, pos token.Pos) *ast.BlockStmt {
 	switch s := stmt.(type) {
 	case *ast.BlockStmt:
@@ -1025,34 +1237,41 @@ func directChildBlockContaining(block *ast.BlockStmt, pos token.Pos) *ast.BlockS
 	return nil
 }
 
-// loopBodyChain returns, from outermost to innermost, every ForStmt/
-// RangeStmt body that lexically contains pos within fnBody. Only loop
-// bodies are tracked — see collectLocalDefs's doc comment for why the
-// scoping fix this exists for is deliberately this narrow (compound
-// assignments across if/else branches still resolve via the flat,
-// branch-insensitive walk, which is what lets sdk/cogos.go's
-// `memPath += ".md"` fix work at all).
-func loopBodyChain(fnBody *ast.BlockStmt, pos token.Pos) []*ast.BlockStmt {
+// scopeChain returns, from outermost to innermost, every nested block scope
+// — a loop body, an if/else body, a switch/type-switch case body, a select
+// comm-clause body, or a bare `{ }` block — that lexically contains pos
+// within fnBody, by walking directChildBlockContaining one level at a time
+// from fnBody down. This replaces the earlier, loop-only loopBodyChain:
+// generalizing to every scope-introducing construct is what lets
+// localDefsFor layer a CONDITIONAL branch's own local defs back on top of
+// the flat map for a position inside that specific branch (see
+// localDefsFor's doc comment for the two round-5-gate defects this closes
+// — sibling branches colliding, and a shadow's own write being invisible to
+// reads inside its own branch), not just a loop iteration's.
+//
+// Loop bodies keep behaving exactly as loopBodyChain always had them:
+// nothing here changes what a position OUTSIDE every conditional resolves
+// to (collectLocalDefs's own flat fold, plus poisonConditionalAndLoopRebinds,
+// is unaffected — this only adds overlays for positions strictly INSIDE a
+// tracked body), and a plain nested `{ }` block with no conditional or loop
+// around it is a genuine, if previously untracked, Go lexical scope of its
+// own — layering it in only makes a same-named local declared solely inside
+// such a block resolve correctly for reads inside that block, never for
+// reads outside it.
+func scopeChain(fnBody *ast.BlockStmt, pos token.Pos) []*ast.BlockStmt {
 	var chain []*ast.BlockStmt
 	if fnBody == nil || pos < fnBody.Pos() || pos >= fnBody.End() {
 		return chain
 	}
-	ast.Inspect(fnBody, func(n ast.Node) bool {
-		var loopBody *ast.BlockStmt
-		switch s := n.(type) {
-		case *ast.ForStmt:
-			loopBody = s.Body
-		case *ast.RangeStmt:
-			loopBody = s.Body
-		default:
-			return true
+	cur := fnBody
+	for {
+		next := directChildBlockContaining(cur, pos)
+		if next == nil {
+			return chain
 		}
-		if loopBody != nil && pos >= loopBody.Pos() && pos < loopBody.End() {
-			chain = append(chain, loopBody)
-		}
-		return true
-	})
-	return chain
+		chain = append(chain, next)
+		cur = next
+	}
 }
 
 // topLevelReturns collects every *ast.ReturnStmt directly in body, WITHOUT

@@ -748,6 +748,50 @@ func TestRound4GateFindings_NeverElsewhere(t *testing.T) {
 	}
 }
 
+// TestManifestGoRunsRootEnvBranch_NoLongerOverclaimsHome is the round-5
+// gate's own regression: internal/testkernel/experiment/manifest.go's
+// RunsRoot conditionally rebinds `root` (`root := os.Getenv(...); if root ==
+// "" { home, _ := os.UserHomeDir(); root = filepath.Join(home,
+// "workspaces") }`) and both of its call sites (manifest.go:41 and :103)
+// used to resolve on the env-var-UNSET branch's join alone, stamping a
+// confident "home" for a root that is genuinely branch-dependent — an
+// unresolvable os.Getenv() on one path, a resolvable <Home>/workspaces on
+// the other. TestRound4GateFindings_NeverElsewhere already accepted "home"
+// OR "unanchored" at :103 (never demanding the fix); this test pins the
+// actual post-fix behavior down precisely, at BOTH call sites, so a future
+// change that reintroduces the over-claim fails here even if a broader
+// "home or unanchored" check would not have caught it.
+func TestManifestGoRunsRootEnvBranch_NoLongerOverclaimsHome(t *testing.T) {
+	root := repoRoot(t)
+	report, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(%s): %v", root, err)
+	}
+	find := func(line int) (Site, bool) {
+		for _, s := range report.Sites {
+			if s.File == "internal/testkernel/experiment/manifest.go" && s.Line == line {
+				return s, true
+			}
+		}
+		return Site{}, false
+	}
+	for _, line := range []int{41, 103} {
+		s, ok := find(line)
+		if !ok {
+			t.Fatalf("manifest.go:%d not found in inventory", line)
+		}
+		if s.Category == "home" {
+			t.Errorf("manifest.go:%d = home (pattern %q) — RunsRoot's `root` is only \"home\" on the env-var-UNSET branch; the env-var-SET branch is an unresolvable os.Getenv(), so this must never confidently claim home again", line, s.Pattern)
+		}
+		if s.Category != "unanchored" {
+			t.Errorf("manifest.go:%d = category %q, want unanchored", line, s.Category)
+		}
+		if strings.Contains(s.Pattern, "<Home>") {
+			t.Errorf("manifest.go:%d pattern %q still shows the env-var-unset branch's <Home> — the conditional rebind was not poisoned", line, s.Pattern)
+		}
+	}
+}
+
 // TestAppendEventBucketRows_NeverDoubleCount checks that a call site whose
 // bucket argument is genuinely dynamic (not a positive literal) does NOT
 // get a synthetic bucket row — the ledger.go primitive site already covers
