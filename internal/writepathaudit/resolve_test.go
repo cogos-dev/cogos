@@ -1953,3 +1953,231 @@ func cogRunPath(root string) string { return filepath.Join(root, ".cog", "run", 
 		t.Errorf("after the branch (line 10) = category %q pattern %q, want unanchored — a TempDir default and a .cog/run rebind are a real disagreement for a site outside the branch", after.Category, after.Pattern)
 	}
 }
+
+// ─── Round-8 gate: the pair must compose upward, not just resolve at top ─────
+//
+// Round 7's pair reported a disagreement as reserved MARKER TEXT with
+// degenerateRoot=false, and relied on isOpaqueRoot finding that text at the
+// pattern's ROOT. Every round-7 test resolved the pair at the top level — the
+// pair WAS the whole path argument — so the marker was always at the root and
+// always found. Composed into a larger expression under a positively-known
+// non-.cog root, the marker lands in the TAIL, where nothing looks for it, and
+// the site laundered straight back into a confident "elsewhere": the exact
+// leak commit 86bea26 removed for the degenerate-concat sentinel, reintroduced
+// one commit later in a different guise.
+//
+// The fix unifies the two: a disagreement now returns the variable's ordinary
+// opaque placeholder with degenerateRoot=TRUE, and degeneracy is the signal
+// that composes — through filepath.Join in any argument position, string
+// concatenation, filepath.Dir/Base, and across a call boundary (where
+// substituteAndMergeDefs declines to substitute a degenerate argument at all).
+// These tests compose the pair in every one of those directions.
+
+// TestComposedDisagreementNeverLaundersToElsewhere is the primary round-8
+// finding, in all four shapes the verifier reproduced. The disagreeing name
+// carries a .cog-relative value on one branch and an opaque parameter on the
+// other, and is then joined/concatenated under a plainly non-.cog absolute
+// root. Round 7 answered "elsewhere" with the marker sitting unnoticed in the
+// pattern's tail — a genuine .cog/ write stamped with a confident non-.cog
+// category, which is the one failure this package declares never acceptable.
+func TestComposedDisagreementNeverLaundersToElsewhere(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		line int
+		want string // the composed pattern the site must report
+	}{
+		{
+			name: "pair joined under a non-.cog literal root",
+			src: `package p
+func Save(useCog bool, opaque string) error {
+	name := opaque
+	if useCog {
+		name = cogRel()
+	}
+	return os.WriteFile(filepath.Join("/var/lib/myapp", name), nil, 0644)
+}
+func cogRel() string { return ".cog/state.json" }`,
+			line: 7,
+			want: "/var/lib/myapp/{name}",
+		},
+		{
+			name: "pair concatenated onto a non-.cog literal root",
+			src: `package p
+func Save(useCog bool, opaque string) error {
+	name := opaque
+	if useCog {
+		name = cogRel()
+	}
+	return os.WriteFile("/var/lib/myapp/"+name, nil, 0644)
+}
+func cogRel() string { return ".cog/state.json" }`,
+			line: 7,
+			want: "/var/lib/myapp/{name}",
+		},
+		{
+			name: "pair wrapped in filepath.Base inside a join",
+			src: `package p
+func Save(useCog bool, opaque string) error {
+	name := opaque
+	if useCog {
+		name = cogRel()
+	}
+	return os.WriteFile(filepath.Join("/var/lib/myapp", filepath.Base(name)), nil, 0644)
+}
+func cogRel() string { return ".cog/state.json" }`,
+			line: 7,
+			want: "/var/lib/myapp/basename({name})",
+		},
+		{
+			name: "pair composed one call-frame down, through a chased callee",
+			src: `package p
+func Save(useCog bool, opaque string) error {
+	return os.WriteFile(filepath.Join("/var/lib/myapp", pick(useCog, opaque)), nil, 0644)
+}
+func pick(useCog bool, opaque string) string {
+	name := opaque
+	if useCog {
+		name = cogRel()
+	}
+	return name
+}
+func cogRel() string { return ".cog/state.json" }`,
+			line: 3,
+			want: "/var/lib/myapp/{name}",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := siteAtLine(t, tc.src, tc.line)
+			if s.Category == "elsewhere" || s.Category == "home" {
+				t.Fatalf("category = %q pattern = %q — a disagreement composed under a positively-known non-.cog root must not produce a confident category; the .cog branch is a real possible destination", s.Category, s.Pattern)
+			}
+			if s.Category != "unanchored" {
+				t.Errorf("category = %q pattern = %q, want unanchored", s.Category, s.Pattern)
+			}
+			if s.Pattern != tc.want {
+				t.Errorf("pattern = %q, want %q — the disagreement is carried out-of-band, so the text is the variable's ordinary opaque placeholder and nothing else", s.Pattern, tc.want)
+			}
+		})
+	}
+}
+
+// TestComposedDisagreementUnderInvariantCogTailStaysCog is the OTHER
+// direction, and it is a pinned decision rather than an accident: a .cog
+// segment that sits OUTSIDE the disagreement is invariant across every branch,
+// so the site writes under .cog/ whichever branch runs and classify's
+// unconditional cog-first test is allowed to say so. This is the shape
+// internal/engine/cli_install_unix.go's cogBinDir has — only `home`
+// disagrees (os.UserHomeDir vs os.Getenv("HOME")), while ".cog", "bin" are
+// literals — and it is why the five cli_selfupdate_unix.go rows keep "cog"
+// with the honest pattern "{home}/.cog/bin/cogos" instead of a marker.
+//
+// Changing this to "unanchored" would be a deliberate tightening, not a bug
+// fix; this test exists so that change has to be made on purpose.
+func TestComposedDisagreementUnderInvariantCogTailStaysCog(t *testing.T) {
+	src := `package p
+func Save() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.Getenv("HOME")
+	}
+	return os.WriteFile(filepath.Join(home, ".cog", "bin", "cogos"), nil, 0644)
+}`
+	s := siteAtLine(t, src, 7)
+	if s.Category != "cog" {
+		t.Errorf("category = %q pattern = %q, want cog — only the root disagrees; the .cog/bin tail is invariant across both branches, so the write is under .cog/ either way", s.Category, s.Pattern)
+	}
+	if s.Pattern != "{home}/.cog/bin/cogos" {
+		t.Errorf("pattern = %q, want %q — no marker text may reach a shipping pattern", s.Pattern, "{home}/.cog/bin/cogos")
+	}
+}
+
+// TestComposedDisagreementUnderHomeRootIsNotHome is the home-side counterpart
+// of the elsewhere test above, and the reason classify gates its <Home> test
+// on degenerateRoot. "home" is a CONFIDENT category exactly like "elsewhere":
+// the invariant forbids assigning it from a value only one branch justifies.
+// Only "cog" is exempt, and only because over-claiming toward .cog is this
+// tool's acceptable failure direction.
+func TestComposedDisagreementUnderHomeRootIsNotHome(t *testing.T) {
+	src := `package p
+func Save(useCog bool, opaque string) error {
+	home, _ := os.UserHomeDir()
+	name := opaque
+	if useCog {
+		name = cogRel()
+	}
+	return os.WriteFile(filepath.Join(home, name), nil, 0644)
+}
+func cogRel() string { return ".cog/state.json" }`
+	s := siteAtLine(t, src, 8)
+	if s.Category == "home" || s.Category == "elsewhere" {
+		t.Fatalf("category = %q pattern = %q — a disagreeing tail under <Home> has not established a home write any more than it established an elsewhere one", s.Category, s.Pattern)
+	}
+	if s.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored", s.Category, s.Pattern)
+	}
+}
+
+// TestIfInitAssignmentIsNotConditional is the round-8 latent-correctness
+// finding. An assignment in an IfStmt's (or SwitchStmt's) Init ALWAYS executes
+// on the way into the statement, so the binding it displaces is DEAD — it can
+// never reach any site below. applyDirectLocalDefs counted the whole IfStmt
+// node as the conditional region, header included, so the Init's `=` recorded
+// the dead pre-init value in displaced[]; a later unreadable body rebind then
+// paired against that dead value, and two dead-but-agreeing values handed the
+// site a confident category built from a path that cannot run.
+//
+// Here "/etc/base.json" (dead) and other() (live) both classify "elsewhere"
+// and agree, so round 7 reported "/etc/base.json" — while the LIVE candidates,
+// cogPath() and other(), disagree and one of them is .cog-rooted. The fix
+// splits the one depth counter in two: scopeDepth (the whole statement, for
+// `:=` shadow protection) and condDepth (the bodies only, for execution
+// certainty). poisonConditionalAndLoopRebinds already walked only Body/Else;
+// this is the matching half.
+//
+// No site in the repo has this shape today, so the golden is unchanged by it —
+// but it is squarely inside the class this repair claims to close.
+func TestIfInitAssignmentIsNotConditional(t *testing.T) {
+	src := `package p
+func Save(a bool) error {
+	path := "/etc/base.json"
+	if path = cogPath(); a {
+		path = other()
+	}
+	return os.WriteFile(path, nil, 0644)
+}
+func cogPath() string { return "/srv/.cog/live.json" }
+func other() string   { return "/var/other.json" }`
+	s := siteAtLine(t, src, 7)
+	if s.Category == "elsewhere" || s.Category == "home" {
+		t.Fatalf("category = %q pattern = %q — the pre-init binding is dead; the live candidates are cogPath() and other(), which disagree", s.Category, s.Pattern)
+	}
+	if s.Category != "unanchored" {
+		t.Errorf("category = %q pattern = %q, want unanchored", s.Category, s.Pattern)
+	}
+	if strings.Contains(s.Pattern, "/etc/base.json") {
+		t.Errorf("pattern = %q — reports a value the Init assignment overwrote before the branch was ever reached", s.Pattern)
+	}
+}
+
+// TestIfInitDefineStillShadows is the control for the split above: the shadow
+// half of the old single counter must be untouched. A `:=` in an if HEADER is
+// scoped to that if statement, so it must not clobber the outer binding for a
+// site AFTER the statement — which is exactly why scopeDepth still counts the
+// whole statement node while condDepth counts only its bodies.
+func TestIfInitDefineStillShadows(t *testing.T) {
+	src := `package p
+func Save(a bool, root string) error {
+	path := filepath.Join(root, ".cog", "outer.json")
+	if path := "/etc/shadow.json"; a {
+		_ = path
+	}
+	return os.WriteFile(path, nil, 0644)
+}`
+	s := siteAtLine(t, src, 7)
+	if s.Category != "cog" {
+		t.Errorf("category = %q pattern = %q, want cog — the header `:=` declares a name scoped to the if statement and must resolve exactly as if the shadow never existed", s.Category, s.Pattern)
+	}
+}

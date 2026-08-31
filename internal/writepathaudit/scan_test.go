@@ -343,8 +343,14 @@ func TestRound3GateFindings_Fixed(t *testing.T) {
 					if s.Category == "elsewhere" || s.Category == "home" {
 						t.Errorf("rotating_writer.go:%d = category %q pattern %q — the gate's own finding: a confident non-.cog category taken from one branch is never acceptable here", line, s.Category, s.Pattern)
 					}
-					if s.Category != "unanchored" || !strings.Contains(s.Pattern, "branch-disagreement") {
-						t.Errorf("rotating_writer.go:%d = category %q pattern %q, want unanchored / branch-disagreement (cfg.KernelLogPath vs the DefaultKernelLogPath fallback disagree in category)", line, s.Category, s.Pattern)
+					// The disagreement travels out-of-band (degenerateRoot),
+					// never as marker text: what the pattern shows is the
+					// variable's ORDINARY opaque placeholder, exactly as any
+					// unresolvable name renders. Asserting on the placeholder
+					// rather than on a reserved string is the point — there is
+					// no reserved string any more.
+					if s.Category != "unanchored" || !strings.Contains(s.Pattern, "{path}") {
+						t.Errorf("rotating_writer.go:%d = category %q pattern %q, want unanchored / {path} (cfg.KernelLogPath vs the DefaultKernelLogPath fallback disagree in category)", line, s.Category, s.Pattern)
 					}
 				}
 				// log_capture.go itself has no os/io primitive of its own
@@ -691,8 +697,8 @@ func TestRound4GateFindings_NeverElsewhere(t *testing.T) {
 				// complaint — a false "elsewhere" — stays closed either way,
 				// which is what wantNeverElsewhere asserts.
 				s := wantNeverElsewhere(t, "internal/engine/memory_sections.go", 353)
-				if s.Category != "unanchored" || !strings.Contains(s.Pattern, "branch-disagreement") {
-					t.Errorf("memory_sections.go:353 = category %q pattern %q, want unanchored / branch-disagreement (resolveMemoryDocPath's workspace-relative branch disagrees in category with its .cog/mem branches)", s.Category, s.Pattern)
+				if s.Category != "unanchored" || !strings.Contains(s.Pattern, "{candidate}") {
+					t.Errorf("memory_sections.go:353 = category %q pattern %q, want unanchored / {candidate} (resolveMemoryDocPath's workspace-relative branch disagrees in category with its .cog/mem branches; the disagreement is carried out-of-band, so the pattern shows the variable's ordinary opaque placeholder)", s.Category, s.Pattern)
 				}
 			},
 		},
@@ -702,8 +708,8 @@ func TestRound4GateFindings_NeverElsewhere(t *testing.T) {
 			check: func(t *testing.T) {
 				// Same re-pin as :353 above, same call chain.
 				s := wantNeverElsewhere(t, "internal/engine/memory_sections.go", 375)
-				if s.Category != "unanchored" || !strings.Contains(s.Pattern, "branch-disagreement") {
-					t.Errorf("memory_sections.go:375 = category %q pattern %q, want unanchored / branch-disagreement", s.Category, s.Pattern)
+				if s.Category != "unanchored" || !strings.Contains(s.Pattern, "{candidate}") {
+					t.Errorf("memory_sections.go:375 = category %q pattern %q, want unanchored / {candidate}", s.Category, s.Pattern)
 				}
 			},
 		},
@@ -913,5 +919,39 @@ func TestSubprocessAppendix_Declared(t *testing.T) {
 	md := RenderMarkdown(report)
 	if !strings.Contains(md, "Subprocess writers (declared out of scope for v1 — uncounted)") {
 		t.Error("rendered markdown is missing the 'Subprocess writers' appendix heading")
+	}
+}
+
+// TestNoInBandDisagreementMarker is the round-8 grep, made a test. The whole
+// premise of the branch-disagreement repair is that a disagreement travels
+// out-of-band as degenerateRoot; if any reserved marker string could reach a
+// pattern, the leak that motivated the repair is back. Asserted over BOTH the
+// live scan and the committed golden bytes, since a marker that reached only
+// one of the two would be its own kind of drift.
+//
+// The retired marker is reconstructed at runtime rather than spelled, so this
+// test cannot pass merely because this file contains the literal.
+func TestNoInBandDisagreementMarker(t *testing.T) {
+	retired := "{" + "branch-" + "disagreement" + "}"
+
+	report, err := Scan(repoRoot(t))
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	for _, s := range report.Sites {
+		if strings.Contains(s.Pattern, retired) {
+			t.Errorf("%s:%d pattern %q carries the retired in-band marker", s.File, s.Line, s.Pattern)
+		}
+	}
+
+	jsonPath, mdPath := goldenPaths(t)
+	for _, path := range []string{jsonPath, mdPath} {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if strings.Contains(string(b), retired) {
+			t.Errorf("%s still contains the retired in-band marker", filepath.Base(path))
+		}
 	}
 }
