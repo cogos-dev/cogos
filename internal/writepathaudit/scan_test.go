@@ -88,9 +88,15 @@ func marshalReport(t *testing.T, r *Report) []byte {
 // nothing about whether the REAL gate's comparison fails closed — it
 // would keep passing even if TestInventory_MatchesGolden's own comparison
 // were silently neutered, since the two never share code. Routing both
-// through diffAgainstGolden means a bug in the comparison logic breaks
-// both tests identically, which is what makes the mutation test's proof
-// actually apply to the gate it claims to guard.
+// through diffAgainstGolden is what makes the mutation test's proof
+// actually apply to the gate it claims to guard: no neuter of this shared
+// comparison leaves BOTH tests green. That is weaker than "any bug here
+// breaks both identically" — a blind neuter that always returns (false,
+// false), say, still fails TestGoldenGate_DetectsInjectedCogWrite (its own
+// injected write no longer shows as a diff) while TestInventory_
+// MatchesGolden keeps passing (no drift ever gets reported either) — but
+// it is the property this test actually needs: at least one of the two
+// always catches a broken comparison.
 func diffAgainstGolden(t *testing.T, report *Report) (jsonDiffers, mdDiffers bool) {
 	t.Helper()
 	jsonPath, mdPath := goldenPaths(t)

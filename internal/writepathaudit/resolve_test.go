@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 	"testing"
 )
 
@@ -243,14 +244,14 @@ func f(w io.Writer, r io.Reader) {
 			}
 
 			argExpr, defs, r := parseCallArg(t, tt.src)
-			gotPattern, gotResolved := r.resolveExpr(argExpr, defs, 0)
+			gotPattern, gotResolved, gotDegenerate := r.resolveExpr(argExpr, defs, 0)
 			if gotPattern != tt.wantPattern {
 				t.Errorf("pattern = %q, want %q", gotPattern, tt.wantPattern)
 			}
 			if gotResolved != tt.wantResolved {
 				t.Errorf("resolved = %v, want %v", gotResolved, tt.wantResolved)
 			}
-			gotCategory := classify(gotPattern, gotResolved)
+			gotCategory := classify(gotPattern, gotResolved, gotDegenerate)
 			if gotCategory != tt.wantCategory {
 				t.Errorf("category = %q, want %q", gotCategory, tt.wantCategory)
 			}
@@ -282,7 +283,7 @@ func f() {
 	os.WriteFile(filepath.Join(base, "state.json"), nil, 0644)
 }`
 	argExpr, defs, r := parseCallArg(t, src)
-	pattern, resolved := r.resolveExpr(argExpr, defs, 0)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
 
 	if pattern != "state.json" {
 		t.Errorf("pattern = %q, want %q (filepath.Join must skip the empty base, not leave a stray leading slash)", pattern, "state.json")
@@ -290,8 +291,8 @@ func f() {
 	if !resolved {
 		t.Errorf("resolved = false, want true — both the base and the literal resolved successfully")
 	}
-	if got := classify(pattern, resolved); got == "elsewhere" {
-		t.Errorf("classify(%q, %v) = %q, want anything but \"elsewhere\" — a bare relative literal with no anchor has not positively established a destination outside .cog/", pattern, resolved, got)
+	if got := classify(pattern, resolved, degenerate); got == "elsewhere" {
+		t.Errorf("classify(%q, %v, %v) = %q, want anything but \"elsewhere\" — a bare relative literal with no anchor has not positively established a destination outside .cog/", pattern, resolved, degenerate, got)
 	}
 }
 
@@ -300,16 +301,25 @@ func f() {
 // filepath.Join: `base := ""` followed by `base + "/observations.jsonl"`
 // reached through string concatenation (token.ADD on a *ast.BinaryExpr)
 // rather than a filepath.Join call. The Join fix alone did not cover this
-// producer — the round-2 CI review's confirmed finding against it — because
-// the "/" here is already baked into the right-hand literal rather than
-// inserted as a separator between joined parts, so Join's empty-part-
-// skipping logic never runs. The fix instead tags the concatenation result
-// with degenerateRootMarker whenever the left operand resolves to the
-// literal empty string and the right operand starts with "/", and
-// isOpaqueRoot treats that marker as an opaque root — the same "we have not
-// positively established a destination outside .cog/" honesty margin the
-// Join case lands in, not a confirmed absolute-path literal like
-// "/etc/cogos/config.yaml".
+// producer because the "/" here is already baked into the right-hand
+// literal rather than inserted as a separator between joined parts, so
+// Join's empty-part-skipping logic never runs.
+//
+// The fix is resolveExpr's third return value, degenerateRoot: an explicit
+// out-of-band bool reported alongside the (unmodified) pattern text,
+// rather than an in-band sentinel folded into pattern itself. A prior
+// round tried the sentinel (a NUL-delimited degenerateRootMarker prefix,
+// stripped again before a Site.Pattern was ever rendered) and a second
+// review round found it did not compose: filepath.Join joins already-
+// resolved parts with "/", and filepath.Dir/Base wrap the inner resolution
+// in "dirname(...)"/"basename(...)" — neither preserves a marker at the
+// pattern's own prefix, so nesting a degenerate concat inside either
+// leaked the raw marker bytes into the rendered inventory AND silently
+// lost the degeneracy signal at the same time (see
+// TestJoinNonFirstArgDegenerateConcatNeverLeaksOrElsewhere and
+// TestDirWrappingDegenerateConcatNeverLeaksOrElsewhere below). Reporting
+// degeneracy out-of-band sidesteps the composition problem entirely: there
+// is no marker text for any wrapper to fail to preserve.
 func TestConcatEmptyBaseNeverElsewhere(t *testing.T) {
 	src := `package p
 func f() {
@@ -317,19 +327,105 @@ func f() {
 	os.WriteFile(base+"/observations.jsonl", nil, 0644)
 }`
 	argExpr, defs, r := parseCallArg(t, src)
-	pattern, resolved := r.resolveExpr(argExpr, defs, 0)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
 
+	if pattern != "/observations.jsonl" {
+		t.Errorf("pattern = %q, want %q — the pattern TEXT is never touched; degeneracy is reported out-of-band", pattern, "/observations.jsonl")
+	}
 	if !resolved {
 		t.Errorf("resolved = false, want true — both the base and the literal resolved successfully")
 	}
-	if got := classify(pattern, resolved); got == "elsewhere" {
-		t.Errorf("classify(%q, %v) = %q, want anything but \"elsewhere\" — the leading slash came from concatenating a literal onto an empty-resolved base, not from a genuine absolute-path literal", pattern, resolved, got)
+	if !degenerate {
+		t.Errorf("degenerate = false, want true — this concatenation's root is an artifact of an empty-resolved base, not a positively-established absolute path")
 	}
+	if got := classify(pattern, resolved, degenerate); got == "elsewhere" {
+		t.Errorf("classify(%q, %v, %v) = %q, want anything but \"elsewhere\" — the leading slash came from concatenating a literal onto an empty-resolved base, not from a genuine absolute-path literal", pattern, resolved, degenerate, got)
+	}
+}
 
-	// stripDegenerateRootMarker is what a Site.Pattern actually carries —
-	// the marker itself must never reach the rendered inventory.
-	if displayed := stripDegenerateRootMarker(pattern); displayed != "/observations.jsonl" {
-		t.Errorf("stripDegenerateRootMarker(%q) = %q, want %q", pattern, displayed, "/observations.jsonl")
+// TestJoinNonFirstArgDegenerateConcatNeverLeaksOrElsewhere reproduces the
+// round-3 CI review's confirmed leak: a degenerate concatenation
+// (base+"/observations.jsonl" with an empty base) passed as a NON-FIRST
+// argument to filepath.Join, alongside a real anchor (workspaceRoot,
+// which resolves to the <WorkspaceRoot> anchor via identifierAnchors).
+// With the old in-band marker, strings.Join(parts, "/") spliced the
+// marker's raw NUL bytes into the middle of the resulting pattern text —
+// corrupting anything that persisted Site.Pattern verbatim (the golden
+// JSON/markdown) — while ALSO losing the degeneracy signal entirely,
+// because the marker was no longer at the pattern's own prefix for
+// isOpaqueRoot's HasPrefix check to find, so classify fell through to
+// "elsewhere" even though the tail segment was never a positively
+// established path fragment.
+//
+// With degeneracy carried out-of-band there is no marker text to leak,
+// and filepath.Join's degenerateRoot is true whenever ANY kept argument
+// was flagged degenerate — not only the one occupying the joined
+// pattern's own first segment — so a degenerate fragment buried in the
+// tail still keeps classify from confirming "elsewhere", the same
+// under-claiming posture hasOpaqueSegment already applies to an ordinary
+// text-opaque tail segment on a <WorkspaceRoot>-rooted pattern.
+func TestJoinNonFirstArgDegenerateConcatNeverLeaksOrElsewhere(t *testing.T) {
+	src := `package p
+func f(workspaceRoot string) {
+	base := ""
+	os.WriteFile(filepath.Join(workspaceRoot, base+"/observations.jsonl"), nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+
+	if strings.ContainsRune(pattern, 0) {
+		t.Errorf("pattern = %q contains a NUL byte — a marker leaked into rendered text", pattern)
+	}
+	if !resolved {
+		t.Errorf("resolved = false, want true")
+	}
+	if !degenerate {
+		t.Errorf("degenerate = false, want true — the second Join argument is a degenerate concat even though it isn't the pattern's own first segment")
+	}
+	if got := classify(pattern, resolved, degenerate); got == "elsewhere" {
+		t.Errorf("classify(%q, %v, %v) = %q, want anything but \"elsewhere\" — the tail segment was never a positively established path fragment", pattern, resolved, degenerate, got)
+	}
+	if got := classify(pattern, resolved, degenerate); got != "unanchored" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q", pattern, resolved, degenerate, got, "unanchored")
+	}
+}
+
+// TestDirWrappingDegenerateConcatNeverLeaksOrElsewhere reproduces the
+// round-3 CI review's other confirmed leak: filepath.Dir wrapping a
+// degenerate concatenation as its ONLY argument. The old in-band marker
+// ended up as "dirname(\x00degenerate-root\x00/observations.jsonl)" —
+// leaking raw marker bytes into rendered text, and losing the degeneracy
+// signal because the wrapped pattern no longer started with the marker.
+//
+// Here the concat IS the whole inner expression, so dirname(...)'s own
+// root is exactly as degenerate as its inner resolution — the fix
+// threads that through explicitly (see resolveCall's filepath.Dir case).
+func TestDirWrappingDegenerateConcatNeverLeaksOrElsewhere(t *testing.T) {
+	src := `package p
+func f() {
+	base := ""
+	os.MkdirAll(filepath.Dir(base+"/x"), 0755)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+
+	if strings.ContainsRune(pattern, 0) {
+		t.Errorf("pattern = %q contains a NUL byte — a marker leaked into rendered text", pattern)
+	}
+	if pattern != "dirname(/x)" {
+		t.Errorf("pattern = %q, want %q", pattern, "dirname(/x)")
+	}
+	if !resolved {
+		t.Errorf("resolved = false, want true")
+	}
+	if !degenerate {
+		t.Errorf("degenerate = false, want true — filepath.Dir wrapping a degenerate concat inherits its inner expression's degeneracy")
+	}
+	if got := classify(pattern, resolved, degenerate); got == "elsewhere" {
+		t.Errorf("classify(%q, %v, %v) = %q, want anything but \"elsewhere\" — dirname(...) wrapping a degenerate root has not positively established a destination outside .cog/", pattern, resolved, degenerate, got)
+	}
+	if got := classify(pattern, resolved, degenerate); got != "unanchored" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q", pattern, resolved, degenerate, got, "unanchored")
 	}
 }
 
