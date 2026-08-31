@@ -124,6 +124,90 @@ func TestInventory_MatchesGolden(t *testing.T) {
 	}
 }
 
+// TestGoldenGate_DetectsInjectedCogWrite is the negative-path mutation
+// check the PR description claims exists but that no test in this package
+// actually implemented: proof that the golden-diff gate itself fails
+// closed. TestInventory_MatchesGolden only ever exercises the drift
+// comparison against the CURRENT, unmodified repo — it can pass forever
+// even if the comparison it performs were silently neutered (an always-
+// take-the--update-branch bug, or Scan returning stale/cached data), and
+// nothing else in the suite would notice.
+//
+// This test takes a full report that is DIFFERENT from the committed
+// golden by exactly one injected write site under .cog/, serializes it
+// exactly the way TestInventory_MatchesGolden serializes a real scan, and
+// asserts that the resulting JSON and markdown are NOT byte-identical to
+// the committed golden — i.e. that the comparison the gate depends on
+// actually notices an unreviewed .cog/ writer. It never calls -update and
+// never writes to testdata/; the injected site lives only in an in-memory
+// copy of the report.
+func TestGoldenGate_DetectsInjectedCogWrite(t *testing.T) {
+	root := repoRoot(t)
+	report, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan(%s): %v", root, err)
+	}
+
+	jsonPath, mdPath := goldenPaths(t)
+	wantJSON, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read golden json (run TestInventory_MatchesGolden -update first): %v", err)
+	}
+	wantMD, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read golden md (run TestInventory_MatchesGolden -update first): %v", err)
+	}
+
+	// Precondition: the UNMODIFIED live scan must already match the
+	// committed golden. Otherwise this test would "pass" for the wrong
+	// reason — ANY report at all would differ from an already-stale
+	// golden, telling us nothing about whether the gate detects a real,
+	// isolated mutation. TestInventory_MatchesGolden enforces this same
+	// invariant; asserting it again here keeps this test meaningful on
+	// its own even if run in isolation.
+	if got := marshalReport(t, report); string(got) != string(wantJSON) {
+		t.Fatalf("precondition failed: the live scan does not match the committed golden BEFORE injecting anything — golden is stale, run -update first")
+	}
+	if got := RenderMarkdown(report); got != string(wantMD) {
+		t.Fatalf("precondition failed: the live scan's markdown does not match the committed golden BEFORE injecting anything — golden is stale, run -update first")
+	}
+
+	// Inject a synthetic .cog/ write site the real repo does not have —
+	// the exact defect class this gate exists to catch: a new writer
+	// landing under .cog/ without ever going through review.
+	mutated := *report
+	mutated.Sites = append(append([]Site{}, report.Sites...), Site{
+		File:      "internal/testkernel/injected_mutation_probe.go",
+		Line:      1,
+		Column:    1,
+		Primitive: "os.WriteFile",
+		Func:      "injectedMutationProbe",
+		Pattern:   "<WorkspaceRoot>/.cog/injected-mutation-probe/site.json",
+		Category:  "cog",
+		Resolved:  true,
+		Subsystem: "internal:testkernel",
+		Raw:       "path",
+	})
+	mutated.Summary.Total++
+	mutated.Summary.Cog++
+	byPrimitive := make(map[string]int, len(report.Summary.ByPrimitive)+1)
+	for k, v := range report.Summary.ByPrimitive {
+		byPrimitive[k] = v
+	}
+	byPrimitive["os.WriteFile"]++
+	mutated.Summary.ByPrimitive = byPrimitive
+
+	gotJSON := marshalReport(t, &mutated)
+	gotMD := RenderMarkdown(&mutated)
+
+	if string(gotJSON) == string(wantJSON) {
+		t.Error("golden gate did not notice an injected .cog/ write site — mutated JSON is byte-identical to the committed golden")
+	}
+	if gotMD == string(wantMD) {
+		t.Error("golden gate did not notice an injected .cog/ write site — mutated markdown is byte-identical to the committed golden")
+	}
+}
+
 // ─── Round-3 adversarial gate: named regression fixtures ───────────────────
 //
 // TestRound3GateFindings_Fixed pins, by name, every writer the round-3

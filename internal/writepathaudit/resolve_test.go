@@ -258,6 +258,43 @@ func f(w io.Writer, r io.Reader) {
 	}
 }
 
+// TestJoinEmptyBaseNeverElsewhere reproduces the exact scenario from the
+// CI review's confirmed finding against audit.go's filepath.Join handling:
+// a base that resolves to the literal empty string, joined with a real
+// filename. The buggy implementation joined resolved parts with a literal
+// strings.Join(parts, "/"), which does not replicate real filepath.Join's
+// empty-component-skipping — Join("", "state.json") is "state.json" at
+// runtime, never "/state.json" — so the tool's own resolution disagreed
+// with the runtime behavior it claims to model, produced a spurious
+// leading-slash artifact, and isOpaqueRoot didn't recognize that artifact
+// as degenerate either, letting classify stamp it "elsewhere": a positive
+// claim that the write lands outside .cog/ that neither the true runtime
+// path nor the tool's own resolution logic ever actually established.
+//
+// Fixed in two places: the Join handler now skips empty-resolved parts
+// (matching real filepath.Join), and isBareUnanchoredLiteral in classify
+// additionally refuses "elsewhere" for the bare, anchor-less single
+// segment ("state.json") that a correctly-fixed join now produces here.
+func TestJoinEmptyBaseNeverElsewhere(t *testing.T) {
+	src := `package p
+func f() {
+	base := ""
+	os.WriteFile(filepath.Join(base, "state.json"), nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved := r.resolveExpr(argExpr, defs, 0)
+
+	if pattern != "state.json" {
+		t.Errorf("pattern = %q, want %q (filepath.Join must skip the empty base, not leave a stray leading slash)", pattern, "state.json")
+	}
+	if !resolved {
+		t.Errorf("resolved = false, want true — both the base and the literal resolved successfully")
+	}
+	if got := classify(pattern, resolved); got == "elsewhere" {
+		t.Errorf("classify(%q, %v) = %q, want anything but \"elsewhere\" — a bare relative literal with no anchor has not positively established a destination outside .cog/", pattern, resolved, got)
+	}
+}
+
 // TestFieldAndParamOriginChase exercises the callable-origin index directly
 // — the mechanism that chases a struct field or a bare function parameter
 // back to where it was actually constructed, closing the exact defect class
@@ -455,6 +492,74 @@ func handlePut(dir string) {
 	}
 	if !sawCopy {
 		t.Errorf("expected an io.Copy site chased through to the CreateTemp target")
+	}
+}
+
+// TestFieldOriginMemo_DoesNotPoisonAcrossDepths reproduces the CI review's
+// unverified note against fieldOrigin/paramOrigin: both memoize by
+// (type, field) / (dir, func, paramIdx) alone, with no dependency on the
+// depth budget the FIRST caller to reach that key happened to have left.
+// A deeply-nested call site (here, objA.path buried under many layers of
+// filepath.Join) can genuinely exhaust maxChaseDepth resolving Shared's
+// field candidate, while a second, SHALLOW call site referencing the exact
+// same field (objB.path, one hop from a bare receiver) has ample budget to
+// resolve it fully. Before the fix, whichever site's resolution ran FIRST
+// (here, the deep one, textually first in the file and so visited first
+// by the single ast.Inspect walk) decided the answer for BOTH — the
+// shallow site inherited the deep site's exhausted-budget failure and was
+// wrongly downgraded from "home" to "unanchored".
+func TestFieldOriginMemo_DoesNotPoisonAcrossDepths(t *testing.T) {
+	joinWrap := func(n int, inner string) string {
+		s := inner
+		for i := 0; i < n; i++ {
+			s = "filepath.Join(" + s + ")"
+		}
+		return s
+	}
+	// 5 wrapping Joins around the field's own composite-literal value is
+	// comfortably resolvable from a fresh (depth-0) call, but pushes a
+	// call that starts 11 Joins deep past maxChaseDepth (=16).
+	src := `package p
+
+type Shared struct{ path string }
+
+func makeShared(homeDir string) *Shared {
+	return &Shared{path: ` + joinWrap(5, "homeDir") + `}
+}
+
+func (objA *Shared) deepSite() {
+	os.WriteFile(` + joinWrap(11, "objA.path") + `, nil, 0644)
+}
+
+func (objB *Shared) shallowSite() {
+	os.WriteFile(objB.path, nil, 0644)
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "snippet.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	pf := parsedFile{relPath: "snippet.go", dir: "pkg", fset: fset, file: f, scopes: collectFuncScopes(f, fset)}
+	idx := buildGlobalIndex([]parsedFile{pf})
+	sites := scanParsedFile(pf, idx)
+
+	var sawShallow bool
+	for _, s := range sites {
+		if s.Func != "(*Shared).shallowSite" {
+			continue
+		}
+		sawShallow = true
+		// The deep site's exhausted budget must never leak into this
+		// site's answer: with its own full budget, objB.path resolves
+		// all the way to the <Home> anchor, category "home" — never the
+		// deep site's opaque "{objA.path}"/"unanchored" leftover.
+		if s.Pattern != "<Home>" || s.Category != "home" {
+			t.Errorf("shallowSite: pattern=%q category=%q, want <Home>/home — poisoned by an unrelated deep call site's exhausted chase-depth budget", s.Pattern, s.Category)
+		}
+	}
+	if !sawShallow {
+		t.Fatalf("expected a shallowSite write site")
 	}
 }
 

@@ -1019,6 +1019,24 @@ func compositeLitTypeName(t ast.Expr) (string, bool) {
 // fieldOrigin resolves the value assigned to typeName's field across every
 // keyed composite literal found for it. Only an unambiguous, unanimous
 // answer is used — never a guess between disagreeing literals.
+//
+// Only a SUCCESSFUL resolution is memoized. depth is the caller's own
+// chase depth, not an intrinsic property of (typeName, field): a
+// negative result computed here can be nothing more than an artifact of
+// how much maxChaseDepth budget the FIRST caller to reach this key
+// happened to have left — a deeply-nested call site (many levels of
+// filepath.Join, or several interprocedural hops already spent) can
+// exhaust the budget resolving a candidate that a shallower caller, with
+// its own full budget, would resolve completely. Caching that negative
+// result would let the deep caller permanently poison every later
+// caller's answer for the same (typeName, field), regardless of how much
+// headroom THEY have — silently downgrading an otherwise-knowable
+// destination to "unanchored"/"dynamic". A successful resolution has no
+// such dependency on the asking depth (more budget cannot change an
+// answer already reached), so it is always safe to cache. The cycle-guard
+// placeholder below is still required — and still correct — for the
+// duration of THIS call's own recursion; it is simply not left behind
+// afterward when the call ends negatively.
 func (idx *globalIndex) fieldOrigin(typeName, field string, depth int) (string, bool) {
 	key := typeName + "\x00" + field
 	if r, ok := idx.fieldMemo[key]; ok {
@@ -1043,10 +1061,11 @@ func (idx *globalIndex) fieldOrigin(typeName, field string, depth int) (string, 
 		}
 	}
 
-	result := originResult{}
-	if foundSet && !conflict {
-		result = originResult{pattern: found, ok: true}
+	if !foundSet || conflict {
+		delete(idx.fieldMemo, key) // negative: don't freeze a depth-dependent non-answer
+		return "", false
 	}
+	result := originResult{pattern: found, ok: true}
 	idx.fieldMemo[key] = result
 	return result.pattern, result.ok
 }
@@ -1054,6 +1073,13 @@ func (idx *globalIndex) fieldOrigin(typeName, field string, depth int) (string, 
 // paramOrigin resolves the i'th argument passed to (dir, funcName) across
 // every same-directory bare-identifier call site found for it. Only an
 // unambiguous, unanimous answer is used.
+//
+// Same depth-independence rule as fieldOrigin above, and for the identical
+// reason: a negative result here can be purely a function of how much
+// budget the FIRST caller to reach this (dir, funcName, paramIdx) key had
+// left, not a fact about the key itself. Only a successful resolution is
+// memoized; the cycle-guard placeholder is removed rather than frozen when
+// the call ends negatively.
 func (idx *globalIndex) paramOrigin(dir, funcName string, paramIdx, depth int) (string, bool) {
 	key := dir + "\x00" + funcName + "\x00" + strconv.Itoa(paramIdx)
 	if r, ok := idx.paramMemo[key]; ok {
@@ -1079,10 +1105,11 @@ func (idx *globalIndex) paramOrigin(dir, funcName string, paramIdx, depth int) (
 		}
 	}
 
-	result := originResult{}
-	if foundSet && !conflict {
-		result = originResult{pattern: found, ok: true}
+	if !foundSet || conflict {
+		delete(idx.paramMemo, key) // negative: don't freeze a depth-dependent non-answer
+		return "", false
 	}
+	result := originResult{pattern: found, ok: true}
 	idx.paramMemo[key] = result
 	return result.pattern, result.ok
 }
@@ -1342,11 +1369,20 @@ func (r *resolver) resolveCall(call *ast.CallExpr, defs map[string]ast.Expr, dep
 		if pkgIdent, isPkg := sel.X.(*ast.Ident); isPkg {
 			switch {
 			case pkgIdent.Name == "filepath" && sel.Sel.Name == "Join":
+				// Real filepath.Join skips empty components rather than
+				// separator-joining them literally: Join("", "state.json")
+				// is "state.json", not "/state.json". Reproduce that here
+				// by dropping any part that resolved to the literal empty
+				// string before joining with "/" — a resolved-but-opaque
+				// part (e.g. "<expr>", "{name}") is never itself "", so
+				// this can't accidentally swallow a real pattern marker.
 				parts := make([]string, 0, len(call.Args))
 				allOK := true
 				for _, arg := range call.Args {
 					p, ok := r.resolveExpr(arg, defs, depth+1)
-					parts = append(parts, p)
+					if p != "" {
+						parts = append(parts, p)
+					}
 					allOK = allOK && ok
 				}
 				return strings.Join(parts, "/"), allOK
@@ -1908,7 +1944,39 @@ func classify(pattern string, resolvedOK bool) string {
 	if strings.HasPrefix(pattern, "<WorkspaceRoot>") && hasOpaqueSegment(pattern) {
 		return "unanchored"
 	}
+	if isBareUnanchoredLiteral(pattern) {
+		return "unanchored"
+	}
 	return "elsewhere"
+}
+
+// isBareUnanchoredLiteral reports whether pattern is a single path segment
+// — no "/" anywhere in it — that also isn't one of this tool's own
+// single-token anchors (<TempDir>, <WorkspaceRoot>; <Home> and <CogDir>
+// never reach this point, both intercepted earlier in classify). Such a
+// pattern carries no directory context at all: it is exactly what a
+// filepath.Join(emptyOrOpaqueBase, "name") resolves to now that the Join
+// handler above correctly skips an empty leading argument instead of
+// leaving a stray "/" in front of it (real filepath.Join does the same —
+// Join("", "state.json") is "state.json", not "/state.json"), and it is
+// equally what a bare relative literal passed straight to a write
+// primitive resolves to. Neither has positively established a destination
+// outside .cog/ — the tool has no visibility into the process's working
+// directory a relative path like this would actually resolve against —
+// so "unanchored" is the honest bin, not "elsewhere". This check is
+// deliberately NOT folded into isOpaqueRoot: that function is also used by
+// appendEventBucketSites to validate a bucket/session-ID VALUE (never a
+// filepath), where a bare literal like "main" is exactly the positive,
+// non-opaque case it must accept.
+func isBareUnanchoredLiteral(pattern string) bool {
+	if strings.Contains(pattern, "/") {
+		return false
+	}
+	switch pattern {
+	case "<TempDir>", "<WorkspaceRoot>":
+		return false
+	}
+	return true
 }
 
 func hasCogSegment(pattern string) bool {
@@ -1929,10 +1997,26 @@ func hasCogSegment(pattern string) bool {
 // marker) and the DEGENERATE shapes a partially-failed resolution leaves
 // behind, none of which are positive evidence of anything:
 //
-//   - an EMPTY root — including the root of a pattern that begins with
-//     "/" (a "leading-slash fragment" like "/observations.jsonl", left
-//     over from a chase that resolved its root to "" without the
-//     resolution itself being flagged as failed)
+//   - a bare "/" or a doubled leading separator ("//...") — an empty root
+//     with NOTHING real after it, or with another empty component
+//     immediately behind it. This is distinct from a genuine absolute-path
+//     literal like "/etc/cogos/config.yaml" (a single leading slash with
+//     real content right after it), which legitimately IS positive
+//     evidence and is deliberately left alone: the two are the same
+//     "empty root" shape by IndexByte alone, so the extra check below is
+//     keyed on the full pattern, not just root. This shape can only arise
+//     from a resolution that dropped, or duplicated, an empty component —
+//     e.g. a naive "/"-join of an empty leading argument. The
+//     filepath.Join handling above already skips empty arguments (real
+//     filepath.Join does the same: Join("", "x") is "x", not "/x"), so
+//     this specific artifact shouldn't recur from there; this is defense
+//     in depth against any other pattern-building path making the same
+//     mistake. (A bare-word root with no leading slash at all — the shape
+//     Join("", "x") actually produces once fixed — carries the identical
+//     lack of evidence but is handled at the classify() level instead,
+//     via isBareUnanchoredLiteral, because isOpaqueRoot is also used on
+//     non-path bucket/session-ID values where a bare word is the valid,
+//     positive case.)
 //   - a bare extension fragment, e.g. ".md" — the leftover of a suffix
 //     with nothing real joined in front of it (see the compound-assignment
 //     fix in applyAssign: before it, `memPath += ".md"` on an
@@ -1974,6 +2058,13 @@ func isOpaqueRoot(pattern string) bool {
 		// opaque tail this wraps could easily have absorbed .cog. A
 		// non-empty inner value, e.g. "dirname(<WorkspaceRoot>)", is left
 		// alone — it carries real information.
+		return true
+	case pattern == "/" || strings.HasPrefix(pattern, "//"):
+		// Defense in depth: a bare "/" or a doubled leading separator, as
+		// opposed to a single leading slash with real content after it
+		// (a genuine absolute path, left alone — see the function doc
+		// comment above). Keyed on the full pattern rather than root
+		// because root alone can't tell these two apart.
 		return true
 	}
 	return false
