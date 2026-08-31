@@ -531,6 +531,119 @@ func f() {
 	}
 }
 
+// TestConditionalPlainRebindPoisonsToUnanchored reproduces the round-5 CI
+// review's confirmed finding at audit.go:587 verbatim: poisonLoopRebinds
+// (now poisonConditionalAndLoopRebinds) only un-trusted a plain `=` rebind
+// inside a FOR/RANGE body, so applyDirectLocalDefs's identical flat walk
+// let an if-branch's plain rebind permanently overwrite the outer
+// filepath.Join binding, and the write resolved on that overwritten value
+// alone — turning a real, conditional .cog/ write into a false "elsewhere"
+// for the branch where the rebind does NOT fire. Must land on
+// "unanchored", never "elsewhere": the site cannot prove either branch
+// alone from outside the `if`.
+func TestConditionalPlainRebindPoisonsToUnanchored(t *testing.T) {
+	src := `package p
+func Save(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if !useCog {
+		path = "/etc/cogos/global-settings.json"
+	}
+	return os.WriteFile(path, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	if got := classify(pattern, resolved, degenerate); got != "unanchored" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q — the if-branch's plain rebind to an unrelated, non-.cog literal must not let the outer .cog/settings.json join stand uncontested, and must especially never read as \"elsewhere\"", pattern, resolved, degenerate, got, "unanchored")
+	}
+}
+
+// TestConditionalElseBranchPlainRebindPoisons is the same shape as
+// TestConditionalPlainRebindPoisonsToUnanchored, but the rebind sits in the
+// ELSE arm rather than the sole `if` arm — poisonConditionalAndLoopRebinds
+// must poison an else block exactly like an if body (see that function's
+// IfStmt case).
+func TestConditionalElseBranchPlainRebindPoisons(t *testing.T) {
+	src := `package p
+func f(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if useCog {
+		_ = useCog
+	} else {
+		path = "/etc/cogos/global-settings.json"
+	}
+	return os.WriteFile(path, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	if got := classify(pattern, resolved, degenerate); got != "unanchored" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q — a plain rebind in the ELSE arm is exactly as untrustworthy from outside the if/else as one in the IF arm", pattern, resolved, degenerate, got, "unanchored")
+	}
+}
+
+// TestConditionalSwitchCasePlainRebindPoisons extends the same coverage to
+// SwitchStmt case bodies — poisonConditionalAndLoopRebinds's SwitchStmt
+// case must poison a case body's plain rebind the same way its IfStmt case
+// does.
+func TestConditionalSwitchCasePlainRebindPoisons(t *testing.T) {
+	src := `package p
+func f(mode int, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	switch mode {
+	case 1:
+		path = "/etc/cogos/global-settings.json"
+	}
+	return os.WriteFile(path, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	if got := classify(pattern, resolved, degenerate); got != "unanchored" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q — a switch-case's plain rebind must poison exactly like an if-branch's", pattern, resolved, degenerate, got, "unanchored")
+	}
+}
+
+// TestConditionalShadowDeclarationDoesNotPoisonOuter is the required
+// control for `:=`: a `:=` inside a conditional body declares a NEW name
+// shadowing the outer `path`, never rebinding it, so the outer binding
+// must resolve exactly as if the shadow never existed — never poisoned,
+// never "unanchored".
+func TestConditionalShadowDeclarationDoesNotPoisonOuter(t *testing.T) {
+	src := `package p
+func f(useCog bool, workspaceRoot string) error {
+	path := filepath.Join(workspaceRoot, ".cog", "settings.json")
+	if useCog {
+		path := "/etc/cogos/global-settings.json"
+		_ = path
+	}
+	return os.WriteFile(path, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	if got := classify(pattern, resolved, degenerate); got != "cog" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q — a `:=` inside the if-block shadows `path` locally and must not clobber or poison the OUTER binding read by os.WriteFile", pattern, resolved, degenerate, got, "cog")
+	}
+	if !strings.Contains(pattern, ".cog/settings.json") {
+		t.Errorf("pattern = %q, want it to still contain the outer join's \".cog/settings.json\" — the shadow's own value must never leak into the outer resolution either", pattern)
+	}
+}
+
+// TestStraightLineRebindStillLastAssignmentWins is the required control at
+// the opposite end: a plain `=` rebind that is NOT inside any conditional
+// or loop must be completely unaffected by this fix — last-assignment-wins
+// stays the rule outside a conditionally-executed subtree.
+func TestStraightLineRebindStillLastAssignmentWins(t *testing.T) {
+	src := `package p
+func f(workspaceRoot string) error {
+	path := "/tmp/placeholder"
+	path = filepath.Join(workspaceRoot, ".cog", "settings.json")
+	return os.WriteFile(path, nil, 0644)
+}`
+	argExpr, defs, r := parseCallArg(t, src)
+	pattern, resolved, degenerate := r.resolveExpr(argExpr, defs, 0)
+	if got := classify(pattern, resolved, degenerate); got != "cog" {
+		t.Errorf("classify(%q, %v, %v) = %q, want %q — a straight-line rebind outside any conditional must still resolve on the LAST assignment, exactly as before this fix", pattern, resolved, degenerate, got, "cog")
+	}
+}
+
 // TestFieldAndParamOriginChase exercises the callable-origin index directly
 // — the mechanism that chases a struct field or a bare function parameter
 // back to where it was actually constructed, closing the exact defect class

@@ -563,32 +563,119 @@ func localDefsFor(cache map[*ast.BlockStmt]map[string]ast.Expr, fnBody *ast.Bloc
 func collectLocalDefs(body *ast.BlockStmt) map[string]ast.Expr {
 	defs := map[string]ast.Expr{}
 	applyDirectLocalDefs(defs, body, true)
-	poisonLoopRebinds(defs, body)
+	poisonConditionalAndLoopRebinds(defs, body)
 	return defs
 }
 
-// poisonLoopRebinds deletes from defs every name that a skipped FOR/RANGE
-// subtree REBINDS (plain `=` or a compound assign — never `:=`, which
-// declares a loop-local shadow). A use site OUTSIDE the loop cannot know
-// whether the loop's rebind fired (it depends on iteration count and
-// branch conditions the resolver does not model), so the outer definition
-// is one of two possible runtime values and must not be trusted alone:
-// deleting the name routes such sites to the opaque fallback (unanchored)
-// instead of resolving on the outer branch (round-3 gate finding:
-// internal/engine/daemon_detach_unix.go's logPath — TempDir outer def,
-// workspace/.cog rebind inside a range over args — stamped "elsewhere" on
-// the outer branch alone). Use sites INSIDE the loop are unaffected:
-// localDefsFor layers the loop body's own assignments back on top. Loop
-// headers (Init/Post, and a `for k, v = range` with Tok==ASSIGN) count as
-// rebinds too — applyDirectLocalDefs skips the whole construct, so they
-// are equally invisible to the outer map. FuncLit bodies are deliberately
-// NOT excluded: a plain `=` inside a closure rebinds the captured outer
-// variable, and over-poisoning fails toward unanchored, the honest side.
-func poisonLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt) {
+// poisonConditionalAndLoopRebinds deletes from defs every name that a
+// FOR/RANGE loop OR a conditionally-executed subtree (IfStmt — body and
+// else chain, SwitchStmt/TypeSwitchStmt case bodies, SelectStmt comm
+// clauses) rebinds in a way a use site OUTSIDE that subtree cannot safely
+// trust. `:=` never poisons — when it shadows an existing outer name, it
+// never touches that outer binding in the first place (see
+// applyDirectLocalDefs/applyAssign's condDepth handling), so there is
+// nothing here to poison; when it introduces a brand-new name with no
+// outer counterpart, it is not a rebind of anything outer at all, so
+// poisoning has no name to act on either way.
+//
+// LOOPS: applyDirectLocalDefs never applies a loop body's assignments to
+// the outer map at all (skipLoopBodies=true skips the whole construct,
+// Init/Cond/Post/Key/Value included) — poisoning here strips a
+// PRE-EXISTING outer binding that the (unseen) loop rebind could
+// invalidate, plain `=` or compound (`+=`, ...) alike, because in the
+// loop case NEITHER kind of rebind was ever folded onto that outer binding
+// to begin with — there is no established anchor being discarded, so
+// poisoning both is free. A use site OUTSIDE the loop cannot know whether
+// the rebind fired at all (it depends on iteration count and branch
+// conditions the resolver does not model) — round-3 gate finding:
+// internal/engine/daemon_detach_unix.go's logPath (TempDir outer def,
+// workspace/.cog rebind inside a range over args) stamped "elsewhere" on
+// the outer branch alone. Use sites INSIDE the loop are unaffected:
+// localDefsFor layers the loop body's own assignments back on top.
+// FuncLit bodies are deliberately NOT excluded: a plain `=` inside a
+// closure rebinds the captured outer variable, and over-poisoning fails
+// toward unanchored, the honest side.
+//
+// CONDITIONALS are a deliberately NARROWER poison than loops, for two
+// independent reasons layered on top of each other.
+//
+// First (unchanged from before this fix): a conditional's direct
+// assignments ARE folded into the outer map by the ordinary
+// applyDirectLocalDefs walk — it does not skip if/switch/select, unlike a
+// loop body — see that function's own doc comment: `memPath += ".md"`
+// inside a nested if-block must still resolve to the enclosing
+// filepath.Join plus the suffix, at any point in the function, not just
+// inside that one if-block (sdk/cogos.go's setMemory, a real .cog/mem/
+// writer, pinned down by a named regression test). A COMPOUND assign's
+// synthetic `BinaryExpr{X: prev, Op: ADD, Y: rhs}` (applyAssign) is
+// PROVABLY still anchored on the same prior binding no matter which
+// branch executes — every branch's fold shares the identical root, only
+// the literal suffix differs — so its classification is guaranteed
+// regardless of path, and this function never poisons a compound assign
+// found inside a conditional (poisonLoop below is the only place a
+// compound assign gets deleted, and only because the loop case never
+// established a prior fold to protect in the first place — see the loop
+// section of this comment).
+//
+// Second (the actual round-4 gate fix): a PLAIN `=` rebind is poisoned
+// only when this function can PROVE, using nothing but the rebind's own
+// syntax — no resolver, no call chase, no defs lookup beyond existence —
+// that the rebind assigns a root DIFFERENT from .cog/. literalPathText
+// recognizes exactly one shape for this: a self-contained string literal
+// (or a `+`-chain of them) whose text does not itself contain a ".cog"
+// segment (hasCogSegment). Two real, currently-shipping .cog/ writers
+// pin down why the check has to be this narrow rather than "any plain `=`
+// inside a conditional poisons, full stop":
+//
+//   - internal/engine/log_capture.go's `path := cfg.KernelLogPath; if
+//     path == "" { path = DefaultKernelLogPath(cfg.WorkspaceRoot) }` — the
+//     OUTER value is an opaque, unchased struct field; the CONDITIONAL
+//     rebind is the one call that actually resolves to
+//     <WorkspaceRoot>/.cog/run/kernel.log.jsonl. Poisoning this (as an
+//     earlier, unconditional version of this fix did) throws away the
+//     ONLY known-good classification for a genuine .cog/run/ writer,
+//     purely because the rebind sits inside an `if`.
+//   - internal/engine/memory_sections.go's resolveMemoryDocPath: every
+//     branch of its switch (and the if/else nested in its default case)
+//     assigns `candidate` via a filepath.Join call, never a bare literal;
+//     the read at :252/:def happens after the switch closes. Same shape,
+//     same reasoning.
+//
+// In both cases the rebind's RHS is a CallExpr (or a bare Ident naming a
+// further local), which literalPathText deliberately cannot evaluate —
+// there is no resolver available yet at this stage of building defs to
+// chase it, so this function has no basis to call it a conflict, and
+// leaves it alone. This is a conscious asymmetry, not an oversight: the
+// round-4 finding's OWN reproduction —
+// `path := filepath.Join(workspaceRoot, ".cog", "settings.json"); if
+// !useCog { path = "/etc/cogos/global-settings.json" }` — is a
+// self-contained literal with no ".cog" segment, so it IS caught. A
+// hypothetical rebind that instead called some OTHER, non-.cog-rooted
+// helper function (`path = filepath.Join("/etc", "cogos")`) would not be
+// caught by this narrower check; that residual gap needs the resolver
+// itself to be branch-aware to close (see the package doc's open-issues
+// section) and is out of scope for this fix, which targets the literal
+// confirmed finding. This is the resolver's own invariant, applied as
+// far as pre-resolution syntax alone can prove it: a write site must
+// never classify from a binding not guaranteed on its execution path —
+// when a branch's own fold GUARANTEES the anchor (compound assign) or
+// this function cannot yet tell whether a rebind disagrees (an
+// unresolved call/field), the existing binding stands; only a rebind this
+// function can already read as a DIFFERENT, non-.cog literal forces the
+// site to the unanchored margin.
+func poisonConditionalAndLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt) {
 	if body == nil {
 		return
 	}
-	poison := func(n ast.Node) {
+	// poisonLoop deletes defs[name] for EVERY name a loop-body rebind
+	// touches, plain `=` or compound alike — see this function's doc
+	// comment's LOOPS section for why loops get no plain-vs-compound
+	// distinction (applyDirectLocalDefs never folds a loop body's
+	// assignments into the outer map at all, so there is no established
+	// anchor here to protect — only a PRE-EXISTING outer binding, from
+	// before the loop, that the loop's own invisible-to-this-map rebind
+	// could invalidate).
+	poisonLoop := func(n ast.Node) {
 		if n == nil {
 			return
 		}
@@ -605,12 +692,42 @@ func poisonLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt) {
 			return true
 		})
 	}
+	// poisonConditional deletes defs[name] for a plain `=` rebind found
+	// inside a conditionally-executed subtree, but ONLY when the rebind's
+	// own RHS is a literalPathText the auditor can read WITHOUT a
+	// resolver and that text does not carry a ".cog" segment — see this
+	// function's doc comment for the two real .cog/ writers (a struct
+	// field and a filepath.Join call, both left alone) that a broader,
+	// unconditional version of this check silently broke.
+	poisonConditional := func(n ast.Node) {
+		if n == nil {
+			return
+		}
+		ast.Inspect(n, func(m ast.Node) bool {
+			assign, ok := m.(*ast.AssignStmt)
+			if !ok || assign.Tok != token.ASSIGN {
+				return true
+			}
+			for i, lhs := range assign.Lhs {
+				ident, isIdent := lhs.(*ast.Ident)
+				if !isIdent || ident.Name == "_" || i >= len(assign.Rhs) {
+					continue
+				}
+				text, litOK := literalPathText(assign.Rhs[i])
+				if !litOK || hasCogSegment(text) {
+					continue
+				}
+				delete(defs, ident.Name)
+			}
+			return true
+		})
+	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch s := n.(type) {
 		case *ast.ForStmt:
-			poison(s.Init)
-			poison(s.Post)
-			poison(s.Body)
+			poisonLoop(s.Init)
+			poisonLoop(s.Post)
+			poisonLoop(s.Body)
 		case *ast.RangeStmt:
 			if s.Tok == token.ASSIGN {
 				for _, e := range []ast.Expr{s.Key, s.Value} {
@@ -619,10 +736,67 @@ func poisonLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt) {
 					}
 				}
 			}
-			poison(s.Body)
+			poisonLoop(s.Body)
+		case *ast.IfStmt:
+			// s.Else is either a further *ast.IfStmt (an else-if link,
+			// which ast.Inspect's own continued traversal — we return true
+			// below — will re-visit as its own IfStmt case, poisoning its
+			// Body/Else in turn) or a final *ast.BlockStmt, poisoned
+			// directly here since it is not itself an IfStmt node.
+			poisonConditional(s.Body)
+			if blk, ok := s.Else.(*ast.BlockStmt); ok {
+				poisonConditional(blk)
+			}
+		case *ast.SwitchStmt:
+			poisonConditional(s.Body)
+		case *ast.TypeSwitchStmt:
+			poisonConditional(s.Body)
+		case *ast.SelectStmt:
+			poisonConditional(s.Body)
 		}
 		return true
 	})
+}
+
+// literalPathText cheaply evaluates expr as a self-contained literal path
+// string — no resolver, no call chase, no anchor-token recognition —
+// returning ok only for a plain string literal or a `+`-chain of them.
+// This exists solely so poisonConditionalAndLoopRebinds can tell a
+// conditional rebind's root apart from an outer binding's using nothing
+// but syntax: a hardcoded literal is either .cog-rooted (its text says so
+// directly) or it manifestly is not, and either way no resolution
+// machinery is needed to know which. Anything this function can't read
+// at all — a filepath.Join call, a struct-field or parameter reference,
+// a call to another function — returns ok=false, which
+// poisonConditionalAndLoopRebinds treats as "cannot prove a conflict",
+// not as "no conflict": see that function's doc comment for why guessing
+// either way here would be wrong.
+func literalPathText(expr ast.Expr) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(e.Value)
+		if err != nil {
+			return "", false
+		}
+		return v, true
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		left, ok := literalPathText(e.X)
+		if !ok {
+			return "", false
+		}
+		right, ok := literalPathText(e.Y)
+		if !ok {
+			return "", false
+		}
+		return left + right, true
+	}
+	return "", false
 }
 
 // applyDirectLocalDefs folds body's assignments/declarations into defs IN
@@ -636,21 +810,59 @@ func poisonLoopRebinds(defs map[string]ast.Expr, body *ast.BlockStmt) {
 // When skipLoopBodies is true, a ForStmt/RangeStmt's own Body (and its
 // Init/Cond/Post/Key/Value) is not descended into at all — see
 // collectLocalDefs's doc comment for why.
+//
+// A `:=` DECLARATION found while this walk is inside a conditionally-
+// executed subtree (IfStmt, SwitchStmt/TypeSwitchStmt, SelectStmt — a
+// depth counter, condDepth, tracks this using ast.Inspect's own paired
+// nil-on-exit callback) is recorded UNLESS it would SHADOW an existing
+// outer binding of the same name (applyAssign checks defs for a prior
+// entry before applying): unlike a plain `=` or a compound assign, a
+// shadowing `:=` declares a NEW variable scoped to that subtree, and this
+// map has no block-scoping of its own to keep the shadow from permanently
+// clobbering the outer binding otherwise (the `:=`-shadow-control
+// regression test pins this down: the outer binding must resolve exactly
+// as if the shadow never existed). A `:=` with NO outer counterpart is not
+// a shadow of anything — it is simply this conditional subtree's own
+// fresh local — and is recorded exactly as it would be anywhere else;
+// suppressing it unconditionally (an earlier, over-eager version of this
+// fix did) regressed several real, previously-correct resolutions whose
+// only declaration site happens to sit inside an if/switch/select (a bare
+// `home := os.UserHomeDir()` inside an if-block, among others) to a
+// suddenly-unresolvable opaque name. A plain `=` and a compound assign are
+// NOT gated on conditional depth at all here — both are still recorded
+// (and still fold, for compound) exactly as outside a conditional; it is
+// poisonConditionalAndLoopRebinds, run once collectLocalDefs's walk is
+// complete, that decides which of THOSE survive for a use site outside the
+// subtree. See that function's doc comment for the plain-vs-compound
+// split and why a `:=` needs no matching poison step at all.
 func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoopBodies bool) {
 	if body == nil {
 		return
 	}
+	condDepth := 0
+	var isCondStack []bool
+	isCond := func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.IfStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt:
+			return true
+		}
+		return false
+	}
 	ast.Inspect(body, func(n ast.Node) bool {
-		switch stmt := n.(type) {
-		case *ast.AssignStmt:
-			applyAssign(defs, stmt)
-		case *ast.ValueSpec:
-			for i, name := range stmt.Names {
-				if name.Name == "_" || i >= len(stmt.Values) {
-					continue
+		if n == nil {
+			// Paired exit for whichever node's entry pushed last (ast.Inspect
+			// calls f(nil) once per non-skipped node, immediately after that
+			// node's children are fully walked — see ast.Inspect's doc).
+			if len(isCondStack) > 0 {
+				wasCond := isCondStack[len(isCondStack)-1]
+				isCondStack = isCondStack[:len(isCondStack)-1]
+				if wasCond {
+					condDepth--
 				}
-				defs[name.Name] = stmt.Values[i]
 			}
+			return true
+		}
+		switch n.(type) {
 		case *ast.ForStmt:
 			if skipLoopBodies {
 				return false
@@ -658,6 +870,24 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 		case *ast.RangeStmt:
 			if skipLoopBodies {
 				return false
+			}
+		}
+		cond := isCond(n)
+		isCondStack = append(isCondStack, cond)
+		if cond {
+			condDepth++
+		}
+		switch stmt := n.(type) {
+		case *ast.AssignStmt:
+			applyAssign(defs, stmt, condDepth > 0)
+		case *ast.ValueSpec:
+			if condDepth == 0 {
+				for i, name := range stmt.Names {
+					if name.Name == "_" || i >= len(stmt.Values) {
+						continue
+					}
+					defs[name.Name] = stmt.Values[i]
+				}
 			}
 		}
 		return true
@@ -683,7 +913,18 @@ func applyDirectLocalDefs(defs map[string]ast.Expr, body *ast.BlockStmt, skipLoo
 // is recorded — still not a "rebind to nothing": the resolver's opaque
 // placeholder fallback for the parameter case keeps this honest either
 // way.
-func applyAssign(defs map[string]ast.Expr, stmt *ast.AssignStmt) {
+//
+// insideConditional (true when applyDirectLocalDefs's condDepth is > 0 at
+// this statement) affects ONLY the `:=` case: a declaration found inside a
+// conditionally-executed subtree is a shadow local to it and must not
+// overwrite an outer binding of the same name in this flat, scope-blind
+// map — see applyDirectLocalDefs's own doc comment. A plain `=` still
+// records outright (poisonConditionalAndLoopRebinds decides afterward
+// whether a conditional's plain rebind survives for a use site outside
+// it); a compound assign still folds exactly as it does anywhere else,
+// conditional or not — folding never discards the prior binding, so there
+// is nothing here that needs gating on conditional depth.
+func applyAssign(defs map[string]ast.Expr, stmt *ast.AssignStmt, insideConditional bool) {
 	for i, lhs := range stmt.Lhs {
 		ident, ok := lhs.(*ast.Ident)
 		if !ok || ident.Name == "_" || i >= len(stmt.Rhs) {
@@ -693,6 +934,25 @@ func applyAssign(defs map[string]ast.Expr, stmt *ast.AssignStmt) {
 		if stmt.Tok != token.ASSIGN && stmt.Tok != token.DEFINE {
 			if prev, had := defs[ident.Name]; had {
 				rhs = &ast.BinaryExpr{X: prev, Op: token.ADD, Y: rhs}
+			}
+			defs[ident.Name] = rhs
+			continue
+		}
+		if stmt.Tok == token.DEFINE && insideConditional {
+			// Only a genuine SHADOW — a `:=` whose name already has an
+			// outer binding from before this conditional subtree — is
+			// protected here. A `:=` that introduces a brand-new name with
+			// no outer counterpart has nothing to protect and must still
+			// be recorded, exactly as it was before conditionals got any
+			// special treatment: this is the one difference between "shadow"
+			// and "fresh conditional-local", and conflating them regressed
+			// several real, previously-correct resolutions (a bare `home :=
+			// os.UserHomeDir()` declared only inside an if-block, a `ws :=`
+			// used only inside a conditional branch, and similar) to a
+			// suddenly-unresolvable name the moment this fix started
+			// suppressing EVERY conditional `:=` rather than just shadows.
+			if _, hadOuter := defs[ident.Name]; hadOuter {
+				continue
 			}
 		}
 		defs[ident.Name] = rhs

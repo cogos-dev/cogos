@@ -626,18 +626,6 @@
       "raw": "path + \"?mode=ro\u0026_busy_timeout=3000\""
     },
     {
-      "file": "internal/engine/cli_emit.go",
-      "line": 189,
-      "column": 12,
-      "primitive": "engine.AppendEvent(bucket)",
-      "func": "runEmitHookStyle",
-      "pattern": "\u003cWorkspaceRoot\u003e/.cog/ledger/unknown/events.jsonl",
-      "category": "cog",
-      "resolved": true,
-      "subsystem": "internal:engine",
-      "raw": "sessionID"
-    },
-    {
       "file": "internal/engine/cli_install_unix.go",
       "line": 44,
       "column": 12,
@@ -2859,14 +2847,14 @@
     }
   ],
   "summary": {
-    "total": 238,
-    "cog": 101,
+    "total": 237,
+    "cog": 100,
     "home": 4,
     "elsewhere": 13,
     "unanchored": 77,
     "dynamic": 43,
     "by_primitive": {
-      "engine.AppendEvent(bucket)": 6,
+      "engine.AppendEvent(bucket)": 5,
       "io.Copy": 7,
       "os.Create": 6,
       "os.CreateTemp": 9,
