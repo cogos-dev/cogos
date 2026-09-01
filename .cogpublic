@@ -1,9 +1,19 @@
 # .cogpublic — Public release gate for myrgic/cogos
 # Defines what crosses the constellation boundary outward.
-# Used by `cog plan upstream` / `cog apply upstream` to sanitize pushes.
 #
-# Gate 1: private dev → org upstream (myrgic/cogos, direct branch workflow)
-# Gate 2: squash-merge to main
+# ENFORCED BY: scripts/cogpublic-guard.py, run in CI on every PR
+#   ("Public release gate" steps in .github/workflows/ci.yml).
+#   Locally:  python3 ./scripts/cogpublic-guard.py [--staged]
+#
+# HISTORY / WHY THE ABOVE LINE MATTERS: from 2026-04-14 until 2026-09-01 this
+# file's header claimed it was "used by `cog plan upstream` / `cog apply
+# upstream` to sanitize pushes." That command was never implemented, nothing
+# else referenced this file, and no repo carried an active git hook — so the
+# guards below were declared and never executed. Three instances of the exact
+# patterns listed here reached public repos in that window (mod3 #138/#142,
+# cogos #588, mod3 #146). Keep this pointer accurate: a guard that names a
+# non-existent enforcer reads like coverage during review and stops anyone
+# from looking twice.
 
 version: 1
 
@@ -85,6 +95,25 @@ content_guards:
     description: "Slack bot token"
   - pattern: '@gmail\.com|@yahoo\.com|@hotmail\.com'
     description: "Personal email address (git author emails exempt)"
+
+# Paths the content scan skips.
+#
+# The guard executor is here BY EXPLICIT DECLARATION, not by an invisible rule.
+# Review of #19 found the previous implementation excluded files by FILENAME
+# (`sanitize_fixture.py`, `*_names_test.go`), which meant a real leak could be
+# hidden simply by naming the file that way — reproduced: exit 0 with the leak
+# present, exit 1 for identical content under an ordinary name. Filename
+# exclusion is not a security property. The script legitimately contains probe
+# strings for every guard it tests, so it is listed here where a reviewer sees
+# it in the diff.
+exclude:
+  - scripts/cogpublic-guard.py
+  # Asserts the gate BLOCKS a build-time-injected home path, so it must contain
+  # one. Declared here rather than skipped by a filename rule — the filename
+  # exclusion this replaced was itself the HIGH-severity bypass found in
+  # myrgic/.github#19 review. An exclusion that a reviewer can see in the diff
+  # is a different thing from one baked into the scanner.
+  - internal/providers/site/gate_artifact_test.go
 
 # Post-push structural checks
 post_guards:
