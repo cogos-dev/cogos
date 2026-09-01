@@ -1983,10 +1983,22 @@
     },
     {
       "file": "internal/providers/site/site.go",
-      "line": 805,
+      "line": 836,
+      "column": 12,
+      "primitive": "os.WriteFile",
+      "func": "gateArtifact",
+      "pattern": "\u003cTempDir\u003e/.cogpublic",
+      "category": "elsewhere",
+      "resolved": true,
+      "subsystem": "provider:site",
+      "raw": "stagedCfg"
+    },
+    {
+      "file": "internal/providers/site/site.go",
+      "line": 907,
       "column": 11,
       "primitive": "os.MkdirAll",
-      "func": "func literal (line 795)",
+      "func": "func literal (line 897)",
       "pattern": "{dst}/\u003ccall:filepath.Rel\u003e",
       "category": "dynamic",
       "resolved": false,
@@ -1995,7 +2007,7 @@
     },
     {
       "file": "internal/providers/site/site.go",
-      "line": 817,
+      "line": 919,
       "column": 12,
       "primitive": "os.MkdirAll",
       "func": "copyFile",
@@ -2007,7 +2019,7 @@
     },
     {
       "file": "internal/providers/site/site.go",
-      "line": 820,
+      "line": 922,
       "column": 14,
       "primitive": "os.OpenFile",
       "func": "copyFile",
@@ -2019,7 +2031,7 @@
     },
     {
       "file": "internal/providers/site/site.go",
-      "line": 825,
+      "line": 927,
       "column": 11,
       "primitive": "io.Copy",
       "func": "copyFile",
@@ -2847,10 +2859,10 @@
     }
   ],
   "summary": {
-    "total": 237,
+    "total": 238,
     "cog": 97,
     "home": 2,
-    "elsewhere": 13,
+    "elsewhere": 14,
     "unanchored": 84,
     "dynamic": 41,
     "by_primitive": {
@@ -2863,7 +2875,7 @@
       "os.OpenFile": 27,
       "os.Rename": 33,
       "os.Symlink": 1,
-      "os.WriteFile": 64,
+      "os.WriteFile": 65,
       "sql.Open(sqlite3)": 7
     }
   },
@@ -3510,7 +3522,17 @@
     },
     {
       "file": "internal/providers/site/site.go",
-      "line": 785,
+      "line": 851,
+      "column": 10,
+      "func": "gateArtifact",
+      "subsystem": "provider:site",
+      "raw": "exec.CommandContext(ctx, \"python3\", args...)",
+      "dir": "\u003cTempDir\u003e",
+      "dir_known": true
+    },
+    {
+      "file": "internal/providers/site/site.go",
+      "line": 887,
       "column": 9,
       "func": "gitRun",
       "subsystem": "provider:site",
