@@ -863,56 +863,83 @@ func TestSubprocessAppendix_Declared(t *testing.T) {
 		t.Fatal("Report.Subprocess is empty — the subprocess appendix must enumerate exec.Command/exec.CommandContext sites, never silently drop them")
 	}
 
-	find := func(file string, line int) (SubprocessSite, bool) {
+	// findCall locates a subprocess site by file + a substring of the rendered
+	// call, rather than by hardcoded line number.
+	//
+	// Line-keyed assertions fail on any edit ABOVE the call, which is a false
+	// alarm that looks identical to the real thing this appendix guards
+	// (a subprocess site disappearing). That is exactly what happened: #587
+	// inserted one line into worktree_reconciler.go, the `git worktree list`
+	// call moved 831->832 relative to its old position, and CI on main went
+	// red with "not found in subprocess appendix" — indistinguishable, at a
+	// glance, from someone deleting a tracked subprocess. main stayed red
+	// across three subsequent merges.
+	//
+	// The call text is the stable identity here; the line number is an
+	// accident of layout.
+	findCall := func(file, callContains string) (SubprocessSite, bool) {
 		for _, s := range report.Subprocess {
-			if s.File == file && s.Line == line {
+			if s.File == file && strings.Contains(s.Raw, callContains) {
 				return s, true
 			}
 		}
 		return SubprocessSite{}, false
 	}
 
-	wantDir := func(t *testing.T, file string, line int, dirContains string) {
+	wantDirCall := func(t *testing.T, file, callContains, dirContains string) {
 		t.Helper()
-		s, ok := find(file, line)
+		s, ok := findCall(file, callContains)
 		if !ok {
-			t.Fatalf("%s:%d not found in subprocess appendix", file, line)
+			t.Fatalf("%s: no subprocess site whose call contains %q — "+
+				"either the call was removed or the scanner stopped seeing it",
+				file, callContains)
 		}
 		if !s.DirKnown {
-			t.Errorf("%s:%d DirKnown=false, want a resolved cmd.Dir", file, line)
+			t.Errorf("%s:%d DirKnown=false, want a resolved cmd.Dir", file, s.Line)
 			return
 		}
 		if !strings.Contains(s.Dir, dirContains) {
-			t.Errorf("%s:%d Dir = %q, want it to contain %q", file, line, s.Dir, dirContains)
+			t.Errorf("%s:%d Dir=%q, want it to contain %q", file, s.Line, s.Dir, dirContains)
 		}
 	}
+
+	wantCall := func(t *testing.T, file, callContains, why string) {
+		t.Helper()
+		if _, ok := findCall(file, callContains); !ok {
+			t.Errorf("%s: no subprocess site whose call contains %q (%s)",
+				file, callContains, why)
+		}
+	}
+
+	// NOTE: the line-keyed `find`/`wantDir` helpers were removed here in favour
+	// of findCall/wantDirCall above. Every assertion in this test now keys on
+	// the rendered call text, so inserting a line above a tracked subprocess
+	// no longer turns CI red with a message that reads like a deleted site.
 
 	// transition_hooks.go's `sh -c <h.Shell>` runs with cmd.Dir set to the
 	// hook's own workspace parameter — an operator-configured shell
 	// hook getting the workspace root as its cwd, exactly the §5.1a
 	// config-overwrite shape the appendix exists to surface.
-	if _, ok := find("internal/engine/transition_hooks.go", 225); !ok {
-		t.Error("transition_hooks.go:225 (the sh -c transition-hook subprocess) missing from the subprocess appendix")
-	}
+	wantCall(t, "internal/engine/transition_hooks.go", `"sh"`,
+		"the sh -c transition-hook subprocess")
 	// worktree_spawn.go / worktree_reconciler.go: `git worktree add|remove`
 	// with cmd.Dir = repoRoot — a real filesystem mutation (a whole
 	// worktree directory tree, or its recursive removal) this tool's
 	// primitive scanner cannot see because it crosses a process boundary.
-	wantDir(t, "internal/engine/worktree_spawn.go", 134, "repoRoot")
-	wantDir(t, "internal/engine/worktree_reconciler.go", 832, "repoRoot")
+	wantDirCall(t, "internal/engine/worktree_spawn.go", `"git", args...`, "repoRoot")
+	wantDirCall(t, "internal/engine/worktree_reconciler.go", `"list", "--porcelain"`, "repoRoot")
 	// mcp_architecture.go / projection_compiler.go: python3 script
 	// subprocesses with no cmd.Dir set at all (inherits the process's own
 	// cwd) — DirKnown must be false, not a guessed value.
-	if s, ok := find("internal/engine/mcp_architecture.go", 156); !ok {
-		t.Error("mcp_architecture.go:156 (the python3 architecture-tool subprocess) missing from the subprocess appendix")
+	if s, ok := findCall("internal/engine/mcp_architecture.go", `"python3"`); !ok {
+		t.Error("mcp_architecture.go: python3 architecture-tool subprocess missing from the appendix")
 	} else if s.DirKnown {
-		t.Errorf("mcp_architecture.go:156 DirKnown=true (Dir=%q), want false — no cmd.Dir is set in source", s.Dir)
+		t.Errorf("mcp_architecture.go:%d DirKnown=true (Dir=%q), want false — no cmd.Dir is set in source", s.Line, s.Dir)
 	}
-	if _, ok := find("internal/engine/projection_compiler.go", 388); !ok {
-		t.Error("projection_compiler.go:388 (the python3 cogblock-parse subprocess) missing from the subprocess appendix")
-	}
+	wantCall(t, "internal/engine/projection_compiler.go", `"python3"`,
+		"the python3 cogblock-parse subprocess")
 	// site.go: `bash build.sh` with cmd.Dir = appDir.
-	wantDir(t, "internal/providers/site/site.go", 601, "appDir")
+	wantDirCall(t, "internal/providers/site/site.go", `"build.sh"`, "appDir")
 
 	// The rendered markdown must carry the appendix and its scope-boundary
 	// statement — declared, not silent.
