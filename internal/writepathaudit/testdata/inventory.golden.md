@@ -343,11 +343,11 @@ Total subprocess sites: 73
 | _(not set — inherits the process's own working directory)_ | `exec.Command("id", "-u")` | internal/engine/service_supervisor_launchctl.go:376 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.Command("sh", "-c", "echo $HOME")` | internal/engine/service_supervisor_launchctl.go:386 | internal:engine |
 | `{workspace}` | `exec.CommandContext(ctx, "sh", "-c", h.Shell)` | internal/engine/transition_hooks.go:225 | internal:engine |
-| `{repoRoot}` | `exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain")` | internal/engine/worktree_reconciler.go:801 | internal:engine |
-| `{repoRoot}` | `exec.CommandContext(ctx, "git", "worktree", "remove", "--force", path)` | internal/engine/worktree_reconciler.go:832 | internal:engine |
-| `{wts[i].Path}` | `exec.CommandContext(ctx, "git", "--no-optional-locks", "status", "--porcelain")` | internal/engine/worktree_reconciler.go:905 | internal:engine |
-| `{wts[i].Path}` | `exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "@{upstream}")` | internal/engine/worktree_reconciler.go:921 | internal:engine |
-| `{wts[i].Path}` | `exec.CommandContext(ctx, "git", "rev-list", "--count", upstreamRef+"..HEAD")` | internal/engine/worktree_reconciler.go:933 | internal:engine |
+| `{repoRoot}` | `exec.CommandContext(ctx, "git", "worktree", "list", "--porcelain")` | internal/engine/worktree_reconciler.go:831 | internal:engine |
+| `{repoRoot}` | `exec.CommandContext(ctx, "git", "worktree", "remove", "--force", path)` | internal/engine/worktree_reconciler.go:862 | internal:engine |
+| `{wts[i].Path}` | `exec.CommandContext(ctx, "git", "--no-optional-locks", "status", "--porcelain")` | internal/engine/worktree_reconciler.go:935 | internal:engine |
+| `{wts[i].Path}` | `exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "@{upstream}")` | internal/engine/worktree_reconciler.go:951 | internal:engine |
+| `{wts[i].Path}` | `exec.CommandContext(ctx, "git", "rev-list", "--count", upstreamRef+"..HEAD")` | internal/engine/worktree_reconciler.go:963 | internal:engine |
 | `{repoRoot}` | `exec.CommandContext(ctx, "git", args...)` | internal/engine/worktree_spawn.go:134 | internal:engine |
 | `{root}` | `exec.CommandContext(ctx, cogScript, args...)` | internal/linkfeed/linkfeed.go:977 | internal:linkfeed |
 | _(not set — inherits the process's own working directory)_ | `exec.Command("git", "rev-parse", "--show-toplevel")` | internal/providers/all/all.go:126 | provider:all |

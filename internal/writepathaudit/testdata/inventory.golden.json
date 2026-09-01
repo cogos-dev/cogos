@@ -3360,7 +3360,7 @@
     },
     {
       "file": "internal/engine/worktree_reconciler.go",
-      "line": 801,
+      "line": 831,
       "column": 9,
       "func": "(*CLIGitAdapter).ListWorktrees",
       "subsystem": "internal:engine",
@@ -3370,7 +3370,7 @@
     },
     {
       "file": "internal/engine/worktree_reconciler.go",
-      "line": 832,
+      "line": 862,
       "column": 9,
       "func": "(*CLIGitAdapter).RemoveWorktree",
       "subsystem": "internal:engine",
@@ -3380,7 +3380,7 @@
     },
     {
       "file": "internal/engine/worktree_reconciler.go",
-      "line": 905,
+      "line": 935,
       "column": 9,
       "func": "gitHasUncommittedChanges",
       "subsystem": "internal:engine",
@@ -3390,7 +3390,7 @@
     },
     {
       "file": "internal/engine/worktree_reconciler.go",
-      "line": 921,
+      "line": 951,
       "column": 9,
       "func": "gitHasUnmergedCommits",
       "subsystem": "internal:engine",
@@ -3400,7 +3400,7 @@
     },
     {
       "file": "internal/engine/worktree_reconciler.go",
-      "line": 933,
+      "line": 963,
       "column": 10,
       "func": "gitHasUnmergedCommits",
       "subsystem": "internal:engine",
