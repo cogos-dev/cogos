@@ -331,6 +331,12 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	// eclipse model is surfaced via live enumeration as a composite id regardless.
 	eclipseServed := eclipseModelServed(router)
 
+	// Live enumeration first (probe every ModelLister provider concurrently,
+	// each bounded, skipping any that error/time out): the alias entries below
+	// derive their context_length (#518) from the live listing of whatever the
+	// alias actually routes to.
+	live := liveModelEntries(ctx, router, now)
+
 	var data []compatModel
 	seen := make(map[string]bool)
 	add := func(m compatModel) {
@@ -340,38 +346,79 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 		seen[m.ID] = true
 		data = append(data, m)
 	}
+	withCtx := func(m compatModel, ctxLen int) compatModel {
+		if ctxLen > 0 {
+			m.ContextLength = ctxLen
+		}
+		return m
+	}
 
 	if frontierConfigured {
-		// Intent aliases for frontier-managed tiers.
-		add(mkCompatModel("foreground", "cogos", "frontier-managed",
-			"interactive, full capability (managed Claude, Max sub)", now))
-		add(mkCompatModel("deliberation", "cogos", "frontier-managed",
-			"heavier reasoning (Opus)", now))
+		// Intent aliases for frontier-managed tiers. Both resolve (resolve.go
+		// intentAliases) to claude-oauth model overrides, i.e. Anthropic
+		// models with the standard 200k window (#518).
+		add(withCtx(mkCompatModel("foreground", "cogos", "frontier-managed",
+			"interactive, full capability (managed Claude, Max sub)", now), anthropicMaxContextTokens))
+		add(withCtx(mkCompatModel("deliberation", "cogos", "frontier-managed",
+			"heavier reasoning (Opus)", now), anthropicMaxContextTokens))
 	}
 	if localConfigured {
-		// Intent alias for the local-sovereign tier.
-		add(mkCompatModel("local", "cogos", "local-sovereign",
-			"private, no egress (E4B on this node)", now))
+		// Intent alias for the local-sovereign tier. Its context window is
+		// whatever is loaded on the provider "local" actually resolves to —
+		// pulled from the live listings, omitted when genuinely unknown (#518).
+		add(withCtx(mkCompatModel("local", "cogos", "local-sovereign",
+			"private, no egress (E4B on this node)", now), localAliasContextLength(router, live)))
 	}
 	if frontierConfigured {
 		// Static frontier model IDs — retained so clients keep working even when
-		// the live Anthropic catalog probe is unavailable.
-		add(mkCompatModel("claude-sonnet-4-6", "anthropic", "frontier-managed", "", now))
-		add(mkCompatModel("claude-opus-4-7", "anthropic", "frontier-managed", "", now))
-		add(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now))
+		// the live Anthropic catalog probe is unavailable. All Anthropic models
+		// carry the standard 200k window (#518).
+		add(withCtx(mkCompatModel("claude-sonnet-4-6", "anthropic", "frontier-managed", "", now), anthropicMaxContextTokens))
+		add(withCtx(mkCompatModel("claude-opus-4-7", "anthropic", "frontier-managed", "", now), anthropicMaxContextTokens))
+		add(withCtx(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now), anthropicMaxContextTokens))
 	}
 	if eclipseServed {
 		add(mkCompatModel("eclipse-26b", "cogos", "lan-local",
 			"LAN-resident 26B model (Eclipse node)", now))
 	}
 
-	// Live enumeration: probe every ModelLister provider concurrently, each
-	// bounded, skipping any that error/time out.
-	for _, m := range liveModelEntries(ctx, router, now) {
+	for _, m := range live {
 		add(m)
 	}
 
 	return data
+}
+
+// localAliasContextLength resolves the "local" intent alias to its target
+// provider (same logic clients hit at request time, ResolveModelRequest) and
+// returns the context window of that provider's CONFIGURED model, looked up in
+// the already-probed live entries — the loaded window, never a guess (#518).
+// Returns 0 (⇒ omitted on the wire) when the alias doesn't resolve, the
+// provider has no configured model, or the live probe didn't report a window.
+func localAliasContextLength(router Router, live []compatModel) int {
+	res := ResolveModelRequest(router, "local", "")
+	if res.PreferProvider == "" || router == nil {
+		return 0
+	}
+	var model string
+	router.RangeProviders(func(p Provider) {
+		if p.Name() != res.PreferProvider {
+			return
+		}
+		if ms := p.Capabilities().ModelsAvailable; len(ms) > 0 {
+			model = ms[0]
+		}
+	})
+	if model == "" {
+		return 0
+	}
+	want := res.PreferProvider + "/" + model
+	for _, m := range live {
+		if m.ID == want {
+			return m.ContextLength
+		}
+	}
+	return 0
 }
 
 // liveModelEntries walks the router's providers, probing each ModelLister (or
@@ -517,6 +564,12 @@ func modelEntryFor(p Provider, listing ModelListing, frontier bool, now int64) c
 	var m compatModel
 	if frontier && strings.HasPrefix(id, "claude-") {
 		m = mkCompatModel(id, "anthropic", "frontier-managed", desc, now)
+		if listing.ContextLength == 0 {
+			// Anthropic's /v1/models exposes no per-model context field; the
+			// whole claude-sonnet-4+ family carries the standard 200k window
+			// (#518). Reuse the provider-layer constant, never a second copy.
+			m.ContextLength = anthropicMaxContextTokens
+		}
 	} else {
 		name := p.Name()
 		composite := name + "/" + id

@@ -31,6 +31,13 @@ const (
 	anthropicDefaultEndpoint = "https://api.anthropic.com"
 	anthropicAPIVersion      = "2023-06-01"
 	anthropicDefaultMaxToks  = 8192
+
+	// anthropicMaxContextTokens is the standard context window for the
+	// claude-sonnet-4+ family (200k). Shared by AnthropicProvider's
+	// Capabilities and by /v1/models composition (#518) so every advertised
+	// Anthropic model carries a real context_length instead of leaving
+	// clients to guess a default.
+	anthropicMaxContextTokens = 200_000
 )
 
 // AnthropicProvider implements Provider against the Anthropic Messages API.
@@ -92,7 +99,7 @@ func (p *AnthropicProvider) Capabilities() ProviderCapabilities {
 		Capabilities: []Capability{
 			CapStreaming, CapToolUse, CapVision, CapLongContext, CapJSON, CapCaching,
 		},
-		MaxContextTokens:   200_000, // claude-sonnet-4+ supports 200k context
+		MaxContextTokens:   anthropicMaxContextTokens,
 		MaxOutputTokens:    p.maxTokens,
 		ModelsAvailable:    []string{p.model},
 		IsLocal:            false,

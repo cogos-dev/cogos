@@ -711,3 +711,44 @@ func TestOpenAICompatListModelsWithContext_SlowProbeDoesNotStarveFallback(t *tes
 		t.Fatalf("listings = %v; want 1 entry with id llama-3-8b", listings)
 	}
 }
+
+// TestHandleModels_AllEntriesCarryContextLength is the #518 completion
+// regression: on a production-shaped router (frontier claude-oauth lister +
+// local context-lister), EVERY advertised entry — intent aliases (foreground,
+// deliberation, local), static frontier ids, and live-enumerated ids — must
+// carry a context_length. Anthropic entries get the shared 200k constant;
+// the "local" alias inherits the loaded window of the provider it resolves to.
+func TestHandleModels_AllEntriesCarryContextLength(t *testing.T) {
+	t.Parallel()
+
+	claude := newListerStub("claude-oauth", false, "claude-opus-4-8", "claude-sonnet-5")
+	local := newContextListerStub("lmstudio-darkstar", true,
+		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+	)
+	// The "local" alias resolves to lmstudio-darkstar (resolve.go); its
+	// configured model determines which live listing the alias inherits.
+	local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
+
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+	router.RegisterProvider(claude)
+	router.RegisterProvider(local)
+
+	srv := freshModelsServer(t, router)
+	resp := fetchModels(t, srv)
+
+	for _, e := range resp.Data {
+		if e.ContextLength <= 0 {
+			t.Errorf("entry %q: no context_length advertised (#518)", e.ID)
+		}
+	}
+
+	byID := modelIDSet(resp)
+	for _, id := range []string{"foreground", "deliberation", "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001", "claude-opus-4-8", "claude-sonnet-5"} {
+		if m, ok := byID[id]; !ok || m.ContextLength != 200_000 {
+			t.Errorf("entry %q: ContextLength = %d (present=%v); want 200000", id, m.ContextLength, ok)
+		}
+	}
+	if m, ok := byID["local"]; !ok || m.ContextLength != 32768 {
+		t.Errorf("local alias: ContextLength = %d (present=%v); want 32768 (loaded window of resolved provider)", m.ContextLength, ok)
+	}
+}
