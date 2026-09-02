@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,6 +39,25 @@ type CodexProvider struct {
 	binary        string // path to codex binary (default: "codex")
 	defaultBinary bool
 	workDir       string // working directory for codex exec
+
+	// Availability cache (mirrors ClaudeOAuthProvider). The auth-status probe
+	// spawns a subprocess, so the result is cached for availCacheTTL and the
+	// mutex is held across the probe to collapse concurrent callers.
+	availMu     sync.Mutex
+	availAt     time.Time
+	availResult bool
+}
+
+// codexAuthProbe runs `<binary> login status` and returns nil iff the CLI
+// reports an authenticated session (exit 0). Package-level var so tests can
+// stub the subprocess. The working directory is the user's home so a broken
+// repo-local .codex/config.toml can't skew the result.
+var codexAuthProbe = func(ctx context.Context, binary string) error {
+	cmd := exec.CommandContext(ctx, binary, "login", "status")
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cmd.Dir = home
+	}
+	return cmd.Run()
 }
 
 // NewCodexProvider creates a CodexProvider from a ProviderConfig.
@@ -117,9 +137,46 @@ func codexAppBundlePaths() []string {
 	return paths
 }
 
+// Available reports whether the codex binary exists AND the CLI is
+// authenticated (`codex login status` exits 0). The result is cached for
+// availCacheTTL so the router's availability ticker (and the per-request
+// /v1/providers handler) don't spawn a subprocess on every call. The mutex is
+// held across the probe so concurrent callers collapse into a single
+// subprocess.
 func (p *CodexProvider) Available(ctx context.Context) bool {
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if !p.availAt.IsZero() && time.Since(p.availAt) < availCacheTTL {
+		return p.availResult
+	}
+	fresh := p.probeAvailable(ctx)
+	// Don't cache a false result caused by caller-initiated cancellation
+	// (client disconnect); a deadline is a genuine probe timeout and is cached.
+	if !fresh && ctx.Err() == context.Canceled {
+		return p.availResult
+	}
+	p.availResult = fresh
+	p.availAt = time.Now()
+	return p.availResult
+}
+
+// probeAvailable performs the real availability check backing Available():
+// binary resolvable, then `codex login status` succeeding. Call via
+// Available() for TTL caching.
+func (p *CodexProvider) probeAvailable(ctx context.Context) bool {
 	path, err := p.resolveBinary()
-	return err == nil && path != ""
+	if err != nil || path == "" {
+		return false
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if err := codexAuthProbe(probeCtx, path); err != nil {
+		slog.Debug("codex: Available: login status probe failed", "err", err)
+		return false
+	}
+	return true
 }
 
 func (p *CodexProvider) Capabilities() ProviderCapabilities {

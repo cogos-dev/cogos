@@ -27,11 +27,15 @@ func resetCodexResolverForTest(t *testing.T) {
 	oldLookPath := codexLookPath
 	oldStat := codexStat
 	oldGOOS := codexGOOS
+	oldAuthProbe := codexAuthProbe
 	t.Cleanup(func() {
 		codexLookPath = oldLookPath
 		codexStat = oldStat
 		codexGOOS = oldGOOS
+		codexAuthProbe = oldAuthProbe
 	})
+	// Default: auth probe succeeds. Tests exercising bad auth override this.
+	codexAuthProbe = func(ctx context.Context, binary string) error { return nil }
 }
 
 func TestCodexResolveBinaryPrefersPath(t *testing.T) {
