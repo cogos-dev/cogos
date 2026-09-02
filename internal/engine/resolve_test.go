@@ -270,25 +270,68 @@ func TestResolveModelRequest_Deliberation(t *testing.T) {
 	}
 }
 
+// Previous-generation raw claude ids: on the DISPATCH path (nil router) they
+// resolve via dispatchFrontierAliases (the #430 protection); on the GATEWAY
+// path (live router) they resolve DYNAMICALLY via resolveLiveCatalog →
+// frontierProviderName, like every other claude id — a claude-code-only
+// install must route them to the provider it actually has, not a hardcoded
+// claude-oauth pin.
 func TestResolveModelRequest_SonnetModelID(t *testing.T) {
 	t.Parallel()
+	// Dispatch path (nil router): static table keeps the pin.
 	res := ResolveModelRequest(nil, "claude-sonnet-4-6", "req-s")
 	if res.PreferProvider != "claude-oauth" {
-		t.Errorf("claude-sonnet-4-6: PreferProvider = %q; want claude-oauth", res.PreferProvider)
+		t.Errorf("dispatch claude-sonnet-4-6: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "claude-sonnet-4-6" {
-		t.Errorf("claude-sonnet-4-6: ModelOverride = %q; want claude-sonnet-4-6", res.ModelOverride)
+		t.Errorf("dispatch claude-sonnet-4-6: ModelOverride = %q; want claude-sonnet-4-6", res.ModelOverride)
+	}
+	// Gateway path (live router, claude-code-only frontier): dynamic resolution
+	// must route to the registered frontier provider, not a static pin.
+	router := newStubRouter().addProvider("claude-code", "", false)
+	res = ResolveModelRequest(router, "claude-sonnet-4-6", "req-s2")
+	if res.PreferProvider != "claude-code" {
+		t.Errorf("gateway claude-sonnet-4-6: PreferProvider = %q; want claude-code (dynamic frontier)", res.PreferProvider)
+	}
+	if res.ModelOverride != "claude-sonnet-4-6" {
+		t.Errorf("gateway claude-sonnet-4-6: ModelOverride = %q; want claude-sonnet-4-6", res.ModelOverride)
 	}
 }
 
 func TestResolveModelRequest_OpusModelID(t *testing.T) {
 	t.Parallel()
+	// Dispatch path (nil router): static table keeps the pin.
 	res := ResolveModelRequest(nil, "claude-opus-4-7", "req-o")
 	if res.PreferProvider != "claude-oauth" {
-		t.Errorf("claude-opus-4-7: PreferProvider = %q; want claude-oauth", res.PreferProvider)
+		t.Errorf("dispatch claude-opus-4-7: PreferProvider = %q; want claude-oauth", res.PreferProvider)
 	}
 	if res.ModelOverride != "claude-opus-4-7" {
-		t.Errorf("claude-opus-4-7: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
+		t.Errorf("dispatch claude-opus-4-7: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
+	}
+	// Gateway path (live router with claude-oauth registered): dynamic
+	// resolution still lands on claude-oauth via frontierProviderName.
+	router := newStubRouter().addProvider("claude-oauth", "", false)
+	res = ResolveModelRequest(router, "claude-opus-4-7", "req-o2")
+	if res.PreferProvider != "claude-oauth" {
+		t.Errorf("gateway claude-opus-4-7: PreferProvider = %q; want claude-oauth", res.PreferProvider)
+	}
+	if res.ModelOverride != "claude-opus-4-7" {
+		t.Errorf("gateway claude-opus-4-7: ModelOverride = %q; want claude-opus-4-7", res.ModelOverride)
+	}
+}
+
+// TestIntentAliases_NoRawClaudeIDs is the regrowth guard for the alias-shadowing
+// defect: a raw "claude-*" model-id key in intentAliases is consulted BEFORE
+// resolveLiveCatalog in ResolveModelRequest, so it statically shadows the
+// dynamic gateway-path resolution that claude-code-only installs depend on
+// (see TestHandleModels_HaikuAdmitsUnderClaudeCodeOnly). Raw claude ids for the
+// nil-router dispatch path belong in dispatchFrontierAliases instead.
+func TestIntentAliases_NoRawClaudeIDs(t *testing.T) {
+	t.Parallel()
+	for key := range intentAliases {
+		if strings.HasPrefix(key, "claude-") {
+			t.Errorf("intentAliases contains raw claude model id %q; raw claude-* ids must resolve dynamically via resolveLiveCatalog (gateway) or live in dispatchFrontierAliases (dispatch)", key)
+		}
 	}
 }
 

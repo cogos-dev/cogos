@@ -11,8 +11,8 @@
 //
 // Alias table (intent → provider + model override):
 //
-//	foreground        → claude-oauth, claude-sonnet-4-6  (interactive, full capability)
-//	deliberation      → claude-oauth, claude-opus-4-7    (heavier reasoning)
+//	foreground        → claude-oauth, claude-sonnet-5    (interactive, full capability)
+//	deliberation      → claude-oauth, claude-opus-4-8    (heavier reasoning)
 //	haiku/sonnet/opus → claude-oauth, <model id>         (per-model selection)
 //	claude            → claude-oauth, ""                 (generic managed alias)
 //	codex             → codex,        ""
@@ -51,14 +51,17 @@ var intentAliases = map[string]ModelResolution{
 	// fallback, so nothing is stranded if the OAuth path is unavailable.
 	"foreground":   {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-5"},
 	"deliberation": {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-8"},
-	// Raw model IDs that should route to claude-oauth.
-	"claude-sonnet-4-6": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
-	"claude-opus-4-7":   {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
+	// NOTE: no raw "claude-*" model-id keys belong in this table. On the gateway
+	// path raw claude ids MUST resolve dynamically via resolveLiveCatalog →
+	// frontierProviderName so installs whose frontier tier is claude-code-only
+	// route to the provider they actually have; a static pin here shadows that
+	// (see TestIntentAliases_NoRawClaudeIDs). On the nil-router dispatch path
+	// raw claude ids resolve via dispatchFrontierAliases below.
 	// Short convenience aliases — per-model selection (haiku / sonnet / opus /
 	// fable). claude-oauth is model-agnostic (effectiveModel honours
 	// ModelOverride), so a single provider serves the whole family. Aliases track
 	// the CURRENT generation; older generations stay reachable via their raw ids
-	// above.
+	// (dynamically on the gateway path, via dispatchFrontierAliases on dispatch).
 	"claude": {PreferProvider: "claude-oauth"},
 	"haiku":  {PreferProvider: "claude-oauth", ModelOverride: "claude-haiku-4-5-20251001"},
 	"sonnet": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-5"},
@@ -78,11 +81,11 @@ var intentAliases = map[string]ModelResolution{
 	"kernel-agent": {PreferProvider: "lmstudio-darkstar", InjectKernelTools: true},
 }
 
-// dispatchFrontierAliases maps raw current-generation Anthropic model ids to
+// dispatchFrontierAliases maps raw Anthropic model ids to
 // claude-oauth for the NIL-ROUTER (dispatch) path only. The dispatch harness
 // resolves models with no live router ("no live probe, no I/O"), so
 // resolveLiveCatalog's dynamic claude-prefix rule never runs there — without
-// these entries a dispatch caller pinning a raw 5-generation id silently falls
+// these entries a dispatch caller pinning a raw claude id silently falls
 // through to the local default and is served a different model than requested
 // (the #430 wrong-model trap; observed live 2026-07-17: Model=claude-fable-5 →
 // served ornith-1.0-35b).
@@ -99,6 +102,11 @@ var dispatchFrontierAliases = map[string]ModelResolution{
 	"claude-opus-4-8":           {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-8"},
 	"claude-fable-5":            {PreferProvider: "claude-oauth", ModelOverride: "claude-fable-5"},
 	"claude-haiku-4-5-20251001": {PreferProvider: "claude-oauth", ModelOverride: "claude-haiku-4-5-20251001"},
+	// Previous-generation ids, moved here from intentAliases so dispatch callers
+	// pinning them keep the #430 wrong-model protection while the gateway path
+	// resolves them dynamically like every other claude id.
+	"claude-sonnet-4-6": {PreferProvider: "claude-oauth", ModelOverride: "claude-sonnet-4-6"},
+	"claude-opus-4-7":   {PreferProvider: "claude-oauth", ModelOverride: "claude-opus-4-7"},
 }
 
 // resolveLiveCatalog resolves the two id families that the live GET /v1/models
