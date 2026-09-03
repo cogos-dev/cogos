@@ -23,8 +23,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,6 +53,25 @@ type ClaudeCodeProvider struct {
 
 	// Process manager (shared across all providers/callers).
 	procMgr *ProcessManager
+
+	// Availability cache (mirrors ClaudeOAuthProvider). The auth-status probe
+	// spawns a subprocess, so the result is cached for availCacheTTL and the
+	// mutex is held across the probe to collapse concurrent callers.
+	availMu     sync.Mutex
+	availAt     time.Time
+	availResult bool
+}
+
+// claudeCodeAuthProbe runs `<binary> auth status --json` and returns its
+// combined output and error. Package-level var so tests can stub the
+// subprocess. The command's working directory is the user's home so a
+// poisoned repo-local config can't skew the result.
+var claudeCodeAuthProbe = func(ctx context.Context, binary string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, binary, "auth", "status", "--json")
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cmd.Dir = home
+	}
+	return cmd.Output()
 }
 
 // NewClaudeCodeProvider creates a ClaudeCodeProvider from a ProviderConfig.
@@ -105,10 +126,53 @@ func (p *ClaudeCodeProvider) Name() string { return p.name }
 // Model returns the configured model identifier (e.g. "sonnet", "haiku").
 func (p *ClaudeCodeProvider) Model() string { return p.model }
 
-// Available checks that the claude binary exists and is authenticated.
+// Available reports whether the claude binary exists AND the CLI is
+// authenticated. The result is cached for availCacheTTL so the router's
+// periodic availability ticker (and the per-request /v1/providers handler)
+// don't spawn a subprocess on every call. The mutex is held across the probe
+// so concurrent callers collapse into a single subprocess.
 func (p *ClaudeCodeProvider) Available(ctx context.Context) bool {
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if !p.availAt.IsZero() && time.Since(p.availAt) < availCacheTTL {
+		return p.availResult
+	}
+	fresh := p.probeAvailable(ctx)
+	// Don't cache a false result caused by caller-initiated cancellation
+	// (client disconnect); a deadline is a genuine probe timeout and is cached.
+	if !fresh && ctx.Err() == context.Canceled {
+		return p.availResult
+	}
+	p.availResult = fresh
+	p.availAt = time.Now()
+	return p.availResult
+}
+
+// probeAvailable performs the real availability check backing Available():
+// binary on PATH, then `claude auth status --json` reporting loggedIn=true.
+// Call via Available() for TTL caching.
+func (p *ClaudeCodeProvider) probeAvailable(ctx context.Context) bool {
 	path, err := exec.LookPath(p.cliBinary)
-	return err == nil && path != ""
+	if err != nil || path == "" {
+		return false
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	out, err := claudeCodeAuthProbe(probeCtx, p.cliBinary)
+	if err != nil {
+		slog.Debug("claude-code: Available: auth status probe failed", "err", err)
+		return false
+	}
+	var status struct {
+		LoggedIn bool `json:"loggedIn"`
+	}
+	if err := json.Unmarshal(out, &status); err != nil {
+		slog.Debug("claude-code: Available: auth status parse failed", "err", err)
+		return false
+	}
+	return status.LoggedIn
 }
 
 // Capabilities returns what this provider supports.

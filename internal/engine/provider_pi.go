@@ -22,8 +22,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -48,6 +50,15 @@ type PiProvider struct {
 	piBinary string // path to pi binary (default: "pi")
 	tools    string // comma-separated tools (default: "read,bash,edit,write")
 	procMgr  *ProcessManager
+
+	// backend overrides the local server URL probed by Available (tests /
+	// non-default LM Studio ports). Empty means defaultPiBackendURL.
+	backend string
+
+	// Availability cache — same shape as ClaudeCodeProvider / ClaudeOAuthProvider.
+	availMu     sync.Mutex
+	availAt     time.Time
+	availResult bool
 }
 
 // NewPiProvider creates a PiProvider from a ProviderConfig.
@@ -96,9 +107,85 @@ func NewPiProvider(name string, cfg ProviderConfig, procMgr *ProcessManager) *Pi
 func (p *PiProvider) Name() string  { return p.name }
 func (p *PiProvider) Model() string { return p.model }
 
+// piLookPath and piBackendProbe are package-level so tests can stub them.
+// Mirrors codexLookPath / claudeCodeAuthProbe.
+var piLookPath = exec.LookPath
+
+// piBackendProbe asks the local inference backend pi will spawn against whether
+// it is actually serving. pi has no credential of its own — it fronts an
+// OpenAI-compatible local server (LM Studio by default, PR #417) — so the
+// honest availability question is not "is pi installed" but "is the backend pi
+// will talk to up". A pi binary with no backend is exactly as unavailable as
+// a claude binary with no login.
+var piBackendProbe = func(ctx context.Context, baseURL string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/models", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("backend %s returned %d", baseURL, resp.StatusCode)
+	}
+	return nil
+}
+
+// defaultPiBackendURL is where pi's default local provider (lmstudio) listens.
+// Matches the resident LM Studio server documented in the file header.
+const defaultPiBackendURL = "http://127.0.0.1:1234"
+
+// Available reports whether pi can actually serve a request: the binary must be
+// on PATH AND the local backend it fronts must answer. Before this, Available
+// was exec.LookPath alone — the same defect class as claude-code and codex
+// (a binary on PATH is not a working provider). Result is cached for
+// availCacheTTL under availMu, the pattern validated in ClaudeOAuthProvider.
 func (p *PiProvider) Available(ctx context.Context) bool {
-	path, err := exec.LookPath(p.piBinary)
-	return err == nil && path != ""
+	p.availMu.Lock()
+	defer p.availMu.Unlock()
+	if !p.availAt.IsZero() && time.Since(p.availAt) < availCacheTTL {
+		return p.availResult
+	}
+	fresh := p.probeAvailable(ctx)
+	// Don't cache a false result caused by caller-initiated cancellation
+	// (client disconnect); a deadline is a genuine probe timeout and is cached.
+	if !fresh && ctx.Err() == context.Canceled {
+		return p.availResult
+	}
+	p.availResult = fresh
+	p.availAt = time.Now()
+	return p.availResult
+}
+
+func (p *PiProvider) probeAvailable(ctx context.Context) bool {
+	path, err := piLookPath(p.piBinary)
+	if err != nil || path == "" {
+		return false
+	}
+	// Only the local lmstudio backend has a probe target we own. For any other
+	// pi provider (openrouter, etc.) we cannot vouch for the remote's auth
+	// state from here, so binary presence remains the best available signal —
+	// but that is a known limitation, not a claim of verified availability.
+	if p.provider != defaultLocalPiProvider {
+		return true
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := piBackendProbe(probeCtx, p.backendURL()); err != nil {
+		slog.Debug("pi: Available: backend probe failed", "backend", p.backendURL(), "err", err)
+		return false
+	}
+	return true
+}
+
+// backendURL is the local server pi's default provider connects to.
+func (p *PiProvider) backendURL() string {
+	if p.backend != "" {
+		return p.backend
+	}
+	return defaultPiBackendURL
 }
 
 func (p *PiProvider) Capabilities() ProviderCapabilities {

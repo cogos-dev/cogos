@@ -290,7 +290,7 @@ These sites write to disk but this tool could not structurally resolve their pat
 
 v1 counts direct filesystem primitives + sqlite only (see the package doc). A spawned process can write anywhere its own logic chooses, which this tool cannot see without executing it — these sites are enumerated for visibility, with cmd.Dir resolved where possible, but are NOT classified into any bin above and do not contribute to the totals at the top of this document. Non-Go writers (shell/Python scripts this repo runs) are not enumerable by a Go source scanner at all and are not listed here either — see the package doc.
 
-Total subprocess sites: 73
+Total subprocess sites: 75
 
 | cmd.Dir | call | file:line | subsystem |
 |---|---|---|---|
@@ -325,18 +325,20 @@ Total subprocess sites: 73
 | _(not set — inherits the process's own working directory)_ | `exec.Command("ps", "-o", "etime=", "-p", pid)` | internal/engine/node_cmd.go:134 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.Command("ps", "-o", "comm=", "-p", pid)` | internal/engine/node_cmd.go:183 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, "python3", cogblockPath, "parse", sourcePath)` | internal/engine/projection_compiler.go:388 | internal:engine |
-| _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, p.cliBinary, "--version")` | internal/engine/provider_claudecode.go:136 | internal:engine |
+| `{home}` | `exec.CommandContext(ctx, binary, "auth", "status", "--json")` | internal/engine/provider_claudecode.go:70 | internal:engine |
+| _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, p.cliBinary, "--version")` | internal/engine/provider_claudecode.go:200 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.Command(cmd, "--version")` | internal/engine/provider_claudeoauth.go:224 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w")` | internal/engine/provider_claudeoauth.go:302 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(runCtx, actuatorPath)` | internal/engine/provider_claudeoauth.go:560 | internal:engine |
-| _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, binary, "--version")` | internal/engine/provider_codex.go:147 | internal:engine |
+| `{home}` | `exec.CommandContext(ctx, binary, "login", "status")` | internal/engine/provider_codex.go:56 | internal:engine |
+| _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, binary, "--version")` | internal/engine/provider_codex.go:204 | internal:engine |
 | `{opts.Dir}` | `exec.CommandContext(ctx, binary, args...)` | internal/engine/provider_env.go:44 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(psCtx, p.lmsCLI, "ps", "--json")` | internal/engine/provider_lms_model_state.go:387 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, p.lmsCLI, "unload", model)` | internal/engine/provider_lms_model_state.go:768 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, p.lmsCLI, args...)` | internal/engine/provider_lms_model_state.go:786 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, p.nodeBin, args...)` | internal/engine/provider_lms_model_state.go:818 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.Command("git", "rev-parse", "--show-toplevel")` | internal/engine/provider_lms_model_state.go:1324 | internal:engine |
-| _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, p.piBinary, "--help")` | internal/engine/provider_pi.go:122 | internal:engine |
+| _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, p.piBinary, "--help")` | internal/engine/provider_pi.go:209 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, "launchctl", args...)` | internal/engine/service_supervisor_launchctl.go:321 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, "launchctl", args...)` | internal/engine/service_supervisor_launchctl.go:331 | internal:engine |
 | _(not set — inherits the process's own working directory)_ | `exec.CommandContext(ctx, "launchctl", args...)` | internal/engine/service_supervisor_launchctl.go:349 | internal:engine |
