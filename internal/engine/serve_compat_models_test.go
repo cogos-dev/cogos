@@ -711,3 +711,266 @@ func TestOpenAICompatListModelsWithContext_SlowProbeDoesNotStarveFallback(t *tes
 		t.Fatalf("listings = %v; want 1 entry with id llama-3-8b", listings)
 	}
 }
+
+// TestHandleModels_AllEntriesCarryContextLength is the #518 completion
+// regression: on a production-shaped router (frontier claude-oauth lister +
+// local context-lister), EVERY advertised entry — intent aliases (foreground,
+// deliberation, local), static frontier ids, and live-enumerated ids — must
+// carry a context_length. Anthropic entries get the shared 200k constant;
+// the "local" alias inherits the loaded window of the provider it resolves to.
+func TestHandleModels_AllEntriesCarryContextLength(t *testing.T) {
+	t.Parallel()
+
+	claude := newListerStub("claude-oauth", false, "claude-opus-4-8", "claude-sonnet-5")
+	// The frontier window is whatever the SERVING provider declares — not a
+	// constant. Real claude-oauth declares 1M (provider_claudeoauth.go:848);
+	// use a distinctive value here so a regression to any hardcoded number
+	// (200k, 1M, anything) fails rather than passing by coincidence.
+	const frontierWindow = 777_000
+	claude.capabilities.MaxContextTokens = frontierWindow
+	local := newContextListerStub("lmstudio-darkstar", true,
+		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+	)
+	// The "local" alias resolves to lmstudio-darkstar (resolve.go); its
+	// configured model determines which live listing the alias inherits.
+	local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
+
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+	router.RegisterProvider(claude)
+	router.RegisterProvider(local)
+
+	srv := freshModelsServer(t, router)
+	resp := fetchModels(t, srv)
+
+	for _, e := range resp.Data {
+		if e.ContextLength <= 0 {
+			t.Errorf("entry %q: no context_length advertised (#518)", e.ID)
+		}
+	}
+
+	byID := modelIDSet(resp)
+	for _, id := range []string{"foreground", "deliberation", "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001", "claude-opus-4-8", "claude-sonnet-5"} {
+		if m, ok := byID[id]; !ok || m.ContextLength != frontierWindow {
+			t.Errorf("entry %q: ContextLength = %d (present=%v); want %d = the serving provider's declared MaxContextTokens, never a constant", id, m.ContextLength, ok, frontierWindow)
+		}
+	}
+	if m, ok := byID["local"]; !ok || m.ContextLength != 32768 {
+		t.Errorf("local alias: ContextLength = %d (present=%v); want 32768 (loaded window of resolved provider)", m.ContextLength, ok)
+	}
+}
+
+// TestHandleModels_EclipseEntryCarriesContextLength closes the last static
+// entry that shipped without a window (#518 review round 2). A provider whose
+// Model() is "eclipse-26b" makes eclipseServed true; its declared window must
+// reach the entry, and MUST be omitted (not zero, not a constant) when the
+// provider declares nothing.
+func TestHandleModels_EclipseEntryCarriesContextLength(t *testing.T) {
+	t.Parallel()
+
+	eclipse := NewStubProvider("lmstudio-eclipse", "resp")
+	eclipse.model = "eclipse-26b"
+	eclipse.capabilities.IsLocal = true
+	const eclipseWindow = 131_072
+	eclipse.capabilities.MaxContextTokens = eclipseWindow
+
+	router := NewSimpleRouter(RoutingConfig{Default: "lmstudio-eclipse"})
+	router.RegisterProvider(eclipse)
+
+	resp := fetchModels(t, freshModelsServer(t, router))
+	m, ok := modelIDSet(resp)["eclipse-26b"]
+	if !ok {
+		t.Fatalf("eclipse-26b entry missing; ids=%v", modelIDKeys(modelIDSet(resp)))
+	}
+	if m.ContextLength != eclipseWindow {
+		t.Fatalf("eclipse-26b ContextLength = %d; want %d = the serving provider's declared window", m.ContextLength, eclipseWindow)
+	}
+
+	// Declares nothing → omitted, never a made-up number. Fresh router +
+	// server: the models response is cached per server, and the router
+	// snapshot must reflect the changed capability.
+	eclipse2 := NewStubProvider("lmstudio-eclipse", "resp")
+	eclipse2.model = "eclipse-26b"
+	eclipse2.capabilities.IsLocal = true
+	eclipse2.capabilities.MaxContextTokens = 0
+	router2 := NewSimpleRouter(RoutingConfig{Default: "lmstudio-eclipse"})
+	router2.RegisterProvider(eclipse2)
+	resp = fetchModels(t, freshModelsServer(t, router2))
+	if m := modelIDSet(resp)["eclipse-26b"]; m.ContextLength != 0 {
+		t.Fatalf("eclipse-26b ContextLength = %d with no declared window; want omitted", m.ContextLength)
+	}
+}
+
+// TestHandleCard_AgreesWithModels pins the invariant the #518 review found
+// broken: /v1/card and /v1/models are two views of the same Capabilities()
+// and must never disagree about a model's context window.
+func TestHandleCard_AgreesWithModels(t *testing.T) {
+	t.Parallel()
+
+	claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
+	const frontierWindow = 999_000
+	claude.capabilities.MaxContextTokens = frontierWindow
+	// A realistic local provider too, so the local-alias comparison is
+	// actually exercised (round 4: it previously never was).
+	local := newContextListerStub("lmstudio-darkstar", true,
+		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+	)
+	local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+	router.RegisterProvider(claude)
+	router.RegisterProvider(local)
+	srv := freshModelsServer(t, router)
+
+	models := modelIDSet(fetchModels(t, srv))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/card", nil)
+	w := httptest.NewRecorder()
+	srv.handleCard(w, req)
+	var card struct {
+		Models []struct {
+			ID     string         `json:"id"`
+			Name   string         `json:"name"`
+			Limits map[string]int `json:"limits"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&card); err != nil {
+		t.Fatalf("decode /v1/card: %v", err)
+	}
+	if len(card.Models) == 0 {
+		t.Fatal("card advertises no models")
+	}
+	for _, cm := range card.Models {
+		if cm.Name == "Local (Ollama)" {
+			t.Errorf("card still advertises the Ollama entry #417 decommissioned")
+		}
+		mm, ok := models[cm.ID]
+		if !ok {
+			t.Errorf("%s: on /v1/card but absent from /v1/models — card must be a projection of the list", cm.ID)
+			continue
+		}
+		if cm.ID == "local" && mm.ContextLength != 32768 {
+			t.Errorf("local: /v1/models context_length=%d; want 32768 (live probe) — precondition for the agreement check", mm.ContextLength)
+		}
+		if cm.Limits["context"] != mm.ContextLength {
+			t.Errorf("%s: /v1/card context=%d but /v1/models context_length=%d — the two endpoints disagree", cm.ID, cm.Limits["context"], mm.ContextLength)
+		}
+	}
+}
+
+// TestHandleCard_LocalEntryResolvesThroughAlias closes review rounds 3 and 4:
+// the card's "local" entry must carry the SAME window /v1/models reports for
+// "local" — which is the live per-model probe result, resolved through the
+// alias — not a provider-name lookup (round 3) and not Capabilities()
+// .MaxContextTokens, which real local providers leave at 0 (round 4).
+func TestHandleCard_LocalEntryResolvesThroughAlias(t *testing.T) {
+	t.Parallel()
+
+	local := newContextListerStub("lmstudio-darkstar", true,
+		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+	)
+	local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
+	// Deliberately NOT setting MaxContextTokens: a real OpenAICompatProvider
+	// hardcodes it to 0 (provider_openai.go, "unknown for generic endpoints").
+	// The ONLY source of the local window in production is the live
+	// per-model probe (32768 above). Review round 4 caught the prior version
+	// of this test masking that by setting a Capabilities() value real
+	// providers never produce.
+	const localWindow = 32768
+	claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
+
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+	router.RegisterProvider(claude)
+	router.RegisterProvider(local)
+	srv := freshModelsServer(t, router)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/card", nil)
+	w := httptest.NewRecorder()
+	srv.handleCard(w, req)
+	var card struct {
+		Models []struct {
+			ID     string         `json:"id"`
+			Limits map[string]int `json:"limits"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&card); err != nil {
+		t.Fatalf("decode /v1/card: %v", err)
+	}
+	for _, cm := range card.Models {
+		if cm.ID != "local" {
+			continue
+		}
+		got, ok := cm.Limits["context"]
+		if !ok {
+			t.Fatal(`card "local" entry has no context — alias was looked up as a literal provider name instead of resolved`)
+		}
+		if got != localWindow {
+			t.Fatalf(`card "local" context = %d; want %d = the live-probed window /v1/models reports for the same alias`, got, localWindow)
+		}
+		return
+	}
+	t.Fatal(`card has no "local" entry despite a configured local provider`)
+}
+
+// TestHandleCard_DefaultModelIsListed closes review round 5: defaultModel
+// must always be a member of the card's own models array. The reachable
+// failure was the documented zero-config local-only deployment (no frontier
+// provider; defaults/providers.yaml ships anthropic disabled), where frontier
+// ids were filtered out of models while defaultModel still said sonnet.
+func TestHandleCard_DefaultModelIsListed(t *testing.T) {
+	t.Parallel()
+
+	decode := func(t *testing.T, srv *Server) (string, map[string]bool) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		srv.handleCard(w, httptest.NewRequest(http.MethodGet, "/v1/card", nil))
+		var card struct {
+			DefaultModel string `json:"defaultModel"`
+			Models       []struct {
+				ID string `json:"id"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(w.Body).Decode(&card); err != nil {
+			t.Fatalf("decode /v1/card: %v", err)
+		}
+		ids := map[string]bool{}
+		for _, m := range card.Models {
+			ids[m.ID] = true
+		}
+		return card.DefaultModel, ids
+	}
+
+	t.Run("local-only, no frontier", func(t *testing.T) {
+		local := newContextListerStub("lmstudio-darkstar", true,
+			ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+		)
+		local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
+		router := NewSimpleRouter(RoutingConfig{Default: "lmstudio-darkstar"})
+		router.RegisterProvider(local)
+
+		def, ids := decode(t, freshModelsServer(t, router))
+		if ids["claude-sonnet-4-6"] || ids["claude-opus-4-7"] {
+			t.Fatalf("frontier ids listed with no frontier provider: %v", ids)
+		}
+		if def == "" || !ids[def] {
+			t.Fatalf("defaultModel=%q not in models %v — card disagrees with itself", def, ids)
+		}
+	})
+
+	t.Run("frontier configured", func(t *testing.T) {
+		claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
+		router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+		router.RegisterProvider(claude)
+
+		def, ids := decode(t, freshModelsServer(t, router))
+		if def != "claude-sonnet-4-6" || !ids[def] {
+			t.Fatalf("defaultModel=%q (listed=%v); want claude-sonnet-4-6 as the curated first choice when frontier is up", def, ids[def])
+		}
+	})
+
+	t.Run("nothing configured", func(t *testing.T) {
+		router := NewSimpleRouter(RoutingConfig{})
+		def, ids := decode(t, freshModelsServer(t, router))
+		if def != "" || len(ids) != 0 {
+			t.Fatalf("defaultModel=%q models=%v; want empty/none — never a model that cannot be served", def, ids)
+		}
+	})
+}

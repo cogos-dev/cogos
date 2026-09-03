@@ -70,39 +70,32 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 		port = 6931
 	}
 
+	// Model limits come from the SAME cached list /v1/models serves
+	// (composeModelsList), so the two endpoints are one dataset viewed twice
+	// and cannot disagree — for frontier ids, for the "local" alias (whose
+	// window is a LIVE probe result, not a Capabilities() field — review
+	// round 4), for anything. Before this the card was a hand-maintained
+	// literal — sonnet 200k, opus 1M, "Local (Ollama)" #417 decommissioned.
+	models := cardModelsFrom(composeModelsList(r.Context(), s.router))
+	// defaultModel is drawn from the same projection, in curated preference
+	// order, so it can never name a model the card does not list (review
+	// round 5: a zero-config local-only node had frontier ids filtered out of
+	// models while defaultModel still said claude-sonnet-4-6). Empty string
+	// when nothing is configured — honest, and a client validating
+	// defaultModel ∈ models sees a consistent card either way.
+	defaultModel := ""
+	if len(models) > 0 {
+		defaultModel, _ = models[0]["id"].(string)
+	}
+
 	card := map[string]any{
 		"schemaVersion":   "1.0",
 		"name":            "CogOS Kernel v3",
 		"humanReadableId": "cogos/kernel-v3",
 		"description":     "v3 production kernel — foveated context, TRM, attentional field",
 		"url":             fmt.Sprintf("http://localhost:%d", port),
-		"defaultModel":    "claude-sonnet-4-6",
-		"models": []map[string]any{
-			{
-				"id":   "claude-sonnet-4-6",
-				"name": "Claude Sonnet 4.6",
-				"limits": map[string]int{
-					"context": 200000,
-					"output":  8192,
-				},
-			},
-			{
-				"id":   "claude-opus-4-7",
-				"name": "Claude Opus 4.7",
-				"limits": map[string]int{
-					"context": 1000000,
-					"output":  32000,
-				},
-			},
-			{
-				"id":   "local",
-				"name": "Local (Ollama)",
-				"limits": map[string]int{
-					"context": 32768,
-					"output":  4096,
-				},
-			},
-		},
+		"defaultModel":    defaultModel,
+		"models":          models,
 		"capabilities": map[string]bool{
 			"streaming":         true,
 			"taaAware":          true,
@@ -331,6 +324,12 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	// eclipse model is surfaced via live enumeration as a composite id regardless.
 	eclipseServed := eclipseModelServed(router)
 
+	// Live enumeration first (probe every ModelLister provider concurrently,
+	// each bounded, skipping any that error/time out): the alias entries below
+	// derive their context_length (#518) from the live listing of whatever the
+	// alias actually routes to.
+	live := liveModelEntries(ctx, router, now)
+
 	var data []compatModel
 	seen := make(map[string]bool)
 	add := func(m compatModel) {
@@ -340,38 +339,163 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 		seen[m.ID] = true
 		data = append(data, m)
 	}
+	withCtx := func(m compatModel, ctxLen int) compatModel {
+		if ctxLen > 0 {
+			m.ContextLength = ctxLen
+		}
+		return m
+	}
 
 	if frontierConfigured {
-		// Intent aliases for frontier-managed tiers.
-		add(mkCompatModel("foreground", "cogos", "frontier-managed",
-			"interactive, full capability (managed Claude, Max sub)", now))
-		add(mkCompatModel("deliberation", "cogos", "frontier-managed",
-			"heavier reasoning (Opus)", now))
+		// Intent aliases for frontier-managed tiers. Their window is whatever
+		// the registered frontier provider actually declares — claude-oauth and
+		// claude-code declare 1M (context beta), the API-key AnthropicProvider
+		// declares 200k. Never a constant: /v1/card already derives from the
+		// same Capabilities() and the two endpoints must agree (#518 review).
+		fctx := frontierContextLength(router)
+		add(withCtx(mkCompatModel("foreground", "cogos", "frontier-managed",
+			"interactive, full capability (managed Claude, Max sub)", now), fctx))
+		add(withCtx(mkCompatModel("deliberation", "cogos", "frontier-managed",
+			"heavier reasoning (Opus)", now), fctx))
 	}
 	if localConfigured {
-		// Intent alias for the local-sovereign tier.
-		add(mkCompatModel("local", "cogos", "local-sovereign",
-			"private, no egress (E4B on this node)", now))
+		// Intent alias for the local-sovereign tier. Its context window is
+		// whatever is loaded on the provider "local" actually resolves to —
+		// pulled from the live listings, omitted when genuinely unknown (#518).
+		add(withCtx(mkCompatModel("local", "cogos", "local-sovereign",
+			"private, no egress (E4B on this node)", now), localAliasContextLength(router, live)))
 	}
 	if frontierConfigured {
 		// Static frontier model IDs — retained so clients keep working even when
-		// the live Anthropic catalog probe is unavailable.
-		add(mkCompatModel("claude-sonnet-4-6", "anthropic", "frontier-managed", "", now))
-		add(mkCompatModel("claude-opus-4-7", "anthropic", "frontier-managed", "", now))
-		add(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now))
+		// the live Anthropic catalog probe is unavailable. Window comes from the
+		// serving frontier provider's declared capability (#518).
+		fctx := frontierContextLength(router)
+		add(withCtx(mkCompatModel("claude-sonnet-4-6", "anthropic", "frontier-managed", "", now), fctx))
+		add(withCtx(mkCompatModel("claude-opus-4-7", "anthropic", "frontier-managed", "", now), fctx))
+		add(withCtx(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now), fctx))
 	}
 	if eclipseServed {
-		add(mkCompatModel("eclipse-26b", "cogos", "lan-local",
-			"LAN-resident 26B model (Eclipse node)", now))
+		// Same rule as every other entry: the window is what the serving
+		// provider declares, or omitted when it declares nothing (#518 review
+		// round 2 — this static entry was the last one shipping without it).
+		add(withCtx(mkCompatModel("eclipse-26b", "cogos", "lan-local",
+			"LAN-resident 26B model (Eclipse node)", now), servingProviderContextLength(router, "eclipse-26b")))
 	}
 
-	// Live enumeration: probe every ModelLister provider concurrently, each
-	// bounded, skipping any that error/time out.
-	for _, m := range liveModelEntries(ctx, router, now) {
+	for _, m := range live {
 		add(m)
 	}
 
 	return data
+}
+
+// cardModelsFrom projects the /v1/models list into the card's curated shape.
+// The card has always advertised a short curated set (a sonnet, an opus, and
+// the local alias) rather than the full catalog; it keeps that shape but every
+// limit is read from the /v1/models entry for the same id — never computed
+// independently. An id absent from the list is absent from the card. A window
+// the list omits is omitted here too (never invented).
+func cardModelsFrom(list []compatModel) []map[string]any {
+	byID := make(map[string]compatModel, len(list))
+	for _, m := range list {
+		byID[m.ID] = m
+	}
+	type curated struct {
+		id, name string
+		out      int
+	}
+	want := []curated{
+		{"claude-sonnet-4-6", "Claude Sonnet 4.6", 8192},
+		{"claude-opus-4-7", "Claude Opus 4.7", 32000},
+		{"local", "Local (LM Studio)", 4096},
+	}
+	out := make([]map[string]any, 0, len(want))
+	for _, c := range want {
+		m, ok := byID[c.id]
+		if !ok {
+			continue
+		}
+		limits := map[string]int{"output": c.out}
+		if m.ContextLength > 0 {
+			limits["context"] = m.ContextLength
+		}
+		out = append(out, map[string]any{"id": c.id, "name": c.name, "limits": limits})
+	}
+	return out
+}
+
+// servingProviderContextLength returns the context window declared by whichever
+// provider the router would route model id to, or 0 (omitted) when nothing
+// serves it. One rule for every advertised entry, static or live (#518).
+func servingProviderContextLength(router Router, id string) int {
+	if router == nil {
+		return 0
+	}
+	name, ok := router.ProviderForModel(id)
+	if !ok || name == "" {
+		return 0
+	}
+	var n int
+	router.RangeProviders(func(p Provider) {
+		if p.Name() == name {
+			n = p.Capabilities().MaxContextTokens
+		}
+	})
+	return n
+}
+
+// frontierContextLength returns the context window the registered frontier
+// provider declares via Capabilities().MaxContextTokens, or 0 (omitted) when
+// no frontier provider is registered. Used for the static frontier entries
+// and the foreground/deliberation aliases so /v1/models agrees with /v1/card,
+// which derives from the same Capabilities() (#518 review finding).
+func frontierContextLength(router Router) int {
+	if router == nil {
+		return 0
+	}
+	name, ok := frontierProviderName(router)
+	if !ok {
+		return 0
+	}
+	var n int
+	router.RangeProviders(func(p Provider) {
+		if p.Name() == name {
+			n = p.Capabilities().MaxContextTokens
+		}
+	})
+	return n
+}
+
+// localAliasContextLength resolves the "local" intent alias to its target
+// provider (same logic clients hit at request time, ResolveModelRequest) and
+// returns the context window of that provider's CONFIGURED model, looked up in
+// the already-probed live entries — the loaded window, never a guess (#518).
+// Returns 0 (⇒ omitted on the wire) when the alias doesn't resolve, the
+// provider has no configured model, or the live probe didn't report a window.
+func localAliasContextLength(router Router, live []compatModel) int {
+	res := ResolveModelRequest(router, "local", "")
+	if res.PreferProvider == "" || router == nil {
+		return 0
+	}
+	var model string
+	router.RangeProviders(func(p Provider) {
+		if p.Name() != res.PreferProvider {
+			return
+		}
+		if ms := p.Capabilities().ModelsAvailable; len(ms) > 0 {
+			model = ms[0]
+		}
+	})
+	if model == "" {
+		return 0
+	}
+	want := res.PreferProvider + "/" + model
+	for _, m := range live {
+		if m.ID == want {
+			return m.ContextLength
+		}
+	}
+	return 0
 }
 
 // liveModelEntries walks the router's providers, probing each ModelLister (or
@@ -517,6 +641,13 @@ func modelEntryFor(p Provider, listing ModelListing, frontier bool, now int64) c
 	var m compatModel
 	if frontier && strings.HasPrefix(id, "claude-") {
 		m = mkCompatModel(id, "anthropic", "frontier-managed", desc, now)
+		if listing.ContextLength == 0 {
+			// Anthropic's /v1/models exposes no per-model context field. Fall
+			// back to what THIS serving provider declares — 1M for claude-oauth
+			// / claude-code, 200k for the API-key provider — never a constant
+			// that ignores which provider is actually behind the id (#518).
+			m.ContextLength = p.Capabilities().MaxContextTokens
+		}
 	} else {
 		name := p.Name()
 		composite := name + "/" + id
