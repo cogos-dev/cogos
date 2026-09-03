@@ -289,7 +289,7 @@ import (
 // the browser blocks the real request before it ever reaches the gate.
 func corsMiddleware(next http.Handler) http.Handler {
 	const allowMethods = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
-	const allowHeaders = "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization, X-Cogos-Grant"
+	const allowHeaders = "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization, X-Cogos-Grant, x-api-key, anthropic-version"
 	const maxAge = "86400"
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

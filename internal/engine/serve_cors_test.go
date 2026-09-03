@@ -28,7 +28,9 @@ func TestCORSPreflight_OKStatus(t *testing.T) {
 	// All allow-* headers should be present on the preflight response.
 	wantHeaders := map[string]string{
 		"Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
-		"Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization, X-Cogos-Grant",
+		// x-api-key + anthropic-version: an Anthropic-SDK client in a browser
+		// sends both and the grant gate now accepts x-api-key as a carrier.
+		"Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, X-Workspace-Root, Authorization, X-Cogos-Grant, x-api-key, anthropic-version",
 		"Access-Control-Max-Age":       "86400",
 	}
 	for h, want := range wantHeaders {

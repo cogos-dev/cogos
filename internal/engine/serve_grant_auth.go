@@ -97,6 +97,7 @@ package engine
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -133,6 +134,43 @@ func grantFromContext(ctx context.Context) (*IdentityGrant, bool) {
 // grant token in. Exported so hook scripts, the dashboard, and tests share
 // one literal rather than re-typing "X-Cogos-Grant".
 const GrantHeaderName = "X-Cogos-Grant"
+
+// grantTokenFromRequest returns the grant token a request presents, from
+// either accepted carrier:
+//
+//  1. X-Cogos-Grant: <token>            — the kernel's own header (canonical)
+//  2. Authorization: Bearer <token>     — the OpenAI-compatible convention
+//     (and Anthropic's ANTHROPIC_AUTH_TOKEN path).
+//  3. x-api-key: <token>                — the Anthropic SDK's API-key header.
+//     A client's Anthropic-provider "API key" field lands HERE, not in
+//     Authorization; without this, pointing an Anthropic-shaped client at
+//     /v1/messages can never authenticate.
+//
+// An external client (dsh, Zed, any OpenAI/Anthropic SDK) has exactly one
+// auth knob — an "API key" field — and cannot be taught a custom header.
+// Pasting the grant into that field is the whole onboarding story for a
+// client the kernel did not write.
+//
+// X-Cogos-Grant wins when both are present. The CSRF threat model in the
+// file header is unchanged: neither Authorization nor x-api-key is one of
+// the Fetch spec's CORS-safelisted request headers (only Accept,
+// Accept-Language, Content-Language, Content-Type-with-simple-values are), so
+// a browser request carrying either forces the same preflight that
+// corsMiddleware refuses for non-loopback origins. Only the literal "Bearer"
+// scheme is honored in Authorization; anything else is treated as absent.
+func grantTokenFromRequest(r *http.Request) string {
+	if t := r.Header.Get(GrantHeaderName); t != "" {
+		return t
+	}
+	auth := r.Header.Get("Authorization")
+	const scheme = "Bearer "
+	if len(auth) > len(scheme) && strings.EqualFold(auth[:len(scheme)], scheme) {
+		if t := strings.TrimSpace(auth[len(scheme):]); t != "" {
+			return t
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("x-api-key"))
+}
 
 // grantMintRequestPath is the one route the bootstrap exemption applies to.
 const grantMintRequestPath = "/v1/identity/grants"
@@ -235,10 +273,10 @@ func (s *Server) grantAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		token := r.Header.Get(GrantHeaderName)
+		token := grantTokenFromRequest(r)
 		if token == "" {
 			writeJSONError(w, http.StatusUnauthorized, "missing_grant",
-				GrantHeaderName+" header required for this route")
+				GrantHeaderName+" header (or Authorization: Bearer <grant>, or x-api-key: <grant>) required for this route")
 			return
 		}
 		if s.identityGrants == nil {
