@@ -276,7 +276,7 @@ func (s *Server) grantAuthMiddleware(next http.Handler) http.Handler {
 		token := grantTokenFromRequest(r)
 		if token == "" {
 			writeJSONError(w, http.StatusUnauthorized, "missing_grant",
-				GrantHeaderName+" header (or Authorization: Bearer <grant>) required for this route")
+				GrantHeaderName+" header (or Authorization: Bearer <grant>, or x-api-key: <grant>) required for this route")
 			return
 		}
 		if s.identityGrants == nil {
