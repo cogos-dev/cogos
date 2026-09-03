@@ -758,3 +758,89 @@ func TestHandleModels_AllEntriesCarryContextLength(t *testing.T) {
 		t.Errorf("local alias: ContextLength = %d (present=%v); want 32768 (loaded window of resolved provider)", m.ContextLength, ok)
 	}
 }
+
+// TestHandleModels_EclipseEntryCarriesContextLength closes the last static
+// entry that shipped without a window (#518 review round 2). A provider whose
+// Model() is "eclipse-26b" makes eclipseServed true; its declared window must
+// reach the entry, and MUST be omitted (not zero, not a constant) when the
+// provider declares nothing.
+func TestHandleModels_EclipseEntryCarriesContextLength(t *testing.T) {
+	t.Parallel()
+
+	eclipse := NewStubProvider("lmstudio-eclipse", "resp")
+	eclipse.model = "eclipse-26b"
+	eclipse.capabilities.IsLocal = true
+	const eclipseWindow = 131_072
+	eclipse.capabilities.MaxContextTokens = eclipseWindow
+
+	router := NewSimpleRouter(RoutingConfig{Default: "lmstudio-eclipse"})
+	router.RegisterProvider(eclipse)
+
+	resp := fetchModels(t, freshModelsServer(t, router))
+	m, ok := modelIDSet(resp)["eclipse-26b"]
+	if !ok {
+		t.Fatalf("eclipse-26b entry missing; ids=%v", modelIDKeys(modelIDSet(resp)))
+	}
+	if m.ContextLength != eclipseWindow {
+		t.Fatalf("eclipse-26b ContextLength = %d; want %d = the serving provider's declared window", m.ContextLength, eclipseWindow)
+	}
+
+	// Declares nothing → omitted, never a made-up number. Fresh router +
+	// server: the models response is cached per server, and the router
+	// snapshot must reflect the changed capability.
+	eclipse2 := NewStubProvider("lmstudio-eclipse", "resp")
+	eclipse2.model = "eclipse-26b"
+	eclipse2.capabilities.IsLocal = true
+	eclipse2.capabilities.MaxContextTokens = 0
+	router2 := NewSimpleRouter(RoutingConfig{Default: "lmstudio-eclipse"})
+	router2.RegisterProvider(eclipse2)
+	resp = fetchModels(t, freshModelsServer(t, router2))
+	if m := modelIDSet(resp)["eclipse-26b"]; m.ContextLength != 0 {
+		t.Fatalf("eclipse-26b ContextLength = %d with no declared window; want omitted", m.ContextLength)
+	}
+}
+
+// TestHandleCard_AgreesWithModels pins the invariant the #518 review found
+// broken: /v1/card and /v1/models are two views of the same Capabilities()
+// and must never disagree about a model's context window.
+func TestHandleCard_AgreesWithModels(t *testing.T) {
+	t.Parallel()
+
+	claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
+	const frontierWindow = 999_000
+	claude.capabilities.MaxContextTokens = frontierWindow
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+	router.RegisterProvider(claude)
+	srv := freshModelsServer(t, router)
+
+	models := modelIDSet(fetchModels(t, srv))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/card", nil)
+	w := httptest.NewRecorder()
+	srv.handleCard(w, req)
+	var card struct {
+		Models []struct {
+			ID     string         `json:"id"`
+			Name   string         `json:"name"`
+			Limits map[string]int `json:"limits"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&card); err != nil {
+		t.Fatalf("decode /v1/card: %v", err)
+	}
+	if len(card.Models) == 0 {
+		t.Fatal("card advertises no models")
+	}
+	for _, cm := range card.Models {
+		if cm.Name == "Local (Ollama)" {
+			t.Errorf("card still advertises the Ollama entry #417 decommissioned")
+		}
+		mm, ok := models[cm.ID]
+		if !ok {
+			continue // card may list an id /v1/models omits when unconfigured
+		}
+		if cm.Limits["context"] != mm.ContextLength {
+			t.Errorf("%s: /v1/card context=%d but /v1/models context_length=%d — the two endpoints disagree", cm.ID, cm.Limits["context"], mm.ContextLength)
+		}
+	}
+}

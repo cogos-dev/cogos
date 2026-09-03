@@ -70,6 +70,27 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 		port = 6931
 	}
 
+	// Model limits derive from the SAME provider Capabilities() that /v1/models
+	// now uses (#518 review), so the two endpoints cannot disagree about a
+	// model's window. Before this the card was a hand-maintained literal —
+	// sonnet at 200k, opus at 1M, and a "Local (Ollama)" entry #417 had
+	// decommissioned — that drifted from /v1/models silently.
+	fctx := frontierContextLength(s.router)
+	cardModel := func(id, name string, ctxLen, out int) map[string]any {
+		limits := map[string]int{"output": out}
+		if ctxLen > 0 {
+			limits["context"] = ctxLen
+		}
+		return map[string]any{"id": id, "name": name, "limits": limits}
+	}
+	models := []map[string]any{
+		cardModel("claude-sonnet-4-6", "Claude Sonnet 4.6", fctx, 8192),
+		cardModel("claude-opus-4-7", "Claude Opus 4.7", fctx, 32000),
+	}
+	if lctx := servingProviderContextLength(s.router, "local"); lctx > 0 || isLocalConfigured(s.router) {
+		models = append(models, cardModel("local", "Local (LM Studio)", lctx, 4096))
+	}
+
 	card := map[string]any{
 		"schemaVersion":   "1.0",
 		"name":            "CogOS Kernel v3",
@@ -77,32 +98,7 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 		"description":     "v3 production kernel — foveated context, TRM, attentional field",
 		"url":             fmt.Sprintf("http://localhost:%d", port),
 		"defaultModel":    "claude-sonnet-4-6",
-		"models": []map[string]any{
-			{
-				"id":   "claude-sonnet-4-6",
-				"name": "Claude Sonnet 4.6",
-				"limits": map[string]int{
-					"context": 200000,
-					"output":  8192,
-				},
-			},
-			{
-				"id":   "claude-opus-4-7",
-				"name": "Claude Opus 4.7",
-				"limits": map[string]int{
-					"context": 1000000,
-					"output":  32000,
-				},
-			},
-			{
-				"id":   "local",
-				"name": "Local (Ollama)",
-				"limits": map[string]int{
-					"context": 32768,
-					"output":  4096,
-				},
-			},
-		},
+		"models":          models,
 		"capabilities": map[string]bool{
 			"streaming":         true,
 			"taaAware":          true,
@@ -382,8 +378,11 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 		add(withCtx(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now), fctx))
 	}
 	if eclipseServed {
-		add(mkCompatModel("eclipse-26b", "cogos", "lan-local",
-			"LAN-resident 26B model (Eclipse node)", now))
+		// Same rule as every other entry: the window is what the serving
+		// provider declares, or omitted when it declares nothing (#518 review
+		// round 2 — this static entry was the last one shipping without it).
+		add(withCtx(mkCompatModel("eclipse-26b", "cogos", "lan-local",
+			"LAN-resident 26B model (Eclipse node)", now), servingProviderContextLength(router, "eclipse-26b")))
 	}
 
 	for _, m := range live {
@@ -391,6 +390,26 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	}
 
 	return data
+}
+
+// servingProviderContextLength returns the context window declared by whichever
+// provider the router would route model id to, or 0 (omitted) when nothing
+// serves it. One rule for every advertised entry, static or live (#518).
+func servingProviderContextLength(router Router, id string) int {
+	if router == nil {
+		return 0
+	}
+	name, ok := router.ProviderForModel(id)
+	if !ok || name == "" {
+		return 0
+	}
+	var n int
+	router.RangeProviders(func(p Provider) {
+		if p.Name() == name {
+			n = p.Capabilities().MaxContextTokens
+		}
+	})
+	return n
 }
 
 // frontierContextLength returns the context window the registered frontier
