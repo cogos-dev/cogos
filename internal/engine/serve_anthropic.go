@@ -17,12 +17,14 @@ import (
 )
 
 type anthropicMessagesRequest struct {
-	Model     string                  `json:"model"`
-	System    json.RawMessage         `json:"system,omitempty"`
-	Messages  []anthropicInputMessage `json:"messages"`
-	MaxTokens int                     `json:"max_tokens,omitempty"`
-	Stream    bool                    `json:"stream,omitempty"`
-	Metadata  anthropicRequestMeta    `json:"metadata,omitempty"`
+	Model      string                  `json:"model"`
+	System     json.RawMessage         `json:"system,omitempty"`
+	Messages   []anthropicInputMessage `json:"messages"`
+	MaxTokens  int                     `json:"max_tokens,omitempty"`
+	Stream     bool                    `json:"stream,omitempty"`
+	Metadata   anthropicRequestMeta    `json:"metadata,omitempty"`
+	Tools      []anthropicTool         `json:"tools,omitempty"`
+	ToolChoice *anthropicToolChoice    `json:"tool_choice,omitempty"`
 }
 
 // anthropicRequestMeta holds the optional metadata object from the Anthropic
@@ -60,6 +62,102 @@ type anthropicMessagesUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// anthropicInputContentBlock is a lenient decode target for inbound content
+// blocks. It differs from anthropicContentBlock in that tool_result content
+// may be either a plain string or an array of nested blocks, so Content is
+// kept raw and resolved by anthropicToolResultText.
+type anthropicInputContentBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`          // tool_use
+	Name      string          `json:"name,omitempty"`        // tool_use
+	Input     json.RawMessage `json:"input,omitempty"`       // tool_use
+	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result
+	Content   json.RawMessage `json:"content,omitempty"`     // tool_result: string or []blocks
+}
+
+// anthropicToolResultText flattens a tool_result content payload (string or
+// array of blocks) into plain text for the OpenAI-shape role:"tool" message.
+func anthropicToolResultText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var blocks []anthropicInputContentBlock
+	if err := json.Unmarshal(raw, &blocks); err == nil {
+		var parts []string
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				parts = append(parts, b.Text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return string(raw)
+}
+
+// expandAnthropicMessage translates one Anthropic input message into one or
+// more OpenAI-shape messages:
+//   - assistant tool_use blocks → assistant message with tool_calls
+//     (Arguments = the tool_use input object serialized as a string).
+//   - user tool_result blocks → one role:"tool" message per result, each
+//     carrying tool_call_id, emitted BEFORE any remaining user text.
+//   - plain text (string or text blocks) passes through unchanged.
+func expandAnthropicMessage(message anthropicInputMessage) []oaiMessage {
+	var blocks []anthropicInputContentBlock
+	if err := json.Unmarshal(message.Content, &blocks); err != nil {
+		// String (or unrecognized) content — pass through as before.
+		return []oaiMessage{{Role: message.Role, Content: normalizeAnthropicContent(message.Content)}}
+	}
+
+	var out []oaiMessage
+	var textParts []string
+	var toolCalls []oaiToolCall
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			if b.Text != "" {
+				textParts = append(textParts, b.Text)
+			}
+		case "tool_use":
+			args := "{}"
+			if len(b.Input) > 0 {
+				args = string(b.Input)
+			}
+			toolCalls = append(toolCalls, oaiToolCall{
+				ID:   b.ID,
+				Type: "function",
+				Function: oaiToolCallFunc{
+					Name:      b.Name,
+					Arguments: args,
+				},
+			})
+		case "tool_result":
+			out = append(out, oaiMessage{
+				Role:       "tool",
+				Content:    mustMarshalString(anthropicToolResultText(b.Content)),
+				ToolCallID: b.ToolUseID,
+			})
+		}
+	}
+
+	text := strings.Join(textParts, "\n")
+	if len(toolCalls) > 0 {
+		raw, _ := json.Marshal(toolCalls)
+		out = append(out, oaiMessage{
+			Role:      message.Role,
+			Content:   mustMarshalString(text),
+			ToolCalls: raw,
+		})
+	} else if text != "" || len(out) == 0 {
+		out = append(out, oaiMessage{Role: message.Role, Content: normalizeAnthropicContent(message.Content)})
+	}
+	return out
+}
+
 func anthropicToOpenAIRequest(req *anthropicMessagesRequest) *oaiChatRequest {
 	if req == nil {
 		return &oaiChatRequest{}
@@ -70,18 +168,54 @@ func anthropicToOpenAIRequest(req *anthropicMessagesRequest) *oaiChatRequest {
 		messages = append(messages, oaiMessage{Role: "system", Content: system})
 	}
 	for _, message := range req.Messages {
-		messages = append(messages, oaiMessage{
-			Role:    message.Role,
-			Content: normalizeAnthropicContent(message.Content),
-		})
+		messages = append(messages, expandAnthropicMessage(message)...)
 	}
 
-	return &oaiChatRequest{
+	out := &oaiChatRequest{
 		Model:     req.Model,
 		Messages:  messages,
 		Stream:    req.Stream,
 		MaxTokens: req.MaxTokens,
 	}
+
+	// Translate tool definitions to the OpenAI function envelope so the
+	// normalized request is complete on both surfaces.
+	for _, t := range req.Tools {
+		out.Tools = append(out.Tools, oaiToolDefinition{
+			Type: "function",
+			Function: oaiToolFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.InputSchema,
+			},
+		})
+	}
+	if tc := anthropicToolChoiceString(req.ToolChoice); tc != "" {
+		out.ToolChoice, _ = json.Marshal(tc)
+	}
+
+	return out
+}
+
+// anthropicToolChoiceString maps the Anthropic tool_choice object to the
+// internal CompletionRequest.ToolChoice string convention (same values the
+// OpenAI-shape handler produces): "auto", "none", "required" (from "any"),
+// or a specific tool name (from {type:"tool",name}).
+func anthropicToolChoiceString(tc *anthropicToolChoice) string {
+	if tc == nil {
+		return ""
+	}
+	switch tc.Type {
+	case "auto":
+		return "auto"
+	case "none":
+		return "none"
+	case "any":
+		return "required"
+	case "tool":
+		return tc.Name
+	}
+	return ""
 }
 
 func normalizeAnthropicContent(raw json.RawMessage) json.RawMessage {
@@ -100,6 +234,20 @@ func normalizeAnthropicContent(raw json.RawMessage) json.RawMessage {
 	}
 
 	return raw
+}
+
+// toolInputJSON parses a stringified tool-call Arguments payload into the
+// JSON object Anthropic's tool_use.input field requires. Invalid or empty
+// arguments render as {} rather than corrupting the response body.
+func toolInputJSON(args string) json.RawMessage {
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" {
+		return json.RawMessage("{}")
+	}
+	if json.Valid([]byte(trimmed)) && strings.HasPrefix(trimmed, "{") {
+		return json.RawMessage(trimmed)
+	}
+	return json.RawMessage("{}")
 }
 
 func anthropicStopReason(stopReason string) string {
@@ -146,6 +294,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	s.process.RecordBlock(block)
 
 	clientMsgs := block.Messages
+
+	// Resolve any pending client-ownership tool calls whose results are
+	// arriving on this turn (tool_result blocks translated to role=tool
+	// messages by anthropicToOpenAIRequest). Mirrors handleChat.
+	for _, msg := range clientMsgs {
+		if msg.Role == "tool" && msg.ToolCallID != "" {
+			s.process.resolvePendingToolCall(msg.ToolCallID, msg.Content)
+		}
+	}
+
 	query := ""
 	for i := len(clientMsgs) - 1; i >= 0; i-- {
 		if clientMsgs[i].Role == "user" {
@@ -178,6 +336,30 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			Source:       "http-anthropic",
 		},
 	}
+
+	// Convert Anthropic tool definitions to internal ToolDefinition and
+	// partition by ownership — same three pools as handleChat (serve.go):
+	// kernel-classified names, MCP-internal tools, and everything else
+	// forwarded back to the client as tool_use blocks.
+	if len(anthropicReq.Tools) > 0 {
+		creq.Tools = make([]ToolDefinition, 0, len(anthropicReq.Tools))
+		for _, t := range anthropicReq.Tools {
+			td := ToolDefinition{
+				Name:        t.Name,
+				Description: t.Description,
+				InputSchema: t.InputSchema,
+			}
+			creq.Tools = append(creq.Tools, td)
+			if classifyToolOwnership(t.Name) == ToolOwnershipKernel {
+				continue
+			}
+			if s.mcpServer != nil && s.mcpServer.IsInternalTool(t.Name) {
+				continue
+			}
+			creq.ExternalTools = append(creq.ExternalTools, td)
+		}
+	}
+	creq.ToolChoice = anthropicToolChoiceString(anthropicReq.ToolChoice)
 
 	switch oaiReq.Model {
 	case "", "local":
@@ -362,6 +544,72 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 		return
 	}
 
+	// Server-side execution of MCP-internal tools — mirrors completeChat's
+	// #94 loop. Kernel-owned tool_use is executed in-process and never
+	// rendered to the client; only external tool calls surface below as
+	// Anthropic tool_use content blocks.
+	if s.mcpServer != nil {
+		const maxInternalHops = 8
+		for hop := 0; hop < maxInternalHops; hop++ {
+			internal, external := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer)
+			if len(internal) == 0 {
+				break
+			}
+			req.Messages = appendToolHopMessages(req.Messages, resp, internal)
+			for _, tc := range internal {
+				s.executeInternalToolCall(ctx, provider.Name(), tc)
+				resultText, isErr, callErr := s.mcpServer.CallTool(ctx, tc.Name, []byte(tc.Arguments))
+				if callErr != nil {
+					slog.Warn("anthropic: internal MCP tool call failed",
+						"tool", tc.Name, "err", callErr,
+						"request_id", req.Metadata.RequestID,
+					)
+					resultText = "tool error: " + callErr.Error()
+					isErr = true
+				}
+				s.process.resolvePendingToolCall(tc.ID, resultText)
+				req.Messages = append(req.Messages, ProviderMessage{
+					Role:       "tool",
+					Content:    resultText,
+					Name:       tc.Name,
+					ToolCallID: tc.ID,
+				})
+				if turn != nil {
+					rec := ToolCallRecord{
+						ID:        tc.ID,
+						Name:      tc.Name,
+						Arguments: tc.Arguments,
+						Result:    truncateForTurn(resultText),
+					}
+					if isErr {
+						rec.Rejected = true
+						rec.RejectReason = "tool reported error"
+					}
+					turn.ToolCalls = append(turn.ToolCalls, rec)
+				}
+			}
+			next, nerr := CompleteCancelSafeIfSupported(ctx, provider, req)
+			if nerr != nil {
+				recordAbandonedInference("anthropic-complete-post-tool", req.Metadata.RequestID, nerr)
+				slog.Warn("anthropic: complete after internal tool exec failed", "err", nerr)
+				if turn != nil {
+					turn.Status = "error"
+					turn.Error = nerr.Error()
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]string{"type": "inference_error", "message": nerr.Error()},
+				})
+				return
+			}
+			if len(external) > 0 {
+				next.ToolCalls = append(next.ToolCalls, external...)
+			}
+			resp = next
+		}
+	}
+
 	if turn != nil {
 		turn.Response = resp.Content
 		turn.Usage = TurnUsage{
@@ -380,13 +628,33 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 		}
 	}
 
+	// Render content blocks: text (when present) followed by one tool_use
+	// block per remaining (client-owned) tool call. tool_use input must be
+	// a JSON object, so the stringified Arguments are parsed back.
+	content := make([]anthropicContentBlock, 0, 1+len(resp.ToolCalls))
+	if resp.Content != "" || len(resp.ToolCalls) == 0 {
+		content = append(content, anthropicContentBlock{Type: "text", Text: resp.Content})
+	}
+	for _, tc := range resp.ToolCalls {
+		content = append(content, anthropicContentBlock{
+			Type:  "tool_use",
+			ID:    nonEmptyID(tc.ID),
+			Name:  tc.Name,
+			Input: toolInputJSON(tc.Arguments),
+		})
+	}
+	stopReason := anthropicStopReason(resp.StopReason)
+	if len(resp.ToolCalls) > 0 {
+		stopReason = "tool_use"
+	}
+
 	response := anthropicMessagesResponse{
 		ID:         respID,
 		Type:       "message",
 		Role:       "assistant",
-		Content:    []anthropicContentBlock{{Type: "text", Text: resp.Content}},
+		Content:    content,
 		Model:      model,
-		StopReason: anthropicStopReason(resp.StopReason),
+		StopReason: stopReason,
 		Usage: anthropicMessagesUsage{
 			InputTokens:  resp.Usage.InputTokens,
 			OutputTokens: resp.Usage.OutputTokens,
@@ -447,6 +715,26 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 			"usage": anthropicMessagesUsage{},
 		},
 	})
+
+	writeErrorAndStop := func(index int) {
+		writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		writeEvent("message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "end_turn"},
+			"usage": anthropicMessagesUsage{},
+		})
+		writeEvent("message_stop", map[string]any{"type": "message_stop"})
+	}
+
+	// Hop loop — mirrors streamChat's #94/#95 pattern: drain each upstream
+	// stream into a buffer, execute kernel-internal tool calls in-process,
+	// and re-issue Stream(). Only the final hop's text + any client-owned
+	// (external) tool calls are rendered to the client.
+	const maxStreamHops = 8
+	var carriedExternal []ToolCall
+	var respBuf strings.Builder
+	usage := anthropicMessagesUsage{}
+
 	writeEvent("content_block_start", map[string]any{
 		"type":  "content_block_start",
 		"index": 0,
@@ -456,36 +744,77 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 		},
 	})
 
-	var respBuf strings.Builder
-	usage := anthropicMessagesUsage{}
-	for sc := range chunks {
-		if sc.Error != nil {
-			slog.Warn("anthropic: stream chunk error", "err", sc.Error)
+	for hop := 0; hop < maxStreamHops; hop++ {
+		hopBuf, hopErr := drainStreamHop(chunks)
+		if hopErr != nil {
+			slog.Warn("anthropic: stream chunk error", "err", hopErr)
 			if turn != nil {
 				turn.Status = "error"
-				turn.Error = sc.Error.Error()
+				turn.Error = hopErr.Error()
 				turn.Response = respBuf.String()
 			}
-			break
+			writeErrorAndStop(0)
+			return
 		}
-		if sc.Usage != nil {
-			usage.InputTokens = sc.Usage.InputTokens
-			usage.OutputTokens = sc.Usage.OutputTokens
+		if hopBuf.usage != nil {
+			usage.InputTokens = hopBuf.usage.InputTokens
+			usage.OutputTokens = hopBuf.usage.OutputTokens
 		}
-		if sc.Delta != "" {
-			if turn != nil {
-				respBuf.WriteString(sc.Delta)
+
+		toolCalls := hopBuf.assembledToolCalls()
+		internal, external := splitToolCallsByOwnership(toolCalls, s.mcpServer)
+		carriedExternal = append(carriedExternal, external...)
+
+		if len(internal) == 0 {
+			// Terminal hop: replay text deltas, then render external
+			// tool_use blocks at fresh indices.
+			for _, d := range hopBuf.deltas {
+				respBuf.WriteString(d)
+				writeEvent("content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": 0,
+					"delta": map[string]any{
+						"type": "text_delta",
+						"text": d,
+					},
+				})
 			}
-			writeEvent("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": 0,
-				"delta": map[string]any{
-					"type": "text_delta",
-					"text": sc.Delta,
-				},
-			})
-		}
-		if sc.Done {
+			writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+
+			for i, tc := range carriedExternal {
+				idx := i + 1
+				writeEvent("content_block_start", map[string]any{
+					"type":  "content_block_start",
+					"index": idx,
+					"content_block": map[string]any{
+						"type":  "tool_use",
+						"id":    nonEmptyID(tc.ID),
+						"name":  tc.Name,
+						"input": map[string]any{},
+					},
+				})
+				writeEvent("content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": idx,
+					"delta": map[string]any{
+						"type":         "input_json_delta",
+						"partial_json": string(toolInputJSON(tc.Arguments)),
+					},
+				})
+				writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+				if turn != nil {
+					turn.ToolCalls = append(turn.ToolCalls, ToolCallRecord{
+						ID:        tc.ID,
+						Name:      tc.Name,
+						Arguments: tc.Arguments,
+					})
+				}
+			}
+
+			stopReason := anthropicStopReason(hopBuf.stopReason)
+			if len(carriedExternal) > 0 {
+				stopReason = "tool_use"
+			}
 			if turn != nil {
 				turn.Response = respBuf.String()
 				turn.Usage = TurnUsage{
@@ -494,19 +823,95 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 					TotalTokens:  usage.InputTokens + usage.OutputTokens,
 				}
 			}
-			writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 			writeEvent("message_delta", map[string]any{
 				"type": "message_delta",
 				"delta": map[string]any{
-					"stop_reason": anthropicStopReason(sc.StopReason),
+					"stop_reason": stopReason,
 				},
 				"usage": usage,
 			})
 			writeEvent("message_stop", map[string]any{"type": "message_stop"})
 			return
 		}
+
+		// Internal tool calls: execute in-process, extend the transcript,
+		// and re-open the upstream stream. Any text this hop produced is
+		// still streamed so the client doesn't lose interleaved reasoning.
+		for _, d := range hopBuf.deltas {
+			respBuf.WriteString(d)
+			writeEvent("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]any{
+					"type": "text_delta",
+					"text": d,
+				},
+			})
+		}
+
+		req.Messages = appendToolHopMessages(req.Messages, &CompletionResponse{
+			Content:    hopBuf.content.String(),
+			ToolCalls:  toolCalls,
+			StopReason: hopBuf.stopReason,
+		}, internal)
+		for _, tc := range internal {
+			s.executeInternalToolCall(ctx, provider.Name(), tc)
+			resultText, isErr, callErr := s.mcpServer.CallTool(ctx, tc.Name, []byte(tc.Arguments))
+			if callErr != nil {
+				slog.Warn("anthropic: internal MCP tool call failed (stream)",
+					"tool", tc.Name, "err", callErr,
+					"request_id", req.Metadata.RequestID,
+				)
+				resultText = "tool error: " + callErr.Error()
+				isErr = true
+			}
+			s.process.resolvePendingToolCall(tc.ID, resultText)
+			req.Messages = append(req.Messages, ProviderMessage{
+				Role:       "tool",
+				Content:    resultText,
+				Name:       tc.Name,
+				ToolCallID: tc.ID,
+			})
+			if turn != nil {
+				rec := ToolCallRecord{
+					ID:        tc.ID,
+					Name:      tc.Name,
+					Arguments: tc.Arguments,
+					Result:    truncateForTurn(resultText),
+				}
+				if isErr {
+					rec.Rejected = true
+					rec.RejectReason = "tool reported error"
+				}
+				turn.ToolCalls = append(turn.ToolCalls, rec)
+			}
+		}
+
+		if hop+1 >= maxStreamHops {
+			slog.Warn("anthropic: stream tool-loop exceeded hop cap", "hops", maxStreamHops)
+			if turn != nil {
+				turn.Status = "error"
+				turn.Error = fmt.Sprintf("stream tool-loop exceeded %d hops", maxStreamHops)
+				turn.Response = respBuf.String()
+			}
+			writeErrorAndStop(0)
+			return
+		}
+
+		nextStream, nerr := provider.Stream(ctx, req)
+		if nerr != nil {
+			slog.Warn("anthropic: stream after internal tool exec failed", "err", nerr)
+			if turn != nil {
+				turn.Status = "error"
+				turn.Error = nerr.Error()
+				turn.Response = respBuf.String()
+			}
+			writeErrorAndStop(0)
+			return
+		}
+		chunks = nextStream
 	}
-	// In case the loop exited without sc.Done (error path), preserve what we captured.
+	// In case the loop exited without a terminal hop, preserve what we captured.
 	if turn != nil && turn.Response == "" {
 		turn.Response = respBuf.String()
 	}
