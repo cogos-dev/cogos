@@ -70,26 +70,13 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 		port = 6931
 	}
 
-	// Model limits derive from the SAME provider Capabilities() that /v1/models
-	// now uses (#518 review), so the two endpoints cannot disagree about a
-	// model's window. Before this the card was a hand-maintained literal —
-	// sonnet at 200k, opus at 1M, and a "Local (Ollama)" entry #417 had
-	// decommissioned — that drifted from /v1/models silently.
-	fctx := frontierContextLength(s.router)
-	cardModel := func(id, name string, ctxLen, out int) map[string]any {
-		limits := map[string]int{"output": out}
-		if ctxLen > 0 {
-			limits["context"] = ctxLen
-		}
-		return map[string]any{"id": id, "name": name, "limits": limits}
-	}
-	models := []map[string]any{
-		cardModel("claude-sonnet-4-6", "Claude Sonnet 4.6", fctx, 8192),
-		cardModel("claude-opus-4-7", "Claude Opus 4.7", fctx, 32000),
-	}
-	if lctx := aliasProviderContextLength(s.router, "local"); lctx > 0 || isLocalConfigured(s.router) {
-		models = append(models, cardModel("local", "Local (LM Studio)", lctx, 4096))
-	}
+	// Model limits come from the SAME cached list /v1/models serves
+	// (composeModelsList), so the two endpoints are one dataset viewed twice
+	// and cannot disagree — for frontier ids, for the "local" alias (whose
+	// window is a LIVE probe result, not a Capabilities() field — review
+	// round 4), for anything. Before this the card was a hand-maintained
+	// literal — sonnet 200k, opus 1M, "Local (Ollama)" #417 decommissioned.
+	models := cardModelsFrom(composeModelsList(r.Context(), s.router))
 
 	card := map[string]any{
 		"schemaVersion":   "1.0",
@@ -392,27 +379,39 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	return data
 }
 
-// aliasProviderContextLength resolves an intent alias ("local", "foreground",
-// …) through the same ResolveModelRequest that request-time routing uses, then
-// returns the resolved provider's declared MaxContextTokens (0 => omitted).
-// Aliases are NOT provider names — ProviderForModel("local") never matches a
-// provider registered as "lmstudio-darkstar" (#518 review round 3) — so they
-// must go through resolution, not the model/name lookup.
-func aliasProviderContextLength(router Router, alias string) int {
-	if router == nil {
-		return 0
+// cardModelsFrom projects the /v1/models list into the card's curated shape.
+// The card has always advertised a short curated set (a sonnet, an opus, and
+// the local alias) rather than the full catalog; it keeps that shape but every
+// limit is read from the /v1/models entry for the same id — never computed
+// independently. An id absent from the list is absent from the card. A window
+// the list omits is omitted here too (never invented).
+func cardModelsFrom(list []compatModel) []map[string]any {
+	byID := make(map[string]compatModel, len(list))
+	for _, m := range list {
+		byID[m.ID] = m
 	}
-	res := ResolveModelRequest(router, alias, "")
-	if res.PreferProvider == "" {
-		return 0
+	type curated struct {
+		id, name string
+		out      int
 	}
-	var n int
-	router.RangeProviders(func(p Provider) {
-		if p.Name() == res.PreferProvider {
-			n = p.Capabilities().MaxContextTokens
+	want := []curated{
+		{"claude-sonnet-4-6", "Claude Sonnet 4.6", 8192},
+		{"claude-opus-4-7", "Claude Opus 4.7", 32000},
+		{"local", "Local (LM Studio)", 4096},
+	}
+	out := make([]map[string]any, 0, len(want))
+	for _, c := range want {
+		m, ok := byID[c.id]
+		if !ok {
+			continue
 		}
-	})
-	return n
+		limits := map[string]int{"output": c.out}
+		if m.ContextLength > 0 {
+			limits["context"] = m.ContextLength
+		}
+		out = append(out, map[string]any{"id": c.id, "name": c.name, "limits": limits})
+	}
+	return out
 }
 
 // servingProviderContextLength returns the context window declared by whichever

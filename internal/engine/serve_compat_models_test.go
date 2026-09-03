@@ -809,8 +809,15 @@ func TestHandleCard_AgreesWithModels(t *testing.T) {
 	claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
 	const frontierWindow = 999_000
 	claude.capabilities.MaxContextTokens = frontierWindow
+	// A realistic local provider too, so the local-alias comparison is
+	// actually exercised (round 4: it previously never was).
+	local := newContextListerStub("lmstudio-darkstar", true,
+		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+	)
+	local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
 	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
 	router.RegisterProvider(claude)
+	router.RegisterProvider(local)
 	srv := freshModelsServer(t, router)
 
 	models := modelIDSet(fetchModels(t, srv))
@@ -837,7 +844,11 @@ func TestHandleCard_AgreesWithModels(t *testing.T) {
 		}
 		mm, ok := models[cm.ID]
 		if !ok {
-			continue // card may list an id /v1/models omits when unconfigured
+			t.Errorf("%s: on /v1/card but absent from /v1/models — card must be a projection of the list", cm.ID)
+			continue
+		}
+		if cm.ID == "local" && mm.ContextLength != 32768 {
+			t.Errorf("local: /v1/models context_length=%d; want 32768 (live probe) — precondition for the agreement check", mm.ContextLength)
 		}
 		if cm.Limits["context"] != mm.ContextLength {
 			t.Errorf("%s: /v1/card context=%d but /v1/models context_length=%d — the two endpoints disagree", cm.ID, cm.Limits["context"], mm.ContextLength)
@@ -845,11 +856,11 @@ func TestHandleCard_AgreesWithModels(t *testing.T) {
 	}
 }
 
-// TestHandleCard_LocalEntryResolvesThroughAlias closes review round 3: the
-// card's "local" entry must resolve the ALIAS through ResolveModelRequest, not
-// look up a provider literally named "local" (none ever is — real local
-// providers are "lmstudio-darkstar" etc.). With a realistically-named local
-// provider registered, the card must carry that provider's declared window.
+// TestHandleCard_LocalEntryResolvesThroughAlias closes review rounds 3 and 4:
+// the card's "local" entry must carry the SAME window /v1/models reports for
+// "local" — which is the live per-model probe result, resolved through the
+// alias — not a provider-name lookup (round 3) and not Capabilities()
+// .MaxContextTokens, which real local providers leave at 0 (round 4).
 func TestHandleCard_LocalEntryResolvesThroughAlias(t *testing.T) {
 	t.Parallel()
 
@@ -857,8 +868,13 @@ func TestHandleCard_LocalEntryResolvesThroughAlias(t *testing.T) {
 		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
 	)
 	local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
-	const localWindow = 65_536
-	local.capabilities.MaxContextTokens = localWindow
+	// Deliberately NOT setting MaxContextTokens: a real OpenAICompatProvider
+	// hardcodes it to 0 (provider_openai.go, "unknown for generic endpoints").
+	// The ONLY source of the local window in production is the live
+	// per-model probe (32768 above). Review round 4 caught the prior version
+	// of this test masking that by setting a Capabilities() value real
+	// providers never produce.
+	const localWindow = 32768
 	claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
 
 	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
@@ -887,7 +903,7 @@ func TestHandleCard_LocalEntryResolvesThroughAlias(t *testing.T) {
 			t.Fatal(`card "local" entry has no context — alias was looked up as a literal provider name instead of resolved`)
 		}
 		if got != localWindow {
-			t.Fatalf(`card "local" context = %d; want %d = the resolved local provider's declared window`, got, localWindow)
+			t.Fatalf(`card "local" context = %d; want %d = the live-probed window /v1/models reports for the same alias`, got, localWindow)
 		}
 		return
 	}
