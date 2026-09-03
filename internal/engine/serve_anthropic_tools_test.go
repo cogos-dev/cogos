@@ -402,3 +402,47 @@ func TestHandleAnthropicMessagesNonStreaming_InternalToolNotForwarded(t *testing
 		t.Fatalf("content = %+v", resp.Content)
 	}
 }
+
+// TestHandleAnthropicMessagesNonStreaming_HopCapNeverLeaksKernelTool closes
+// review round 1: a provider that re-emits a kernel-owned tool call on EVERY
+// hop exhausts maxInternalHops. Before the fix the loop fell through and the
+// unexecuted cog_* tool_use was rendered to the client — the exact disclosure
+// the gateway exists to prevent, and inconsistent with the streaming path
+// which already errored. Now: hard 500, and the renderer independently
+// filters by ownership so no path can leak a kernel tool name.
+func TestHandleAnthropicMessagesNonStreaming_HopCapNeverLeaksKernelTool(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+	if srv.mcpServer == nil || !srv.mcpServer.IsInternalTool("cog_read_cogdoc") {
+		t.Fatal("test server lacks an mcpServer with cog_read_cogdoc")
+	}
+	// Single script entry: scriptedToolUseProvider repeats the last entry
+	// forever, so every hop yields the same kernel-owned call.
+	prov := newScriptedToolUseProvider("scripted", &CompletionResponse{
+		StopReason: "tool_use",
+		ToolCalls: []ToolCall{{
+			ID: "call_loop", Name: "cog_read_cogdoc",
+			Arguments: `{"uri":"cog://mem/does-not-exist.md"}`,
+		}},
+		ProviderMeta: ProviderMeta{Provider: "scripted", Model: "scripted"},
+	})
+	router := NewSimpleRouter(RoutingConfig{Default: "scripted"})
+	router.RegisterProvider(prov)
+	srv.SetRouter(router)
+
+	body := `{"model":"claude","messages":[{"role":"user","content":"go"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handleAnthropicMessages(w, req)
+
+	if strings.Contains(w.Body.String(), "cog_read_cogdoc") || strings.Contains(w.Body.String(), "cog://") {
+		t.Fatalf("kernel-owned tool name/URI leaked to client on hop-cap exhaustion: %s", w.Body.String())
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d; want 500 (hop cap exceeded, mirroring the streaming path); body=%s", w.Code, w.Body.String())
+	}
+	if len(prov.requests) > 10 {
+		t.Fatalf("provider called %d times; cap is not bounding the loop", len(prov.requests))
+	}
+}

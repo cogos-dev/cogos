@@ -608,6 +608,22 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 			}
 			resp = next
 		}
+		// Cap exhausted with kernel-owned calls still pending: hard error,
+		// mirroring the streaming path. Falling through would hand
+		// unexecuted cog_* tool_use to an external client (review round 1).
+		if internal, _ := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer); len(internal) > 0 {
+			slog.Warn("anthropic: internal tool hop cap exceeded", "cap", maxInternalHops, "pending", len(internal))
+			if turn != nil {
+				turn.Status = "error"
+				turn.Error = "internal tool hop cap exceeded"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]string{"type": "inference_error", "message": "internal tool hop cap exceeded"},
+			})
+			return
+		}
 	}
 
 	if turn != nil {
@@ -629,13 +645,21 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 	}
 
 	// Render content blocks: text (when present) followed by one tool_use
-	// block per remaining (client-owned) tool call. tool_use input must be
-	// a JSON object, so the stringified Arguments are parsed back.
-	content := make([]anthropicContentBlock, 0, 1+len(resp.ToolCalls))
-	if resp.Content != "" || len(resp.ToolCalls) == 0 {
+	// block per CLIENT-OWNED tool call. The renderer is the aperture: it
+	// filters by ownership itself rather than trusting the loop above to
+	// have drained every kernel-owned call, so the "kernel tools never reach
+	// the client" invariant holds here regardless of how we arrived.
+	// tool_use input must be a JSON object, so stringified Arguments are
+	// parsed back.
+	clientCalls := resp.ToolCalls
+	if s.mcpServer != nil {
+		_, clientCalls = splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer)
+	}
+	content := make([]anthropicContentBlock, 0, 1+len(clientCalls))
+	if resp.Content != "" || len(clientCalls) == 0 {
 		content = append(content, anthropicContentBlock{Type: "text", Text: resp.Content})
 	}
-	for _, tc := range resp.ToolCalls {
+	for _, tc := range clientCalls {
 		content = append(content, anthropicContentBlock{
 			Type:  "tool_use",
 			ID:    nonEmptyID(tc.ID),
