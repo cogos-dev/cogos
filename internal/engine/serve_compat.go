@@ -87,7 +87,7 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 		cardModel("claude-sonnet-4-6", "Claude Sonnet 4.6", fctx, 8192),
 		cardModel("claude-opus-4-7", "Claude Opus 4.7", fctx, 32000),
 	}
-	if lctx := servingProviderContextLength(s.router, "local"); lctx > 0 || isLocalConfigured(s.router) {
+	if lctx := aliasProviderContextLength(s.router, "local"); lctx > 0 || isLocalConfigured(s.router) {
 		models = append(models, cardModel("local", "Local (LM Studio)", lctx, 4096))
 	}
 
@@ -390,6 +390,29 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	}
 
 	return data
+}
+
+// aliasProviderContextLength resolves an intent alias ("local", "foreground",
+// …) through the same ResolveModelRequest that request-time routing uses, then
+// returns the resolved provider's declared MaxContextTokens (0 => omitted).
+// Aliases are NOT provider names — ProviderForModel("local") never matches a
+// provider registered as "lmstudio-darkstar" (#518 review round 3) — so they
+// must go through resolution, not the model/name lookup.
+func aliasProviderContextLength(router Router, alias string) int {
+	if router == nil {
+		return 0
+	}
+	res := ResolveModelRequest(router, alias, "")
+	if res.PreferProvider == "" {
+		return 0
+	}
+	var n int
+	router.RangeProviders(func(p Provider) {
+		if p.Name() == res.PreferProvider {
+			n = p.Capabilities().MaxContextTokens
+		}
+	})
+	return n
 }
 
 // servingProviderContextLength returns the context window declared by whichever

@@ -844,3 +844,52 @@ func TestHandleCard_AgreesWithModels(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleCard_LocalEntryResolvesThroughAlias closes review round 3: the
+// card's "local" entry must resolve the ALIAS through ResolveModelRequest, not
+// look up a provider literally named "local" (none ever is — real local
+// providers are "lmstudio-darkstar" etc.). With a realistically-named local
+// provider registered, the card must carry that provider's declared window.
+func TestHandleCard_LocalEntryResolvesThroughAlias(t *testing.T) {
+	t.Parallel()
+
+	local := newContextListerStub("lmstudio-darkstar", true,
+		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+	)
+	local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
+	const localWindow = 65_536
+	local.capabilities.MaxContextTokens = localWindow
+	claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
+
+	router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+	router.RegisterProvider(claude)
+	router.RegisterProvider(local)
+	srv := freshModelsServer(t, router)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/card", nil)
+	w := httptest.NewRecorder()
+	srv.handleCard(w, req)
+	var card struct {
+		Models []struct {
+			ID     string         `json:"id"`
+			Limits map[string]int `json:"limits"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&card); err != nil {
+		t.Fatalf("decode /v1/card: %v", err)
+	}
+	for _, cm := range card.Models {
+		if cm.ID != "local" {
+			continue
+		}
+		got, ok := cm.Limits["context"]
+		if !ok {
+			t.Fatal(`card "local" entry has no context — alias was looked up as a literal provider name instead of resolved`)
+		}
+		if got != localWindow {
+			t.Fatalf(`card "local" context = %d; want %d = the resolved local provider's declared window`, got, localWindow)
+		}
+		return
+	}
+	t.Fatal(`card has no "local" entry despite a configured local provider`)
+}
