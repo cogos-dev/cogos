@@ -615,3 +615,123 @@ func TestGrantMintLimiter_AllowsUpToLimitThenBlocks(t *testing.T) {
 		t.Fatalf("Allow() after window elapsed = false; want true (window should reset)")
 	}
 }
+
+// ── Authorization: Bearer as a grant carrier ─────────────────────────────────
+//
+// An OpenAI/Anthropic-compatible client has one auth knob: an "API key"
+// field that lands in Authorization: Bearer. It cannot send X-Cogos-Grant.
+// The gate must accept the grant there, with the same verification.
+
+func bearerPost(t *testing.T, url, authorization string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+"/v1/attention", bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+func TestGrantAuth_BearerWithValidGrant_PassesGate(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := mintTestGrant(t, srv, "bearer-surface")
+
+	if code := bearerPost(t, ts.URL, "Bearer "+token); code == http.StatusUnauthorized {
+		t.Fatal("401 with a valid grant in Authorization: Bearer — an ignorant OpenAI-compat client cannot get past the gate")
+	}
+	// Scheme is case-insensitive per RFC 9110.
+	if code := bearerPost(t, ts.URL, "bearer "+token); code == http.StatusUnauthorized {
+		t.Fatal("401 with lowercase 'bearer' scheme")
+	}
+}
+
+func TestGrantAuth_BearerWithBogusGrant_401(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	if code := bearerPost(t, ts.URL, "Bearer not-a-real-grant"); code != http.StatusUnauthorized {
+		t.Fatalf("status = %d with a bogus bearer token; want 401 — Bearer must go through the SAME verification, not bypass it", code)
+	}
+}
+
+func TestGrantAuth_NonBearerAuthorization_TreatedAsAbsent(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := mintTestGrant(t, srv, "basic-surface")
+
+	// A valid grant under the wrong scheme must NOT be honored.
+	for _, hdr := range []string{"Basic " + token, token, "Token " + token, "Bearer"} {
+		if code := bearerPost(t, ts.URL, hdr); code != http.StatusUnauthorized {
+			t.Errorf("Authorization=%q: status = %d; want 401 — only the Bearer scheme carries a grant", hdr, code)
+		}
+	}
+}
+
+func TestGrantAuth_XCogosGrantWinsOverBearer(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := mintTestGrant(t, srv, "both-surface")
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/attention", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(GrantHeaderName, token)
+	req.Header.Set("Authorization", "Bearer bogus")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatal("401 when a valid X-Cogos-Grant is present alongside a bogus Bearer — canonical header must win")
+	}
+}
+
+func TestGrantAuth_XApiKeyWithValidGrant_PassesGate(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := mintTestGrant(t, srv, "apikey-surface")
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/attention", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatal("401 with a valid grant in x-api-key — an Anthropic-SDK client (dsh's Anthropic provider) cannot get past the gate")
+	}
+
+	// Bogus x-api-key must still be 401: same verification, not a bypass.
+	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/attention", bytes.NewBufferString(`{}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("x-api-key", "not-a-grant")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d with bogus x-api-key; want 401", resp2.StatusCode)
+	}
+}
