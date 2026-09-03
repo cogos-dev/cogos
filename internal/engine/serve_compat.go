@@ -77,6 +77,16 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 	// round 4), for anything. Before this the card was a hand-maintained
 	// literal — sonnet 200k, opus 1M, "Local (Ollama)" #417 decommissioned.
 	models := cardModelsFrom(composeModelsList(r.Context(), s.router))
+	// defaultModel is drawn from the same projection, in curated preference
+	// order, so it can never name a model the card does not list (review
+	// round 5: a zero-config local-only node had frontier ids filtered out of
+	// models while defaultModel still said claude-sonnet-4-6). Empty string
+	// when nothing is configured — honest, and a client validating
+	// defaultModel ∈ models sees a consistent card either way.
+	defaultModel := ""
+	if len(models) > 0 {
+		defaultModel, _ = models[0]["id"].(string)
+	}
 
 	card := map[string]any{
 		"schemaVersion":   "1.0",
@@ -84,7 +94,7 @@ func (s *Server) handleCard(w http.ResponseWriter, r *http.Request) {
 		"humanReadableId": "cogos/kernel-v3",
 		"description":     "v3 production kernel — foveated context, TRM, attentional field",
 		"url":             fmt.Sprintf("http://localhost:%d", port),
-		"defaultModel":    "claude-sonnet-4-6",
+		"defaultModel":    defaultModel,
 		"models":          models,
 		"capabilities": map[string]bool{
 			"streaming":         true,

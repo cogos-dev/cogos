@@ -909,3 +909,68 @@ func TestHandleCard_LocalEntryResolvesThroughAlias(t *testing.T) {
 	}
 	t.Fatal(`card has no "local" entry despite a configured local provider`)
 }
+
+// TestHandleCard_DefaultModelIsListed closes review round 5: defaultModel
+// must always be a member of the card's own models array. The reachable
+// failure was the documented zero-config local-only deployment (no frontier
+// provider; defaults/providers.yaml ships anthropic disabled), where frontier
+// ids were filtered out of models while defaultModel still said sonnet.
+func TestHandleCard_DefaultModelIsListed(t *testing.T) {
+	t.Parallel()
+
+	decode := func(t *testing.T, srv *Server) (string, map[string]bool) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		srv.handleCard(w, httptest.NewRequest(http.MethodGet, "/v1/card", nil))
+		var card struct {
+			DefaultModel string `json:"defaultModel"`
+			Models       []struct {
+				ID string `json:"id"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(w.Body).Decode(&card); err != nil {
+			t.Fatalf("decode /v1/card: %v", err)
+		}
+		ids := map[string]bool{}
+		for _, m := range card.Models {
+			ids[m.ID] = true
+		}
+		return card.DefaultModel, ids
+	}
+
+	t.Run("local-only, no frontier", func(t *testing.T) {
+		local := newContextListerStub("lmstudio-darkstar", true,
+			ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
+		)
+		local.capabilities.ModelsAvailable = []string{"gemma-4-26b"}
+		router := NewSimpleRouter(RoutingConfig{Default: "lmstudio-darkstar"})
+		router.RegisterProvider(local)
+
+		def, ids := decode(t, freshModelsServer(t, router))
+		if ids["claude-sonnet-4-6"] || ids["claude-opus-4-7"] {
+			t.Fatalf("frontier ids listed with no frontier provider: %v", ids)
+		}
+		if def == "" || !ids[def] {
+			t.Fatalf("defaultModel=%q not in models %v — card disagrees with itself", def, ids)
+		}
+	})
+
+	t.Run("frontier configured", func(t *testing.T) {
+		claude := newListerStub("claude-oauth", false, "claude-opus-4-8")
+		router := NewSimpleRouter(RoutingConfig{Default: "claude-oauth"})
+		router.RegisterProvider(claude)
+
+		def, ids := decode(t, freshModelsServer(t, router))
+		if def != "claude-sonnet-4-6" || !ids[def] {
+			t.Fatalf("defaultModel=%q (listed=%v); want claude-sonnet-4-6 as the curated first choice when frontier is up", def, ids[def])
+		}
+	})
+
+	t.Run("nothing configured", func(t *testing.T) {
+		router := NewSimpleRouter(RoutingConfig{})
+		def, ids := decode(t, freshModelsServer(t, router))
+		if def != "" || len(ids) != 0 {
+			t.Fatalf("defaultModel=%q models=%v; want empty/none — never a model that cannot be served", def, ids)
+		}
+	})
+}
