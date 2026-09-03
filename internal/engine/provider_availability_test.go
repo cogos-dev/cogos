@@ -166,3 +166,92 @@ func TestClaudeCodeAvailableCachesResult(t *testing.T) {
 		t.Fatalf("auth probe ran %d times after TTL expiry, want 2", *calls)
 	}
 }
+
+// ── pi ───────────────────────────────────────────────────────────────────────
+//
+// pi has no credential of its own; it fronts a local OpenAI-compatible backend
+// (LM Studio by default). "Available" therefore means: binary on PATH AND the
+// backend answers /v1/models. Binary presence alone must not report available.
+
+func resetPiProbesForTest(t *testing.T) {
+	t.Helper()
+	origLook, origProbe := piLookPath, piBackendProbe
+	t.Cleanup(func() { piLookPath, piBackendProbe = origLook, origProbe })
+}
+
+func piOnPath(t *testing.T) {
+	t.Helper()
+	piLookPath = func(file string) (string, error) { return "/usr/local/bin/pi", nil }
+}
+
+func newLocalPi() *PiProvider {
+	// Empty config resolves to defaultLocalPiProvider (lmstudio).
+	return NewPiProvider("pi", ProviderConfig{}, nil)
+}
+
+func TestPiAvailableBinaryPresentBackendUp(t *testing.T) {
+	resetPiProbesForTest(t)
+	piOnPath(t)
+	piBackendProbe = func(ctx context.Context, baseURL string) error { return nil }
+
+	if !newLocalPi().Available(context.Background()) {
+		t.Fatal("Available should be true with binary present and backend up")
+	}
+}
+
+func TestPiAvailableBinaryPresentBackendDown(t *testing.T) {
+	resetPiProbesForTest(t)
+	piOnPath(t)
+	piBackendProbe = func(ctx context.Context, baseURL string) error {
+		return errors.New("connection refused")
+	}
+
+	if newLocalPi().Available(context.Background()) {
+		t.Fatal("Available must be false when the binary exists but the backend is down — this was the LookPath-only defect")
+	}
+}
+
+func TestPiAvailableBinaryAbsent(t *testing.T) {
+	resetPiProbesForTest(t)
+	piLookPath = func(file string) (string, error) { return "", errors.New("not found") }
+	piBackendProbe = func(ctx context.Context, baseURL string) error {
+		t.Fatal("backend probe must not run when the binary is absent")
+		return nil
+	}
+
+	if newLocalPi().Available(context.Background()) {
+		t.Fatal("Available must be false when the binary is absent")
+	}
+}
+
+func TestPiAvailableProbesDefaultBackendURL(t *testing.T) {
+	resetPiProbesForTest(t)
+	piOnPath(t)
+	var got string
+	piBackendProbe = func(ctx context.Context, baseURL string) error { got = baseURL; return nil }
+
+	newLocalPi().Available(context.Background())
+	if got != defaultPiBackendURL {
+		t.Fatalf("probe hit %q, want default backend %q", got, defaultPiBackendURL)
+	}
+}
+
+func TestPiAvailableCachesResult(t *testing.T) {
+	resetPiProbesForTest(t)
+	piOnPath(t)
+	calls := 0
+	piBackendProbe = func(ctx context.Context, baseURL string) error { calls++; return nil }
+
+	p := newLocalPi()
+	p.Available(context.Background())
+	p.Available(context.Background())
+	if calls != 1 {
+		t.Fatalf("probe ran %d times within availCacheTTL, want 1", calls)
+	}
+	// Expire the cache and confirm it re-probes.
+	p.availAt = time.Now().Add(-2 * availCacheTTL)
+	p.Available(context.Background())
+	if calls != 2 {
+		t.Fatalf("probe ran %d times after cache expiry, want 2", calls)
+	}
+}
