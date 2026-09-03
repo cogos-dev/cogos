@@ -354,13 +354,16 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	}
 
 	if frontierConfigured {
-		// Intent aliases for frontier-managed tiers. Both resolve (resolve.go
-		// intentAliases) to claude-oauth model overrides, i.e. Anthropic
-		// models with the standard 200k window (#518).
+		// Intent aliases for frontier-managed tiers. Their window is whatever
+		// the registered frontier provider actually declares — claude-oauth and
+		// claude-code declare 1M (context beta), the API-key AnthropicProvider
+		// declares 200k. Never a constant: /v1/card already derives from the
+		// same Capabilities() and the two endpoints must agree (#518 review).
+		fctx := frontierContextLength(router)
 		add(withCtx(mkCompatModel("foreground", "cogos", "frontier-managed",
-			"interactive, full capability (managed Claude, Max sub)", now), anthropicMaxContextTokens))
+			"interactive, full capability (managed Claude, Max sub)", now), fctx))
 		add(withCtx(mkCompatModel("deliberation", "cogos", "frontier-managed",
-			"heavier reasoning (Opus)", now), anthropicMaxContextTokens))
+			"heavier reasoning (Opus)", now), fctx))
 	}
 	if localConfigured {
 		// Intent alias for the local-sovereign tier. Its context window is
@@ -371,11 +374,12 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	}
 	if frontierConfigured {
 		// Static frontier model IDs — retained so clients keep working even when
-		// the live Anthropic catalog probe is unavailable. All Anthropic models
-		// carry the standard 200k window (#518).
-		add(withCtx(mkCompatModel("claude-sonnet-4-6", "anthropic", "frontier-managed", "", now), anthropicMaxContextTokens))
-		add(withCtx(mkCompatModel("claude-opus-4-7", "anthropic", "frontier-managed", "", now), anthropicMaxContextTokens))
-		add(withCtx(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now), anthropicMaxContextTokens))
+		// the live Anthropic catalog probe is unavailable. Window comes from the
+		// serving frontier provider's declared capability (#518).
+		fctx := frontierContextLength(router)
+		add(withCtx(mkCompatModel("claude-sonnet-4-6", "anthropic", "frontier-managed", "", now), fctx))
+		add(withCtx(mkCompatModel("claude-opus-4-7", "anthropic", "frontier-managed", "", now), fctx))
+		add(withCtx(mkCompatModel("claude-haiku-4-5-20251001", "anthropic", "frontier-managed", "fast, low-cost", now), fctx))
 	}
 	if eclipseServed {
 		add(mkCompatModel("eclipse-26b", "cogos", "lan-local",
@@ -387,6 +391,28 @@ func buildModelsList(ctx context.Context, router Router) []compatModel {
 	}
 
 	return data
+}
+
+// frontierContextLength returns the context window the registered frontier
+// provider declares via Capabilities().MaxContextTokens, or 0 (omitted) when
+// no frontier provider is registered. Used for the static frontier entries
+// and the foreground/deliberation aliases so /v1/models agrees with /v1/card,
+// which derives from the same Capabilities() (#518 review finding).
+func frontierContextLength(router Router) int {
+	if router == nil {
+		return 0
+	}
+	name, ok := frontierProviderName(router)
+	if !ok {
+		return 0
+	}
+	var n int
+	router.RangeProviders(func(p Provider) {
+		if p.Name() == name {
+			n = p.Capabilities().MaxContextTokens
+		}
+	})
+	return n
 }
 
 // localAliasContextLength resolves the "local" intent alias to its target
@@ -565,10 +591,11 @@ func modelEntryFor(p Provider, listing ModelListing, frontier bool, now int64) c
 	if frontier && strings.HasPrefix(id, "claude-") {
 		m = mkCompatModel(id, "anthropic", "frontier-managed", desc, now)
 		if listing.ContextLength == 0 {
-			// Anthropic's /v1/models exposes no per-model context field; the
-			// whole claude-sonnet-4+ family carries the standard 200k window
-			// (#518). Reuse the provider-layer constant, never a second copy.
-			m.ContextLength = anthropicMaxContextTokens
+			// Anthropic's /v1/models exposes no per-model context field. Fall
+			// back to what THIS serving provider declares — 1M for claude-oauth
+			// / claude-code, 200k for the API-key provider — never a constant
+			// that ignores which provider is actually behind the id (#518).
+			m.ContextLength = p.Capabilities().MaxContextTokens
 		}
 	} else {
 		name := p.Name()

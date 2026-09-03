@@ -722,6 +722,12 @@ func TestHandleModels_AllEntriesCarryContextLength(t *testing.T) {
 	t.Parallel()
 
 	claude := newListerStub("claude-oauth", false, "claude-opus-4-8", "claude-sonnet-5")
+	// The frontier window is whatever the SERVING provider declares — not a
+	// constant. Real claude-oauth declares 1M (provider_claudeoauth.go:848);
+	// use a distinctive value here so a regression to any hardcoded number
+	// (200k, 1M, anything) fails rather than passing by coincidence.
+	const frontierWindow = 777_000
+	claude.capabilities.MaxContextTokens = frontierWindow
 	local := newContextListerStub("lmstudio-darkstar", true,
 		ModelListing{ID: "gemma-4-26b", ContextLength: 32768},
 	)
@@ -744,8 +750,8 @@ func TestHandleModels_AllEntriesCarryContextLength(t *testing.T) {
 
 	byID := modelIDSet(resp)
 	for _, id := range []string{"foreground", "deliberation", "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001", "claude-opus-4-8", "claude-sonnet-5"} {
-		if m, ok := byID[id]; !ok || m.ContextLength != 200_000 {
-			t.Errorf("entry %q: ContextLength = %d (present=%v); want 200000", id, m.ContextLength, ok)
+		if m, ok := byID[id]; !ok || m.ContextLength != frontierWindow {
+			t.Errorf("entry %q: ContextLength = %d (present=%v); want %d = the serving provider's declared MaxContextTokens, never a constant", id, m.ContextLength, ok, frontierWindow)
 		}
 	}
 	if m, ok := byID["local"]; !ok || m.ContextLength != 32768 {
