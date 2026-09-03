@@ -51,8 +51,13 @@ type anthropicMessagesResponse struct {
 }
 
 type anthropicMessagesUsage struct {
-	InputTokens  int `json:"input_tokens,omitempty"`
-	OutputTokens int `json:"output_tokens,omitempty"`
+	// No omitempty: the Anthropic SDK (and pi-ai on top of it) reads
+	// usage.input_tokens / usage.output_tokens unconditionally from
+	// message_start and message_delta. A zero must serialize as 0, not
+	// vanish — an absent key crashes the client with
+	// "Cannot read properties of undefined (reading 'input_tokens')".
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 func anthropicToOpenAIRequest(req *anthropicMessagesRequest) *oaiChatRequest {
@@ -428,11 +433,18 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 	writeEvent("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":      respID,
-			"type":    "message",
-			"role":    "assistant",
-			"content": []anthropicContentBlock{},
-			"model":   model,
+			"id":            respID,
+			"type":          "message",
+			"role":          "assistant",
+			"content":       []anthropicContentBlock{},
+			"model":         model,
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			// Real Anthropic sends usage on message_start (input known,
+			// output 0). SDK clients dereference it; omitting it is a crash,
+			// not a degradation. Input is unknown until the provider reports
+			// it, so 0 here and the true figure on message_delta.
+			"usage": anthropicMessagesUsage{},
 		},
 	})
 	writeEvent("content_block_start", map[string]any{
