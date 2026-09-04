@@ -88,8 +88,25 @@ func NormalizeAnthropicRequest(body []byte, source string) *CogBlock {
 		msgs = make([]ProviderMessage, len(oaiReq.Messages))
 		for i, m := range oaiReq.Messages {
 			msgs[i] = ProviderMessage{
-				Role:    m.Role,
-				Content: extractContent(m.Content),
+				Role:       m.Role,
+				Content:    extractContent(m.Content),
+				ToolCallID: m.ToolCallID,
+			}
+			// Forward tool_calls from assistant history (translated from
+			// Anthropic tool_use blocks) so the provider sees the full
+			// tool-loop transcript.
+			if len(m.ToolCalls) > 0 {
+				var calls []oaiToolCall
+				if err := json.Unmarshal(m.ToolCalls, &calls); err == nil {
+					msgs[i].ToolCalls = make([]ToolCall, len(calls))
+					for j, tc := range calls {
+						msgs[i].ToolCalls[j] = ToolCall{
+							ID:        tc.ID,
+							Name:      tc.Function.Name,
+							Arguments: tc.Function.Arguments,
+						}
+					}
+				}
 			}
 		}
 	}

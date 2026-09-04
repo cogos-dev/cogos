@@ -1589,6 +1589,26 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 			}
 			resp = next
 		}
+		// Cap exhausted with kernel-owned calls still pending: hard error.
+		// Same guard the Anthropic surface got in #600 round 1; this is its
+		// twin (round 2). Falling through would render unexecuted cog_*
+		// tool_calls to an external client.
+		if internal, _ := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer); len(internal) > 0 {
+			slog.Warn("chat: internal tool hop cap exceeded", "cap", maxInternalHops, "pending", len(internal))
+			if turn != nil {
+				turn.Status = "error"
+				turn.Error = "internal tool hop cap exceeded"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": "internal tool hop cap exceeded",
+					"type":    "server_error",
+				},
+			})
+			return pt
+		}
 	}
 	if !pt.toolCallStart.IsZero() {
 		pt.toolCallEnd = time.Now()
@@ -1653,15 +1673,21 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 		finishReason = "stop"
 	}
 
-	// Wrap tool calls in the OpenAI response format.
-	if len(resp.ToolCalls) > 0 {
+	// Wrap CLIENT-OWNED tool calls in the OpenAI response format. The
+	// renderer filters by ownership itself — it is the aperture and does not
+	// trust the loop above to have drained every kernel-owned call.
+	clientCalls := resp.ToolCalls
+	if s.mcpServer != nil {
+		_, clientCalls = splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer)
+	}
+	if len(clientCalls) > 0 {
 		finishReason = "tool_calls"
 		// OpenAI spec: tool-call-only messages must have "content": null, not "".
 		if resp.Content == "" {
 			msg.Content = json.RawMessage("null")
 		}
-		calls := make([]oaiToolCall, len(resp.ToolCalls))
-		for i, tc := range resp.ToolCalls {
+		calls := make([]oaiToolCall, len(clientCalls))
+		for i, tc := range clientCalls {
 			calls[i] = oaiToolCall{
 				ID:   tc.ID,
 				Type: "function",
