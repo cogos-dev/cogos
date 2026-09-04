@@ -484,3 +484,43 @@ func TestSplitToolCallsByOwnership(t *testing.T) {
 		t.Errorf("nil MCPServer must forward all calls externally; got %d", len(external2))
 	}
 }
+
+// TestHandleChat_HopCapNeverLeaksKernelTool is the OpenAI-surface twin of
+// TestHandleAnthropicMessagesNonStreaming_HopCapNeverLeaksKernelTool (#600
+// review round 2: the fix landed on one surface and not its sibling). A
+// provider re-emitting a kernel-owned call on every hop exhausts the cap;
+// the response must be a 500 with no kernel tool name or cog:// URI in it.
+func TestHandleChat_HopCapNeverLeaksKernelTool(t *testing.T) {
+	t.Parallel()
+	srv := newTestServer(t)
+	if srv.mcpServer == nil || !srv.mcpServer.IsInternalTool("cog_read_cogdoc") {
+		t.Fatal("test server lacks an mcpServer with cog_read_cogdoc")
+	}
+	prov := newScriptedToolUseProvider("scripted", &CompletionResponse{
+		StopReason: "tool_use",
+		ToolCalls: []ToolCall{{
+			ID: "call_loop", Name: "cog_read_cogdoc",
+			Arguments: `{"uri":"cog://mem/does-not-exist.md"}`,
+		}},
+		ProviderMeta: ProviderMeta{Provider: "scripted", Model: "scripted"},
+	})
+	router := NewSimpleRouter(RoutingConfig{Default: "scripted"})
+	router.RegisterProvider(prov)
+	srv.SetRouter(router)
+
+	body := `{"model":"kernel-agent","messages":[{"role":"user","content":"go"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handleChat(w, req)
+
+	if strings.Contains(w.Body.String(), "cog_read_cogdoc") || strings.Contains(w.Body.String(), "cog://") {
+		t.Fatalf("kernel-owned tool name/URI leaked to client on hop-cap exhaustion: %s", w.Body.String())
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d; want 500; body=%s", w.Code, w.Body.String())
+	}
+	if len(prov.requests) > 10 {
+		t.Fatalf("provider called %d times; cap is not bounding the loop", len(prov.requests))
+	}
+}
