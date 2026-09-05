@@ -47,6 +47,28 @@ func anthropicResponseBody(text string) anthropicResponse {
 
 // ── buildAnthropicRequest ─────────────────────────────────────────────────────
 
+// systemText flattens the System field to its text regardless of wire form.
+// Since the cache-breakpoint change, a non-empty system is always emitted as
+// a []anthropicSystemBlock (so it can carry cache_control) on BOTH the API-key
+// and OAuth paths; Anthropic accepts either form.
+func systemText(t *testing.T, sys any) string {
+	t.Helper()
+	switch v := sys.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []anthropicSystemBlock:
+		var b strings.Builder
+		for _, blk := range v {
+			b.WriteString(blk.Text)
+		}
+		return b.String()
+	}
+	t.Fatalf("unexpected System type %T", sys)
+	return ""
+}
+
 func TestBuildAnthropicRequestSystemPrompt(t *testing.T) {
 	t.Parallel()
 	req := &CompletionRequest{
@@ -63,8 +85,8 @@ func TestBuildAnthropicRequestSystemPrompt(t *testing.T) {
 	if ar.MaxTokens != 8192 {
 		t.Errorf("max_tokens = %d; want 8192", ar.MaxTokens)
 	}
-	if ar.System != "You are helpful." {
-		t.Errorf("system = %q; want 'You are helpful.'", ar.System)
+	if got := systemText(t, ar.System); got != "You are helpful." {
+		t.Errorf("system = %q; want 'You are helpful.'", got)
 	}
 	if ar.Stream {
 		t.Error("stream should be false")
@@ -102,12 +124,12 @@ func TestBuildAnthropicRequestContextItems(t *testing.T) {
 	}
 	ar := buildAnthropicRequest("m", req, false, 1024)
 
-	// The x-api-key path keeps System as a plain string (the OAuth path uses a
-	// block array; see buildOAuthSystem).
-	sys, ok := ar.System.(string)
-	if !ok {
-		t.Fatalf("x-api-key System should be a string; got %T", ar.System)
+	// Both paths now emit System as a block array so the last block can carry
+	// a prompt-cache breakpoint (anthropic_cache.go).
+	if _, ok := ar.System.([]anthropicSystemBlock); !ok {
+		t.Fatalf("System should be a block array (cache breakpoint carrier); got %T", ar.System)
 	}
+	sys := systemText(t, ar.System)
 	// System should contain both context items and the system prompt.
 	if !strings.Contains(sys, "relevant note") {
 		t.Error("system should contain context item content")
@@ -135,9 +157,9 @@ func TestBuildAnthropicRequestEmptyContextItemsSkipped(t *testing.T) {
 		},
 	}
 	ar := buildAnthropicRequest("m", req, false, 1024)
-	// Empty context item should not pollute the system string.
-	if ar.System != "Base." {
-		t.Errorf("system = %q; want 'Base.' (empty context item skipped)", ar.System)
+	// Empty context item should not pollute the system text.
+	if got := systemText(t, ar.System); got != "Base." {
+		t.Errorf("system = %q; want 'Base.' (empty context item skipped)", got)
 	}
 }
 
