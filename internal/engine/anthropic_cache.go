@@ -36,10 +36,19 @@ func applyAnthropicCacheBreakpoints(payload *anthropicRequest) {
 	if payload == nil {
 		return
 	}
-	// 1. system: last block.
-	if blocks, ok := payload.System.([]anthropicSystemBlock); ok && len(blocks) > 0 {
-		blocks[len(blocks)-1].CacheControl = ephemeral
-		payload.System = blocks
+	// 1. system: last block. The API-key path builds System as a plain
+	// string; convert it to a single text block so it can carry the marker
+	// (Anthropic accepts either form). The OAuth path already sends blocks.
+	switch sys := payload.System.(type) {
+	case string:
+		if sys != "" {
+			payload.System = []anthropicSystemBlock{{Type: "text", Text: sys, CacheControl: ephemeral}}
+		}
+	case []anthropicSystemBlock:
+		if len(sys) > 0 {
+			sys[len(sys)-1].CacheControl = ephemeral
+			payload.System = sys
+		}
 	}
 	// 2. tools: last definition.
 	if n := len(payload.Tools); n > 0 {

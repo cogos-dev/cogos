@@ -260,3 +260,26 @@ func TestHandleAnthropicMessages_ForwardsCacheUsage(t *testing.T) {
 		}
 	})
 }
+
+// Review round 2: the API-key path builds System as a STRING. The system
+// breakpoint must apply there too — it is the largest stable region.
+func TestCacheBreakpoints_StringSystemGetsBreakpoint(t *testing.T) {
+	t.Parallel()
+	req := &CompletionRequest{
+		SystemPrompt: strings.Repeat("nucleus ", 200),
+		Messages:     []ProviderMessage{{Role: "user", Content: "hi"}},
+	}
+	payload := buildAnthropicRequest("claude-sonnet-4-6", req, false, 100)
+	blocks, ok := payload.System.([]anthropicSystemBlock)
+	if !ok || len(blocks) != 1 || blocks[0].CacheControl == nil || !strings.HasPrefix(blocks[0].Text, "nucleus") {
+		t.Fatalf("API-key string system must become one marked text block; got %T %+v", payload.System, payload.System)
+	}
+	if _, isStr := payload.System.(string); isStr {
+		t.Fatal("system left as a string — marker cannot attach")
+	}
+	// empty system stays absent (omitempty), never an empty marked block
+	empty := buildAnthropicRequest("claude-sonnet-4-6", &CompletionRequest{Messages: []ProviderMessage{{Role: "user", Content: "hi"}}}, false, 100)
+	if b, _ := json.Marshal(empty); strings.Contains(string(b), `"system"`) && strings.Contains(string(b), `"text":""`) {
+		t.Fatal("empty system must not become an empty marked block")
+	}
+}
