@@ -11,12 +11,12 @@ import (
 
 // StubProvider is an in-memory Provider for testing.
 type StubProvider struct {
-	name         string
-	model        string // reported by Model(); empty by default
-	response     string
+	name     string
+	model    string // reported by Model(); empty by default
+	response string
 	// usage, when set, is reported on Complete() and on the final Stream chunk
 	// so tests can prove the kernel forwards provider accounting (incl. cache).
-	usage *TokenUsage
+	usage        *TokenUsage
 	err          error
 	latency      time.Duration
 	available    bool
@@ -40,7 +40,7 @@ func NewStubProvider(name, response string) *StubProvider {
 		response:  response,
 		available: true,
 		capabilities: ProviderCapabilities{
-			Capabilities:    []Capability{CapStreaming, CapToolUse, CapVision, CapJSON},
+			Capabilities:     []Capability{CapStreaming, CapToolUse, CapVision, CapJSON},
 			MaxContextTokens: 128000,
 			MaxOutputTokens:  4096,
 			IsLocal:          true,
