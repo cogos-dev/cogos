@@ -60,6 +60,11 @@ type anthropicMessagesUsage struct {
 	// "Cannot read properties of undefined (reading 'input_tokens')".
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// Cache accounting is optional on the wire (omitempty is correct here —
+	// the SDK reads these defensively) but the kernel MUST forward them so an
+	// external client can see prompt-cache hits instead of inferring 0%.
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 }
 
 // anthropicInputContentBlock is a lenient decode target for inbound content
@@ -680,8 +685,10 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 		Model:      model,
 		StopReason: stopReason,
 		Usage: anthropicMessagesUsage{
-			InputTokens:  resp.Usage.InputTokens,
-			OutputTokens: resp.Usage.OutputTokens,
+			InputTokens:              resp.Usage.InputTokens,
+			OutputTokens:             resp.Usage.OutputTokens,
+			CacheReadInputTokens:     resp.Usage.CacheReadTokens,
+			CacheCreationInputTokens: resp.Usage.CacheWriteTokens,
 		},
 	}
 
@@ -783,6 +790,8 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 		if hopBuf.usage != nil {
 			usage.InputTokens = hopBuf.usage.InputTokens
 			usage.OutputTokens = hopBuf.usage.OutputTokens
+			usage.CacheReadInputTokens = hopBuf.usage.CacheReadTokens
+			usage.CacheCreationInputTokens = hopBuf.usage.CacheWriteTokens
 		}
 
 		toolCalls := hopBuf.assembledToolCalls()

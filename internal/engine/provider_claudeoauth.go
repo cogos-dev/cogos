@@ -915,8 +915,9 @@ func (p *ClaudeOAuthProvider) effectiveModel(req *CompletionRequest) string {
 // anthropicSystemBlock is one text block of a multi-block system prompt, as the
 // Claude Code client sends it.
 type anthropicSystemBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 // buildOAuthSystem builds the system field for the OAuth (Max-subscription) path
@@ -1094,6 +1095,7 @@ func (p *ClaudeOAuthProvider) Complete(ctx context.Context, req *CompletionReque
 		payload.Messages = repaired
 		rpt2.emit("claudeoauth.post_relocate")
 	}
+	applyAnthropicCacheBreakpoints(payload)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1224,6 +1226,7 @@ func (p *ClaudeOAuthProvider) Stream(ctx context.Context, req *CompletionRequest
 		payload.Messages = repaired
 		rpt2.emit("claudeoauth.stream.post_relocate")
 	}
+	applyAnthropicCacheBreakpoints(payload)
 
 	body, err := json.Marshal(payload)
 	if err != nil {
