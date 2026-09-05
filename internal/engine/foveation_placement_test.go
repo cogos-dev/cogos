@@ -385,3 +385,99 @@ func TestLightConeManagerKeepsFresh(t *testing.T) {
 		t.Error("fresh cone should still be retrievable")
 	}
 }
+
+// ── Foveal block is once-per-turn, never per-step ─────────────────────────────
+//
+// Observed in a real external-client session (dsh, 62 steps): every tool step
+// re-injected the foveal block as a fresh user-role message, which the model
+// read as an unattributed directive ("Context refresh, not a directive —
+// continuing", 52 times) and which moved the block every step, defeating the
+// prefix cache (3.8M input tokens, 0% hit, two operator turns).
+
+// Mid-agentic-turn on the OpenAI path: last client message is role:tool.
+// CurrentMessage is nil. The old code synthesised a standalone user message
+// holding only the foveal block. Now: nothing is injected.
+func TestFovealBlockNotSynthesisedMidTurn_ToolRole(t *testing.T) {
+	t.Parallel()
+	pkg := &ContextPackage{
+		NucleusText: "I am Cog.",
+		FovealDocs:  manifestDocs(0.91, 0.42),
+		Conversation: []ScoredMessage{
+			{Role: "user", Content: "list the files"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "bash", Arguments: `{"command":"ls"}`}}},
+			{Role: "tool", ToolCallID: "c1", Content: "a.go\nb.go"},
+		},
+		CurrentMessage: nil, // last message is role:tool
+	}
+	_, msgs := pkg.FormatForProvider()
+	for i, m := range msgs {
+		if strings.Contains(m.Content, "# Workspace Context") {
+			t.Fatalf("msg[%d] role=%q carries the foveal block mid-turn; must not: %q", i, m.Role, m.Content[:80])
+		}
+	}
+	if last := msgs[len(msgs)-1]; last.Role != "tool" {
+		t.Fatalf("no user message may be synthesised; last role = %q", last.Role)
+	}
+}
+
+// Mid-agentic-turn where the tool result rides under role:user (Anthropic
+// shape, via ContentParts or ToolCallID). It is user-role but NOT the operator.
+func TestFovealBlockNotFoldedIntoToolResult_UserRole(t *testing.T) {
+	t.Parallel()
+	for name, cur := range map[string]*ProviderMessage{
+		"tool_call_id": {Role: "user", ToolCallID: "c1", Content: "a.go\nb.go"},
+		"content_part": {Role: "user", Content: "a.go", ContentParts: []ContentPart{{Type: "tool_result", Text: "a.go"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pkg := &ContextPackage{NucleusText: "I am Cog.", FovealDocs: manifestDocs(0.91, 0.42), CurrentMessage: cur}
+			_, msgs := pkg.FormatForProvider()
+			last := msgs[len(msgs)-1]
+			if strings.Contains(last.Content, "# Workspace Context") {
+				t.Fatalf("foveal block folded into a tool result: %q", last.Content[:80])
+			}
+			if last.Content != cur.Content {
+				t.Fatalf("tool result content altered: %q", last.Content)
+			}
+		})
+	}
+}
+
+// A genuine operator turn still gets the block — exactly once — so this
+// change narrows injection without removing it.
+func TestFovealBlockExactlyOnceAcrossAgenticTurn(t *testing.T) {
+	t.Parallel()
+	docs := manifestDocs(0.91, 0.42)
+	count := func(msgs []ProviderMessage) int {
+		n := 0
+		for _, m := range msgs {
+			n += strings.Count(m.Content, "# Workspace Context")
+		}
+		return n
+	}
+	// step 0: operator speaks
+	s0 := &ContextPackage{NucleusText: "I am Cog.", FovealDocs: docs,
+		CurrentMessage: &ProviderMessage{Role: "user", Content: "list the files"}}
+	_, m0 := s0.FormatForProvider()
+	// step 1: model called a tool, result came back (role:tool), model to continue
+	s1 := &ContextPackage{NucleusText: "I am Cog.", FovealDocs: docs,
+		Conversation: []ScoredMessage{
+			{Role: "user", Content: "list the files"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "bash"}}},
+			{Role: "tool", ToolCallID: "c1", Content: "a.go"},
+		}}
+	_, m1 := s1.FormatForProvider()
+	// step 2: another tool round
+	s2 := &ContextPackage{NucleusText: "I am Cog.", FovealDocs: docs,
+		Conversation: append(s1.Conversation,
+			ScoredMessage{Role: "assistant", ToolCalls: []ToolCall{{ID: "c2", Name: "bash"}}},
+			ScoredMessage{Role: "tool", ToolCallID: "c2", Content: "b.go"},
+		)}
+	_, m2 := s2.FormatForProvider()
+
+	if got := count(m0); got != 1 {
+		t.Fatalf("operator turn: foveal block count = %d; want exactly 1", got)
+	}
+	if got := count(m1) + count(m2); got != 0 {
+		t.Fatalf("tool steps re-injected the foveal block %d times; want 0", got)
+	}
+}

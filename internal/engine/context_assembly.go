@@ -598,19 +598,31 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 			ToolCalls:    sm.ToolCalls,
 		})
 	}
-	if pkg.CurrentMessage != nil {
+	if pkg.CurrentMessage != nil && isOperatorTurn(pkg.CurrentMessage) {
+		// Genuine operator message: fold the foveal block in once, here.
 		cur := *pkg.CurrentMessage
 		if foveal != "" {
 			foldTrailingFoveal(&cur, foveal)
 		}
 		msgs = append(msgs, cur)
-	} else if foveal != "" {
-		// No current user message (last client message wasn't a user turn). Rather
-		// than resurrect the leading-system placement, attach the foveal block to a
-		// standalone trailing user message so it still renders after the stable
-		// prefix and the sequence ends on a user turn (I7-safe).
-		msgs = append(msgs, ProviderMessage{Role: "user", Content: foveal})
+	} else if pkg.CurrentMessage != nil {
+		// Last message is user-role but carries tool results, not operator
+		// speech. Forward it untouched — the turn's foveal block already
+		// landed on the operator message that opened this turn.
+		msgs = append(msgs, *pkg.CurrentMessage)
 	}
+	// No operator message to fold into (mid-agentic-turn: the last client
+	// message is a tool result or an assistant turn). Inject NOTHING.
+	//
+	// The previous behaviour synthesised a standalone role:user message
+	// holding only the foveal block. Observed in a real external-client
+	// session (dsh, 62 steps): every tool step produced a fresh user-role
+	// wall of CogDocs, which the model read as an unattributed directive and
+	// answered "Context refresh, not a directive — continuing" 52 times. It
+	// also moved the block's position every step, defeating the prefix
+	// cache the trailing placement exists to protect (3.8M input tokens,
+	// 0% cache hit, for two operator turns). The foveal block is a
+	// once-per-turn hormone, not a per-step signal.
 
 	// Tool-pairing repair is now handled by the wire-layer normalizer
 	// (normalizeAnthropicMessages) inside buildAnthropicRequest, which operates
@@ -657,6 +669,25 @@ func (pkg *ContextPackage) renderTrailingFovealBlock() string {
 	}
 
 	return sb.String()
+}
+
+// isOperatorTurn reports whether a user-role message is the operator speaking,
+// as opposed to a tool result the wire format happens to carry under
+// role:"user" (Anthropic tool_result) or role:"tool" (OpenAI). Only operator
+// turns receive the trailing foveal block; tool traffic never does.
+func isOperatorTurn(m *ProviderMessage) bool {
+	if m == nil || m.Role != "user" {
+		return false
+	}
+	if m.ToolCallID != "" {
+		return false
+	}
+	for _, p := range m.ContentParts {
+		if p.Type == "tool_result" {
+			return false
+		}
+	}
+	return true
 }
 
 // foldTrailingFoveal appends the foveal block to the final user message AFTER the
