@@ -1006,3 +1006,95 @@ func TestClaudeOAuthProviderUsesReadOnlyRefresh(t *testing.T) {
 // is not flagged dead) while making explicit in the test that it is the path the
 // claude_code source must NEVER use.
 var claudeOAuthRefreshSentinel RefreshFunc = claudeOAuthRefresh
+
+// TestClaudeOAuthComplete_CacheBreakpointsOnWire (cache PR review round 3):
+// exercise the OAuth path with a non-empty SystemPrompt (which triggers
+// prependOAuthSystemToUserTurn + the second normalize pass) and an agentic
+// history of >=3 messages, then assert cache_control placement on the
+// ACTUAL wire body — not on an intermediate struct. This is the path most
+// likely to regress silently if the normalizer's pass order or the prepend
+// logic changes.
+func TestClaudeOAuthComplete_CacheBreakpointsOnWire(t *testing.T) {
+	t.Parallel()
+	var wire map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(anthropicResponseBody("ok"))
+	}))
+	defer srv.Close()
+
+	p := newTestOAuthProvider(t, srv.URL, freshCred())
+	_, err := p.Complete(context.Background(), &CompletionRequest{
+		SystemPrompt: "nucleus identity card",
+		Messages: []ProviderMessage{
+			{Role: "user", Content: "list files"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "ls", Arguments: `{"dir":"/a"}`}}},
+			{Role: "tool", ToolCallID: "c1", Content: "x.go"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "c2", Name: "ls", Arguments: `{"dir":"/b"}`}}},
+			{Role: "tool", ToolCallID: "c2", Content: "y.go"},
+		},
+		Tools: []ToolDefinition{{Name: "ls", Description: "list", InputSchema: map[string]any{"type": "object"}}},
+	})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if wire == nil {
+		t.Fatal("no request reached the wire")
+	}
+	isMarked := func(blk any) bool {
+		m, _ := blk.(map[string]any)
+		cc, _ := m["cache_control"].(map[string]any)
+		return cc != nil && cc["type"] == "ephemeral"
+	}
+	lastOf := func(arr []any) any { return arr[len(arr)-1] }
+
+	// 1. system: last block marked, first (canonical prefix) untouched.
+	sys, _ := wire["system"].([]any)
+	if len(sys) == 0 || !isMarked(lastOf(sys)) {
+		t.Fatalf("system: last block must carry cache_control; got %v", sys)
+	}
+	if first, _ := sys[0].(map[string]any); first["text"] != claudeCodeSystemPrefix {
+		t.Fatal("system block[0] must still be the canonical Claude Code prefix")
+	}
+	// 2. tools: last def marked.
+	tools, _ := wire["tools"].([]any)
+	if len(tools) == 0 || !isMarked(lastOf(tools)) {
+		t.Fatal("tools: last definition must carry cache_control")
+	}
+	// 3. history: second-to-last message's last block marked; final message cold.
+	msgs, _ := wire["messages"].([]any)
+	if len(msgs) < 3 {
+		t.Fatalf("expected >=3 messages on the wire after relocate+merge; got %d", len(msgs))
+	}
+	blocksOf := func(m any) []any {
+		mm, _ := m.(map[string]any)
+		switch c := mm["content"].(type) {
+		case []any:
+			return c
+		case string:
+			return []any{map[string]any{"type": "text", "text": c}}
+		}
+		return nil
+	}
+	pen := blocksOf(msgs[len(msgs)-2])
+	if len(pen) == 0 || !isMarked(lastOf(pen)) {
+		t.Fatalf("second-to-last message must carry the history breakpoint; got %v", msgs[len(msgs)-2])
+	}
+	for _, b := range blocksOf(lastOf(msgs)) {
+		if isMarked(b) {
+			t.Fatalf("final message must be the cold region (no cache_control); got %v", lastOf(msgs))
+		}
+	}
+	// relocated system content landed in the first user turn (not lost).
+	if first := blocksOf(msgs[0]); len(first) == 0 || !strings.Contains(fmt.Sprint(first), "nucleus identity card") {
+		t.Fatal("relocated system content must reach the first user turn")
+	}
+	// exactly 3 markers on the whole body.
+	raw, _ := json.Marshal(wire)
+	if n := strings.Count(string(raw), `"cache_control":{"type":"ephemeral"}`); n != 3 {
+		t.Fatalf("breakpoints on wire = %d; want exactly 3", n)
+	}
+}

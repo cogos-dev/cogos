@@ -575,9 +575,10 @@ func (pkg *ContextPackage) FormatForProvider() (string, []ProviderMessage) {
 
 	// TODO(ADR-103): deferred cache-retool tiers — hysteresis / session-stable
 	// doc re-render, contiguous-oldest history eviction (keep the evictable region
-	// a suffix so it doesn't fracture the prefix), tiered content loading, and
-	// cache_control breakpoints for the Anthropic path. This change lands only the
-	// leading→trailing placement + salience strip (the load-bearing prefill fix).
+	// a suffix so it doesn't fracture the prefix), and tiered content loading.
+	// DONE: cache_control breakpoints for the Anthropic path
+	// (anthropic_cache.go, applied in buildAnthropicRequest). The July change
+	// landed the leading→trailing placement + salience strip.
 
 	// === Trailing foveal block (the VOLATILE half of Zone 1 + Zone 3 speculative) ===
 	// Built separately so it can be folded into the final user message instead of

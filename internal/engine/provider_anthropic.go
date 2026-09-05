@@ -170,17 +170,18 @@ type anthropicMessage struct {
 
 // anthropicContentBlock is a structured content block for tool_use, tool_result, and image.
 type anthropicContentBlock struct {
-	Type      string                `json:"type"`                  // "text", "tool_use", "tool_result", "image"
-	Text      string                `json:"text,omitempty"`        // type == "text"
-	ID        string                `json:"id,omitempty"`          // type == "tool_use"
-	ToolUseID string                `json:"tool_use_id,omitempty"` // type == "tool_result"
-	Name      string                `json:"name,omitempty"`        // type == "tool_use"
-	Input     json.RawMessage       `json:"input,omitempty"`       // type == "tool_use"
-	Content   string                `json:"content,omitempty"`     // type == "tool_result"
-	Source    *anthropicImageSource `json:"source,omitempty"`      // type == "image"
+	Type         string                 `json:"type"`                  // "text", "tool_use", "tool_result", "image"
+	Text         string                 `json:"text,omitempty"`        // type == "text"
+	ID           string                 `json:"id,omitempty"`          // type == "tool_use"
+	ToolUseID    string                 `json:"tool_use_id,omitempty"` // type == "tool_result"
+	Name         string                 `json:"name,omitempty"`        // type == "tool_use"
+	Input        json.RawMessage        `json:"input,omitempty"`       // type == "tool_use"
+	Content      string                 `json:"content,omitempty"`     // type == "tool_result"
+	Source       *anthropicImageSource  `json:"source,omitempty"`      // type == "image"
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 	// Thinking block fields (type == "thinking" or "redacted_thinking").
-	Thinking  string `json:"thinking,omitempty"`   // type == "thinking"
-	Signature string `json:"signature,omitempty"`  // type == "thinking" signed block (may be present on redacted_thinking too)
+	Thinking  string `json:"thinking,omitempty"`  // type == "thinking"
+	Signature string `json:"signature,omitempty"` // type == "thinking" signed block (may be present on redacted_thinking too)
 }
 
 // anthropicImageSource is the base64 image payload for Anthropic vision requests.
@@ -191,9 +192,10 @@ type anthropicImageSource struct {
 }
 
 type anthropicTool struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	InputSchema map[string]interface{} `json:"input_schema"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  map[string]interface{} `json:"input_schema"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 // anthropicToolChoice maps ToolChoice strings to Anthropic's object form.
@@ -358,7 +360,7 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 	if len(req.Tools) > 0 {
 		ar.Tools = make([]anthropicTool, len(req.Tools))
 		for i, t := range req.Tools {
-			ar.Tools[i] = anthropicTool(t)
+			ar.Tools[i] = anthropicTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema}
 		}
 	}
 
@@ -374,6 +376,13 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 	repaired, rpt := normalizeAnthropicMessages(ar.Messages)
 	ar.Messages = repaired
 	rpt.emit("buildAnthropicRequest")
+
+	// Prompt-cache breakpoints on the final block structure. This is the
+	// shared exit for BOTH Anthropic-wire providers (API-key AnthropicProvider
+	// and ClaudeOAuthProvider), so neither can ship without them. The OAuth
+	// path re-applies after its late mutators (system relocation, tool-name
+	// rewrite, second normalize); the call is idempotent.
+	applyAnthropicCacheBreakpoints(ar)
 
 	return ar
 }
@@ -621,7 +630,7 @@ func (p *AnthropicProvider) Stream(ctx context.Context, req *CompletionRequest) 
 // Tool calls are emitted as ToolCallDelta chunks as they arrive, so the kernel
 // can reconstruct complete ToolCall objects from the delta stream.
 func parseAnthropicSSE(ctx context.Context, r io.Reader, ch chan<- StreamChunk, model, providerName string) {
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cacheRead, cacheWrite int
 	var stopReason string
 
 	send := func(sc StreamChunk) bool {
@@ -657,6 +666,8 @@ func parseAnthropicSSE(ctx context.Context, r io.Reader, ch chan<- StreamChunk, 
 		case "message_start":
 			if event.Message != nil {
 				inputTokens = event.Message.Usage.InputTokens
+				cacheRead = event.Message.Usage.CacheReadInputTokens
+				cacheWrite = event.Message.Usage.CacheCreationInputTokens
 			}
 
 		case "content_block_start":
@@ -715,8 +726,10 @@ func parseAnthropicSSE(ctx context.Context, r io.Reader, ch chan<- StreamChunk, 
 				Done:       true,
 				StopReason: stopReason,
 				Usage: &TokenUsage{
-					InputTokens:  inputTokens,
-					OutputTokens: outputTokens,
+					InputTokens:      inputTokens,
+					OutputTokens:     outputTokens,
+					CacheReadTokens:  cacheRead,
+					CacheWriteTokens: cacheWrite,
 				},
 				ProviderMeta: &ProviderMeta{
 					Provider: providerName,
