@@ -14,6 +14,9 @@ type StubProvider struct {
 	name         string
 	model        string // reported by Model(); empty by default
 	response     string
+	// usage, when set, is reported on Complete() and on the final Stream chunk
+	// so tests can prove the kernel forwards provider accounting (incl. cache).
+	usage *TokenUsage
 	err          error
 	latency      time.Duration
 	available    bool
@@ -69,7 +72,7 @@ func (s *StubProvider) Complete(_ context.Context, req *CompletionRequest) (*Com
 	if len(s.toolCalls) > 0 {
 		stop = "tool_use"
 	}
-	return &CompletionResponse{
+	resp := &CompletionResponse{
 		Content:    s.response,
 		ToolCalls:  s.toolCalls,
 		StopReason: stop,
@@ -77,8 +80,15 @@ func (s *StubProvider) Complete(_ context.Context, req *CompletionRequest) (*Com
 			Provider: s.name,
 			Model:    "stub",
 		},
-	}, nil
+	}
+	if s.usage != nil {
+		resp.Usage = *s.usage
+	}
+	return resp, nil
 }
+
+// WithUsage makes the stub report the given accounting on both paths.
+func (s *StubProvider) WithUsage(u TokenUsage) *StubProvider { s.usage = &u; return s }
 
 func (s *StubProvider) Stream(_ context.Context, req *CompletionRequest) (<-chan StreamChunk, error) {
 	s.lastRequest = req
@@ -118,6 +128,7 @@ func (s *StubProvider) Stream(_ context.Context, req *CompletionRequest) (<-chan
 	ch <- StreamChunk{
 		Done:         true,
 		StopReason:   stop,
+		Usage:        s.usage,
 		ProviderMeta: &ProviderMeta{Provider: s.name, Model: "stub"},
 	}
 	close(ch)

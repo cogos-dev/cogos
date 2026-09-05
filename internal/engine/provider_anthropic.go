@@ -377,6 +377,13 @@ func buildAnthropicRequest(model string, req *CompletionRequest, stream bool, ma
 	ar.Messages = repaired
 	rpt.emit("buildAnthropicRequest")
 
+	// Prompt-cache breakpoints on the final block structure. This is the
+	// shared exit for BOTH Anthropic-wire providers (API-key AnthropicProvider
+	// and ClaudeOAuthProvider), so neither can ship without them. The OAuth
+	// path re-applies after its late mutators (system relocation, tool-name
+	// rewrite, second normalize); the call is idempotent.
+	applyAnthropicCacheBreakpoints(ar)
+
 	return ar
 }
 

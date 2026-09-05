@@ -1,7 +1,10 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -136,4 +139,124 @@ func TestCacheBreakpoints_PrefixStableAcrossAgenticSteps(t *testing.T) {
 	if len(stepN1.Messages)-1 <= len(stepN.Messages)-1 {
 		t.Fatal("step N+1's breakpoint must advance past step N's")
 	}
+}
+
+// ── Review round 2: twin surface + usage forwarding ───────────────────────────
+
+// Finding 1: the API-key AnthropicProvider shares buildAnthropicRequest with
+// the OAuth path. Breakpoints must ship from that shared exit, not just the
+// OAuth call sites.
+func TestCacheBreakpoints_ApiKeyPathShipsBreakpoints(t *testing.T) {
+	t.Parallel()
+	req := &CompletionRequest{
+		SystemPrompt: "nucleus",
+		Messages: []ProviderMessage{
+			{Role: "user", Content: "list files"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "ls", Arguments: `{}`}}},
+			{Role: "tool", ToolCallID: "c1", Content: "x.go"},
+		},
+		Tools: []ToolDefinition{{Name: "ls", Description: "list", InputSchema: map[string]any{"type": "object"}}},
+	}
+	payload := buildAnthropicRequest("claude-sonnet-4-6", req, false, 100)
+	b, _ := json.Marshal(payload)
+	if n := strings.Count(string(b), `"cache_control":{"type":"ephemeral"}`); n < 2 {
+		t.Fatalf("API-key path (buildAnthropicRequest) shipped %d breakpoints; want >=2 (tools + history)", n)
+	}
+	if payload.Tools[len(payload.Tools)-1].CacheControl == nil {
+		t.Fatal("last tool def must carry cache_control on the API-key path")
+	}
+}
+
+// Finding 2a: the SSE parser must capture cache accounting from message_start.
+func TestParseAnthropicSSE_CapturesCacheUsage(t *testing.T) {
+	t.Parallel()
+	sse := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"m","role":"assistant","content":[],"model":"x","usage":{"input_tokens":17,"output_tokens":0,"cache_read_input_tokens":1637,"cache_creation_input_tokens":72}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	ch := make(chan StreamChunk, 16)
+	go func() { // mirrors the provider: caller owns close()
+		defer close(ch)
+		parseAnthropicSSE(context.Background(), strings.NewReader(sse), ch, "x", "anthropic")
+	}()
+	var final *StreamChunk
+	for c := range ch {
+		if c.Done {
+			cc := c
+			final = &cc
+		}
+	}
+	if final == nil || final.Usage == nil {
+		t.Fatal("final chunk must carry Usage")
+	}
+	if final.Usage.CacheReadTokens != 1637 || final.Usage.CacheWriteTokens != 72 {
+		t.Fatalf("cache accounting dropped: read=%d write=%d; want 1637/72", final.Usage.CacheReadTokens, final.Usage.CacheWriteTokens)
+	}
+}
+
+// Finding 2b: /v1/messages must forward cache accounting to the client —
+// non-streaming response body and streaming message_delta.usage.
+func TestHandleAnthropicMessages_ForwardsCacheUsage(t *testing.T) {
+	t.Parallel()
+	mk := func() *Server {
+		srv := newTestServer(t)
+		router := NewSimpleRouter(RoutingConfig{Default: "stub"})
+		router.RegisterProvider(NewStubProvider("stub", "ok").WithUsage(TokenUsage{InputTokens: 17, OutputTokens: 1, CacheReadTokens: 1637, CacheWriteTokens: 72}))
+		srv.SetRouter(router)
+		return srv
+	}
+	t.Run("non-stream", func(t *testing.T) {
+		srv := mk()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"stream":false}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.handleAnthropicMessages(w, req)
+		var resp struct {
+			Usage map[string]int `json:"usage"`
+		}
+		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Usage["cache_read_input_tokens"] != 1637 || resp.Usage["cache_creation_input_tokens"] != 72 {
+			t.Fatalf("non-stream usage did not forward cache fields: %v", resp.Usage)
+		}
+	})
+	t.Run("stream", func(t *testing.T) {
+		srv := mk()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"stream":true}`))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.handleAnthropicMessages(w, req)
+		var delta map[string]any
+		for _, block := range strings.Split(w.Body.String(), "\n\n") {
+			if !strings.Contains(block, "event: message_delta") {
+				continue
+			}
+			for _, line := range strings.Split(block, "\n") {
+				if strings.HasPrefix(line, "data: ") {
+					_ = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &delta)
+				}
+			}
+		}
+		u, _ := delta["usage"].(map[string]any)
+		if u == nil || u["cache_read_input_tokens"] != float64(1637) {
+			t.Fatalf("stream message_delta.usage did not forward cache_read: %v", delta)
+		}
+	})
 }
