@@ -214,3 +214,63 @@ func a0ToolNames(defs []ToolDefinition) []string {
 // a0Unused keeps encoding/json imported if future assertions need it without
 // churn; referenced here so the compiler is satisfied.
 var _ = json.Marshal
+
+// TestA0RefusedClientTool_ThenKernelInjection_StillExecutes — review finding
+// on #606. A client on a kernel-tools model ("kernel-agent") names a kernel
+// tool in its request. The definition is refused as client-supplied; that
+// leaves creq.Tools empty, so injectKernelAgentTools legitimately offers the
+// kernel's OWN definition of the same tool. The refusal set must not outlive
+// the intake it belongs to: the model calls the injected tool, and the kernel
+// must EXECUTE it (a second provider call carrying the tool_result), not drop
+// the call as "refused". Negative control: on the pre-fix code the refusal
+// set persists, the call is dropped, and the provider is called once.
+func TestA0RefusedClientTool_ThenKernelInjection_StillExecutes(t *testing.T) {
+	t.Parallel()
+
+	srv := newTestServer(t)
+	if srv.mcpServer == nil || !srv.mcpServer.IsInternalTool(a0KernelToolName) {
+		t.Fatalf("test server lacks an mcpServer registering %q", a0KernelToolName)
+	}
+	prov := a0ScriptedProvider()
+	router := NewSimpleRouter(RoutingConfig{Default: "a0"})
+	router.RegisterProvider(prov)
+	srv.SetRouter(router)
+
+	body := `{"model":"kernel-agent","stream":false,` +
+		`"messages":[{"role":"user","content":"go"}],` +
+		`"tools":[{"type":"function","function":{"name":"` + a0KernelToolName + `",` +
+		`"description":"client-supplied impostor",` +
+		`"parameters":{"type":"object","properties":{"uri":{"type":"string"}}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.handleChat(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	// The kernel's own definition must have reached the provider (injection ran).
+	offered := false
+	for _, td := range prov.requests[0].Tools {
+		if td.Name == a0KernelToolName {
+			offered = true
+		}
+	}
+	if !offered {
+		t.Fatalf("kernel injection did not offer %q on a kernel-tools model; request[0].Tools=%d", a0KernelToolName, len(prov.requests[0].Tools))
+	}
+	// And the call the model made against it must have been EXECUTED:
+	// a second provider call carrying the tool_result for a0_call.
+	if len(prov.requests) < 2 {
+		t.Fatalf("provider called %d time(s); want ≥2. The kernel-injected tool call was dropped as refused", len(prov.requests))
+	}
+	found := false
+	for _, m := range prov.requests[1].Messages {
+		if m.Role == "tool" && m.ToolCallID == "a0_call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("request[1] carries no tool_result for a0_call; the injected tool was not executed")
+	}
+}

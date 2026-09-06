@@ -1094,6 +1094,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Eventually this aliases the kernel-managed in-host harness;
 		// see .cog/scratch/audit-inference-paths/REPORT.md.
 		if mres.InjectKernelTools && len(creq.Tools) == 0 && s.mcpServer != nil {
+			// RefusedToolNames records CLIENT-supplied definitions we declined
+			// to honour. Kernel injection is a different authority: it offers
+			// the kernel's own tools on the kernel's terms. Clear the refusal
+			// set before injecting, or a name refused as client-supplied
+			// (e.g. cog_read_cogdoc) stays refused after the kernel itself
+			// legitimately offers it — the model sees the tool, calls it,
+			// and the ownership split drops the call. (Review on #606.)
+			creq.RefusedToolNames = nil
 			injectKernelAgentTools(creq, s.mcpServer)
 			// G2 PART C: when IdentityNakedDefault is true and the request is
 			// bound to an identity with a wired capResolver, filter the injected
