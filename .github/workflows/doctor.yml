@@ -1,0 +1,109 @@
+name: doctor
+
+# Visibility, not enforcement.
+#
+# `cogos doctor --lint --severity-min <X>` was built as a CI gate (#573) and
+# has never been invoked by any workflow — a purpose-built gate wired into
+# nothing. This job closes that, but deliberately stops short of gating.
+#
+# Measured on a fresh `cogos init` workspace (2026-09-06, origin/main built
+# with -tags fts5): 7 OK / 7 WARN / 0 FAIL / 5 UNKNOWN.
+#   - `--severity-min warn` exits 1 on a clean tree, so gating at warn today
+#     would red-light every PR.
+#   - `--severity-min fail` exits 0. FAIL is genuinely empty on a healthy
+#     scaffold, which makes it the honest gate threshold.
+#
+# The 5 UNKNOWNs are structural, not defects: a freshly-scaffolded workspace
+# has no constellation.db until something indexes it, so the index/store
+# checks correctly report "could not check" rather than OK. That is doctor's
+# own contract ("UNKNOWN never reported as OK") behaving properly, and it is
+# why this job must not treat UNKNOWN as failure.
+#
+# Several WARNs measured locally were HOST-derived (binary sprawl from a dev
+# ~/.cog/bin, path references from a dev ~/.claude/settings.json). A clean
+# runner should report fewer. That difference is itself worth watching, which
+# is the point of running this on every PR before deciding any threshold.
+#
+# Promotion path: watch the summary across PRs; once the clean-runner WARN set
+# is understood and driven to zero, flip `continue-on-error` off and raise
+# --severity-min to warn.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  doctor:
+    name: doctor (advisory)
+    runs-on: ubuntu-latest
+    # Advisory: this job reports, it never blocks a merge.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # -tags fts5 matters: a bare `go build` links go-sqlite3 WITHOUT FTS5,
+      # and doctor's index/store checks would then measure a degraded binary
+      # rather than the one release ships. Same tag the Makefile and
+      # release.yml use.
+      - name: Build cogos (with fts5)
+        run: go build -tags fts5 -o /tmp/cogos ./cmd/cogos
+
+      - name: Scaffold a fresh workspace
+        run: |
+          mkdir -p /tmp/ws
+          /tmp/cogos init --workspace /tmp/ws
+
+      # Advisory posture: exit 0 unless a check reports FAIL. Captured to a
+      # file so the same run feeds both the log and the job summary.
+      - name: Run doctor
+        id: doctor
+        working-directory: /tmp/ws
+        run: |
+          set +e
+          /tmp/cogos doctor | tee /tmp/doctor.txt
+          echo "advisory_exit=$?" >> "$GITHUB_OUTPUT"
+
+      # The gate posture is exercised but NOT enforced, so we learn what it
+      # would have done long before anyone depends on it.
+      - name: Lint posture (reported, not enforced)
+        working-directory: /tmp/ws
+        run: |
+          set +e
+          /tmp/cogos doctor --lint --severity-min warn >/dev/null 2>&1
+          echo "would-fail-at-warn: exit $?"
+          /tmp/cogos doctor --lint --severity-min fail >/dev/null 2>&1
+          echo "would-fail-at-fail: exit $?"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## cogos doctor — advisory"
+            echo
+            echo "| verdict | count |"
+            echo "|---|---|"
+            for v in OK WARN FAIL UNKNOWN; do
+              n=$(grep -cE "^[[:space:]]*\[$v\]" /tmp/doctor.txt || true)
+              echo "| $v | ${n:-0} |"
+            done
+            echo
+            echo "Advisory exit: \`${{ steps.doctor.outputs.advisory_exit }}\` (0 unless a check FAILs)"
+            echo
+            echo "<details><summary>Non-OK findings</summary>"
+            echo
+            echo '```'
+            grep -E "^[[:space:]]*\[(WARN|FAIL|UNKNOWN)\]" /tmp/doctor.txt || echo "(none)"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
