@@ -189,6 +189,35 @@ for tool in cog_get_state cog_search_memory cog_search_conversations cog_list_se
     fi
 done
 
+# Registration is not function. Before the fts5 sweep, every non-Makefile
+# build shipped without the tag: cog_search_memory was REGISTERED and
+# returned 0 rows for any multi-word query, because searchMemoryFTS failed
+# with "no such module: fts5" and SearchMemory silently fell back to an
+# unranked substring grep. tools/list could not see that. So call it.
+SEARCH_OUT=$(mcp_post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cog_search_memory","arguments":{"query":"cog kernel memory","limit":5}}}')
+if echo "$SEARCH_OUT" | grep -q '"error"'; then
+    echo "  FAIL  cog_search_memory call returned an error: $(echo "$SEARCH_OUT" | head -c 200)"
+    fail=$((fail + 1))
+else
+    echo "  PASS  cog_search_memory call succeeded"
+    pass=$((pass + 1))
+fi
+
+# The fts5 verdict from the running binary itself. A stub/tagless build
+# reports fts5=false here even though the daemon is otherwise healthy.
+HEALTH_OUT=$(curl -s -m 10 "http://localhost:$PORT/health" 2>/dev/null || true)
+if echo "$HEALTH_OUT" | grep -q '"build_tags"'; then
+    if echo "$HEALTH_OUT" | grep -qE '"fts5"[[:space:]]*:[[:space:]]*true'; then
+        echo "  PASS  /health build_tags.fts5 = true"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  /health build_tags.fts5 is not true — this binary's search is degraded"
+        fail=$((fail + 1))
+    fi
+else
+    echo "  SKIP  /health has no build_tags (kernel predates ledger L01)"
+fi
+
 CALL_OUT=$(mcp_post '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cog_get_state","arguments":{}}}')
 if echo "$CALL_OUT" | grep -q '"result"' && ! echo "$CALL_OUT" | grep -q '"isError":true'; then
     echo "  PASS  tools/call cog_get_state"
