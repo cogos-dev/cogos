@@ -427,7 +427,7 @@ func TestUIArtifacts_ShellIsInheritedAndOptOutable(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), uiShellTag) {
+	if !strings.Contains(rec.Body.String(), uiShellMarker) {
 		t.Error("plain artifact did not inherit the shell")
 	}
 	if !strings.Contains(rec.Body.String(), "hi") {
@@ -438,14 +438,14 @@ func TestUIArtifacts_ShellIsInheritedAndOptOutable(t *testing.T) {
 	writeArtifact(t, ws, "bare", "index.html",
 		`<html><head><meta name="cog-shell" content="off"></head><body>x</body></html>`)
 	rec = get(t, s.handleUIArtifacts, "/ui/bare/")
-	if strings.Contains(rec.Body.String(), uiShellTag) {
+	if strings.Contains(rec.Body.String(), uiShellMarker) {
 		t.Error("opt-out page was injected anyway")
 	}
 
 	// A fragment with no </head> still gets chrome rather than silently missing it.
 	writeArtifact(t, ws, "frag", "index.html", `<body>fragment</body>`)
 	rec = get(t, s.handleUIArtifacts, "/ui/frag/")
-	if !strings.Contains(rec.Body.String(), uiShellTag) {
+	if !strings.Contains(rec.Body.String(), uiShellMarker) {
 		t.Error("head-less fragment did not inherit the shell")
 	}
 
@@ -455,7 +455,7 @@ func TestUIArtifacts_ShellIsInheritedAndOptOutable(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("shell asset status = %d, want 200", rec.Code)
 	}
-	if strings.Contains(rec.Body.String(), uiShellTag) {
+	if strings.Contains(rec.Body.String(), uiShellMarker) {
 		t.Error("shell asset was injected into itself")
 	}
 
@@ -470,5 +470,53 @@ func TestUIArtifacts_ShellIsInheritedAndOptOutable(t *testing.T) {
 	rec = get(t, s.handleUIArtifactIndex, "/v1/ui/artifacts")
 	if strings.Contains(rec.Body.String(), uiShellDirName) {
 		t.Error("_shell leaked into the artifact listing")
+	}
+}
+
+// The shell carries the mobile contract: a page must be usable on a phone
+// without its author having remembered anything. Without a viewport meta a
+// phone renders at desktop width and zooms out -- the difference between
+// "reachable from my phone" and "usable on my phone".
+func TestUIArtifacts_ShellCarriesMobileContract(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+
+	writeArtifact(t, ws, "p", "index.html", `<html><head><title>p</title></head><body>x</body></html>`)
+	body := get(t, s.handleUIArtifacts, "/ui/p/").Body.String()
+	for _, want := range []string{
+		`name="viewport"`, `width=device-width`, `viewport-fit=cover`,
+		`rel="manifest"`, `name="theme-color"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("injected page missing %s", want)
+		}
+	}
+
+	// An author who set their own viewport keeps it -- exactly one survives.
+	writeArtifact(t, ws, "own", "index.html",
+		`<html><head><meta name="viewport" content="width=500"></head><body>x</body></html>`)
+	body = get(t, s.handleUIArtifacts, "/ui/own/").Body.String()
+	if n := strings.Count(body, `name="viewport"`); n != 1 {
+		t.Errorf("viewport count = %d, want 1 (author's own preserved)", n)
+	}
+	if !strings.Contains(body, `content="width=500"`) {
+		t.Error("author's viewport was overridden")
+	}
+	if !strings.Contains(body, uiShellMarker) {
+		t.Error("page with own viewport still needs the shell script")
+	}
+}
+
+// A .webmanifest must be served as application/manifest+json. Go's mime table
+// has no entry for it, so it silently falls through to text/plain and the
+// browser refuses to install the app without saying why.
+func TestUIArtifacts_WebmanifestContentType(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+	writeArtifact(t, ws, uiShellDirName, "manifest.webmanifest", `{"name":"cog"}`)
+	rec := get(t, s.handleUIArtifacts, "/ui/_shell/manifest.webmanifest")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/manifest+json") {
+		t.Errorf("Content-Type = %q, want application/manifest+json", ct)
 	}
 }

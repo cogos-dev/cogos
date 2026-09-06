@@ -66,8 +66,21 @@ const uiShellDirName = "_shell"
 // author should get the chrome for free, and opting OUT should be the
 // deliberate act.
 //
+// The viewport and manifest tags ride along for the same reason. Without a
+// viewport meta a phone renders the page at desktop width and zooms out,
+// which is the difference between "reachable from my phone" and "usable on
+// my phone" -- and no page author should have to remember it.
+//
 // A page opts out with <meta name="cog-shell" content="off">.
-const uiShellTag = `<script src="/ui/_shell/shell.js" defer></script>`
+const uiShellTag = `<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">` +
+	`<meta name="theme-color" content="#010409">` +
+	`<meta name="mobile-web-app-capable" content="yes">` +
+	`<link rel="manifest" href="/ui/_shell/manifest.webmanifest">` +
+	`<script src="/ui/_shell/shell.js" defer></script>`
+
+// uiShellMarker identifies an already-injected page. The full tag is too
+// long and too likely to be reformatted to test for directly.
+const uiShellMarker = `/ui/_shell/shell.js`
 
 // uiShellOptOut marks a page that does not want the shared chrome.
 const uiShellOptOut = `name="cog-shell" content="off"`
@@ -80,19 +93,26 @@ const uiShellOptOut = `name="cog-shell" content="off"`
 // than silently missing it.
 func injectShell(html []byte) []byte {
 	s := string(html)
-	if strings.Contains(s, uiShellOptOut) || strings.Contains(s, uiShellTag) {
+	if strings.Contains(s, uiShellOptOut) || strings.Contains(s, uiShellMarker) {
 		return html
 	}
+	tag := uiShellTag
+	// A page that declares its own viewport keeps it -- injecting a second
+	// one would silently override an author's deliberate choice.
+	if strings.Contains(strings.ToLower(s), `name="viewport"`) {
+		tag = strings.SplitN(tag, `<meta name="theme-color"`, 2)[1]
+		tag = `<meta name="theme-color"` + tag
+	}
 	if i := strings.Index(strings.ToLower(s), "</head>"); i >= 0 {
-		return []byte(s[:i] + uiShellTag + s[i:])
+		return []byte(s[:i] + tag + s[i:])
 	}
 	if i := strings.Index(strings.ToLower(s), "<body"); i >= 0 {
 		if j := strings.Index(s[i:], ">"); j >= 0 {
 			cut := i + j + 1
-			return []byte(s[:cut] + uiShellTag + s[cut:])
+			return []byte(s[:cut] + tag + s[cut:])
 		}
 	}
-	return append([]byte(uiShellTag), html...)
+	return append([]byte(tag), html...)
 }
 
 // serveHTMLArtifact reads an HTML artifact, injects the shared shell, and
@@ -328,6 +348,11 @@ func (s *Server) handleUIArtifacts(w http.ResponseWriter, r *http.Request) {
 	}
 	if ct := mime.TypeByExtension(strings.ToLower(filepath.Ext(clean))); ct != "" {
 		w.Header().Set("Content-Type", ct)
+	} else if strings.HasSuffix(clean, ".webmanifest") {
+		// Go's mime table has no entry for .webmanifest, so it falls through
+		// to text/plain and browsers refuse the install prompt without ever
+		// saying why. Set it explicitly.
+		w.Header().Set("Content-Type", "application/manifest+json")
 	}
 	// Artifacts are edited in place during design work; never cache them.
 	w.Header().Set("Cache-Control", "no-cache")
