@@ -24,9 +24,14 @@ COPY . .
 # alone would not help — SearchMemory would fall through to the substring-grep
 # path and the e2e suite, which now exercises cog_search_memory rather than
 # only asserting its registration, would be testing a degraded binary.
+#
+# No -X ...engine.BuildTags here: that variable does not exist on this branch.
+# It is introduced by #608, which also adds the /health build_tags report that
+# consumes it. Injecting into an undeclared symbol is a silent no-op, so the
+# flag would have looked like provenance and carried none.
 RUN CGO_ENABLED=1 go build \
     -tags fts5 \
-    -ldflags="-s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME} -X github.com/myrgic/cogos/internal/engine.BuildTags=fts5" \
+    -ldflags="-s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=${BUILD_TIME}" \
     -o /cogos ./cmd/cogos
 
 # ── Stage 2: Test ─────────────────────────────────────────────────────────────
