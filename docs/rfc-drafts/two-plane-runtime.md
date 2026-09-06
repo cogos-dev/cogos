@@ -637,8 +637,9 @@ the *service account* would then execute.
      as a declared request kind (§5.3). The agent is the credential's
      distribution point for user-plane consumers, because it is the only party
      that has authenticated to the machine plane at the OS level.
-   - Existing local consumers that read the gate-exempt GET or the vault file
-     directly — the dashboard, canvas, a running harness hook session, THESEUS,
+   - Existing local consumers that read the then-gate-exempt GET (removed by
+     ledger L03; the vault file is now the only bootstrap path) or the vault
+     file directly — the dashboard, canvas, a running harness hook session, THESEUS,
      all named in `boot_node_root_grant.go`'s own header — acquire the
      credential from the agent instead. **This is a breaking change for those
      consumers and is called out as such**, sequenced at rung 3e (§7.1), where

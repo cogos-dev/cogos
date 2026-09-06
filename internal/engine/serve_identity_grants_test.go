@@ -1212,24 +1212,61 @@ func TestIdentityRoutes_NoLiveGETCurrentClaim(t *testing.T) {
 	//       live route, so matching the bare verb would be wrong; it is the
 	//       exemption claim that is stale. Review round 3 found (b) in two
 	//       more comments after round 2 fixed only (a).
-	re := regexp.MustCompile(`GET\s+/v1/identity/grants/current|gate-exempt\s+GET\s+/v1/identity/`)
+	// Three falsehood shapes, all seen in review:
+	//   (a) the /current route presented as a GET — it is a gated POST;
+	//   (b) a route path described as gate-exempt;
+	//   (c) prose saying "the gate-exempt GET" with NO path at all — the
+	//       round-3 finding at two-plane-runtime.md:640. Matching only
+	//       patterns that carry /v1/identity/ misses it entirely.
+	// GET /v1/identity/grants (the inventory) is still a real live route, so
+	// the bare verb is deliberately not matched — it is the EXEMPTION claim
+	// that is stale, not the verb.
+	re := regexp.MustCompile(`GET\s+/v1/identity/grants/current|gate-exempt\s+GET`)
+	// Scan non-test engine sources AND the design docs. Rounds 2 and 3 both
+	// found stale mentions this test did not cover: it only read *.go, so
+	// docs/rfc-drafts/two-plane-runtime.md drifted three separate times while
+	// the guard stayed green. A doc that tells a reader to GET a route that
+	// is now a gated POST is as wrong as a code comment saying it.
+	var files []string
 	entries, err := os.ReadDir("./")
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
 	}
 	for _, e := range entries {
 		n := e.Name()
-		if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
-			continue
+		if strings.HasSuffix(n, ".go") && !strings.HasSuffix(n, "_test.go") {
+			files = append(files, n)
 		}
+	}
+	docs, err := filepath.Glob(filepath.Join("..", "..", "docs", "rfc-drafts", "*.md"))
+	if err != nil {
+		t.Fatalf("glob docs: %v", err)
+	}
+	files = append(files, docs...)
+
+	for _, n := range files {
 		b, err := os.ReadFile(n)
 		if err != nil {
 			t.Fatalf("read %s: %v", n, err)
 		}
-		for i, line := range strings.Split(string(b), "\n") {
+		lines := strings.Split(string(b), "\n")
+		for i, line := range lines {
 			if !re.MatchString(line) {
 				continue
 			}
+			// A historical marker often sits on a preceding line — prose wraps,
+			// so "…no longer exempts the route; it is a gated POST. As written
+			// below, this described the pre-fix state —" can be three lines
+			// above the mention it disclaims. Check a small window back, not
+			// just the matching line.
+			var ctx strings.Builder
+			for j := i - 3; j <= i; j++ {
+				if j >= 0 && j < len(lines) {
+					ctx.WriteString(lines[j])
+					ctx.WriteString(" ")
+				}
+			}
+			line = ctx.String()
 			// A mention is allowed only if it is explicitly marked historical.
 			if strings.Contains(line, "no longer") || strings.Contains(line, "superseded") ||
 				strings.Contains(line, "was gate-exempt") || strings.Contains(line, "through 2026-09") ||
