@@ -70,6 +70,11 @@ func Spawn(ctx context.Context, opts SpawnOpts) (*Subprocess, error) {
 		"--print",
 		"--verbose", // required for --output-format stream-json with --print
 		"--output-format", "stream-json",
+		// Without this the CLI emits only whole assistant frames, so a UI has
+		// nothing to render until the turn is finished. Measured 2026-09-05:
+		// a live seat session produced kinds system/message/turn_end and ZERO
+		// deltas until this flag was added.
+		"--include-partial-messages",
 		"--input-format", "stream-json",
 	}
 	if opts.SessionID != "" {
