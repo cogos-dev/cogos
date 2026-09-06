@@ -56,7 +56,7 @@ GOARCH := $(shell go env GOARCH)
 # Build targets
 PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64 android-arm64 windows-amd64 windows-arm64
 
-.PHONY: all build clean test test-coverage test-integration bench install check-not-running test-install-guard image run e2e e2e-local $(PLATFORMS) $(BINARY)
+.PHONY: all build clean test test-coverage test-integration bench install check-not-running test-install-guard test-prepush-hook image run e2e e2e-local $(PLATFORMS) $(BINARY)
 
 # Default: build for current platform
 build: $(BINARY)
@@ -195,6 +195,44 @@ vet:
 
 tidy:
 	go mod tidy
+
+# Install the tracked git hooks by pointing core.hooksPath at .githooks/.
+#
+# Deliberately NOT a copy into .git/hooks: a copied hook drifts from its source
+# the moment either changes, and .git/hooks is unversioned so the drift is
+# invisible. Pointing at the tracked directory means there is exactly one
+# implementation and `git pull` updates the guard.
+#
+# Until this existed cogos had no real git hooks at all, while carrying the
+# heavier CI suite — a shell-hardening violation could only be discovered from
+# a red PR. The hook runs the same scripts CI runs; see .githooks/pre-push.
+.PHONY: hooks hooks-verify
+hooks:
+	@git config core.hooksPath .githooks
+	@chmod +x .githooks/*
+	@echo "hooks: core.hooksPath -> .githooks"
+	@echo "  pre-push: shell hardening + doctor (gate: fail)"
+
+# Report whether the hooks are actually active. A guard that is merely present
+# is not a guard that runs.
+hooks-verify:
+	@if [ "$$(git config core.hooksPath)" = ".githooks" ]; then \
+		echo "hooks: ACTIVE (core.hooksPath=.githooks)"; \
+		test -x .githooks/pre-push && echo "  pre-push: executable" || { echo "  pre-push: NOT EXECUTABLE — run 'make hooks'" >&2; exit 1; }; \
+	else \
+		echo "hooks: NOT INSTALLED (core.hooksPath='$$(git config core.hooksPath)') — run 'make hooks'" >&2; \
+		exit 1; \
+	fi
+
+# Negative control for the pre-push hook: proves it actually REFUSES a real
+# shell-hardening violation, rather than merely being installed. Same role
+# test-install-guard plays for refuse-if-running.sh, and wired the same two
+# ways (this target + a CI step) for the same reason: a guard whose refusal
+# path nothing executes regresses silently. Depends on `hooks` because the
+# control exits 2 rather than reporting a meaningless pass when the hook is
+# not installed.
+test-prepush-hook: hooks
+	@sh scripts/test-prepush-hook.sh
 
 lint: vet
 	@echo "=== Checking for bare exec.Command ==="
