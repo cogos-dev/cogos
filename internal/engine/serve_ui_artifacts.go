@@ -51,6 +51,10 @@ const uiArtifactsDirName = "ui"
 // uiArtifactIndexNames are tried, in order, when a directory is requested.
 var uiArtifactIndexNames = []string{"index.html", "index.htm"}
 
+// uiHomeIndexPath is the workspace-authored landing page for GET /ui/.
+// When present it replaces the built-in artifact listing entirely.
+const uiHomeIndexPath = "home/index.html"
+
 // UIArtifact describes one artifact directory under the artifacts root.
 type UIArtifact struct {
 	Name     string    `json:"name"`
@@ -261,7 +265,27 @@ func (s *Server) handleUIArtifacts(w http.ResponseWriter, r *http.Request) {
 }
 
 // renderUIArtifactIndexHTML renders the human-facing list at GET /ui/.
+//
+// A workspace may override this entirely by authoring ui/home/index.html.
+// The built-in listing is a fallback for a workspace that has not written
+// its own landing page -- it can only ever report directory names, file
+// counts, and byte sizes, because that is all the kernel knows about an
+// artifact. A workspace-authored home can read the kernel's own API
+// (/health, /v1/reconcile/coherence, /v1/cluster/status) and lead with
+// state instead of an inventory.
 func (s *Server) renderUIArtifactIndexHTML(w http.ResponseWriter) {
+	if root, err := os.OpenRoot(s.uiArtifactsRoot()); err == nil {
+		defer root.Close()
+		if f, err2 := root.Open(uiHomeIndexPath); err2 == nil {
+			defer f.Close()
+			if st, err3 := f.Stat(); err3 == nil && !st.IsDir() {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				http.ServeContent(w, &http.Request{Method: http.MethodGet},
+					uiHomeIndexPath, st.ModTime(), f)
+				return
+			}
+		}
+	}
 	arts, err := s.listUIArtifacts()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

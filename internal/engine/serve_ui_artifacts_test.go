@@ -374,3 +374,44 @@ func TestUIArtifacts_SymlinkSizeNotFollowedInIndex(t *testing.T) {
 		t.Errorf("symlink served with status %d; want refusal", rec.Code)
 	}
 }
+
+// A workspace-authored ui/home/index.html must REPLACE the built-in listing
+// at GET /ui/. The built-in can only ever report names, file counts, and byte
+// sizes; a workspace home can read the kernel's own API and lead with state.
+// Both branches are asserted here so the fallback cannot silently disappear.
+func TestUIArtifacts_WorkspaceHomeOverridesBuiltinIndex(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+
+	// Without a home page, the built-in listing renders and names the artifact.
+	writeArtifact(t, ws, "jobs", "index.html", `<h1>jobs</h1>`)
+	rec := get(t, s.handleUIArtifacts, "/ui/")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("builtin index status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Workspace artifacts") {
+		t.Error("expected the built-in listing before a home page exists")
+	}
+
+	// With one, it is served verbatim instead.
+	const marker = `<title>cog — home</title>`
+	writeArtifact(t, ws, "home", "index.html", marker+`<p>substrate</p>`)
+	rec = get(t, s.handleUIArtifacts, "/ui/")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("home status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, marker) {
+		t.Errorf("workspace home not served; got %.120q", body)
+	}
+	if strings.Contains(body, "Workspace artifacts") {
+		t.Error("built-in listing leaked through despite a workspace home")
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+
+	// The artifact itself must still resolve on its own path.
+	if rec = get(t, s.handleUIArtifacts, "/ui/jobs/"); rec.Code != http.StatusOK {
+		t.Fatalf("artifact status = %d, want 200", rec.Code)
+	}
+}
