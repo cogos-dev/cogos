@@ -63,6 +63,38 @@ type ContentItem struct {
 	ID    string          `json:"id,omitempty"`    // tool_use
 	Name  string          `json:"name,omitempty"`  // tool_use
 	Input json.RawMessage `json:"input,omitempty"` // tool_use
+
+	// tool_result fields. Content is polymorphic on the wire: a bare string
+	// for simple results, or an array of content blocks. Use ResultText().
+	ToolUseID string          `json:"tool_use_id,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+}
+
+// ResultText flattens a tool_result's polymorphic content into display text.
+// Returns "" when there is nothing renderable rather than guessing.
+func (c ContentItem) ResultText() string {
+	if len(c.Content) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(c.Content, &s); err == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(c.Content, &blocks); err != nil {
+		return ""
+	}
+	var out string
+	for _, b := range blocks {
+		if b.Type == "text" {
+			out += b.Text
+		}
+	}
+	return out
 }
 
 // StreamEvent is the mid-turn delta carrier — Anthropic's SSE event shape
@@ -116,9 +148,28 @@ type UnknownEvent struct {
 type Event struct {
 	System    *SystemEvent
 	Assistant *AssistantEvent
+	User      *UserEvent
 	Stream    *StreamEvent
 	Result    *ResultEvent
 	Unknown   *UnknownEvent
+}
+
+// UserEvent carries tool RESULTS. Counter-intuitively, claude reports the
+// outcome of a tool call in a "user" frame, because in the Anthropic message
+// model a tool_result block is authored by the user role.
+//
+// This type was missing for months: EventUser was declared but absent from
+// both the Event union and ParseLine's switch, so every tool result fell into
+// Unknown and was dropped. The visible symptom was a UI where tool calls
+// announce as "pending" and never complete -- flagged in the 2026-08-28 ACP
+// research doc as "First code fix", then not done.
+type UserEvent struct {
+	Type    string `json:"type"`
+	Message struct {
+		Role    string        `json:"role"`
+		Content []ContentItem `json:"content"`
+	} `json:"message"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // ParseLine decodes one NDJSON line into the typed Event union. Returns an
@@ -142,6 +193,12 @@ func ParseLine(line []byte) (Event, error) {
 			return Event{}, err
 		}
 		return Event{Assistant: &ev}, nil
+	case EventUser:
+		var ev UserEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return Event{}, err
+		}
+		return Event{User: &ev}, nil
 	case EventStream:
 		var ev StreamEvent
 		if err := json.Unmarshal(line, &ev); err != nil {

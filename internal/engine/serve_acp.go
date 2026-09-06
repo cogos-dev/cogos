@@ -319,6 +319,32 @@ func (c *acpConn) pump(ctx context.Context, sub *acp.Subprocess) {
 				"content":       map[string]any{"type": "text", "text": d.Delta.Text},
 			})
 
+		case ev.User != nil:
+			// Tool RESULTS arrive in a "user" frame -- in the Anthropic message
+			// model a tool_result block is authored by the user role. Without
+			// this, every tool call announces as "pending" and never resolves.
+			for _, item := range ev.User.Message.Content {
+				if item.Type != "tool_result" {
+					continue
+				}
+				status := "completed"
+				if item.IsError {
+					status = "failed"
+				}
+				u := map[string]any{
+					"sessionUpdate": "tool_call_update",
+					"toolCallId":    item.ToolUseID,
+					"status":        status,
+				}
+				if txt := item.ResultText(); txt != "" {
+					u["content"] = []any{map[string]any{
+						"type":    "content",
+						"content": map[string]any{"type": "text", "text": txt},
+					}}
+				}
+				c.notifyUpdate(ctx, u)
+			}
+
 		case ev.Assistant != nil:
 			// A tool_use is a tool_call update in ACP, NOT a message with a
 			// tools array. Emitting it as a message is what produced empty
