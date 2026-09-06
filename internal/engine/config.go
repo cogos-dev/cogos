@@ -216,15 +216,22 @@ type Config struct {
 	localModelConfigured bool
 
 	// IdentityNakedDefault controls per-session identity embedding at the
-	// inference gateway (G1). Default TRUE — a 2026-09-05 census found no
-	// HTTP client sending X-Cogos-Session-Id; nothing is bound, so naked
-	// transport is the honest default. Full embodiment (nucleus card +
-	// AssembleContext) is opt-in via cog_register_session.
-	// When FALSE: unbound and foreign-subject requests receive full embodiment
-	// (pre-G2 behaviour for backward compatibility).
+	// inference gateway (G1).
+	//
+	// Code default: FALSE (Go zero value; only kernel.yaml overrides it).
+	// When FALSE, unbound and foreign-subject requests receive full
+	// embodiment (nucleus card + AssembleContext) — the pre-G2 behaviour.
+	//
+	// The cog workspace sets identity_naked_default: true as of 2026-09-05:
+	// a census found no HTTP client sending X-Cogos-Session-Id, so nothing is
+	// bound and naked transport is the honest default there; full embodiment
+	// is opt-in via cog_register_session. That is a DEPLOYMENT choice
+	// recorded in that workspace's kernel.yaml, not this binary's default.
+	// Flipping the code default is a behaviour change with its own test and
+	// is deliberately not done in a docs-only change.
+	//
 	// Only requests bound to the nucleus's own subject keep full embodiment
 	// regardless of this flag.
-	// Configurable via identity_naked_default in kernel.yaml.
 	IdentityNakedDefault bool
 
 	// MaxToolOutputBytes caps the byte length of any cog_* MCP tool text
