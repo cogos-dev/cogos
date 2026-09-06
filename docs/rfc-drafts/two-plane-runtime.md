@@ -540,9 +540,11 @@ earlier drafts did not price at all:
 - **Repointing the node-root credential's local consumers at the agent**
   (§4.1 item 3, sequenced at rung 3e in §7.1). `internal/engine/boot_node_root_grant.go`'s
   own header names them: the dashboard, canvas, Claude Code hook sessions, and
-  THESEUS. Each acquires the credential today either from the gate-exempt
-  `GET /v1/identity/grants/current?surface=node-root` or from the 0600 vault
-  file under the operator's home; both disappear under the split. Net-new per
+  THESEUS. When this draft was written each acquired the credential either from
+  the then-gate-exempt `GET /v1/identity/grants/current?surface=node-root` or
+  from the 0600 vault file under the operator's home. **Superseded 2026-09-06
+  (ledger L03): the GET is gone — the route is a gated POST — so the vault file
+  is the only bootstrap path today.** Both disappear under the split. Net-new per
   consumer: a client change to read the credential from the agent's existing
   seat-owned delivery instead. **No new listener is introduced** — see §4.1
   item 3 for the mechanism constraint and what remains open inside it.
@@ -617,7 +619,9 @@ the *service account* would then execute.
 3. **The gate-exempt node-root-grant GET is deleted under two-plane.** The
    second draft left this as "authenticated, **or** delivered over the door."
    **Decided: delivered over the door; the exemption is removed, not
-   authenticated in place.** `internal/engine/serve_grant_auth.go` today exempts
+   authenticated in place.** **Done 2026-09-06 (ledger L03), ahead of the split:**
+   `serve_grant_auth.go` no longer exempts the route; it is a gated POST. As
+   written below, this described the pre-fix state — it exempted
    `GET /v1/identity/grants/current?surface=node-root` from the grant gate and
    `internal/engine/serve_cors.go` returns the **raw token** on it by design;
    `internal/engine/boot_node_root_grant.go` mints in-process at boot and

@@ -43,7 +43,7 @@
 //	                                   verifies for that token fail.
 //	GET  /v1/identity/grants        — operator-facing inventory. NEVER
 //	                                   returns a token value, per design §3.1.
-//	GET  /v1/identity/grants/current?surface=X — returns the live grant's
+//	POST /v1/identity/grants/current {"surface":"X"} — returns the live grant's
 //	                                   token for a named surface, if one
 //	                                   exists AND its raw value is still
 //	                                   cached in this process's memory. This

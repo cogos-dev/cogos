@@ -15,6 +15,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1191,6 +1193,44 @@ func TestIdentityGrantMint_NonRootCannotEscalateScope(t *testing.T) {
 	for _, g := range s.identityGrants.Snapshot() {
 		if g.Surface == "dashboard" && grantHasScope(g, "inference") {
 			t.Fatalf("a dashboard grant with inference scope exists after refused escalation")
+		}
+	}
+}
+
+// TestIdentityRoutes_NoLiveGETCurrentClaim guards the doc-drift class that
+// review round 1 and round 2 both caught: after ledger L03 made
+// /v1/identity/grants/current a gated POST, prose still told readers to GET
+// it. Round 1's grep used a single space and missed the mechanism table's
+// two-space alignment ("GET  /v1/..."). This scans non-test engine sources
+// with a whitespace-tolerant pattern so the next stale mention fails a test
+// instead of a reviewer.
+func TestIdentityRoutes_NoLiveGETCurrentClaim(t *testing.T) {
+	re := regexp.MustCompile(`GET\s+/v1/identity/grants/current`)
+	entries, err := os.ReadDir("./")
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(n)
+		if err != nil {
+			t.Fatalf("read %s: %v", n, err)
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			if !re.MatchString(line) {
+				continue
+			}
+			// A mention is allowed only if it is explicitly marked historical.
+			if strings.Contains(line, "no longer") || strings.Contains(line, "superseded") ||
+				strings.Contains(line, "was gate-exempt") || strings.Contains(line, "through 2026-09") {
+				continue
+			}
+			t.Errorf("%s:%d still presents the removed GET as live: %s\n"+
+				"the route is a gated POST (ledger L03); mark the mention historical or fix it",
+				n, i+1, strings.TrimSpace(line))
 		}
 	}
 }
