@@ -457,9 +457,10 @@ func withToolObserver[In any](
 			// m.resolveTransportSession looks up the correlation recorded by
 			// toolRegisterSession. When found, the subject is the correct
 			// attribution (the identity that registered this harness session).
-			// When not found (no register call, in-process test path where
-			// req is nil or Session.ID() is empty), fall back to nucleus.Name
-			// — same behaviour as pre-G2, so flag-off regression is impossible.
+			// When not found (production path for HTTP-originated tool calls — no register call
+			// precedes them — and the in-process test path where req is nil or Session.ID() is
+			// empty), fall back to nucleus.Name for attribution. Fail-open is deliberate: an
+			// unregistered session still gets nucleus attribution rather than an empty subject.
 			transportID := ""
 			if req != nil && req.Session != nil {
 				transportID = req.Session.ID()
