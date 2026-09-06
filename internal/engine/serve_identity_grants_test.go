@@ -332,13 +332,20 @@ func TestIdentityGrantMint_CapacityErrorMapsTo429(t *testing.T) {
 	lastResp.Body.Close()
 }
 
+// TestIdentityGrantCurrent_ZeroPasteBootstrap exercises the zero-paste
+// primitive in its post-L03 shape: POST, not GET (see
+// handleIdentityGrantCurrent). This server has no grant middleware in front
+// of it (newIdentityGrantServer mounts the handlers on a bare mux and stamps
+// a node-root grant into every request context), so this covers the handler
+// semantics only; the gate itself is covered in serve_grant_auth_test.go.
 func TestIdentityGrantCurrent_ZeroPasteBootstrap(t *testing.T) {
 	_, front := newIdentityGrantServer(t)
 
 	// No grant minted yet -> 404, so a caller knows to mint or degrade.
-	miss, err := http.Get(front.URL + "/v1/identity/grants/current?surface=constellation-chat")
+	miss, err := http.Post(front.URL+"/v1/identity/grants/current?surface=constellation-chat",
+		"application/json", nil)
 	if err != nil {
-		t.Fatalf("GET current: %v", err)
+		t.Fatalf("POST current: %v", err)
 	}
 	if miss.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 before any grant exists, got %d", miss.StatusCode)
@@ -352,17 +359,31 @@ func TestIdentityGrantCurrent_ZeroPasteBootstrap(t *testing.T) {
 	var mintedOut identityGrantMintResponse
 	identityDecodeBody(t, minted, &mintedOut)
 
-	// Now the surface's own page can bootstrap with zero paste: GET current
+	// Now the surface's own page can bootstrap with zero paste: POST current
 	// returns the SAME live token, no operator action involved.
-	hit, err := http.Get(front.URL + "/v1/identity/grants/current?surface=constellation-chat")
+	hit, err := http.Post(front.URL+"/v1/identity/grants/current?surface=constellation-chat",
+		"application/json", nil)
 	if err != nil {
-		t.Fatalf("GET current: %v", err)
+		t.Fatalf("POST current: %v", err)
 	}
 	var hitOut identityGrantMintResponse
 	identityDecodeBody(t, hit, &hitOut)
 	if hitOut.Token != mintedOut.Token {
-		t.Fatalf("expected GET current to return the live grant's token unchanged, got %q vs %q",
+		t.Fatalf("expected POST current to return the live grant's token unchanged, got %q vs %q",
 			hitOut.Token, mintedOut.Token)
+	}
+
+	// The surface may also arrive in a JSON body rather than the query
+	// param — same result, so a caller that prefers a body does not need the
+	// query string.
+	viaBody := identityPostJSON(t, front.URL+"/v1/identity/grants/current", map[string]any{
+		"surface": "constellation-chat",
+	})
+	var bodyOut identityGrantMintResponse
+	identityDecodeBody(t, viaBody, &bodyOut)
+	if bodyOut.Token != mintedOut.Token {
+		t.Fatalf("expected the JSON-body form to return the same live token, got %q vs %q",
+			bodyOut.Token, mintedOut.Token)
 	}
 }
 
@@ -1087,7 +1108,7 @@ func TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace(t *testing.T) {
 	}()
 
 	// Reader #2: Current, the zero-paste-bootstrap path
-	// GET /v1/identity/grants/current exercises on every call.
+	// POST /v1/identity/grants/current exercises on every call.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

@@ -279,41 +279,36 @@ func (k *Kernel) Stop() error {
 	return k.kernel.Stop()
 }
 
-// NodeRootGrantToken fetches this kernel's boot-minted node-root identity
-// grant token via GET /v1/identity/grants/current?surface=node-root — the
-// zero-paste bootstrap primitive (serve_identity_grants.go) that ensureNodeRootGrant
-// (boot_node_root_grant.go) mints/recovers on every Boot, and the same
-// credential local consumers use to satisfy the write-route grant-auth gate
-// (serve_grant_auth.go). This is a GET request, so it is itself exempt from
-// that gate — no chicken-and-egg problem.
+// NodeRootGrantToken returns this kernel's boot-minted node-root identity
+// grant token, read from the 0600 vault file ~/.cog/vault/node-root-grant
+// that ensureNodeRootGrant (boot_node_root_grant.go) writes on every Boot.
+// This is the same credential local consumers use to satisfy the write-route
+// grant-auth gate (serve_grant_auth.go).
 //
-// Returns "" if no live node-root grant exists (e.g. ensureNodeRootGrant
+// It reads the vault file rather than calling the kernel over HTTP because
+// the zero-paste primitive is no longer an unauthenticated GET (ledger L03):
+// /v1/identity/* is gated on every method now, so a caller holding no grant
+// cannot fetch one over HTTP — which is the point. The vault file is the
+// designated bootstrap store for exactly this case: a same-user local
+// process reads its first credential off a 0600 file instead of off a
+// loopback socket that any process on the host can open.
+//
+// Returns "" if no vault file exists or it is empty (e.g. ensureNodeRootGrant
 // failed at boot, which Boot logs a warning for but does not fail on) —
 // callers should treat that the same as "grant-auth is effectively
 // unreachable for this process", matching the gate's own fail-open posture
 // rather than failing the test outright.
 func (k *Kernel) NodeRootGrantToken(ctx context.Context, t *testing.T) string {
 	t.Helper()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		k.endpoint+"/v1/identity/grants/current?surface=node-root", nil)
+	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Fatalf("NodeRootGrantToken: build request: %v", err)
-	}
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
-	if err != nil {
-		t.Fatalf("NodeRootGrantToken: request: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
 		return ""
 	}
-	var body struct {
-		Token string `json:"token"`
+	raw, err := os.ReadFile(filepath.Join(home, ".cog", "vault", "node-root-grant"))
+	if err != nil {
+		return ""
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("NodeRootGrantToken: decode response: %v", err)
-	}
-	return body.Token
+	return strings.TrimSpace(string(raw))
 }
 
 // ListTools performs an MCP initialize→notifications/initialized→tools/list

@@ -1079,12 +1079,26 @@ func constantTimeEqual(a, b string) bool {
 func (s *Server) registerIdentityGrantRoutes(mux *http.ServeMux) {
 	s.route(mux, "POST /v1/identity/grants", s.handleIdentityGrantMint)
 	s.route(mux, "GET /v1/identity/grants", s.handleIdentityGrantList)
-	s.route(mux, "GET /v1/identity/grants/current", s.handleIdentityGrantCurrent)
+	// POST, not GET (ledger L03): this route returns a live grant's RAW
+	// TOKEN, and the grant-auth middleware exempts GET on most paths. Making
+	// it a POST means it cannot be reached by the blanket GET exemption even
+	// if a future edit to isGrantExemptRequest drops the /v1/identity carve-
+	// out, and it cannot be triggered by a cross-origin <img>/<script>/form
+	// navigation. It is additionally gated: /v1/identity/* is never exempt.
+	s.route(mux, "POST /v1/identity/grants/current", s.handleIdentityGrantCurrent)
 	s.route(mux, "POST /v1/identity/verify", s.handleIdentityVerify)
 	s.route(mux, "POST /v1/identity/grants/{id}/revoke", s.handleIdentityGrantRevoke)
 }
 
 // ─── wire types ───────────────────────────────────────────────────────────────
+
+// identityGrantCurrentRequest is the JSON body shape accepted by
+// POST /v1/identity/grants/current. Optional — the `surface` query param is
+// still honored so the GET→POST migration is a one-word change at call
+// sites.
+type identityGrantCurrentRequest struct {
+	Surface string `json:"surface"`
+}
 
 type identityGrantMintRequest struct {
 	Surface  string   `json:"surface"`
@@ -1216,15 +1230,37 @@ func (s *Server) handleIdentityGrantList(w http.ResponseWriter, r *http.Request)
 	writeJSONResp(w, http.StatusOK, map[string]any{"grants": out})
 }
 
-// ─── GET /v1/identity/grants/current ─────────────────────────────────────────
+// ─── POST /v1/identity/grants/current ────────────────────────────────────────
 
 // handleIdentityGrantCurrent is the zero-paste primitive (operator ruling
 // 2026-07-21, see file header): returns the live grant's raw token for a
 // named surface, if one exists, so a same-loopback page can bootstrap
 // without any operator paste. 404 when no live grant exists for that surface
 // (caller should mint one via POST /v1/identity/grants, or degrade).
+//
+// It is a POST behind the grant gate rather than the unauthenticated GET it
+// used to be (ledger L03). The old shape meant any process that could open a
+// loopback socket could read the node-root token — the kernel's admin
+// credential — out of a GET body with no credential of its own, which made
+// every other check in serve_grant_auth.go decorative. The primitive itself
+// survives, because the caller that needs it (a same-loopback surface
+// already holding SOME grant, wanting the current token for a surface) can
+// present that grant; the caller with no grant at all bootstraps from
+// ~/.cog/vault/node-root-grant (0600) instead.
+//
+// Surface may arrive as a `surface` query param (unchanged from the GET
+// shape, so callers only change the verb) or as {"surface": "..."} in a JSON
+// body. Query param wins when both are present.
 func (s *Server) handleIdentityGrantCurrent(w http.ResponseWriter, r *http.Request) {
 	surface := r.URL.Query().Get("surface")
+	if surface == "" && r.Body != nil {
+		var req identityGrantCurrentRequest
+		// Best-effort: an absent/!JSON body just leaves surface empty and
+		// falls into the 400 below with the same message as before.
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			surface = req.Surface
+		}
+	}
 	if surface == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "surface query param is required")
 		return
