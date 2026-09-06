@@ -39,8 +39,12 @@
 # when git is unavailable, e.g. a source tarball with no .git.
 VERSION ?= $(shell d=$$(git describe --tags --always --dirty 2>/dev/null) && echo "dev-$$d" || echo dev)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS := -s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=$(BUILD_TIME) -X github.com/myrgic/cogos/internal/engine.Version=$(VERSION)
+# BUILD_TAGS must be defined BEFORE LDFLAGS: LDFLAGS uses := (immediate
+# expansion), so a BUILD_TAGS defined afterwards would expand to empty and the
+# binary would silently report declared="" — the same unverifiable state that
+# hid the missing-fts5 kernel on 2026-09-06.
 BUILD_TAGS := fts5
+LDFLAGS := -s -w -X github.com/myrgic/cogos/internal/engine.BuildTime=$(BUILD_TIME) -X github.com/myrgic/cogos/internal/engine.Version=$(VERSION) -X github.com/myrgic/cogos/internal/engine.DeclaredBuildTags=$(BUILD_TAGS)
 BINARY := cog
 GO := go
 

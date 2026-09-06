@@ -624,6 +624,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		},
 		"workspace": s.cfg.WorkspaceRoot,
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		// build_tags reports PROBED runtime capabilities, not build-flag
+		// claims. Consumers (scripts/cog health) gate on build_tags.fts5:
+		// false means memory search is running on an unranked fallback and
+		// "no results" cannot be read as "no prior art".
+		"build_tags": buildTags(),
 	}
 
 	if nh := s.process.NodeHealth(); nh != nil {
