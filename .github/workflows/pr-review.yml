@@ -555,7 +555,6 @@ jobs:
               exit 0
             fi
           fi
-          fi
 
           # Per-assignment fallbacks: normalization above should make these
           # infallible, but the publish contract ("a verdict always lands")
