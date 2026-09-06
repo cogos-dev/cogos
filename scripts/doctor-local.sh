@@ -26,6 +26,7 @@
 # honestly report "could not check". Never gate on UNKNOWN — doctor's contract
 # is "UNKNOWN never reported as OK", and punishing that would teach checks to
 # lie.
+# END-OF-HELP
 
 # no-pipefail: this script's entire job is CAPTURING non-zero exits, not dying
 # on them. `cogos doctor` exits 1 on FAIL, `doctor --lint` exits 1 by design at
@@ -46,7 +47,14 @@ while [ $# -gt 0 ]; do
     --here)  MODE="here"; shift ;;
     --gate)  GATE="${2:-warn}"; shift 2 ;;
     -h|--help)
-      sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      # Print only the user-facing header — everything above the
+      # END-OF-HELP marker. Previously `sed -n '2,34p'`, a hardcoded line
+      # range that silently swallowed the implementation-rationale block
+      # below it into --help output (cog-review note on 5ee1468) and would
+      # drift again on any edit to the header. The marker cannot drift.
+      sed -n '2,/^# END-OF-HELP$/p' "${BASH_SOURCE[0]}" \
+        | grep -v '^# END-OF-HELP$' \
+        | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
