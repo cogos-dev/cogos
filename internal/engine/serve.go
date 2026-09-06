@@ -210,6 +210,7 @@ func NewServer(cfg *Config, nucleus *Nucleus, process *Process) *Server {
 	// two embedded UIs above, these live in $WORKSPACE/ui and are
 	// versioned with the workspace rather than the binary.
 	s.route(mux, "GET /ui/", s.handleUIArtifacts)
+	s.route(mux, "GET /v1/acp", s.handleACP)
 	s.route(mux, "GET /v1/ui/artifacts", s.handleUIArtifactIndex)
 	s.route(mux, "GET /health", s.handleHealth)
 	s.route(mux, "GET /v1/context", s.handleContext)
