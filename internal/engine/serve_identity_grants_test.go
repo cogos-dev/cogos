@@ -1137,3 +1137,60 @@ func TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace(t *testing.T) {
 		t.Errorf("GrantID changed across concurrent extension: got %q, want %q", final.GrantID, grant.GrantID)
 	}
 }
+
+// TestIdentityGrantMint_NonRootCannotEscalateScope — review finding on #605
+// (ledger L02). A non-root caller may mint a replacement grant for its OWN
+// surface, but the scope it requests must be a subset of what it presents.
+// Before the fix, a "dashboard" grant holding only ["admin"] (issued narrowly,
+// to manage its own credential) could POST /v1/identity/grants for itself with
+// scope ["admin","inference","write"] and receive a wider credential — scope
+// enforcement in the middleware was decorative because the mint route let any
+// holder widen itself. Negative control: fails on the pre-fix handler.
+func TestIdentityGrantMint_NonRootCannotEscalateScope(t *testing.T) {
+	s, _ := newIdentityGrantServer(t)
+	narrow, err := s.identityGrants.MintOrReuse("dashboard", []string{"admin"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint narrow: %v", err)
+	}
+	mux := http.NewServeMux()
+	s.registerIdentityGrantRoutes(mux)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(contextWithGrant(r.Context(), narrow)))
+	}))
+	t.Cleanup(front.Close)
+
+	// Same scope it already holds: allowed (idempotent self-refresh).
+	same := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "dashboard", "scope": []string{"admin"},
+	})
+	if same.StatusCode != http.StatusOK {
+		t.Fatalf("same-scope self-mint: want 200, got %d", same.StatusCode)
+	}
+	same.Body.Close()
+
+	// Wider scope: must be refused, and must NOT mint.
+	before := len(s.identityGrants.Snapshot())
+	wider := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "dashboard", "scope": []string{"admin", "inference", "write"},
+	})
+	if wider.StatusCode != http.StatusForbidden {
+		t.Fatalf("scope escalation: want 403, got %d", wider.StatusCode)
+	}
+	var body struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	identityDecodeBody(t, wider, &body)
+	if body.Error.Type != "scope_escalation" {
+		t.Fatalf("want error.type=scope_escalation, got %+v", body)
+	}
+	if after := len(s.identityGrants.Snapshot()); after != before {
+		t.Fatalf("escalation attempt minted a grant: %d → %d", before, after)
+	}
+	for _, g := range s.identityGrants.Snapshot() {
+		if g.Surface == "dashboard" && grantHasScope(g, "inference") {
+			t.Fatalf("a dashboard grant with inference scope exists after refused escalation")
+		}
+	}
+}

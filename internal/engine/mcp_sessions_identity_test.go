@@ -3,15 +3,15 @@
 //
 // Test matrix:
 //  1. TestHarnessBinding_WithSubject           — register WITH subject ⇒ binding
-//                                               created; ResolveHarnessBinding returns it.
+//     created; ResolveHarnessBinding returns it.
 //  2. TestHarnessBinding_WithoutSubject        — register WITHOUT subject ⇒ no binding;
-//                                               ResolveHarnessBinding returns (nil, false).
+//     ResolveHarnessBinding returns (nil, false).
 //  3. TestHarnessBinding_ExistingCallerUnchanged — existing caller (no subject) still
-//                                               succeeds; backward-compat contract.
+//     succeeds; backward-compat contract.
 //  4. TestHarnessBinding_BindingTypeDefault    — subject without binding_type defaults
-//                                               to "agent".
+//     to "agent".
 //  5. TestHarnessBinding_BackendNil            — nil harnessBackend: register with
-//                                               subject still succeeds, just no binding.
+//     subject still succeeds, just no binding.
 package engine
 
 import (

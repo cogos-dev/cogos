@@ -139,8 +139,8 @@ func ensureNodeRootGrant(s *Server) (*IdentityGrant, error) {
 
 	if pathErr != nil {
 		slog.Warn("boot: could not resolve home directory to persist the node-root grant vault file; "+
-			"the token lives only in this process's memory and local consumers must re-fetch it via "+
-			"GET /v1/identity/grants/current?surface=node-root",
+			"the token lives only in this process's memory. With the unauthenticated GET removed (ledger L03), "+
+			"NO local consumer can bootstrap from this kernel: set HOME or pass a vault path, then restart",
 			"err", pathErr)
 		return grant, nil
 	}
@@ -265,8 +265,9 @@ func maybeRenewNodeRootGrant(s *Server) {
 // mint-or-recover path from within a renewal check (either because no live
 // grant exists, or because ExtendGrant lost a narrow race against expiry —
 // see maybeRenewNodeRootGrant's doc comment for both call sites). This IS a
-// real credential change every local consumer must re-fetch via
-// GET /v1/identity/grants/current?surface=node-root, so success logs at Info
+// real credential change every local consumer must pick up (re-read the vault
+// file, or POST /v1/identity/grants/current with a still-valid grant), so
+// success logs at Info
 // rather than Debug; reason is a short, call-site-specific description for
 // the log line.
 func establishFreshNodeRootGrant(s *Server, reason string) {
@@ -278,7 +279,7 @@ func establishFreshNodeRootGrant(s *Server, reason string) {
 		return
 	}
 	slog.Info("node-root grant renewal: "+reason+"; minted/recovered a fresh grant "+
-		"(this is a real credential change — consumers must re-fetch via GET /v1/identity/grants/current?surface=node-root)",
+		"(this is a real credential change — consumers must re-read ~/.cog/vault/node-root-grant or POST /v1/identity/grants/current with a still-valid grant)",
 		"grant_id", fresh.GrantID, "expires_at", fresh.ExpiresAt.Format(time.RFC3339))
 }
 

@@ -71,9 +71,10 @@
 //     00bc7b2 — see also VerifyAny's doc comment). The exemption was never
 //     actually necessary: ensureNodeRootGrant (boot_node_root_grant.go)
 //     mints the node-root credential IN-PROCESS at boot, with no HTTP call
-//     involved, and every local consumer acquires it over the gate-exempt
-//     GET /v1/identity/grants/current?surface=node-root (a read, so no
-//     chicken-and-egg problem). So POST /v1/identity/grants is gated exactly
+//     involved, and every local consumer acquires it from the vault file
+//     ~/.cog/vault/node-root-grant (0600, written at boot by ensureNodeRootGrant)
+//     or, holding a grant, via POST /v1/identity/grants/current behind the gate
+//     (the GET was removed under ledger L03; see below). So POST /v1/identity/grants is gated exactly
 //     like every other write route below: it requires a valid presented
 //     grant. What used to be the "bootstrap" case is now just "present the
 //     node-root token you already fetched via that GET" — indistinguishable

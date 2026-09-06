@@ -8,8 +8,10 @@
 // scoped only migrated the *verification* step; the zero-paste bootstrap UX
 // was deferred to chunk 4. That deferral is overridden here — chunk 1 now
 // also has to make the token acquirable with no operator action, which is
-// why GET /v1/identity/grants/current exists below (a surface can ask "what
-// is MY currently-live grant" without minting a new one every restart).
+// why /v1/identity/grants/current exists below (a surface can ask "what is MY
+// currently-live grant" without minting a new one every restart). It was a
+// gate-exempt GET through 2026-09; ledger L03 made it a POST behind the gate,
+// and unauthenticated bootstrap now goes through the vault file only.
 //
 // Mechanism (per design §3.1-§3.3, chunk-1-sized; §3.2 ledger-first for
 // chunk 2):
@@ -1178,6 +1180,20 @@ func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request)
 			writeJSONError(w, http.StatusForbidden, "surface_mismatch",
 				"the presented grant may not mint a grant for surface "+req.Surface)
 			return
+		}
+		// Scope attenuation: a non-root caller may only mint scopes it already
+		// holds. Without this, a grant issued with Scope=["admin"] (narrowly, to
+		// manage its own credential) could self-mint a replacement carrying
+		// "inference" or "write" and escalate. Node-root is the issuing
+		// authority and is exempt. (Review finding on ledger L02.)
+		if ok && presented.Surface != nodeRootSurface {
+			for _, want := range req.Scope {
+				if !grantHasScope(presented, want) {
+					writeJSONError(w, http.StatusForbidden, "scope_escalation",
+						"the presented grant does not hold scope "+want+" and may not mint it")
+					return
+				}
+			}
 		}
 	}
 	ttl := time.Duration(0)
