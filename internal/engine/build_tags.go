@@ -1,6 +1,6 @@
 // build_tags.go — runtime feature probe for the kernel's compile-time build tags.
 //
-// WHY THIS EXISTS
+// # WHY THIS EXISTS
 //
 // On 2026-09-06 the kernel serving this workspace had been running for an
 // unknown period built WITHOUT `-tags fts5`. Every `/memory/search` silently
@@ -13,7 +13,7 @@
 // A silent retrieval failure is worse than a loud one: it is indistinguishable
 // from a true negative.
 //
-// WHY A RUNTIME PROBE AND NOT THE LDFLAGS CLAIM
+// # WHY A RUNTIME PROBE AND NOT THE LDFLAGS CLAIM
 //
 // The build can *say* fts5 three different ways and still be wrong:
 //

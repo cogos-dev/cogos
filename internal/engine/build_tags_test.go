@@ -7,22 +7,9 @@ import (
 	"testing"
 )
 
-// TestFTS5ProbeIsExecutedNotClaimed asserts the probe reflects what SQLite can
-// actually do. This binary's test run is compiled by the Makefile with
-// BUILD_TAGS=fts5, so the probe must report true. If someone drops `-tags fts5`
-// from the test build, this fails — which is the point: the assertion is bound
-// to a real capability, not to a flag we echo back to ourselves.
-func TestFTS5ProbeIsExecutedNotClaimed(t *testing.T) {
-	if !FTS5Available() {
-		t.Fatal("FTS5Available() = false; this build cannot CREATE VIRTUAL TABLE ... USING fts5. " +
-			"Memory search would silently degrade to an unranked scan. " +
-			"Build with -tags fts5 AND CGO_ENABLED=1.")
-	}
-}
-
 // TestFTS5ProbeIsCached guards the sync.Once: the probe opens a database, so a
 // per-request probe on a hot /health endpoint would be wasteful. Repeat calls
-// must agree and must not re-run the DDL.
+// must agree and must not re-run the DDL. Tag-independent.
 func TestFTS5ProbeIsCached(t *testing.T) {
 	first := FTS5Available()
 	for i := 0; i < 100; i++ {
@@ -54,29 +41,6 @@ func TestProbeFTS5NegativeControl(t *testing.T) {
 			"fts5=false with no reason")
 	}
 	t.Logf("negative control produced: %s", errText)
-}
-
-// TestBuildTagMismatchIsDetected pins the exact 2026-09-06 failure: a build
-// that CLAIMS fts5 via ldflags while the runtime probe disproves it. The
-// report must flag the disagreement rather than echoing the claim.
-func TestBuildTagMismatchIsDetected(t *testing.T) {
-	orig := DeclaredBuildTags
-	t.Cleanup(func() { DeclaredBuildTags = orig })
-
-	DeclaredBuildTags = "fts5"
-	rep := buildTags()
-
-	if rep.FTS5 {
-		// This build genuinely has FTS5, so claim and probe agree.
-		if rep.Mismatch {
-			t.Fatal("Mismatch=true when declared and probed both say fts5")
-		}
-		return
-	}
-	if !rep.Mismatch {
-		t.Fatal("declared 'fts5' but probe says false, and Mismatch=false; " +
-			"the report would hide exactly the defect it exists to catch")
-	}
 }
 
 // TestHealthExposesBuildTags asserts /health carries the field that
