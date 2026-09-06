@@ -387,7 +387,7 @@
     },
     {
       "file": "internal/engine/boot_node_root_grant.go",
-      "line": 275,
+      "line": 292,
       "column": 12,
       "primitive": "os.MkdirAll",
       "func": "persistNodeRootGrant",
@@ -399,7 +399,7 @@
     },
     {
       "file": "internal/engine/boot_node_root_grant.go",
-      "line": 279,
+      "line": 296,
       "column": 12,
       "primitive": "os.WriteFile",
       "func": "persistNodeRootGrant",
@@ -411,7 +411,7 @@
     },
     {
       "file": "internal/engine/boot_node_root_grant.go",
-      "line": 282,
+      "line": 299,
       "column": 12,
       "primitive": "os.Rename",
       "func": "persistNodeRootGrant",
@@ -1611,7 +1611,7 @@
     },
     {
       "file": "internal/engine/serve_identity_grants.go",
-      "line": 723,
+      "line": 725,
       "column": 9,
       "primitive": "engine.AppendEvent(bucket)",
       "func": "(*IdentityGrantRegistry).appendExtendEventLocked",
@@ -1623,7 +1623,7 @@
     },
     {
       "file": "internal/engine/serve_identity_grants.go",
-      "line": 780,
+      "line": 782,
       "column": 9,
       "primitive": "engine.AppendEvent(bucket)",
       "func": "(*IdentityGrantRegistry).appendGrantEventLocked",
@@ -1635,7 +1635,7 @@
     },
     {
       "file": "internal/engine/serve_identity_grants.go",
-      "line": 823,
+      "line": 825,
       "column": 9,
       "primitive": "engine.AppendEvent(bucket)",
       "func": "(*IdentityGrantRegistry).appendSupersessionEventLocked",
@@ -2223,7 +2223,7 @@
     },
     {
       "file": "internal/testkernel/testkernel.go",
-      "line": 562,
+      "line": 557,
       "column": 13,
       "primitive": "os.MkdirAll",
       "func": "makeMinimalWorkspace",
@@ -2235,7 +2235,7 @@
     },
     {
       "file": "internal/testkernel/testkernel.go",
-      "line": 569,
+      "line": 564,
       "column": 12,
       "primitive": "os.WriteFile",
       "func": "makeMinimalWorkspace",
@@ -2247,7 +2247,7 @@
     },
     {
       "file": "internal/testkernel/testkernel.go",
-      "line": 574,
+      "line": 569,
       "column": 12,
       "primitive": "os.WriteFile",
       "func": "makeMinimalWorkspace",
