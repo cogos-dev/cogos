@@ -347,13 +347,27 @@ jobs:
           else
             echo "sandbox=fail" >> "$GITHUB_OUTPUT"
             echo "::error::Sandbox canary failed: expected both tools (Read, Grep) DENIED, got denied=$DENIED_N allowed=$ALLOWED_N. Skipping review (fail closed)."
-            # failure, NOT neutral (neutral passes a required check) — an
-            # unproven sandbox must block the merge, not wave it through.
-            gh api "repos/$REPO_FULL/check-runs" \
-              -f name='cog-review' -f head_sha="$HEAD_SHA" \
-              -f status='completed' -f conclusion='failure' \
-              -f 'output[title]=Reviewer sandbox verification failed' \
-              -f 'output[summary]=The deny-list canary could not prove Read and Grep denial is in effect on /proc/version. Review skipped; no verdict issued. Fail closed.'
+            # Same stand-down rule as the publish step (ledger L24): a canary
+            # failure is INFRA, not a judgement about the code, so it must not
+            # demote a real verdict that already judged this exact head. Both
+            # infra-failure paths now share one implementation via
+            # scripts/ci/standing-verdict.sh — a fix applied to only one exit
+            # is the bug this PR is about.
+            # `|| echo 0` so a helper crash cannot abort this step under the
+            # inherited errexit — that would strand the PR with NO verdict at
+            # all, which is worse than the demotion this guard prevents.
+            STANDING=$(bash scripts/ci/standing-verdict.sh "$REPO_FULL" "$HEAD_SHA" 2>/dev/null || echo 0)
+            if [ "${STANDING:-0}" -gt 0 ]; then
+              echo "::warning::Sandbox canary failed, but a real verdict already stands on $HEAD_SHA — not demoting it to failure (ledger L24)."
+            else
+              # failure, NOT neutral (neutral passes a required check) — an
+              # unproven sandbox must block the merge, not wave it through.
+              gh api "repos/$REPO_FULL/check-runs" \
+                -f name='cog-review' -f head_sha="$HEAD_SHA" \
+                -f status='completed' -f conclusion='failure' \
+                -f 'output[title]=Reviewer sandbox verification failed' \
+                -f 'output[summary]=The deny-list canary could not prove Read and Grep denial is in effect on /proc/version. Review skipped; no verdict issued. Fail closed.'
+            fi
           fi
 
       - name: Run review
@@ -534,19 +548,13 @@ jobs:
           # completed cog-review check on this head. When there is none, the
           # error verdict publishes exactly as before and blocks the merge.
           if [ "$VERDICT" = "error" ]; then
-            PRIOR=$(gh api "repos/$REPO_FULL/commits/$HEAD_SHA/check-runs" \
-              --jq '[.check_runs[]
-                     | select(.name == "cog-review" and .status == "completed")
-                     | (.output.summary // "") + (.output.text // "")]
-                    | map(select(test("cog-review:v1")))
-                    | map(capture("\"verdict\":\"(?<v>[a-z_]+)\"").v)
-                    | map(select(. != "error"))
-                    | length' 2>/dev/null || echo 0)
-            if [ "${PRIOR:-0}" -gt 0 ]; then
+            STANDING=$(bash scripts/ci/standing-verdict.sh "$REPO_FULL" "$HEAD_SHA" 2>/dev/null || echo 0)
+            if [ "${STANDING:-0}" -gt 0 ]; then
               echo "::warning::cog-review reviewer errored, but a real verdict already exists for $HEAD_SHA — standing down rather than demoting it to failure (ledger L24)."
               echo "cog-review verdict: error -> suppressed (a non-error verdict already stands on this head)"
               exit 0
             fi
+          fi
           fi
 
           # Per-assignment fallbacks: normalization above should make these
