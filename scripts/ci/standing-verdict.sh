@@ -27,7 +27,12 @@
 # verdicts that judged nothing defer.
 #
 # Usage: standing-verdict.sh <owner/repo> <head_sha>
-set -uo pipefail
+#
+# errexit is safe here despite every failure path needing to yield 0: the one
+# command that can fail (gh api) is guarded by `|| COUNT=0`, which suppresses
+# errexit for that pipeline, and the `case` below normalises anything
+# non-numeric. Callers additionally wrap the invocation in `|| echo 0`.
+set -euo pipefail
 
 REPO_FULL="${1:?usage: standing-verdict.sh <owner/repo> <head_sha>}"
 HEAD_SHA="${2:?usage: standing-verdict.sh <owner/repo> <head_sha>}"
