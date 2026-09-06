@@ -120,3 +120,48 @@ func filterToolsByCapability(creq *CompletionRequest, subject string, gater capa
 		)
 	}
 }
+
+// admitClientSuppliedTools partitions CLIENT-SUPPLIED tool definitions into
+// the two pools the inference pipeline uses, refusing any name the kernel
+// itself owns.
+//
+// Ledger L06 / audit F2. Before this, both gateway surfaces copied every
+// client-supplied tool definition into creq.Tools verbatim. A name matching
+// an MCP-registered kernel tool (cog_*, mod3_*, ...) therefore reached the
+// provider as a real, callable tool. When the model emitted a tool_use for
+// it, splitToolCallsByOwnership classified the call as kernel-internal and
+// [MCPServer.CallTool] executed it in-process with the client's arguments —
+// so an external client could name a kernel tool in its request's tools[]
+// and have the kernel run it on its behalf.
+//
+// The kernel's tool registry is not part of the client's tool surface. Only
+// the kernel decides when to offer it, via injectKernelAgentTools on the
+// kernel-agent path. A client-supplied definition that collides with a
+// registered kernel tool is dropped here; its name is returned in rejected
+// so the caller can log the refusal.
+//
+// Names in the classifyToolOwnership set (bash/read/write/...) keep their
+// pre-existing treatment: admitted to Tools, withheld from ExternalTools.
+// Those are the Claude-CLI/MCP-bridge surface, are not MCP-registered, and
+// splitToolCallsByOwnership does not route them into CallTool.
+//
+// A nil MCPServer admits everything — the legacy/test path, matching the
+// pre-existing nil-guards at both call sites.
+func admitClientSuppliedTools(defs []ToolDefinition, m *MCPServer) (tools, external []ToolDefinition, rejected []string) {
+	if len(defs) == 0 {
+		return nil, nil, nil
+	}
+	tools = make([]ToolDefinition, 0, len(defs))
+	for _, td := range defs {
+		if m != nil && m.IsInternalTool(td.Name) {
+			rejected = append(rejected, td.Name)
+			continue
+		}
+		tools = append(tools, td)
+		if classifyToolOwnership(td.Name) == ToolOwnershipKernel {
+			continue
+		}
+		external = append(external, td)
+	}
+	return tools, external, rejected
+}

@@ -15,6 +15,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 
 	"github.com/google/uuid"
 )
@@ -106,4 +107,56 @@ func truncateForTurn(s string) string {
 		return s
 	}
 	return s[:max] + "...[truncated]"
+}
+
+// refusedToolNameSet indexes req.RefusedToolNames for lookup.
+func refusedToolNameSet(req *CompletionRequest) map[string]struct{} {
+	if req == nil || len(req.RefusedToolNames) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(req.RefusedToolNames))
+	for _, n := range req.RefusedToolNames {
+		out[n] = struct{}{}
+	}
+	return out
+}
+
+// splitToolCallsByOwnershipFor is splitToolCallsByOwnership narrowed by the
+// set of client-supplied names the gateway refused on this request.
+//
+// Ledger L06, second vector. Refusing the client's tool DEFINITION is not
+// sufficient on its own: splitToolCallsByOwnership classifies purely by name,
+// so a provider that emits a tool_use for a refused kernel-owned name still
+// landed in the internal pool and was executed via [MCPServer.CallTool]. A
+// client naming cog_read_cogdoc in tools[] and talking to a compliant or
+// steerable provider could therefore still drive kernel-side execution with
+// its own arguments, even with the definition stripped.
+//
+// A kernel-owned call whose name the gateway refused is not executed. It
+// falls to the external pool, where the renderer's ownership re-filter (which
+// deliberately keeps the name-only form) drops it before it can reach the
+// client. The call is neither run nor leaked.
+//
+// Calls the kernel legitimately offered — via injectKernelAgentTools on the
+// kernel-agent path, or any request with no refusals — keep their pre-existing
+// treatment, so the #94 in-process execution contract is unchanged.
+func splitToolCallsByOwnershipFor(calls []ToolCall, m *MCPServer, req *CompletionRequest) (internal, external []ToolCall) {
+	refused := refusedToolNameSet(req)
+	if len(refused) == 0 {
+		return splitToolCallsByOwnership(calls, m)
+	}
+	for _, tc := range calls {
+		if m != nil && m.IsInternalTool(tc.Name) {
+			if _, bad := refused[tc.Name]; !bad {
+				internal = append(internal, tc)
+				continue
+			}
+			slog.Warn("tools: refusing tool_use for a client-supplied kernel-owned name",
+				"tool", tc.Name, "call_id", tc.ID)
+			// Fall through to external; the renderer's ownership filter drops
+			// it there, so it is neither executed nor forwarded.
+		}
+		external = append(external, tc)
+	}
+	return internal, external
 }
