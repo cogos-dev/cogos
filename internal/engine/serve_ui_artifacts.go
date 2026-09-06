@@ -55,6 +55,69 @@ var uiArtifactIndexNames = []string{"index.html", "index.htm"}
 // When present it replaces the built-in artifact listing entirely.
 const uiHomeIndexPath = "home/index.html"
 
+// uiShellDirName holds the shared chrome every artifact inherits. It is
+// underscore-prefixed so it reads as private, and is excluded from the
+// artifact listing -- it is furniture, not an artifact.
+const uiShellDirName = "_shell"
+
+// uiShellTag is injected into every HTML artifact served under /ui/ so a
+// page inherits the shared header, breadcrumbs, and status bar without
+// having to import anything. Inheritance by default is the point: a page
+// author should get the chrome for free, and opting OUT should be the
+// deliberate act.
+//
+// A page opts out with <meta name="cog-shell" content="off">.
+const uiShellTag = `<script src="/ui/_shell/shell.js" defer></script>`
+
+// uiShellOptOut marks a page that does not want the shared chrome.
+const uiShellOptOut = `name="cog-shell" content="off"`
+
+// injectShell returns html with the shell tag inserted, or unchanged if the
+// page opted out or already carries the tag.
+//
+// Injection targets </head>, falling back to <body> and finally a prepend,
+// so a fragment without a well-formed head still gets the chrome rather
+// than silently missing it.
+func injectShell(html []byte) []byte {
+	s := string(html)
+	if strings.Contains(s, uiShellOptOut) || strings.Contains(s, uiShellTag) {
+		return html
+	}
+	if i := strings.Index(strings.ToLower(s), "</head>"); i >= 0 {
+		return []byte(s[:i] + uiShellTag + s[i:])
+	}
+	if i := strings.Index(strings.ToLower(s), "<body"); i >= 0 {
+		if j := strings.Index(s[i:], ">"); j >= 0 {
+			cut := i + j + 1
+			return []byte(s[:cut] + uiShellTag + s[cut:])
+		}
+	}
+	return append([]byte(uiShellTag), html...)
+}
+
+// serveHTMLArtifact reads an HTML artifact, injects the shared shell, and
+// writes it. Range requests are given up deliberately: the body is rewritten,
+// so a byte range over the original file would be a lie.
+func serveHTMLArtifact(w http.ResponseWriter, f fs.File, name string) {
+	body, err := io.ReadAll(f)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if !strings.HasPrefix(name, uiShellDirName+"/") {
+		body = injectShell(body)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(body)
+}
+
+// isHTMLPath reports whether a served path should carry the shell.
+func isHTMLPath(p string) bool {
+	e := strings.ToLower(filepath.Ext(p))
+	return e == ".html" || e == ".htm"
+}
+
 // UIArtifact describes one artifact directory under the artifacts root.
 type UIArtifact struct {
 	Name     string    `json:"name"`
@@ -85,7 +148,10 @@ func (s *Server) listUIArtifacts() ([]UIArtifact, error) {
 	}
 	out := make([]UIArtifact, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+		// Underscore-prefixed dirs are shared furniture (the shell), not
+		// artifacts; dot-prefixed are hidden as usual.
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") ||
+			strings.HasPrefix(e.Name(), "_") {
 			continue
 		}
 		a := UIArtifact{
@@ -256,6 +322,10 @@ func (s *Server) handleUIArtifacts(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
+	if isHTMLPath(clean) {
+		serveHTMLArtifact(w, f, clean)
+		return
+	}
 	if ct := mime.TypeByExtension(strings.ToLower(filepath.Ext(clean))); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
@@ -279,9 +349,7 @@ func (s *Server) renderUIArtifactIndexHTML(w http.ResponseWriter) {
 		if f, err2 := root.Open(uiHomeIndexPath); err2 == nil {
 			defer f.Close()
 			if st, err3 := f.Stat(); err3 == nil && !st.IsDir() {
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				http.ServeContent(w, &http.Request{Method: http.MethodGet},
-					uiHomeIndexPath, st.ModTime(), f)
+				serveHTMLArtifact(w, f, uiHomeIndexPath)
 				return
 			}
 		}

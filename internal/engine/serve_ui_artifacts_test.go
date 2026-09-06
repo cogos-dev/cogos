@@ -415,3 +415,60 @@ func TestUIArtifacts_WorkspaceHomeOverridesBuiltinIndex(t *testing.T) {
 		t.Fatalf("artifact status = %d, want 200", rec.Code)
 	}
 }
+
+// Every HTML artifact inherits the shared shell without importing anything;
+// opting out is the deliberate act. Non-HTML is untouched, and the shell's
+// own assets must never be injected into themselves (infinite chrome).
+func TestUIArtifacts_ShellIsInheritedAndOptOutable(t *testing.T) {
+	s, ws := newArtifactTestServer(t)
+
+	writeArtifact(t, ws, "plain", "index.html", `<html><head><title>p</title></head><body>hi</body></html>`)
+	rec := get(t, s.handleUIArtifacts, "/ui/plain/")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), uiShellTag) {
+		t.Error("plain artifact did not inherit the shell")
+	}
+	if !strings.Contains(rec.Body.String(), "hi") {
+		t.Error("injection dropped the page's own body")
+	}
+
+	// Opt-out is honoured.
+	writeArtifact(t, ws, "bare", "index.html",
+		`<html><head><meta name="cog-shell" content="off"></head><body>x</body></html>`)
+	rec = get(t, s.handleUIArtifacts, "/ui/bare/")
+	if strings.Contains(rec.Body.String(), uiShellTag) {
+		t.Error("opt-out page was injected anyway")
+	}
+
+	// A fragment with no </head> still gets chrome rather than silently missing it.
+	writeArtifact(t, ws, "frag", "index.html", `<body>fragment</body>`)
+	rec = get(t, s.handleUIArtifacts, "/ui/frag/")
+	if !strings.Contains(rec.Body.String(), uiShellTag) {
+		t.Error("head-less fragment did not inherit the shell")
+	}
+
+	// The shell's own asset is served unmodified.
+	writeArtifact(t, ws, uiShellDirName, "shell.js", `console.log('shell')`)
+	rec = get(t, s.handleUIArtifacts, "/ui/_shell/shell.js")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("shell asset status = %d, want 200", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), uiShellTag) {
+		t.Error("shell asset was injected into itself")
+	}
+
+	// Non-HTML is byte-identical.
+	writeArtifact(t, ws, "plain", "data.json", `{"a":1}`)
+	rec = get(t, s.handleUIArtifacts, "/ui/plain/data.json")
+	if rec.Body.String() != `{"a":1}` {
+		t.Errorf("json was rewritten: %q", rec.Body.String())
+	}
+
+	// Furniture is not an artifact: _shell must not appear in the listing.
+	rec = get(t, s.handleUIArtifactIndex, "/v1/ui/artifacts")
+	if strings.Contains(rec.Body.String(), uiShellDirName) {
+		t.Error("_shell leaked into the artifact listing")
+	}
+}
