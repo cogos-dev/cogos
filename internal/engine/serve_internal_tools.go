@@ -132,10 +132,17 @@ func refusedToolNameSet(req *CompletionRequest) map[string]struct{} {
 // steerable provider could therefore still drive kernel-side execution with
 // its own arguments, even with the definition stripped.
 //
-// A kernel-owned call whose name the gateway refused is not executed. It
-// falls to the external pool, where the renderer's ownership re-filter (which
-// deliberately keeps the name-only form) drops it before it can reach the
-// client. The call is neither run nor leaked.
+// A kernel-owned call whose name the gateway refused is neither executed nor
+// forwarded: it is DROPPED HERE, at the split, and appears in neither pool.
+//
+// It used to fall through to the external pool on the theory that each
+// renderer re-filters by ownership before responding. Two of the four do
+// (completeChat, completeAnthropicMessages); the two streaming renderers
+// emit the external pool verbatim, so on stream:true the refused call
+// reached the client as a tool_calls delta / tool_use block — carrying
+// model-generated arguments produced in the belief it was invoking the real
+// kernel tool. Dropping at the split makes the property hold for all four
+// paths at one site instead of asking four renderers to remember.
 //
 // Calls the kernel legitimately offered — via injectKernelAgentTools on the
 // kernel-agent path, or any request with no refusals — keep their pre-existing
@@ -153,8 +160,8 @@ func splitToolCallsByOwnershipFor(calls []ToolCall, m *MCPServer, req *Completio
 			}
 			slog.Warn("tools: refusing tool_use for a client-supplied kernel-owned name",
 				"tool", tc.Name, "call_id", tc.ID)
-			// Fall through to external; the renderer's ownership filter drops
-			// it there, so it is neither executed nor forwarded.
+			// Drop it: not executed, not rendered, on every surface and mode.
+			continue
 		}
 		external = append(external, tc)
 	}
