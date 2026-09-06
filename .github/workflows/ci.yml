@@ -132,6 +132,23 @@ jobs:
       - name: Install guard regression suite
         run: ./scripts/test-refuse-if-running.sh
 
+      # Same reasoning as the step above, for the pre-push hook added in #612.
+      # The static gates confirm .githooks/pre-push EXISTS and passes shell
+      # hardening; neither executes its refusal path. A change to the hook —
+      # renaming the "pre-push: REFUSED" line, swapping which script enforces
+      # hardening — would leave a guard that installs cleanly, runs on every
+      # push, and refuses nothing, with CI fully green. This step makes the
+      # refusal load-bearing.
+      #
+      # `make hooks` first: the control exits 2 rather than reporting a
+      # meaningless pass when core.hooksPath is unset, which is exactly the
+      # state a fresh CI checkout is in. It pushes only to a throwaway bare
+      # repo in a temp dir, never to origin.
+      - name: Pre-push hook negative control
+        run: |
+          make hooks
+          sh scripts/test-prepush-hook.sh
+
   e2e:
     runs-on: ubuntu-latest
     needs: build
