@@ -65,13 +65,20 @@ jobs:
 
       # Advisory posture: exit 0 unless a check reports FAIL. Captured to a
       # file so the same run feeds both the log and the job summary.
+      #
+      # ${PIPESTATUS[0]}, never `$?`: Actions runs this with `bash -e` and NO
+      # pipefail, so after `cogos doctor | tee`, `$?` is tee's status (always 0)
+      # and a genuine FAIL would be reported as advisory_exit=0 directly above a
+      # table showing FAIL:1 — the summary silently lying in exactly the case it
+      # exists to surface. Same reason pr-review.yml documents the inherited
+      # shell flags, and same fix scripts/doctor-local.sh already uses.
       - name: Run doctor
         id: doctor
         working-directory: /tmp/ws
+        shell: bash
         run: |
-          set +e
           /tmp/cogos doctor | tee /tmp/doctor.txt
-          echo "advisory_exit=$?" >> "$GITHUB_OUTPUT"
+          echo "advisory_exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       # The gate posture is exercised but NOT enforced, so we learn what it
       # would have done long before anyone depends on it.

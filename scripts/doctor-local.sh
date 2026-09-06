@@ -27,6 +27,13 @@
 # is "UNKNOWN never reported as OK", and punishing that would teach checks to
 # lie.
 
+# no-pipefail: this script's entire job is CAPTURING non-zero exits, not dying
+# on them. `cogos doctor` exits 1 on FAIL, `doctor --lint` exits 1 by design at
+# a threshold, and both are recorded and reported rather than propagated. Under
+# `set -e` the first advisory finding would abort the run before the verdict
+# table is printed, which would defeat the point of an advisory reporter.
+# `-o pipefail` IS set, and every pipeline that matters reads ${PIPESTATUS[0]}
+# explicitly (see ADVISORY_EXIT below) rather than trusting `$?` after a pipe.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
