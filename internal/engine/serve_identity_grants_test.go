@@ -1205,7 +1205,14 @@ func TestIdentityGrantMint_NonRootCannotEscalateScope(t *testing.T) {
 // with a whitespace-tolerant pattern so the next stale mention fails a test
 // instead of a reviewer.
 func TestIdentityRoutes_NoLiveGETCurrentClaim(t *testing.T) {
-	re := regexp.MustCompile(`GET\s+/v1/identity/grants/current`)
+	// Two distinct falsehoods, one test:
+	//   (a) the /current route presented as a GET — it is a gated POST;
+	//   (b) ANY identity route described as gate-exempt — L03 gated the whole
+	//       /v1/identity/* surface. GET /v1/identity/grants is still a real,
+	//       live route, so matching the bare verb would be wrong; it is the
+	//       exemption claim that is stale. Review round 3 found (b) in two
+	//       more comments after round 2 fixed only (a).
+	re := regexp.MustCompile(`GET\s+/v1/identity/grants/current|gate-exempt\s+GET\s+/v1/identity/`)
 	entries, err := os.ReadDir("./")
 	if err != nil {
 		t.Fatalf("readdir: %v", err)
@@ -1225,7 +1232,8 @@ func TestIdentityRoutes_NoLiveGETCurrentClaim(t *testing.T) {
 			}
 			// A mention is allowed only if it is explicitly marked historical.
 			if strings.Contains(line, "no longer") || strings.Contains(line, "superseded") ||
-				strings.Contains(line, "was gate-exempt") || strings.Contains(line, "through 2026-09") {
+				strings.Contains(line, "was gate-exempt") || strings.Contains(line, "through 2026-09") ||
+				strings.Contains(line, "then-gate-exempt") || strings.Contains(line, "was visible via the") {
 				continue
 			}
 			t.Errorf("%s:%d still presents the removed GET as live: %s\n"+

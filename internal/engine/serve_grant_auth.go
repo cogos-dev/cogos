@@ -86,8 +86,9 @@
 //     the bootstrap exemption gone, VerifyAny alone would let ANY live grant
 //     — including one for an unrelated, throwaway surface an authenticated
 //     caller minted for itself — mint a grant for a DIFFERENT surface, or
-//     revoke node-root's own grant outright (its grant_id is visible via the
-//     gate-exempt GET /v1/identity/grants). Closing that residual (cog-review
+//     revoke node-root's own grant outright (its grant_id was visible via the
+//     then-gate-exempt GET /v1/identity/grants; ledger L03 has since put all
+//     of /v1/identity/* behind this gate). Closing that residual (cog-review
 //     unverified note, PR #551) means handleIdentityGrantMint and
 //     handleIdentityGrantRevoke (serve_identity_grants.go) additionally
 //     require the presented grant's surface to be "node-root" (the admin

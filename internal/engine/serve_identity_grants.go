@@ -1348,8 +1348,9 @@ type identityGrantRevokeResponse struct {
 // serve_grant_auth.go's file header "SURFACE-MATCH" section): VerifyAny
 // accepts any live grant regardless of surface, so without an additional
 // check here a caller holding a grant for an unrelated, throwaway surface
-// could revoke node-root's grant outright (its grant_id is visible via the
-// gate-exempt GET /v1/identity/grants). Before mutating anything, this looks
+// could revoke node-root's grant outright (its grant_id was visible via the
+// then-gate-exempt GET /v1/identity/grants; ledger L03 has since gated all of
+// /v1/identity/*, but this check stands on its own). Before mutating anything, this looks
 // up the TARGET grant by id (GrantByID, read-only) and requires the
 // presented grant (grantFromContext) to be node-root or to already match the
 // target's own surface (self-service: a surface may revoke/rotate its own
