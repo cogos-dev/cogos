@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# pre-push — local fail-closed gate for cogos.
+#
+# Until this existed, cogos had ZERO real git hooks (16 *.sample files and
+# nothing else) while carrying the heavier CI suite of the two repos. The cog
+# workspace had the opposite shape: five real hooks, lighter CI. So a developer
+# here could push a shell-hardening violation and only learn about it from a
+# red PR minutes later, while the substrate repo caught its own violations
+# before the commit ever formed.
+#
+# This runs the checks CI already runs, by invoking the SAME scripts CI
+# invokes — not reimplementations. That is the repo's established parity
+# pattern (scripts/lib/refuse-if-running.sh is called from both the Makefile
+# and ci.yml); a second copy of a check drifts from the first silently.
+#
+# Threshold rationale — measured, not chosen:
+#   A fresh `cogos init` workspace reports 7 OK / 7 WARN / 0 FAIL / 5 UNKNOWN.
+#   `doctor --lint --severity-min warn` therefore exits 1 on a CLEAN tree and
+#   would block every push today. `--gate fail` exits 0. FAIL is genuinely
+#   empty on a healthy scaffold, which makes it the only honest gate right now.
+#   Raise it once the clean-runner WARN set is driven to zero.
+#
+# UNKNOWN is never treated as failure. A fresh workspace has no
+# constellation.db until something indexes it, so doctor's index/store checks
+# honestly report "could not check" — that is its "UNKNOWN never reported as
+# OK" contract working, and punishing it would teach checks to lie.
+#
+# Install:  make hooks       (sets core.hooksPath, no copying)
+# Verify:   make hooks-verify
+# Bypass:   git push --no-verify    — and say so, because the guard exists
+#           precisely to catch what discipline misses.
+
+# no-pipefail: this hook runs checks that are EXPECTED to exit non-zero and
+# reports on all of them before deciding. Under `set -e` the first failing
+# check would abort the hook, hiding every subsequent finding behind the first.
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 1
+
+rc=0
+
+echo "pre-push: shell hardening gate"
+if ! ./scripts/check-shell-hardening.sh; then
+  echo "pre-push: FAILED — shell hardening (this is the same check ci.yml's lint job runs)" >&2
+  rc=1
+fi
+
+# doctor-local builds the binary (~20s). Deliberately on pre-push, NOT
+# pre-commit: a 20s tax on every commit is how a guard earns a habit of
+# --no-verify, and a bypassed guard is worse than none because it still looks
+# installed.
+echo "pre-push: doctor (gate: fail)"
+report="$(mktemp)"
+if ! ./scripts/doctor-local.sh --gate fail >"$report" 2>&1; then
+  echo "pre-push: FAILED — doctor reported FAIL findings:" >&2
+  grep -E '^\s*\[FAIL\]' "$report" >&2 || tail -20 "$report" >&2
+  echo "  full report: $report" >&2
+  rc=1
+else
+  grep -E '^\s{2}(OK|WARN|FAIL|UNKNOWN)\s' "$report" | sed 's/^/  /'
+  rm -f "$report"
+fi
+
+if [ "$rc" -ne 0 ]; then
+  echo "pre-push: REFUSED. Fix the above, or 'git push --no-verify' and say why." >&2
+  exit 1
+fi
+
+echo "pre-push: OK"
+exit 0

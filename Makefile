@@ -196,6 +196,34 @@ vet:
 tidy:
 	go mod tidy
 
+# Install the tracked git hooks by pointing core.hooksPath at .githooks/.
+#
+# Deliberately NOT a copy into .git/hooks: a copied hook drifts from its source
+# the moment either changes, and .git/hooks is unversioned so the drift is
+# invisible. Pointing at the tracked directory means there is exactly one
+# implementation and `git pull` updates the guard.
+#
+# Until this existed cogos had no real git hooks at all, while carrying the
+# heavier CI suite — a shell-hardening violation could only be discovered from
+# a red PR. The hook runs the same scripts CI runs; see .githooks/pre-push.
+.PHONY: hooks hooks-verify
+hooks:
+	@git config core.hooksPath .githooks
+	@chmod +x .githooks/*
+	@echo "hooks: core.hooksPath -> .githooks"
+	@echo "  pre-push: shell hardening + doctor (gate: fail)"
+
+# Report whether the hooks are actually active. A guard that is merely present
+# is not a guard that runs.
+hooks-verify:
+	@if [ "$$(git config core.hooksPath)" = ".githooks" ]; then \
+		echo "hooks: ACTIVE (core.hooksPath=.githooks)"; \
+		test -x .githooks/pre-push && echo "  pre-push: executable" || { echo "  pre-push: NOT EXECUTABLE — run 'make hooks'" >&2; exit 1; }; \
+	else \
+		echo "hooks: NOT INSTALLED (core.hooksPath='$$(git config core.hooksPath)') — run 'make hooks'" >&2; \
+		exit 1; \
+	fi
+
 lint: vet
 	@echo "=== Checking for bare exec.Command ==="
 	@if grep -n 'exec\.Command(' *.go | grep -v '_test\.go' | grep -v 'CommandContext' | grep -v '// bare-ok' > /dev/null 2>&1; then \
