@@ -346,22 +346,28 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	// partition by ownership — same three pools as handleChat (serve.go):
 	// kernel-classified names, MCP-internal tools, and everything else
 	// forwarded back to the client as tool_use blocks.
+	//
+	// Ledger L06: identical refusal to the OpenAI twin. This is the surface
+	// the row names — /v1/messages routed client-named cog_* straight into
+	// splitToolCallsByOwnership → MCPServer.CallTool.
 	if len(anthropicReq.Tools) > 0 {
-		creq.Tools = make([]ToolDefinition, 0, len(anthropicReq.Tools))
+		defs := make([]ToolDefinition, 0, len(anthropicReq.Tools))
 		for _, t := range anthropicReq.Tools {
-			td := ToolDefinition{
+			defs = append(defs, ToolDefinition{
 				Name:        t.Name,
 				Description: t.Description,
 				InputSchema: t.InputSchema,
-			}
-			creq.Tools = append(creq.Tools, td)
-			if classifyToolOwnership(t.Name) == ToolOwnershipKernel {
-				continue
-			}
-			if s.mcpServer != nil && s.mcpServer.IsInternalTool(t.Name) {
-				continue
-			}
-			creq.ExternalTools = append(creq.ExternalTools, td)
+			})
+		}
+		tools, external, rejected := admitClientSuppliedTools(defs, s.mcpServer)
+		creq.Tools = tools
+		creq.ExternalTools = append(creq.ExternalTools, external...)
+		creq.RefusedToolNames = rejected
+		if len(rejected) > 0 {
+			slog.Warn("anthropic: refused client-supplied kernel-owned tool definitions",
+				"request_id", creq.Metadata.RequestID,
+				"rejected", rejected,
+			)
 		}
 	}
 	creq.ToolChoice = anthropicToolChoiceString(anthropicReq.ToolChoice)
@@ -556,7 +562,7 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 	if s.mcpServer != nil {
 		const maxInternalHops = 8
 		for hop := 0; hop < maxInternalHops; hop++ {
-			internal, external := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer)
+			internal, external := splitToolCallsByOwnershipFor(resp.ToolCalls, s.mcpServer, req)
 			if len(internal) == 0 {
 				break
 			}
@@ -616,7 +622,7 @@ func (s *Server) completeAnthropicMessages(w http.ResponseWriter, ctx context.Co
 		// Cap exhausted with kernel-owned calls still pending: hard error,
 		// mirroring the streaming path. Falling through would hand
 		// unexecuted cog_* tool_use to an external client (review round 1).
-		if internal, _ := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer); len(internal) > 0 {
+		if internal, _ := splitToolCallsByOwnershipFor(resp.ToolCalls, s.mcpServer, req); len(internal) > 0 {
 			slog.Warn("anthropic: internal tool hop cap exceeded", "cap", maxInternalHops, "pending", len(internal))
 			if turn != nil {
 				turn.Status = "error"
@@ -795,7 +801,7 @@ func (s *Server) streamAnthropicMessages(w http.ResponseWriter, ctx context.Cont
 		}
 
 		toolCalls := hopBuf.assembledToolCalls()
-		internal, external := splitToolCallsByOwnership(toolCalls, s.mcpServer)
+		internal, external := splitToolCallsByOwnershipFor(toolCalls, s.mcpServer, req)
 		carriedExternal = append(carriedExternal, external...)
 
 		if len(internal) == 0 {

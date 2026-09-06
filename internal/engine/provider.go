@@ -180,6 +180,18 @@ type CompletionRequest struct {
 	// kernel-owned. Names are expected to match entries in Tools.
 	ExternalTools []ToolDefinition `json:"external_tools,omitempty"`
 
+	// RefusedToolNames records CLIENT-SUPPLIED tool definitions that were
+	// dropped at the gateway because they collided with a kernel-owned
+	// (MCP-registered) tool name. Ledger L06.
+	//
+	// Stripping the definition is necessary but not sufficient: the tool-call
+	// partitioner classifies by name alone, so a provider that emits a
+	// tool_use for a refused name would still have it executed in-process.
+	// splitToolCallsByOwnershipFor consults this set and routes any such call
+	// away from execution. Not serialized upstream — kernel-local state for
+	// the duration of the request.
+	RefusedToolNames []string `json:"-"`
+
 	// ToolChoice constrains tool use: "auto", "none", "required", or a name.
 	ToolChoice string `json:"tool_choice,omitempty"`
 

@@ -1004,25 +1004,32 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	//     emits a tool_use for them (closes #94).
 	//   - everything else (browser_*, agent-defined tools) — forwarded to
 	//     the client as OpenAI tool_calls for client-side execution.
+	//
+	// Ledger L06: a client-supplied name that collides with an MCP-registered
+	// kernel tool is REFUSED here, not admitted-and-withheld. Admitting it to
+	// creq.Tools handed the provider a real callable whose tool_use
+	// splitToolCallsByOwnership then routed into MCPServer.CallTool.
 	if len(req.Tools) > 0 {
-		creq.Tools = make([]ToolDefinition, 0, len(req.Tools))
+		defs := make([]ToolDefinition, 0, len(req.Tools))
 		for _, t := range req.Tools {
 			if t.Type != "function" {
 				continue
 			}
-			td := ToolDefinition{
+			defs = append(defs, ToolDefinition{
 				Name:        t.Function.Name,
 				Description: t.Function.Description,
 				InputSchema: t.Function.Parameters,
-			}
-			creq.Tools = append(creq.Tools, td)
-			if classifyToolOwnership(t.Function.Name) == ToolOwnershipKernel {
-				continue
-			}
-			if s.mcpServer != nil && s.mcpServer.IsInternalTool(t.Function.Name) {
-				continue
-			}
-			creq.ExternalTools = append(creq.ExternalTools, td)
+			})
+		}
+		tools, external, rejected := admitClientSuppliedTools(defs, s.mcpServer)
+		creq.Tools = tools
+		creq.ExternalTools = append(creq.ExternalTools, external...)
+		creq.RefusedToolNames = rejected
+		if len(rejected) > 0 {
+			slog.Warn("chat: refused client-supplied kernel-owned tool definitions",
+				"request_id", creq.Metadata.RequestID,
+				"rejected", rejected,
+			)
 		}
 	}
 
@@ -1087,6 +1094,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Eventually this aliases the kernel-managed in-host harness;
 		// see .cog/scratch/audit-inference-paths/REPORT.md.
 		if mres.InjectKernelTools && len(creq.Tools) == 0 && s.mcpServer != nil {
+			// RefusedToolNames records CLIENT-supplied definitions we declined
+			// to honour. Kernel injection is a different authority: it offers
+			// the kernel's own tools on the kernel's terms. Clear the refusal
+			// set before injecting, or a name refused as client-supplied
+			// (e.g. cog_read_cogdoc) stays refused after the kernel itself
+			// legitimately offers it — the model sees the tool, calls it,
+			// and the ownership split drops the call. (Review on #606.)
+			creq.RefusedToolNames = nil
 			injectKernelAgentTools(creq, s.mcpServer)
 			// G2 PART C: when IdentityNakedDefault is true and the request is
 			// bound to an identity with a wired capResolver, filter the injected
@@ -1516,7 +1531,7 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 	if s.mcpServer != nil {
 		const maxInternalHops = 8
 		for hop := 0; hop < maxInternalHops; hop++ {
-			internal, external := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer)
+			internal, external := splitToolCallsByOwnershipFor(resp.ToolCalls, s.mcpServer, req)
 			if len(internal) == 0 {
 				break
 			}
@@ -1593,7 +1608,7 @@ func (s *Server) completeChat(w http.ResponseWriter, ctx context.Context, req *C
 		// Same guard the Anthropic surface got in #600 round 1; this is its
 		// twin (round 2). Falling through would render unexecuted cog_*
 		// tool_calls to an external client.
-		if internal, _ := splitToolCallsByOwnership(resp.ToolCalls, s.mcpServer); len(internal) > 0 {
+		if internal, _ := splitToolCallsByOwnershipFor(resp.ToolCalls, s.mcpServer, req); len(internal) > 0 {
 			slog.Warn("chat: internal tool hop cap exceeded", "cap", maxInternalHops, "pending", len(internal))
 			if turn != nil {
 				turn.Status = "error"
@@ -1878,7 +1893,7 @@ func (s *Server) streamChat(w http.ResponseWriter, ctx context.Context, req *Com
 		// snapshot wired (legacy / test paths), splitToolCallsByOwnership
 		// treats everything as external — same behaviour as completeChat.
 		toolCalls := hopBuf.assembledToolCalls()
-		internal, external := splitToolCallsByOwnership(toolCalls, s.mcpServer)
+		internal, external := splitToolCallsByOwnershipFor(toolCalls, s.mcpServer, req)
 
 		// External tool calls observed on this hop are owed to the client.
 		// We don't drop them even if the same hop also produced internal

@@ -15,6 +15,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 
 	"github.com/google/uuid"
 )
@@ -106,4 +107,63 @@ func truncateForTurn(s string) string {
 		return s
 	}
 	return s[:max] + "...[truncated]"
+}
+
+// refusedToolNameSet indexes req.RefusedToolNames for lookup.
+func refusedToolNameSet(req *CompletionRequest) map[string]struct{} {
+	if req == nil || len(req.RefusedToolNames) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(req.RefusedToolNames))
+	for _, n := range req.RefusedToolNames {
+		out[n] = struct{}{}
+	}
+	return out
+}
+
+// splitToolCallsByOwnershipFor is splitToolCallsByOwnership narrowed by the
+// set of client-supplied names the gateway refused on this request.
+//
+// Ledger L06, second vector. Refusing the client's tool DEFINITION is not
+// sufficient on its own: splitToolCallsByOwnership classifies purely by name,
+// so a provider that emits a tool_use for a refused kernel-owned name still
+// landed in the internal pool and was executed via [MCPServer.CallTool]. A
+// client naming cog_read_cogdoc in tools[] and talking to a compliant or
+// steerable provider could therefore still drive kernel-side execution with
+// its own arguments, even with the definition stripped.
+//
+// A kernel-owned call whose name the gateway refused is neither executed nor
+// forwarded: it is DROPPED HERE, at the split, and appears in neither pool.
+//
+// It used to fall through to the external pool on the theory that each
+// renderer re-filters by ownership before responding. Two of the four do
+// (completeChat, completeAnthropicMessages); the two streaming renderers
+// emit the external pool verbatim, so on stream:true the refused call
+// reached the client as a tool_calls delta / tool_use block — carrying
+// model-generated arguments produced in the belief it was invoking the real
+// kernel tool. Dropping at the split makes the property hold for all four
+// paths at one site instead of asking four renderers to remember.
+//
+// Calls the kernel legitimately offered — via injectKernelAgentTools on the
+// kernel-agent path, or any request with no refusals — keep their pre-existing
+// treatment, so the #94 in-process execution contract is unchanged.
+func splitToolCallsByOwnershipFor(calls []ToolCall, m *MCPServer, req *CompletionRequest) (internal, external []ToolCall) {
+	refused := refusedToolNameSet(req)
+	if len(refused) == 0 {
+		return splitToolCallsByOwnership(calls, m)
+	}
+	for _, tc := range calls {
+		if m != nil && m.IsInternalTool(tc.Name) {
+			if _, bad := refused[tc.Name]; !bad {
+				internal = append(internal, tc)
+				continue
+			}
+			slog.Warn("tools: refusing tool_use for a client-supplied kernel-owned name",
+				"tool", tc.Name, "call_id", tc.ID)
+			// Drop it: not executed, not rendered, on every surface and mode.
+			continue
+		}
+		external = append(external, tc)
+	}
+	return internal, external
 }
