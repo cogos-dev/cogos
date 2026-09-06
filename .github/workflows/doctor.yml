@@ -66,12 +66,18 @@ jobs:
       # Advisory posture: exit 0 unless a check reports FAIL. Captured to a
       # file so the same run feeds both the log and the job summary.
       #
-      # ${PIPESTATUS[0]}, never `$?`: Actions runs this with `bash -e` and NO
-      # pipefail, so after `cogos doctor | tee`, `$?` is tee's status (always 0)
-      # and a genuine FAIL would be reported as advisory_exit=0 directly above a
-      # table showing FAIL:1 — the summary silently lying in exactly the case it
-      # exists to surface. Same reason pr-review.yml documents the inherited
-      # shell flags, and same fix scripts/doctor-local.sh already uses.
+      # ${PIPESTATUS[0]}, never `$?`: after `cogos doctor | tee`, `$?` is tee's
+      # status (always 0), so a genuine FAIL would report advisory_exit=0
+      # directly above a table showing FAIL:1 — the summary lying in exactly the
+      # case it exists to surface.
+      #
+      # `shell: bash` is pinned here, which GitHub expands to
+      # `bash --noprofile --norc -eo pipefail {0}` — pipefail IS active, so the
+      # pipeline's own status would also be non-zero. PIPESTATUS is kept anyway
+      # because it is correct under BOTH shells: the repo's default run-shell
+      # (`bash -e`, no pipefail — see pr-review.yml:378-383) and this explicit
+      # one. Reading the command's own status is right regardless of which
+      # shell the step inherits, so the guard cannot rot if `shell:` changes.
       - name: Run doctor
         id: doctor
         working-directory: /tmp/ws

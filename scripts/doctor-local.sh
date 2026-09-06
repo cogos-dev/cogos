@@ -63,9 +63,14 @@ if ! (cd "$REPO_ROOT" && go build -tags fts5 -o "$BIN" ./cmd/cogos); then
   exit 2
 fi
 
-# Assert the tag actually took. A binary that merely *declares* fts5 is the
-# exact defect this repo shipped for weeks (ledger L-01): symbol presence is
-# not module availability, so check the count, not the mere presence.
+# Assert the tag actually took. A binary that merely *declares* fts5 is a real
+# incident this pairing exists to prevent: symbol presence is not module
+# availability, so check the count, not the mere presence. (Recorded outside
+# this repo, in the operator's cog workspace friction ledger
+# 2026-09-06-friction-ledger-memory-search-fts5 L-01 "Live kernel built without
+# FTS5" — cited as provenance, not as a resolvable in-repo reference. The
+# in-repo statement of the same CGO/FTS5 hazard is in .github/workflows/
+# release.yml.)
 syms=$(strings "$BIN" 2>/dev/null | grep -c fts5 || true)
 if [ "${syms:-0}" -lt 5 ]; then
   echo "doctor-local: WARNING — only ${syms} fts5 symbols in the built binary." >&2
