@@ -56,7 +56,22 @@ jobs:
       # rather than the one release ships. Same tag the Makefile and
       # release.yml use.
       - name: Build cogos (with fts5)
-        run: go build -tags fts5 -o /tmp/cogos ./cmd/cogos
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -tags fts5 -o /tmp/cogos ./cmd/cogos
+          # Verify the tag actually took, rather than trusting the build flag.
+          # -tags fts5 without CGO yields a stub: the build succeeds, the
+          # binary declares the tag, and doctor's index checks then silently
+          # measure a degraded binary. Symbol presence is not module
+          # availability, so count. Mirrors the identical assertion in
+          # scripts/doctor-local.sh — the local runner had this guard and this
+          # job did not, which is the sibling gap cog-review flagged.
+          syms=$(strings /tmp/cogos | grep -c fts5 || true)
+          echo "fts5 symbols: $syms (tagged build ~25, tagless ~1)"
+          if [ "${syms:-0}" -lt 5 ]; then
+            echo "::warning::only ${syms} fts5 symbols — doctor may be measuring a degraded binary (CGO_ENABLED?)"
+          fi
 
       - name: Scaffold a fresh workspace
         run: |
@@ -66,23 +81,31 @@ jobs:
       # Advisory posture: exit 0 unless a check reports FAIL. Captured to a
       # file so the same run feeds both the log and the job summary.
       #
-      # ${PIPESTATUS[0]}, never `$?`: after `cogos doctor | tee`, `$?` is tee's
-      # status (always 0), so a genuine FAIL would report advisory_exit=0
-      # directly above a table showing FAIL:1 — the summary lying in exactly the
-      # case it exists to surface.
+      # BOTH guards are required, and each covers a different failure:
       #
-      # `shell: bash` is pinned here, which GitHub expands to
-      # `bash --noprofile --norc -eo pipefail {0}` — pipefail IS active, so the
-      # pipeline's own status would also be non-zero. PIPESTATUS is kept anyway
-      # because it is correct under BOTH shells: the repo's default run-shell
-      # (`bash -e`, no pipefail — see pr-review.yml:378-383) and this explicit
-      # one. Reading the command's own status is right regardless of which
-      # shell the step inherits, so the guard cannot rot if `shell:` changes.
+      #   set +e  — `shell: bash` expands to `bash --noprofile --norc -eo
+      #     pipefail {0}`. Under `-e` + `pipefail`, a genuine FAIL makes the
+      #     `doctor | tee` pipeline non-zero and the step ABORTS on that line —
+      #     before advisory_exit is ever captured, leaving the summary blank and
+      #     skipping the Lint-posture step entirely, in exactly the run that
+      #     matters most. pr-review.yml:378-384 documents this repo hitting the
+      #     identical bug once already ("the canary step already guarded its
+      #     claude call, this sibling didn't"), and its fix was also `set +e`.
+      #
+      #   ${PIPESTATUS[0]} — never `$?`, which after a pipe reads tee's status
+      #     (always 0). Without it a real FAIL reports advisory_exit=0 directly
+      #     above a table showing FAIL:1. Correct under both this pinned shell
+      #     and the repo default (`bash -e`, no pipefail), so it cannot rot if
+      #     the `shell:` key changes.
+      #
+      # Removing either one silently breaks reporting only on FAIL — the case
+      # this job exists to surface — which is why both carry a reason here.
       - name: Run doctor
         id: doctor
         working-directory: /tmp/ws
         shell: bash
         run: |
+          set +e
           /tmp/cogos doctor | tee /tmp/doctor.txt
           echo "advisory_exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
