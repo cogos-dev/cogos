@@ -15,6 +15,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -332,13 +334,20 @@ func TestIdentityGrantMint_CapacityErrorMapsTo429(t *testing.T) {
 	lastResp.Body.Close()
 }
 
+// TestIdentityGrantCurrent_ZeroPasteBootstrap exercises the zero-paste
+// primitive in its post-L03 shape: POST, not GET (see
+// handleIdentityGrantCurrent). This server has no grant middleware in front
+// of it (newIdentityGrantServer mounts the handlers on a bare mux and stamps
+// a node-root grant into every request context), so this covers the handler
+// semantics only; the gate itself is covered in serve_grant_auth_test.go.
 func TestIdentityGrantCurrent_ZeroPasteBootstrap(t *testing.T) {
 	_, front := newIdentityGrantServer(t)
 
 	// No grant minted yet -> 404, so a caller knows to mint or degrade.
-	miss, err := http.Get(front.URL + "/v1/identity/grants/current?surface=constellation-chat")
+	miss, err := http.Post(front.URL+"/v1/identity/grants/current?surface=constellation-chat",
+		"application/json", nil)
 	if err != nil {
-		t.Fatalf("GET current: %v", err)
+		t.Fatalf("POST current: %v", err)
 	}
 	if miss.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 before any grant exists, got %d", miss.StatusCode)
@@ -352,17 +361,31 @@ func TestIdentityGrantCurrent_ZeroPasteBootstrap(t *testing.T) {
 	var mintedOut identityGrantMintResponse
 	identityDecodeBody(t, minted, &mintedOut)
 
-	// Now the surface's own page can bootstrap with zero paste: GET current
+	// Now the surface's own page can bootstrap with zero paste: POST current
 	// returns the SAME live token, no operator action involved.
-	hit, err := http.Get(front.URL + "/v1/identity/grants/current?surface=constellation-chat")
+	hit, err := http.Post(front.URL+"/v1/identity/grants/current?surface=constellation-chat",
+		"application/json", nil)
 	if err != nil {
-		t.Fatalf("GET current: %v", err)
+		t.Fatalf("POST current: %v", err)
 	}
 	var hitOut identityGrantMintResponse
 	identityDecodeBody(t, hit, &hitOut)
 	if hitOut.Token != mintedOut.Token {
-		t.Fatalf("expected GET current to return the live grant's token unchanged, got %q vs %q",
+		t.Fatalf("expected POST current to return the live grant's token unchanged, got %q vs %q",
 			hitOut.Token, mintedOut.Token)
+	}
+
+	// The surface may also arrive in a JSON body rather than the query
+	// param — same result, so a caller that prefers a body does not need the
+	// query string.
+	viaBody := identityPostJSON(t, front.URL+"/v1/identity/grants/current", map[string]any{
+		"surface": "constellation-chat",
+	})
+	var bodyOut identityGrantMintResponse
+	identityDecodeBody(t, viaBody, &bodyOut)
+	if bodyOut.Token != mintedOut.Token {
+		t.Fatalf("expected the JSON-body form to return the same live token, got %q vs %q",
+			bodyOut.Token, mintedOut.Token)
 	}
 }
 
@@ -1087,7 +1110,7 @@ func TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace(t *testing.T) {
 	}()
 
 	// Reader #2: Current, the zero-paste-bootstrap path
-	// GET /v1/identity/grants/current exercises on every call.
+	// POST /v1/identity/grants/current exercises on every call.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1114,5 +1137,145 @@ func TestExtendGrant_ConcurrentWithVerifyAndCurrent_NoRace(t *testing.T) {
 	}
 	if final.GrantID != grant.GrantID {
 		t.Errorf("GrantID changed across concurrent extension: got %q, want %q", final.GrantID, grant.GrantID)
+	}
+}
+
+// TestIdentityGrantMint_NonRootCannotEscalateScope — review finding on #605
+// (ledger L02). A non-root caller may mint a replacement grant for its OWN
+// surface, but the scope it requests must be a subset of what it presents.
+// Before the fix, a "dashboard" grant holding only ["admin"] (issued narrowly,
+// to manage its own credential) could POST /v1/identity/grants for itself with
+// scope ["admin","inference","write"] and receive a wider credential — scope
+// enforcement in the middleware was decorative because the mint route let any
+// holder widen itself. Negative control: fails on the pre-fix handler.
+func TestIdentityGrantMint_NonRootCannotEscalateScope(t *testing.T) {
+	s, _ := newIdentityGrantServer(t)
+	narrow, err := s.identityGrants.MintOrReuse("dashboard", []string{"admin"}, time.Hour)
+	if err != nil {
+		t.Fatalf("mint narrow: %v", err)
+	}
+	mux := http.NewServeMux()
+	s.registerIdentityGrantRoutes(mux)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.ServeHTTP(w, r.WithContext(contextWithGrant(r.Context(), narrow)))
+	}))
+	t.Cleanup(front.Close)
+
+	// Same scope it already holds: allowed (idempotent self-refresh).
+	same := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "dashboard", "scope": []string{"admin"},
+	})
+	if same.StatusCode != http.StatusOK {
+		t.Fatalf("same-scope self-mint: want 200, got %d", same.StatusCode)
+	}
+	same.Body.Close()
+
+	// Wider scope: must be refused, and must NOT mint.
+	before := len(s.identityGrants.Snapshot())
+	wider := identityPostJSON(t, front.URL+"/v1/identity/grants", map[string]any{
+		"surface": "dashboard", "scope": []string{"admin", "inference", "write"},
+	})
+	if wider.StatusCode != http.StatusForbidden {
+		t.Fatalf("scope escalation: want 403, got %d", wider.StatusCode)
+	}
+	var body struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	identityDecodeBody(t, wider, &body)
+	if body.Error.Type != "scope_escalation" {
+		t.Fatalf("want error.type=scope_escalation, got %+v", body)
+	}
+	if after := len(s.identityGrants.Snapshot()); after != before {
+		t.Fatalf("escalation attempt minted a grant: %d → %d", before, after)
+	}
+	for _, g := range s.identityGrants.Snapshot() {
+		if g.Surface == "dashboard" && grantHasScope(g, "inference") {
+			t.Fatalf("a dashboard grant with inference scope exists after refused escalation")
+		}
+	}
+}
+
+// TestIdentityRoutes_NoLiveGETCurrentClaim guards the doc-drift class that
+// review round 1 and round 2 both caught: after ledger L03 made
+// /v1/identity/grants/current a gated POST, prose still told readers to GET
+// it. Round 1's grep used a single space and missed the mechanism table's
+// two-space alignment ("GET  /v1/..."). This scans non-test engine sources
+// with a whitespace-tolerant pattern so the next stale mention fails a test
+// instead of a reviewer.
+func TestIdentityRoutes_NoLiveGETCurrentClaim(t *testing.T) {
+	// Two distinct falsehoods, one test:
+	//   (a) the /current route presented as a GET — it is a gated POST;
+	//   (b) ANY identity route described as gate-exempt — L03 gated the whole
+	//       /v1/identity/* surface. GET /v1/identity/grants is still a real,
+	//       live route, so matching the bare verb would be wrong; it is the
+	//       exemption claim that is stale. Review round 3 found (b) in two
+	//       more comments after round 2 fixed only (a).
+	// Three falsehood shapes, all seen in review:
+	//   (a) the /current route presented as a GET — it is a gated POST;
+	//   (b) a route path described as gate-exempt;
+	//   (c) prose saying "the gate-exempt GET" with NO path at all — the
+	//       round-3 finding at two-plane-runtime.md:640. Matching only
+	//       patterns that carry /v1/identity/ misses it entirely.
+	// GET /v1/identity/grants (the inventory) is still a real live route, so
+	// the bare verb is deliberately not matched — it is the EXEMPTION claim
+	// that is stale, not the verb.
+	re := regexp.MustCompile(`GET\s+/v1/identity/grants/current|gate-exempt\s+GET`)
+	// Scan non-test engine sources AND the design docs. Rounds 2 and 3 both
+	// found stale mentions this test did not cover: it only read *.go, so
+	// docs/rfc-drafts/two-plane-runtime.md drifted three separate times while
+	// the guard stayed green. A doc that tells a reader to GET a route that
+	// is now a gated POST is as wrong as a code comment saying it.
+	var files []string
+	entries, err := os.ReadDir("./")
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasSuffix(n, ".go") && !strings.HasSuffix(n, "_test.go") {
+			files = append(files, n)
+		}
+	}
+	docs, err := filepath.Glob(filepath.Join("..", "..", "docs", "rfc-drafts", "*.md"))
+	if err != nil {
+		t.Fatalf("glob docs: %v", err)
+	}
+	files = append(files, docs...)
+
+	for _, n := range files {
+		b, err := os.ReadFile(n)
+		if err != nil {
+			t.Fatalf("read %s: %v", n, err)
+		}
+		lines := strings.Split(string(b), "\n")
+		for i, line := range lines {
+			if !re.MatchString(line) {
+				continue
+			}
+			// A historical marker often sits on a preceding line — prose wraps,
+			// so "…no longer exempts the route; it is a gated POST. As written
+			// below, this described the pre-fix state —" can be three lines
+			// above the mention it disclaims. Check a small window back, not
+			// just the matching line.
+			var ctx strings.Builder
+			for j := i - 3; j <= i; j++ {
+				if j >= 0 && j < len(lines) {
+					ctx.WriteString(lines[j])
+					ctx.WriteString(" ")
+				}
+			}
+			line = ctx.String()
+			// A mention is allowed only if it is explicitly marked historical.
+			if strings.Contains(line, "no longer") || strings.Contains(line, "superseded") ||
+				strings.Contains(line, "was gate-exempt") || strings.Contains(line, "through 2026-09") ||
+				strings.Contains(line, "then-gate-exempt") || strings.Contains(line, "was visible via the") {
+				continue
+			}
+			t.Errorf("%s:%d still presents the removed GET as live: %s\n"+
+				"the route is a gated POST (ledger L03); mark the mention historical or fix it",
+				n, i+1, strings.TrimSpace(line))
+		}
 	}
 }

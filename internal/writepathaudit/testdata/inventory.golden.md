@@ -37,9 +37,9 @@ Total sites: 237  (cog: 97, home: 2, elsewhere: 13, unanchored: 84, dynamic: 41)
 | `<WorkspaceRoot>/.cog/blobs` | (*BlobStore).Init (`os.MkdirAll`) | internal/engine/blobstore.go:66 | internal:engine |
 | `<WorkspaceRoot>/.cog/blobs/.gitkeep` | (*BlobStore).Init (`os.WriteFile`) | internal/engine/blobstore.go:72 | internal:engine |
 | `<WorkspaceRoot>/.cog/blobs/manifest.jsonl` | (*BlobStore).appendManifest (`os.OpenFile`) | internal/engine/blobstore.go:290 | internal:engine |
-| `dirname(<Home>/.cog/vault/node-root-grant)` | persistNodeRootGrant (`os.MkdirAll`) | internal/engine/boot_node_root_grant.go:275 | internal:engine |
-| `<Home>/.cog/vault/node-root-grant.tmp` | persistNodeRootGrant (`os.WriteFile`) | internal/engine/boot_node_root_grant.go:279 | internal:engine |
-| `<Home>/.cog/vault/node-root-grant` | persistNodeRootGrant (`os.Rename`) | internal/engine/boot_node_root_grant.go:282 | internal:engine |
+| `dirname(<Home>/.cog/vault/node-root-grant)` | persistNodeRootGrant (`os.MkdirAll`) | internal/engine/boot_node_root_grant.go:292 | internal:engine |
+| `<Home>/.cog/vault/node-root-grant.tmp` | persistNodeRootGrant (`os.WriteFile`) | internal/engine/boot_node_root_grant.go:296 | internal:engine |
+| `<Home>/.cog/vault/node-root-grant` | persistNodeRootGrant (`os.Rename`) | internal/engine/boot_node_root_grant.go:299 | internal:engine |
 | `<WorkspaceRoot>/.cog/run/bus` | (*ConsumerRegistry).persistLocked (`os.MkdirAll`) | internal/engine/bus_consumers.go:161 | internal:engine |
 | `<WorkspaceRoot>/.cog/run/bus/<call:pathsafe.SanitizeComponent>.cursors.jsonl` | (*ConsumerRegistry).persistLocked (`os.OpenFile`) | internal/engine/bus_consumers.go:166 | internal:engine |
 | `{root}/.cog/.state/constellation.db?mode=ro&_journal_mode=WAL&_busy_timeout=3000` | doctorIndexHealth (`sql.Open(sqlite3)`) | internal/engine/cli_doctor.go:1028 | internal:engine |
@@ -72,9 +72,9 @@ Total sites: 237  (cog: 97, home: 2, elsewhere: 13, unanchored: 84, dynamic: 41)
 | `<WorkspaceRoot>/.cog/run/proprioceptive.jsonl` | (*ProprioceptiveLogger).Log (`os.OpenFile`) | internal/engine/proprioceptive.go:72 | internal:engine |
 | `<WorkspaceRoot>/.cog/run` | newAttentionLog (`os.MkdirAll`) | internal/engine/serve_attention.go:46 | internal:engine |
 | `<WorkspaceRoot>/.cog/run/attention.jsonl` | (*attentionLog).append (`os.OpenFile`) | internal/engine/serve_attention.go:53 | internal:engine |
-| `<WorkspaceRoot>/.cog/ledger/identity-grants/events.jsonl` | (*IdentityGrantRegistry).appendExtendEventLocked (`engine.AppendEvent(bucket)`) | internal/engine/serve_identity_grants.go:723 | internal:engine |
-| `<WorkspaceRoot>/.cog/ledger/identity-grants/events.jsonl` | (*IdentityGrantRegistry).appendGrantEventLocked (`engine.AppendEvent(bucket)`) | internal/engine/serve_identity_grants.go:780 | internal:engine |
-| `<WorkspaceRoot>/.cog/ledger/identity-grants/events.jsonl` | (*IdentityGrantRegistry).appendSupersessionEventLocked (`engine.AppendEvent(bucket)`) | internal/engine/serve_identity_grants.go:823 | internal:engine |
+| `<WorkspaceRoot>/.cog/ledger/identity-grants/events.jsonl` | (*IdentityGrantRegistry).appendExtendEventLocked (`engine.AppendEvent(bucket)`) | internal/engine/serve_identity_grants.go:725 | internal:engine |
+| `<WorkspaceRoot>/.cog/ledger/identity-grants/events.jsonl` | (*IdentityGrantRegistry).appendGrantEventLocked (`engine.AppendEvent(bucket)`) | internal/engine/serve_identity_grants.go:782 | internal:engine |
+| `<WorkspaceRoot>/.cog/ledger/identity-grants/events.jsonl` | (*IdentityGrantRegistry).appendSupersessionEventLocked (`engine.AppendEvent(bucket)`) | internal/engine/serve_identity_grants.go:825 | internal:engine |
 | `<WorkspaceRoot>/.cog/ledger/worktree-reconciler/events.jsonl` | (*FilesystemLedgerWriter).EmitWorktreeEvent (`engine.AppendEvent(bucket)`) | internal/engine/worktree_spawn.go:273 | internal:engine |
 | `{p.root}/.cog/state` | writeDispatchTrigger (`os.MkdirAll`) | internal/eval/mcp_tools.go:375 | internal:eval |
 | `{p.root}/.cog/state` | writePinBaseline (`os.MkdirAll`) | internal/eval/mcp_tools.go:482 | internal:eval |
@@ -98,7 +98,7 @@ Total sites: 237  (cog: 97, home: 2, elsewhere: 13, unanchored: 84, dynamic: 41)
 | `<WorkspaceRoot>/.cog/mem/semantic/<call:fmt.Sprintf>` | (WorktreeDivergenceInjector).Inject (`os.WriteFile`) | internal/testkernel/experiment/injectors.go:79 | internal:testkernel |
 | `<WorkspaceRoot>/.cog/config` | (ConfigDriftInjector).Inject (`os.MkdirAll`) | internal/testkernel/experiment/injectors.go:101 | internal:testkernel |
 | `<WorkspaceRoot>/.cog/config/kernel.yaml` | (ConfigDriftInjector).Inject (`os.WriteFile`) | internal/testkernel/experiment/injectors.go:105 | internal:testkernel |
-| `<call:t.TempDir>/.cog/config/identity.yaml` | makeMinimalWorkspace (`os.WriteFile`) | internal/testkernel/testkernel.go:574 | internal:testkernel |
+| `<call:t.TempDir>/.cog/config/identity.yaml` | makeMinimalWorkspace (`os.WriteFile`) | internal/testkernel/testkernel.go:569 | internal:testkernel |
 | `<WorkspaceRoot>/.cog/ledger/<call:pathsafe.SanitizeComponent>` | AppendEvent (`os.MkdirAll`) | pkg/cogblock/ledger.go:194 | pkg:cogblock |
 | `<WorkspaceRoot>/.cog/ledger/<call:pathsafe.SanitizeComponent>/events.jsonl` | AppendEvent (`os.OpenFile`) | pkg/cogblock/ledger.go:237 | pkg:cogblock |
 | `<WorkspaceRoot>/.cog/claims` | CreateClaim (`os.MkdirAll`) | pkg/coordination/coordination.go:66 | pkg:coordination |
@@ -216,7 +216,7 @@ These sites structurally resolved (the shape of the path is known) but the ROOT 
 | `{p.TargetPath}` | (ProjectionSymlinkInjector).Inject (`os.Symlink`) | internal/testkernel/experiment/injectors.go:129 | internal:testkernel |
 | `{root}/first-instruments-runs/{runID}` | RunDir (`os.MkdirAll`) | internal/testkernel/experiment/manifest.go:41 | internal:testkernel |
 | `{root}/first-instruments-runs/{runID}/observations.jsonl` | NewObservationWriter (`os.OpenFile`) | internal/testkernel/experiment/manifest.go:103 | internal:testkernel |
-| `{d}` | makeMinimalWorkspace (`os.MkdirAll`) | internal/testkernel/testkernel.go:562 | internal:testkernel |
+| `{d}` | makeMinimalWorkspace (`os.MkdirAll`) | internal/testkernel/testkernel.go:557 | internal:testkernel |
 | `dirname({m.nodeDir}/aliases.yaml)` | writeFile (`os.MkdirAll`) | pkg/alias/alias.go:323 | pkg:alias |
 | `{m.nodeDir}/aliases.yaml` | writeFile (`os.Rename`) | pkg/alias/alias.go:331 | pkg:alias |
 | `{path}` | WriteAbstractToFrontmatter (`os.WriteFile`) | pkg/cogdoc_review/abstract.go:446 | pkg:cogdoc_review |
@@ -277,7 +277,7 @@ These sites write to disk but this tool could not structurally resolve their pat
 | `<expr>` | (*ProjectionReconciler).ApplyPlan (`os.Rename`) | internal/engine/projection_reconciler.go:436 | internal:engine |
 | `<call:fmt.Sprintf>` | (*rotatingWriter).rotateLocked (`os.Rename`) | internal/engine/rotating_writer.go:130 | internal:engine |
 | `{dst}/<call:filepath.Rel>` | func literal (line 795) (`os.MkdirAll`) | internal/providers/site/site.go:805 | provider:site |
-| `<call:t.TempDir>/projects/cog_lab_package/identities/identity_test.md` | makeMinimalWorkspace (`os.WriteFile`) | internal/testkernel/testkernel.go:569 | internal:testkernel |
+| `<call:t.TempDir>/projects/cog_lab_package/identities/identity_test.md` | makeMinimalWorkspace (`os.WriteFile`) | internal/testkernel/testkernel.go:564 | internal:testkernel |
 | `{m.nodeDir}/aliases.yaml.tmp.<call:fmt.Sprintf>` | writeFile (`os.WriteFile`) | pkg/alias/alias.go:328 | pkg:alias |
 | `<call:bep.ExpandCertDir>` | runGen (`os.MkdirAll`) | pkg/substrate/bep/cmd/bep-cert/main.go:103 | pkg:substrate |
 | `dirname({path})/<call:fmt.Sprintf>` | writeFileAtomic (`os.OpenFile`) | pkg/substrate/bep/tls.go:124 | pkg:substrate |

@@ -136,8 +136,12 @@ check_output "context has nucleus"       '"nucleus":"CogOS"'   "http://localhost
 # identity grant at boot (ensureNodeRootGrant, boot_node_root_grant.go) as
 # the zero-paste bootstrap credential for exactly this case. This probe does
 # the REAL bootstrap a live consumer (Claude Code, THESEUS, the dashboard)
-# would do: GET the node-root grant's current token (itself exempt from the
-# gate — it's a GET) and attach it as X-Cogos-Grant on every /mcp call below.
+# would do: read the node-root token from the 0600 vault file the daemon
+# writes at boot (~/.cog/vault/node-root-grant) and attach it as
+# X-Cogos-Grant on every /mcp call below. It is a file read rather than an
+# HTTP GET because /v1/identity/* is now gated on every method (ledger L03) —
+# a caller holding no grant cannot fetch one over loopback, which is the
+# point; the vault file is the designated bootstrap store for that case.
 # Mirrors internal/testkernel/testkernel.go's NodeRootGrantToken/ListTools —
 # keep the two consistent if either changes.
 
@@ -146,13 +150,15 @@ MCP_URL="http://localhost:$PORT/mcp"
 MCP_H_CT='Content-Type: application/json'
 MCP_H_ACC='Accept: application/json, text/event-stream'
 
-GRANT_JSON=$(curl -s -m 10 "http://localhost:$PORT/v1/identity/grants/current?surface=node-root" || echo "")
-GRANT_TOKEN=$(echo "$GRANT_JSON" | grep -o '"token":"[^"]*"' | head -1 | cut -d'"' -f4)
+GRANT_VAULT_FILE="$HOME/.cog/vault/node-root-grant"
+GRANT_TOKEN=$(cat "$GRANT_VAULT_FILE" 2>/dev/null | tr -d '[:space:]')
 if [ -n "${GRANT_TOKEN:-}" ]; then
     echo "  PASS  node-root grant token acquired"
     pass=$((pass + 1))
 else
-    echo "  FAIL  node-root grant token acquired (got: $GRANT_JSON)"
+    # Deliberately does NOT echo any token material on failure — only the
+    # path that was consulted.
+    echo "  FAIL  node-root grant token acquired (no readable token at $GRANT_VAULT_FILE)"
     fail=$((fail + 1))
 fi
 GRANT_HEADER_ARG=""

@@ -452,12 +452,12 @@ func TestRound3GateFindings_Fixed(t *testing.T) {
 				// full — to <Home>/.cog/vault/node-root-grant, a genuine
 				// .cog/ path (home-rooted rather than workspace-rooted,
 				// but .cog/ all the same per hasCogSegment's definition).
-				s, ok := find("internal/engine/boot_node_root_grant.go", 279)
+				s, ok := find("internal/engine/boot_node_root_grant.go", 292)
 				if !ok {
-					t.Fatal("boot_node_root_grant.go:279 not found in inventory")
+					t.Fatal("boot_node_root_grant.go:292 not found in inventory")
 				}
 				if s.Category != "cog" || !strings.Contains(s.Pattern, ".cog/vault/node-root-grant") {
-					t.Errorf("boot_node_root_grant.go:279 = category %q pattern %q, want cog / .cog/vault/node-root-grant", s.Category, s.Pattern)
+					t.Errorf("boot_node_root_grant.go:292 = category %q pattern %q, want cog / .cog/vault/node-root-grant", s.Category, s.Pattern)
 				}
 			},
 		},
@@ -548,9 +548,9 @@ func TestRound3GateFindings_Fixed(t *testing.T) {
 						t.Errorf("%s:%d pattern %q does not contain %q", file, line, s.Pattern, want)
 					}
 				}
-				wantBucket("internal/engine/serve_identity_grants.go", 723, "identity-grants")
-				wantBucket("internal/engine/serve_identity_grants.go", 780, "identity-grants")
-				wantBucket("internal/engine/serve_identity_grants.go", 823, "identity-grants")
+				wantBucket("internal/engine/serve_identity_grants.go", 725, "identity-grants")
+				wantBucket("internal/engine/serve_identity_grants.go", 782, "identity-grants")
+				wantBucket("internal/engine/serve_identity_grants.go", 825, "identity-grants")
 				wantBucket("internal/engine/worktree_spawn.go", 273, "worktree-reconciler")
 				wantBucket("internal/engine/mcp_stubs.go", 641, "mcp-client")
 

@@ -92,9 +92,13 @@
 // fetch('http://127.0.0.1:6931/v1/ledger') and read the body. Round 5's
 // response swept every registered route (the classification table below) and
 // found the same class on more surfaces, including one credential leak:
-// GET /v1/identity/grants/current returns a live grant's RAW TOKEN by design
+// /v1/identity/grants/current returns a live grant's RAW TOKEN by design
 // (the "zero-paste primitive" — its stated consumer is "a same-loopback
-// page", which is exactly this tier's contract).
+// page", which is exactly this tier's contract). As of ledger L03 that route
+// is a POST behind the grant gate rather than an unauthenticated GET, so the
+// CORS tier is now defense-in-depth on it rather than the only thing
+// standing between a visited page and the node-root token; the tier
+// assignment is unchanged.
 //
 // Tiered routes do NOT get the /v1/debug treatment of dropping CORS entirely,
 // because they have legitimate CROSS-origin browser consumers on other
@@ -206,7 +210,8 @@
 //	LOOP  /v1/events[/stream]     QueryLedger wrapper (round 4)
 //	LOOP  /v1/handoffs/*          OfferPayload carries full state blobs
 //	LOOP  /v1/identity/*          grants/current returns a live RAW TOKEN;
-//	                              POST mint response carries one too
+//	                              POST mint response carries one too. Both
+//	                              are additionally grant-gated (L03).
 //	LOOP  /v1/kernel-log          kernel slog rows carry content previews at
 //	                              Info: prompt_prefix (serve_foveated.go),
 //	                              query_prefix (trm_context.go), text_preview

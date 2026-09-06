@@ -60,13 +60,29 @@ import (
 // first write-route request, before it has bootstrapped its own grant.
 const nodeRootSurface = "node-root"
 
-// nodeRootScope is the (single, coarse) scope recorded on the node-root
-// grant. The write-route grant-auth middleware (serve_grant_auth.go) does
-// not itself check scope — VerifyAny only asks "is this token live" — so
-// this value is documentary today (what the credential is FOR), not
-// enforced. A future scope-aware consumer of IdentityGrant.Scope can rely on
-// this name without a corpus-wide rename later.
+// nodeRootScope is the root scope recorded on the node-root grant. It is no
+// longer documentary (ledger L02): grantHasScope in serve_grant_auth.go
+// treats it as the root authority — a grant carrying this scope satisfies
+// every scope requirement, which is what "node-root retains all scopes"
+// means mechanically. Every OTHER surface's grant is checked against the
+// concrete ScopeInference/ScopeWrite/ScopeAdmin vocabulary.
+//
+// The carve-out is keyed on this scope string rather than on
+// nodeRootSurface so a node-root grant reconstructed from a pre-L02 ledger
+// keeps its authority across the upgrade: MintOrReuse REUSES a still-live
+// grant rather than re-minting, so the Scope list recorded at the original
+// mint is what a restarted kernel sees, and no ledger migration is needed.
 const nodeRootScope = "node-root"
+
+// nodeRootScopes is the scope list a freshly minted node-root grant records.
+// nodeRootScope alone would suffice (grantHasScope treats it as root), but
+// enumerating the concrete scopes alongside it makes `GET /v1/identity/grants`
+// self-describing for an operator reading the inventory, and means a future
+// change that narrows the root carve-out does not silently strip the
+// kernel's own credential of the authority it actually exercises.
+func nodeRootScopes() []string {
+	return []string{nodeRootScope, ScopeInference, ScopeWrite, ScopeAdmin}
+}
 
 // nodeRootVaultFileName is the fallback on-disk store for the node-root
 // grant's raw token — see the file header for why this is a fallback rather
@@ -116,15 +132,15 @@ func ensureNodeRootGrant(s *Server) (*IdentityGrant, error) {
 		}
 	}
 
-	grant, err := s.identityGrants.MintOrReuse(nodeRootSurface, []string{nodeRootScope}, 0)
+	grant, err := s.identityGrants.MintOrReuse(nodeRootSurface, nodeRootScopes(), 0)
 	if err != nil {
 		return nil, fmt.Errorf("mint node-root grant: %w", err)
 	}
 
 	if pathErr != nil {
 		slog.Warn("boot: could not resolve home directory to persist the node-root grant vault file; "+
-			"the token lives only in this process's memory and local consumers must re-fetch it via "+
-			"GET /v1/identity/grants/current?surface=node-root",
+			"the token lives only in this process's memory. With the unauthenticated GET removed (ledger L03), "+
+			"NO local consumer can bootstrap from this kernel: set HOME or pass a vault path, then restart",
 			"err", pathErr)
 		return grant, nil
 	}
@@ -249,8 +265,9 @@ func maybeRenewNodeRootGrant(s *Server) {
 // mint-or-recover path from within a renewal check (either because no live
 // grant exists, or because ExtendGrant lost a narrow race against expiry —
 // see maybeRenewNodeRootGrant's doc comment for both call sites). This IS a
-// real credential change every local consumer must re-fetch via
-// GET /v1/identity/grants/current?surface=node-root, so success logs at Info
+// real credential change every local consumer must pick up (re-read the vault
+// file, or POST /v1/identity/grants/current with a still-valid grant), so
+// success logs at Info
 // rather than Debug; reason is a short, call-site-specific description for
 // the log line.
 func establishFreshNodeRootGrant(s *Server, reason string) {
@@ -262,7 +279,7 @@ func establishFreshNodeRootGrant(s *Server, reason string) {
 		return
 	}
 	slog.Info("node-root grant renewal: "+reason+"; minted/recovered a fresh grant "+
-		"(this is a real credential change — consumers must re-fetch via GET /v1/identity/grants/current?surface=node-root)",
+		"(this is a real credential change — consumers must re-read ~/.cog/vault/node-root-grant or POST /v1/identity/grants/current with a still-valid grant)",
 		"grant_id", fresh.GrantID, "expires_at", fresh.ExpiresAt.Format(time.RFC3339))
 }
 

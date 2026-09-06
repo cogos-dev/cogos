@@ -8,8 +8,10 @@
 // scoped only migrated the *verification* step; the zero-paste bootstrap UX
 // was deferred to chunk 4. That deferral is overridden here — chunk 1 now
 // also has to make the token acquirable with no operator action, which is
-// why GET /v1/identity/grants/current exists below (a surface can ask "what
-// is MY currently-live grant" without minting a new one every restart).
+// why /v1/identity/grants/current exists below (a surface can ask "what is MY
+// currently-live grant" without minting a new one every restart). It was a
+// gate-exempt GET through 2026-09; ledger L03 made it a POST behind the gate,
+// and unauthenticated bootstrap now goes through the vault file only.
 //
 // Mechanism (per design §3.1-§3.3, chunk-1-sized; §3.2 ledger-first for
 // chunk 2):
@@ -41,7 +43,7 @@
 //	                                   verifies for that token fail.
 //	GET  /v1/identity/grants        — operator-facing inventory. NEVER
 //	                                   returns a token value, per design §3.1.
-//	GET  /v1/identity/grants/current?surface=X — returns the live grant's
+//	POST /v1/identity/grants/current {"surface":"X"} — returns the live grant's
 //	                                   token for a named surface, if one
 //	                                   exists AND its raw value is still
 //	                                   cached in this process's memory. This
@@ -1079,12 +1081,26 @@ func constantTimeEqual(a, b string) bool {
 func (s *Server) registerIdentityGrantRoutes(mux *http.ServeMux) {
 	s.route(mux, "POST /v1/identity/grants", s.handleIdentityGrantMint)
 	s.route(mux, "GET /v1/identity/grants", s.handleIdentityGrantList)
-	s.route(mux, "GET /v1/identity/grants/current", s.handleIdentityGrantCurrent)
+	// POST, not GET (ledger L03): this route returns a live grant's RAW
+	// TOKEN, and the grant-auth middleware exempts GET on most paths. Making
+	// it a POST means it cannot be reached by the blanket GET exemption even
+	// if a future edit to isGrantExemptRequest drops the /v1/identity carve-
+	// out, and it cannot be triggered by a cross-origin <img>/<script>/form
+	// navigation. It is additionally gated: /v1/identity/* is never exempt.
+	s.route(mux, "POST /v1/identity/grants/current", s.handleIdentityGrantCurrent)
 	s.route(mux, "POST /v1/identity/verify", s.handleIdentityVerify)
 	s.route(mux, "POST /v1/identity/grants/{id}/revoke", s.handleIdentityGrantRevoke)
 }
 
 // ─── wire types ───────────────────────────────────────────────────────────────
+
+// identityGrantCurrentRequest is the JSON body shape accepted by
+// POST /v1/identity/grants/current. Optional — the `surface` query param is
+// still honored so the GET→POST migration is a one-word change at call
+// sites.
+type identityGrantCurrentRequest struct {
+	Surface string `json:"surface"`
+}
 
 type identityGrantMintRequest struct {
 	Surface  string   `json:"surface"`
@@ -1165,6 +1181,20 @@ func (s *Server) handleIdentityGrantMint(w http.ResponseWriter, r *http.Request)
 				"the presented grant may not mint a grant for surface "+req.Surface)
 			return
 		}
+		// Scope attenuation: a non-root caller may only mint scopes it already
+		// holds. Without this, a grant issued with Scope=["admin"] (narrowly, to
+		// manage its own credential) could self-mint a replacement carrying
+		// "inference" or "write" and escalate. Node-root is the issuing
+		// authority and is exempt. (Review finding on ledger L02.)
+		if ok && presented.Surface != nodeRootSurface {
+			for _, want := range req.Scope {
+				if !grantHasScope(presented, want) {
+					writeJSONError(w, http.StatusForbidden, "scope_escalation",
+						"the presented grant does not hold scope "+want+" and may not mint it")
+					return
+				}
+			}
+		}
 	}
 	ttl := time.Duration(0)
 	if req.TTLHours > 0 {
@@ -1216,15 +1246,37 @@ func (s *Server) handleIdentityGrantList(w http.ResponseWriter, r *http.Request)
 	writeJSONResp(w, http.StatusOK, map[string]any{"grants": out})
 }
 
-// ─── GET /v1/identity/grants/current ─────────────────────────────────────────
+// ─── POST /v1/identity/grants/current ────────────────────────────────────────
 
 // handleIdentityGrantCurrent is the zero-paste primitive (operator ruling
 // 2026-07-21, see file header): returns the live grant's raw token for a
 // named surface, if one exists, so a same-loopback page can bootstrap
 // without any operator paste. 404 when no live grant exists for that surface
 // (caller should mint one via POST /v1/identity/grants, or degrade).
+//
+// It is a POST behind the grant gate rather than the unauthenticated GET it
+// used to be (ledger L03). The old shape meant any process that could open a
+// loopback socket could read the node-root token — the kernel's admin
+// credential — out of a GET body with no credential of its own, which made
+// every other check in serve_grant_auth.go decorative. The primitive itself
+// survives, because the caller that needs it (a same-loopback surface
+// already holding SOME grant, wanting the current token for a surface) can
+// present that grant; the caller with no grant at all bootstraps from
+// ~/.cog/vault/node-root-grant (0600) instead.
+//
+// Surface may arrive as a `surface` query param (unchanged from the GET
+// shape, so callers only change the verb) or as {"surface": "..."} in a JSON
+// body. Query param wins when both are present.
 func (s *Server) handleIdentityGrantCurrent(w http.ResponseWriter, r *http.Request) {
 	surface := r.URL.Query().Get("surface")
+	if surface == "" && r.Body != nil {
+		var req identityGrantCurrentRequest
+		// Best-effort: an absent/!JSON body just leaves surface empty and
+		// falls into the 400 below with the same message as before.
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			surface = req.Surface
+		}
+	}
 	if surface == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", "surface query param is required")
 		return
@@ -1296,8 +1348,9 @@ type identityGrantRevokeResponse struct {
 // serve_grant_auth.go's file header "SURFACE-MATCH" section): VerifyAny
 // accepts any live grant regardless of surface, so without an additional
 // check here a caller holding a grant for an unrelated, throwaway surface
-// could revoke node-root's grant outright (its grant_id is visible via the
-// gate-exempt GET /v1/identity/grants). Before mutating anything, this looks
+// could revoke node-root's grant outright (its grant_id was visible via the
+// then-gate-exempt GET /v1/identity/grants; ledger L03 has since gated all of
+// /v1/identity/*, but this check stands on its own). Before mutating anything, this looks
 // up the TARGET grant by id (GrantByID, read-only) and requires the
 // presented grant (grantFromContext) to be node-root or to already match the
 // target's own surface (self-service: a surface may revoke/rotate its own

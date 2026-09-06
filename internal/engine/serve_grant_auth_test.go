@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,17 +27,31 @@ func newGrantAuthTestServer(t *testing.T) *Server {
 	return srv
 }
 
-// mintTestGrant mints a live grant on srv's registry for use as a valid
-// X-Cogos-Grant header value in tests. t.Helper so failures point at the
-// caller.
+// mintTestGrant mints a live, fully-scoped grant on srv's registry for use
+// as a valid X-Cogos-Grant header value in tests. t.Helper so failures point
+// at the caller.
+//
+// It carries all three concrete scopes because its callers are testing the
+// AUTHENTICATION half of the gate ("does a valid credential get through"),
+// not the authorization half — a narrower scope here would make those tests
+// fail for a reason they are not about. Tests that are specifically about
+// scope use mintScopedTestGrant.
 func mintTestGrant(t *testing.T, srv *Server, surface string) string {
 	t.Helper()
-	grant, err := srv.identityGrants.MintOrReuse(surface, []string{"test"}, time.Hour)
+	return mintScopedTestGrant(t, srv, surface, ScopeInference, ScopeWrite, ScopeAdmin)
+}
+
+// mintScopedTestGrant mints a live grant carrying exactly the given scopes.
+// Used by the scope-enforcement tests (ledger L02), where the whole point is
+// that the grant is live but lacks the scope the route demands.
+func mintScopedTestGrant(t *testing.T, srv *Server, surface string, scopes ...string) string {
+	t.Helper()
+	grant, err := srv.identityGrants.MintOrReuse(surface, scopes, time.Hour)
 	if err != nil {
-		t.Fatalf("mintTestGrant: MintOrReuse: %v", err)
+		t.Fatalf("mintScopedTestGrant: MintOrReuse: %v", err)
 	}
 	if grant.Token == "" {
-		t.Fatalf("mintTestGrant: minted grant has empty token")
+		t.Fatalf("mintScopedTestGrant: minted grant has empty token")
 	}
 	return grant.Token
 }
@@ -354,9 +369,10 @@ func TestGrantAuth_IdentityGrantsMint_BlindCSRFMintDoesNotSupersedeNodeRoot(t *t
 }
 
 // (c) mint of a NEW surface, presenting the node-root grant -> 200. This is
-// the real bootstrap path now: a consumer fetches node-root's token via the
-// gate-exempt GET /v1/identity/grants/current?surface=node-root, then uses
-// it to mint its own surface-scoped grant.
+// the real bootstrap path now: a consumer reads node-root's token from the
+// 0600 vault file ~/.cog/vault/node-root-grant (the zero-paste HTTP
+// primitive is itself gated as of ledger L03), then uses it to mint its own
+// surface-scoped grant.
 func TestGrantAuth_IdentityGrantsMint_WithNodeRootGrant_Succeeds(t *testing.T) {
 	t.Parallel()
 	srv := newGrantAuthTestServer(t)
@@ -392,8 +408,9 @@ func TestGrantAuth_IdentityGrantsMint_WithNodeRootGrant_Succeeds(t *testing.T) {
 // (d) revoke of node-root's grant, presented with a throwaway-surface
 // grant -> 403 (surface_mismatch). Closes the unverified-note attack chain:
 // without this, any authenticated-but-unrelated grant holder could revoke
-// node-root outright (its grant_id is visible via the gate-exempt
-// GET /v1/identity/grants).
+// node-root outright (its grant_id is visible via GET /v1/identity/grants,
+// which is itself gated as of ledger L03 but readable by any admin-scoped
+// caller).
 func TestGrantAuth_IdentityGrantsRevoke_ThrowawaySurfaceCannotRevokeNodeRoot(t *testing.T) {
 	t.Parallel()
 	srv := newGrantAuthTestServer(t)
@@ -733,5 +750,325 @@ func TestGrantAuth_XApiKeyWithValidGrant_PassesGate(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d with bogus x-api-key; want 401", resp2.StatusCode)
+	}
+}
+
+// ─── ledger L03: identity read routes are gated ──────────────────────────────
+//
+// Before this change, isGrantExemptRequest exempted EVERY GET except /mcp
+// from the gate. Two of the identity routes are GETs, and one of them —
+// GET /v1/identity/grants/current — returned a live grant's raw token in its
+// response body. So any process that could open a loopback socket could read
+// the node-root token (the kernel's admin credential, which grantHasScope
+// treats as root authority) with no credential of its own, and then mint,
+// revoke, and write with full authority. That made every other check in
+// serve_grant_auth.go decorative.
+//
+// NEGATIVE CONTROL: on the pre-change code these routes answered 200 with a
+// token in the body; the assertions below fail there.
+
+// TestGrantAuth_IdentityReadRoutes_UnauthenticatedGet_401 is the L03 tooth:
+// unauthenticated GET on the identity read routes must be rejected at the
+// gate. /v1/identity/grants/current is included in its OLD (GET) shape too,
+// so this test also pins that the pre-change verb cannot be resurrected as
+// an exempt path by accident.
+func TestGrantAuth_IdentityReadRoutes_UnauthenticatedGet_401(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// A live node-root grant exists — the leak this closes is precisely
+	// "there IS a token to hand out", so the registry must be populated for
+	// the test to be meaningful.
+	mintTestGrant(t, srv, nodeRootSurface)
+
+	paths := []string{
+		"/v1/identity/grants",
+		"/v1/identity/grants/current?surface=node-root",
+		"/v1/identity/grants/current",
+	}
+	for _, path := range paths {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			// Deliberately does NOT print the body — on the old code it
+			// contains a live raw token.
+			t.Errorf("GET %s = %d; want 401 (unauthenticated identity read must be rejected at the gate)",
+				path, resp.StatusCode)
+		}
+		if bytes.Contains(body, []byte(`"token"`)) {
+			t.Errorf("GET %s response body carries a \"token\" field — a raw grant escaped through an unauthenticated read", path)
+		}
+	}
+}
+
+// TestGrantAuth_IdentityGrantCurrent_IsPostBehindGate covers the surviving
+// half of the L03 ruling ("keep the zero-paste primitive if it can be made a
+// POST behind a grant"): the primitive still works, it just requires a grant
+// and a POST now.
+func TestGrantAuth_IdentityGrantCurrent_IsPostBehindGate(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	nodeRootToken := mintTestGrant(t, srv, nodeRootSurface)
+
+	// Unauthenticated POST -> 401 at the gate.
+	unauth, err := http.Post(ts.URL+"/v1/identity/grants/current?surface=node-root",
+		"application/json", nil)
+	if err != nil {
+		t.Fatalf("unauthenticated POST current: %v", err)
+	}
+	unauth.Body.Close()
+	if unauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated POST current = %d; want 401", unauth.StatusCode)
+	}
+
+	// Authenticated POST -> 200, and returns the same live token.
+	req, err := http.NewRequest(http.MethodPost,
+		ts.URL+"/v1/identity/grants/current?surface=node-root", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set(GrantHeaderName, nodeRootToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("authenticated POST current: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated POST current = %d; want 200 — the zero-paste primitive must survive the gating", resp.StatusCode)
+	}
+	var out identityGrantMintResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Token != nodeRootToken {
+		t.Fatal("POST current did not return the live node-root token to an authenticated caller")
+	}
+}
+
+// TestGrantAuth_NonIdentityGetRoutes_StillExempt pins the blast radius of the
+// L03 carve-out: it removes GET exemption for /v1/identity/* ONLY. Every
+// other read stays exempt, so no dashboard/observability consumer regresses.
+func TestGrantAuth_NonIdentityGetRoutes_StillExempt(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	for _, path := range []string{"/health", "/v1/manifest", "/v1/context", "/v1/ledger", "/v1/vitals"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized {
+			t.Errorf("GET %s = 401; the identity carve-out must not widen to other reads", path)
+		}
+	}
+}
+
+// ─── ledger L02: scope enforcement ───────────────────────────────────────────
+//
+// Before this change, IdentityGrant.Scope was recorded at mint time and never
+// read: grantAuthMiddleware called VerifyAny, which asks only "is this token
+// live". A grant minted for one narrow purpose therefore carried the
+// authority of every purpose — a surface allowed to run inference could also
+// mutate config, write cogdocs through /mcp, and mint itself grants for any
+// other surface.
+//
+// NEGATIVE CONTROL: on the pre-change code every case below reached its
+// handler (non-403), so each assertion fails there.
+
+// TestGrantAuth_InferenceScopedGrant_DeniedOnWriteRoute is the L02 tooth
+// named in the ledger: a grant minted with scope ["inference"] is denied on a
+// write route.
+func TestGrantAuth_InferenceScopedGrant_DeniedOnWriteRoute(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	token := mintScopedTestGrant(t, srv, "inference-only-surface", ScopeInference)
+
+	req, err := http.NewRequest(http.MethodPatch, ts.URL+"/v1/config",
+		bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(GrantHeaderName, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PATCH /v1/config: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("PATCH /v1/config with an inference-scoped grant = %d; want 403 insufficient_scope", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["type"] != "insufficient_scope" {
+		t.Errorf("error.type = %v; want insufficient_scope", errObj["type"])
+	}
+}
+
+// TestGrantAuth_ScopeMatrix walks the (grant scope × route) grid so a future
+// edit that widens one scope's reach fails here rather than in production.
+func TestGrantAuth_ScopeMatrix(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	type routeCase struct {
+		name   string
+		method string
+		path   string
+		// want is the scope this route demands.
+		want string
+	}
+	routes := []routeCase{
+		{"chat-completions", http.MethodPost, "/v1/chat/completions", ScopeInference},
+		{"anthropic-messages", http.MethodPost, "/v1/messages", ScopeInference},
+		{"config-patch", http.MethodPatch, "/v1/config", ScopeWrite},
+		{"config-rollback", http.MethodPost, "/v1/config/rollback", ScopeWrite},
+		{"mcp", http.MethodPost, "/mcp", ScopeWrite},
+		{"grant-mint", http.MethodPost, "/v1/identity/grants", ScopeAdmin},
+		{"grant-list", http.MethodGet, "/v1/identity/grants", ScopeAdmin},
+		{"grant-current", http.MethodPost, "/v1/identity/grants/current?surface=node-root", ScopeAdmin},
+	}
+	scopes := []string{ScopeInference, ScopeWrite, ScopeAdmin}
+
+	// One grant per scope, each on its own surface so MintOrReuse doesn't
+	// supersede a sibling.
+	tokenForScope := map[string]string{}
+	for _, sc := range scopes {
+		tokenForScope[sc] = mintScopedTestGrant(t, srv, "matrix-"+sc, sc)
+	}
+	// Plus the kernel's own root credential, which must reach everything.
+	nodeRootToken := mintScopedTestGrant(t, srv, nodeRootSurface, nodeRootScope)
+
+	// deniedForScope reports whether the GATE rejected this request for
+	// scope. It keys on the error TYPE, not the status code alone: some of
+	// these handlers answer 403 on their own account (PATCH /v1/config hits
+	// requireConfigMutation's 403 when EnableConfigMutation is off), and a
+	// status-only check could not tell "the gate stopped it" from "the
+	// handler ran and declined" — which would make the matching-scope half
+	// of this matrix a false failure.
+	deniedForScope := func(t *testing.T, rc routeCase, token string) bool {
+		t.Helper()
+		req, err := http.NewRequest(rc.method, ts.URL+rc.path, bytes.NewBufferString(`{}`))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(GrantHeaderName, token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", rc.method, rc.path, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			return false
+		}
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return false
+		}
+		errObj, _ := body["error"].(map[string]any)
+		return errObj["type"] == "insufficient_scope"
+	}
+
+	for _, rc := range routes {
+		for _, sc := range scopes {
+			denied := deniedForScope(t, rc, tokenForScope[sc])
+			if sc == rc.want {
+				if denied {
+					t.Errorf("%s with the matching %q scope was denied insufficient_scope; the gate must not reject a correctly-scoped grant", rc.name, sc)
+				}
+			} else if !denied {
+				t.Errorf("%s with a %q-scoped grant was NOT denied; want 403 insufficient_scope (route requires %q)",
+					rc.name, sc, rc.want)
+			}
+		}
+		// node-root retains all scopes.
+		if deniedForScope(t, rc, nodeRootToken) {
+			t.Errorf("%s with the node-root grant was denied insufficient_scope; node-root must retain every scope", rc.name)
+		}
+	}
+}
+
+// TestGrantAuth_EmptyScopeGrant_DeniedOnScopedRoute pins the fail-closed
+// direction: a grant with no scopes at all reaches no scoped route. A
+// fail-open reading of grantHasScope ("empty means unrestricted") would make
+// every pre-L02 ledger row a skeleton key.
+func TestGrantAuth_EmptyScopeGrant_DeniedOnScopedRoute(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	token := mintScopedTestGrant(t, srv, "no-scope-surface")
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions",
+		bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(GrantHeaderName, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/chat/completions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("scopeless grant on an inference route = %d; want 403 insufficient_scope", resp.StatusCode)
+	}
+}
+
+// TestGrantAuth_UnscopedRoutes_TakeAnyLiveGrant pins the other half of the
+// blast radius: L02 only ADDS requirements on the routes
+// requiredScopeForRequest names. Every other gated write route keeps its
+// pre-change behavior — any live grant passes.
+func TestGrantAuth_UnscopedRoutes_TakeAnyLiveGrant(t *testing.T) {
+	t.Parallel()
+	srv := newGrantAuthTestServer(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	token := mintScopedTestGrant(t, srv, "narrow-surface", ScopeInference)
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/attention",
+		bytes.NewBufferString(`{}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(GrantHeaderName, token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/attention: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("POST /v1/attention = 403 with a live grant; L02 must not add a scope requirement to unclassified routes")
 	}
 }

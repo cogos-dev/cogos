@@ -31,10 +31,32 @@
 //     gap this build was explicitly asked to close (see the test file).
 //     Carving /mcp out of the blanket "GET routes are exempt" rule below is
 //     deliberate, not an oversight.
-//   - EXEMPT, unconditionally: GET on any path other than /mcp, GET/HEAD
-//     /health, and POST /v1/identity/verify (the verification authority
-//     itself — gating it would be circular: a caller with no grant could
-//     never learn whether ITS token is valid).
+//   - EXEMPT, unconditionally: GET on any path other than /mcp and
+//     /v1/identity/*, GET/HEAD /health, and POST /v1/identity/verify (the
+//     verification authority itself — gating it would be circular: a caller
+//     with no grant could never learn whether ITS token is valid).
+//   - /v1/identity/* is gated on EVERY method, not just writes (ledger L03,
+//     audit F1 HIGH). The blanket "GET is exempt" rule above used to cover
+//     the identity read routes too, and one of them — the zero-paste
+//     primitive — returns a live grant's RAW TOKEN in its response body. The
+//     node-root grant is the kernel's admin credential: any unauthenticated
+//     process on 127.0.0.1 could GET it and then mint, revoke, or write with
+//     full authority, which makes every other check in this file decorative.
+//     Carving /v1/identity/* out of the GET exemption closes that. The
+//     zero-paste primitive itself is no longer a GET at all — it is
+//     POST /v1/identity/grants/current behind this gate (see
+//     handleIdentityGrantCurrent), so a raw token never travels in a GET
+//     response body regardless of what a future exemption edit does.
+//     Bootstrap is unaffected: ensureNodeRootGrant (boot_node_root_grant.go)
+//     persists the node-root token to ~/.cog/vault/node-root-grant (0600) at
+//     boot, which is where a local consumer with no grant yet reads its
+//     first credential — a same-user filesystem read rather than an
+//     unauthenticated HTTP read by anything that can open a loopback socket.
+//   - SCOPE ENFORCEMENT (ledger L02, audit R-C1). Past this point the
+//     presented grant's Scope is no longer documentary: routes classified by
+//     requiredScopeForRequest demand a matching scope, and a live grant
+//     without it gets 403 insufficient_scope. See that function and
+//     grantHasScope for the mapping and the node-root carve-out.
 //   - NO bootstrap exemption for POST /v1/identity/grants (mint). An earlier
 //     version of this file left the mint route reachable without a grant,
 //     reasoning that a brand-new local consumer has no token yet and needs
@@ -49,9 +71,10 @@
 //     00bc7b2 — see also VerifyAny's doc comment). The exemption was never
 //     actually necessary: ensureNodeRootGrant (boot_node_root_grant.go)
 //     mints the node-root credential IN-PROCESS at boot, with no HTTP call
-//     involved, and every local consumer acquires it over the gate-exempt
-//     GET /v1/identity/grants/current?surface=node-root (a read, so no
-//     chicken-and-egg problem). So POST /v1/identity/grants is gated exactly
+//     involved, and every local consumer acquires it from the vault file
+//     ~/.cog/vault/node-root-grant (0600, written at boot by ensureNodeRootGrant)
+//     or, holding a grant, via POST /v1/identity/grants/current behind the gate
+//     (the GET was removed under ledger L03; see below). So POST /v1/identity/grants is gated exactly
 //     like every other write route below: it requires a valid presented
 //     grant. What used to be the "bootstrap" case is now just "present the
 //     node-root token you already fetched via that GET" — indistinguishable
@@ -63,8 +86,9 @@
 //     the bootstrap exemption gone, VerifyAny alone would let ANY live grant
 //     — including one for an unrelated, throwaway surface an authenticated
 //     caller minted for itself — mint a grant for a DIFFERENT surface, or
-//     revoke node-root's own grant outright (its grant_id is visible via the
-//     gate-exempt GET /v1/identity/grants). Closing that residual (cog-review
+//     revoke node-root's own grant outright (its grant_id was visible via the
+//     then-gate-exempt GET /v1/identity/grants; ledger L03 has since put all
+//     of /v1/identity/* behind this gate). Closing that residual (cog-review
 //     unverified note, PR #551) means handleIdentityGrantMint and
 //     handleIdentityGrantRevoke (serve_identity_grants.go) additionally
 //     require the presented grant's surface to be "node-root" (the admin
@@ -183,6 +207,109 @@ const grantVerifyRequestPath = "/v1/identity/verify"
 // is carved out of the blanket GET exemption.
 const mcpRequestPath = "/mcp"
 
+// identityRoutePrefix covers every route registered by
+// registerIdentityGrantRoutes. Requests under it are gated on EVERY method
+// (ledger L03) — the blanket GET exemption does not reach them, because one
+// of these routes hands back a live grant's raw token and the rest are the
+// mint/revoke/list admin surface.
+const identityRoutePrefix = "/v1/identity"
+
+// ─── scopes (ledger L02) ─────────────────────────────────────────────────────
+//
+// IdentityGrant.Scope existed before this and was purely documentary:
+// VerifyAny asked "is this token live" and never looked at Scope, so a grant
+// minted for one purpose carried the authority of every purpose. These three
+// names are the enforced vocabulary; requiredScopeForRequest maps routes onto
+// them and grantAuthMiddleware denies a live-but-wrong-scope grant with 403.
+const (
+	// ScopeInference authorizes the model-inference routes
+	// (POST /v1/chat/completions, POST /v1/messages) — the routes that spend
+	// provider tokens and reach an external API on the operator's account.
+	ScopeInference = "inference"
+
+	// ScopeWrite authorizes mutation of kernel/workspace state: the config
+	// mutation routes and /mcp (which multiplexes cog_write_cogdoc and every
+	// other write-capable tool — see requiredScopeForRequest on why the
+	// whole multiplexer takes the write requirement rather than per-tool).
+	ScopeWrite = "write"
+
+	// ScopeAdmin authorizes the identity/grant surface itself: minting,
+	// listing, revoking, and reading a live raw token. This is the
+	// credential-issuing authority, so it is deliberately separate from
+	// ScopeWrite — a surface that may write cogdocs should not thereby be
+	// able to mint itself a grant for any other surface.
+	ScopeAdmin = "admin"
+)
+
+// requiredScopeForRequest returns the scope a caller's grant must carry to
+// reach r, or "" when the route carries no scope requirement (liveness alone
+// suffices, exactly as before this change — this function only ever ADDS a
+// requirement, it never relaxes one).
+//
+// The classification is intentionally coarse and path-prefix-driven, because
+// this runs in middleware that must not consume r.Body: /mcp carries a
+// JSON-RPC envelope naming the tool, but reading it here would break the
+// downstream handler, so the whole multiplexer takes the strictest
+// requirement of the tools it can dispatch (ScopeWrite). A read-only MCP
+// caller therefore needs a write-scoped grant; that is the conservative
+// direction of the error, and the per-tool split belongs in the MCP dispatch
+// layer where the tool name is already parsed.
+func requiredScopeForRequest(r *http.Request) string {
+	path := r.URL.Path
+
+	// Identity/grant surface — the credential-issuing authority.
+	// POST /v1/identity/verify is exempt from the gate entirely (see
+	// isGrantExemptRequest) so it never reaches this function; listed here
+	// only so the mapping reads as complete.
+	if isIdentityRoutePath(path) {
+		return ScopeAdmin
+	}
+
+	// Inference: the routes that spend provider tokens.
+	if path == "/v1/chat/completions" || path == "/v1/messages" {
+		return ScopeInference
+	}
+
+	// Writes: config mutation, and the MCP multiplexer (cogdoc writes and
+	// every other mutating tool arrive here).
+	if path == mcpRequestPath {
+		return ScopeWrite
+	}
+	if strings.HasPrefix(path, "/v1/config") {
+		return ScopeWrite
+	}
+	if strings.HasPrefix(path, "/v1/settings/") {
+		return ScopeWrite
+	}
+
+	return ""
+}
+
+// grantHasScope reports whether g may act under want.
+//
+// Fail-closed: a grant whose Scope list does not contain want is denied,
+// including a grant with an empty Scope list. The one carve-out is
+// nodeRootScope — the kernel's own bootstrap credential (see
+// boot_node_root_grant.go) is the root authority and retains every scope.
+// That carve-out is matched on the SCOPE STRING rather than the surface name
+// so a node-root grant reconstructed from a pre-L02 ledger (minted with
+// scope ["node-root"] and reused, not re-minted, across restarts by
+// MintOrReuse) keeps working without a ledger migration.
+func grantHasScope(g *IdentityGrant, want string) bool {
+	if want == "" {
+		return true
+	}
+	if g == nil {
+		return false
+	}
+	for _, have := range g.Scope {
+		if have == want || have == nodeRootScope {
+			return true
+		}
+	}
+	return false
+}
+
 // defaultGrantMintRateLimit and defaultGrantMintRateWindow bound
 // POST /v1/identity/grants throughput (see the file header's BOOTSTRAP
 // EXEMPTION note). 20/minute comfortably covers every legitimate local
@@ -293,6 +420,17 @@ func (s *Server) grantAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Scope enforcement (ledger L02). VerifyAny above answers liveness
+		// only; this is where IdentityGrant.Scope stops being documentary.
+		// 403 rather than 401: the credential is genuine and the caller is
+		// authenticated, it simply lacks authority for THIS route, so
+		// re-presenting or refreshing the same grant will not help.
+		if want := requiredScopeForRequest(r); !grantHasScope(grant, want) {
+			writeJSONError(w, http.StatusForbidden, "insufficient_scope",
+				"grant does not carry the '"+want+"' scope required for this route")
+			return
+		}
+
 		// The mint route (see the file header's "NO bootstrap exemption"
 		// section) is no longer reachable without a valid grant, so the rate
 		// limiter here is defense-in-depth against an authenticated caller
@@ -328,8 +466,27 @@ func isGrantExemptRequest(r *http.Request) bool {
 	if r.Method == http.MethodPost && r.URL.Path == grantVerifyRequestPath {
 		return true
 	}
+	// /v1/identity/* is NEVER exempt on any method (ledger L03) — same
+	// reasoning as /mcp above, carved out before the GET rule can apply.
+	// POST /v1/identity/verify already returned true above; that is the one
+	// deliberate hole and it is method- and path-exact.
+	if isIdentityRoutePath(r.URL.Path) {
+		return false
+	}
 	// Every other GET (and HEAD, which ServeMux treats as GET for handler
 	// dispatch) is a read — exempt. Everything else (POST/PUT/PATCH/DELETE
 	// on any other path) falls through to the grant check.
 	return r.Method == http.MethodGet || r.Method == http.MethodHead
+}
+
+// isIdentityRoutePath reports whether path is one of the identity/grant
+// routes. Matches the prefix exactly or as a path segment boundary so that a
+// hypothetical future "/v1/identity-something" route does not get silently
+// swept into the gate (or, worse, a "/v1/identityfoo" route silently escape
+// a check someone believed was prefix-wide).
+func isIdentityRoutePath(path string) bool {
+	if path == identityRoutePrefix {
+		return true
+	}
+	return strings.HasPrefix(path, identityRoutePrefix+"/")
 }
